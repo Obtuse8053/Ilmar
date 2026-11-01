@@ -5,8 +5,9 @@ you are a human or a coding agent (including Ilmar itself). `MANIFEST.md` is the
 founding specification and takes precedence over this file. If the two
 disagree, follow the manifest and open an issue about the conflict.
 
-Read `MANIFEST.md` before your first change. Read `docs/architecture.md` and the
-ADRs in `docs/adr/` before changing anything under `src/ilmar/`.
+Read `MANIFEST.md` before your first change. Read `docs/architecture/README.md`
+and the ADRs in `docs/architecture/decisions/` before changing anything under
+`src/ilmar/`.
 
 ## 1. Repository map
 
@@ -21,7 +22,9 @@ ADRs in `docs/adr/` before changing anything under `src/ilmar/`.
 | `tests/contracts/` | Shared contract suites every adapter of a port must pass. |
 | `tests/unit/` | Fast, deterministic unit tests. |
 | `tests/architecture/` | Tests that enforce the dependency rules and repository policy. |
-| `docs/adr/` | Architecture decision records. |
+| `docs/architecture/` | Architecture overview and decision records (`decisions/`). |
+| `docs/research/` | Source registry, findings and the research review process. |
+| `docs/roadmap.md` | Milestone status and approved improvements, linked to issues. |
 | `scripts/` | Small standard-library helper scripts used by CI. |
 
 ## 2. Commands
@@ -74,6 +77,30 @@ Additional rules:
 - Secrets never appear in configuration files. Configuration names the
   environment variable that holds a secret (`token_env = "GITHUB_TOKEN"`).
 
+## 3a. Research and architectural change
+
+The process and formats are in `docs/research/README.md`. The rules:
+
+1. **Consult first.** Before proposing a significant architectural change, read
+   the relevant ADRs and `docs/research/findings.md`. Cite what you relied on.
+2. **Record sources honestly.** Add new sources to `docs/research/sources.md`
+   with licence and access level. Label each finding Established, Emerging or
+   Experimental. Never present one organisation's self-reported result as
+   established.
+3. **Compare alternatives.** A proposal lists the options considered. If
+   evidence meets an ADR's "Revisit when" condition, say that the ADR should be
+   reconsidered. Do not quietly work around it.
+4. **Decide in ADRs.** Record decisions in `docs/architecture/decisions/`
+   (template in its README), linked to source IDs (`[R<n>]`) and findings
+   (`F-<nnn>`).
+5. **Respect rights.** Paraphrase sources. Never copy third-party code or text
+   without the §7 process. Check the licence of the specific material, not just
+   the repository.
+6. **Propose; don't impose.** Architectural improvements start as a GitHub issue
+   (Architecture proposal template) and land through a reviewed pull request.
+   Never change architecture silently, inside an unrelated change, or by
+   editing an ADR's decision after it is accepted.
+
 ## 4. Coding standards
 
 - Python 3.11+, fully type-annotated, passing `mypy --strict`.
@@ -102,9 +129,9 @@ Additional rules:
    `m2/github-task-provider`.
 2. Define acceptance criteria before coding (MANIFEST §8).
 3. Implement the smallest useful increment.
-4. Write or update an ADR in `docs/adr/` for any decision that changes the
-   architecture, a port contract, persistence format, security boundary or
-   dependency policy.
+4. Write or update an ADR in `docs/architecture/decisions/` for any decision
+   that changes the architecture, a port contract, persistence format, security
+   boundary or dependency policy.
 5. Open a pull request using the template. Fill in the provenance section.
 6. **Never merge your own pull request.** A maintainer approves and merges.
 
@@ -130,7 +157,7 @@ Summary of MANIFEST §7. The manifest text is authoritative.
   inform the design; implementation code and prose from other projects must not
   be copied just because they are public.
 - Record architectural inspiration in the relevant ADR and in
-  `docs/references.md`, citing the manifest's reference IDs (`[R1]`…).
+  `docs/research/sources.md`, citing source IDs (`[R1]`…).
 - Before importing any third-party code or asset: identify exact source, file
   and revision; verify the license of that specific material; confirm Apache-2.0
   compatibility; preserve notices; record it in `THIRD_PARTY_NOTICES.md`; get

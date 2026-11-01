@@ -1,9 +1,9 @@
 # Architecture decision records
 
-Each ADR records one significant decision: its context, the decision itself,
-its consequences, and any prior art that informed it. ADRs are numbered and
-never deleted. To change a decision, add a new ADR that supersedes the old one
-and update the old one's status.
+Each ADR records one significant decision. The format is a lightweight variant
+inspired by MADR ([R10]): problem, considered options, decision, consequences,
+sources, and the conditions under which to reconsider. ADRs are never deleted.
+A changed decision gets a new ADR, and the old one is marked superseded.
 
 | ADR | Title | Status |
 | --- | --- | --- |
@@ -14,23 +14,34 @@ and update the old one's status.
 | [0005](0005-sqlite-execution-store.md) | SQLite execution store with database-enforced single active execution | Proposed |
 | [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Proposed |
 | [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Proposed |
+| [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Proposed |
 
-Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. The ADRs
-in the M1 foundation change stay Proposed until a maintainer approves that
-change.
+Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. The M1
+ADRs stay Proposed until the maintainer approves the M1 pull request.
 
 ## Template
 
 ```markdown
-# ADR-NNNN: Title
+# ADR-NNNN: <decision as a short phrase>
 
 - Status: Proposed
 - Date: YYYY-MM-DD
+- Sources: [Rn], … (see docs/research/sources.md) · Findings: F-nnn, …
 
-## Context
+## Context and problem
+What forces a decision, in a few sentences.
+
+## Considered options
+1. Option A
+2. Option B
+
 ## Decision
+Chosen option: "Option B", because …
+
 ## Consequences
-## Prior art
-Reference IDs from MANIFEST §9 ([R1]...), what was used (ideas only, or
-material that is recorded in THIRD_PARTY_NOTICES.md), and access dates.
+- Good: …
+- Bad: …
+
+## Revisit when
+Observable conditions or evidence that should reopen this decision.
 ```

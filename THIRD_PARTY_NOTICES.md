@@ -2,7 +2,7 @@
 
 This file records third-party material incorporated into the Ilmar repository,
 as required by MANIFEST §7.2. Conceptual inspiration that did not involve copying
-code or text is recorded in `docs/references.md` instead.
+code or text is recorded in `docs/research/sources.md` instead.
 
 ## Incorporated material
 

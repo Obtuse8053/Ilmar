@@ -33,9 +33,11 @@ ilmar config validate ilmar.example.toml
 
 - [`MANIFEST.md`](MANIFEST.md): mission, principles and roadmap.
 - [`AGENTS.md`](AGENTS.md): development instructions for humans and agents.
-- [`docs/architecture.md`](docs/architecture.md): architecture overview.
-- [`docs/adr/`](docs/adr/): architecture decision records.
-- [`docs/references.md`](docs/references.md): prior art and reference register.
+- [`docs/architecture/`](docs/architecture/): architecture overview and
+  [decision records](docs/architecture/decisions/).
+- [`docs/research/`](docs/research/): source registry, findings and the
+  research review process.
+- [`docs/roadmap.md`](docs/roadmap.md): milestone status and approved improvements.
 
 ## Contributing
 

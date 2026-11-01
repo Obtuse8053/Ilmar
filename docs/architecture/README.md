@@ -1,7 +1,9 @@
 # Architecture overview
 
 This document gives a high-level picture of Ilmar. The decisions behind it are
-recorded in `docs/adr/`; the founding requirements are in `MANIFEST.md`.
+recorded in [`decisions/`](decisions/), the evidence behind those decisions is in
+[`../research/`](../research/), and the founding requirements are in
+`MANIFEST.md`.
 
 ## Shape
 
@@ -46,19 +48,15 @@ The sandbox gets the working copy and nothing else. The coordinator alone talks
 to the tracker and source-control platform, and only publishes after
 independent verification. See ADR-0006.
 
-## Milestone status
+## Milestones
 
-| Milestone | Scope | Status |
-| --- | --- | --- |
-| M1 Foundation | Ports, SQLite store, state machine, config, contract tests | This change |
-| M2 End-to-end | GitHub issue → Podman → Claude Code → tests → PR | Next |
-| M3 Reliability | Recovery, duplicate prevention, retries, cancellation, logs, limits | Planned |
-| M4 Self-hosting | Ilmar changes its own repository | Planned |
-| M5 Portability | Docker plus a second tracker/SCM provider | Planned |
-| M6 Public stability | Stable APIs, releases, security review | Planned |
+Milestone scope and status are tracked in [`../roadmap.md`](../roadmap.md).
 
 ## Not yet designed
 
 Structured event logging, the scheduler and coordinator loop, verification and
 approval policies, planning and review stages, network allow-listing for
 sandboxes, and the adapter registry. Each will get an ADR when it is built.
+Open research findings that bear on these are listed in
+[`../research/findings.md`](../research/findings.md), and their scheduling is in
+[`../roadmap.md`](../roadmap.md).

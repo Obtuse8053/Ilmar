@@ -6,9 +6,12 @@
 
 <!-- The measurable criteria this change meets, and how tests demonstrate them. -->
 
-## Architecture
+## Architecture and research
 
-<!-- Decisions made, ADRs added or updated, deviations from MANIFEST.md. -->
+<!-- Decisions made; ADRs added or updated; deviations from MANIFEST.md.
+ADRs and findings consulted (ADR-nnnn, F-nnn), new sources registered (Rn),
+and any ADR whose "Revisit when" condition this change meets. Link the
+proposal issue for architectural changes. -->
 
 ## Sensitive areas
 
