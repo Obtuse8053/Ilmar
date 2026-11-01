@@ -100,3 +100,28 @@ def test_adrs_follow_the_template(path: Path) -> None:
     ):
         assert heading in text, f"missing section {heading!r}"
     assert re.search(r"^- Status: \w", text, re.MULTILINE), "missing status"
+
+
+STATUS_SECTIONS = (
+    "## Current milestone",
+    "## In progress",
+    "## Next up",
+    "## Decisions needed from the maintainer",
+    "## Change log",
+)
+
+
+def test_status_file_has_resume_sections() -> None:
+    """docs/STATUS.md is the resume point for new sessions (ADR-0009)."""
+    text = (DOCS / "STATUS.md").read_text()
+    missing = [s for s in STATUS_SECTIONS if s not in text]
+    assert not missing, f"docs/STATUS.md is missing sections: {missing}"
+    assert re.search(r"^- \d{4}-\d{2}-\d{2}: ", text, re.MULTILINE), (
+        "change log needs dated entries"
+    )
+
+
+def test_agents_md_points_to_resume_files() -> None:
+    text = (REPO_ROOT / "AGENTS.md").read_text()
+    assert "docs/STATUS.md" in text
+    assert "docs/workflow.md" in text

@@ -15,6 +15,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Proposed |
 | [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Proposed |
 | [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Proposed |
+| [0009](0009-issue-driven-workflow.md) | GitHub issues plus in-repository status as the development control plane | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. The M1
 ADRs stay Proposed until the maintainer approves the M1 pull request.

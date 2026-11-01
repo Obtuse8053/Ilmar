@@ -9,6 +9,19 @@ Read `MANIFEST.md` before your first change. Read `docs/architecture/README.md`
 and the ADRs in `docs/architecture/decisions/` before changing anything under
 `src/ilmar/`.
 
+## 0. Start here
+
+Every session, whether it is new or resumed:
+
+1. Read `docs/STATUS.md` (where we are) and `docs/workflow.md` (how work is
+   picked, claimed, handed off and finished).
+2. Check open PRs and issues labelled `status:in-progress` on GitHub before
+   starting anything new.
+3. Work only on `approved` issues, one issue per branch and PR.
+
+You should not need any earlier conversation. If something you need is not in
+the repository or the issues, add it there.
+
 ## 1. Repository map
 
 | Path | Purpose |
@@ -24,6 +37,8 @@ and the ADRs in `docs/architecture/decisions/` before changing anything under
 | `tests/architecture/` | Tests that enforce the dependency rules and repository policy. |
 | `docs/architecture/` | Architecture overview and decision records (`decisions/`). |
 | `docs/research/` | Source registry, findings and the research review process. |
+| `docs/STATUS.md` | Current milestone, in-progress work, ordered next issues, change log. |
+| `docs/workflow.md` | Labels, milestones, session protocol, milestone close-out. |
 | `docs/roadmap.md` | Milestone status and approved improvements, linked to issues. |
 | `scripts/` | Small standard-library helper scripts used by CI. |
 
@@ -125,15 +140,17 @@ The process and formats are in `docs/research/README.md`. The rules:
 
 ## 6. Change workflow
 
-1. Work on a branch named `<milestone-or-area>/<short-topic>`, for example
-   `m2/github-task-provider`.
+1. Work on a branch named `m<N>/<issue>-<topic>` (or `chore/<issue>-<topic>`),
+   for example `m2/6-github-tasks`.
 2. Define acceptance criteria before coding (MANIFEST §8).
 3. Implement the smallest useful increment.
 4. Write or update an ADR in `docs/architecture/decisions/` for any decision
    that changes the architecture, a port contract, persistence format, security
    boundary or dependency policy.
-5. Open a pull request using the template. Fill in the provenance section.
-6. **Never merge your own pull request.** A maintainer approves and merges.
+5. Update `docs/STATUS.md`. Open a pull request using the template, with
+   `Closes #<issue>`, and fill in the provenance section.
+6. **Never merge on your own initiative.** Merge only when the maintainer
+   explicitly asks for that specific PR, and only once CI is green.
 
 ### Sensitive areas
 

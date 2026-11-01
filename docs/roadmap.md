@@ -1,46 +1,49 @@
 # Roadmap
 
-Milestones come from MANIFEST §10. This file adds only **status** and the
-**GitHub issues** that track approved work. An improvement is listed here once
-a maintainer approves its proposal issue; until then it lives in
-`research/findings.md` with status `open` or `proposed`.
+Milestones come from MANIFEST §10. Work is tracked in
+[GitHub issues](https://github.com/Obtuse8053/Ilmar/issues), and current
+position and order are in `STATUS.md`. This file maps milestones and approved
+improvements to issues.
 
 ## Milestones
 
-| Milestone | Status | Tracking issue |
+| Milestone | Status | Issues |
 | --- | --- | --- |
-| M1 Foundation | In review ([PR #1](https://github.com/Obtuse8053/Ilmar/pull/1)) | — |
-| M2 End-to-end execution | Next | to be opened |
-| M3 Reliability | Planned | — |
-| M4 Self-hosting | Planned | — |
-| M5 Portability | Planned | — |
-| M6 Public stability | Planned | — |
+| [M1 Foundation](https://github.com/Obtuse8053/Ilmar/milestone/1?closed=1) | Done (#1, merged 2026-11-01) | — |
+| [M2 End-to-end execution](https://github.com/Obtuse8053/Ilmar/milestone/2) | In progress | #2–#11 |
+| [M3 Reliability](https://github.com/Obtuse8053/Ilmar/milestone/3) | Planned | #12–#18 |
+| [M4 Self-hosting](https://github.com/Obtuse8053/Ilmar/milestone/4) | Planned (epics) | #19–#21 |
+| [M5 Portability](https://github.com/Obtuse8053/Ilmar/milestone/5) | Planned (epics) | #22–#24 |
+| [M6 Public stability](https://github.com/Obtuse8053/Ilmar/milestone/6) | Planned (epic) | #25 |
+| Maintenance (no milestone) | Open | #26–#31 |
 
-## Approved improvements
+Epics are split into issues when their milestone starts (`workflow.md`,
+milestone close-out).
 
-| Improvement | Finding | Milestone | Issue | ADR |
-| --- | --- | --- | --- | --- |
-| *(none approved yet)* | | | | |
+## Approved improvements from research
 
-## Awaiting a decision
+These are findings the maintainer approved as part of the backlog on
+2026-11-01.
 
-Open findings with a recommendation, grouped by suggested milestone. Each needs
-a proposal issue and maintainer approval before it moves to the table above.
-
-- **M2:** F-003 (workspace path safety), F-005 (checks the agent cannot edit),
-  F-015 (GitHub tracker model)
-- **M3:** F-001 (tracker reconciliation), F-002 (backoff and stall detection),
-  F-006 (attempt handoff), F-009 (legible verification output)
-- **M5:** F-010 (open-source second agent)
-- **Maintenance:** F-007 (AGENTS.md size budget), F-016 (fix the MANIFEST §9
-  URL for R3)
+| Improvement | Finding | Milestone | Issue |
+| --- | --- | --- | --- |
+| Safe workspace path derivation | F-003 | M2 | #4 |
+| Checks the agent cannot edit | F-005 | M2 | #9 |
+| GitHub tracker state model | F-015 | M2 | #6 |
+| Tracker reconciliation | F-001 | M3 | #12 |
+| Backoff and stall detection | F-002 | M3 | #13 |
+| Attempt handoff and legible verification output | F-006, F-009 | M3 | #14 |
+| Second, open-source agent | F-010 | M5 | #24 |
+| AGENTS.md size budget | F-007 | — | #30 |
+| Fix the R3 URL in MANIFEST §9 | F-016 | — | #27 |
 
 ## How items get here
 
 1. A finding is recorded in `research/findings.md`.
-2. Someone opens an issue from the **Architecture proposal** template that
-   links the finding and any affected ADR.
-3. A maintainer approves it by applying the `approved` label or commenting.
-4. The approver or implementer adds a row above with the issue link. The
-   finding's status becomes `proposed`, then `accepted` once an ADR or merged
-   PR reflects it.
+2. Someone opens an issue from the **Architecture proposal** template, labelled
+   `proposal`.
+3. The maintainer approves it, and the `proposal` label is replaced by
+   `approved`.
+4. A row is added above, and the finding's status becomes `proposed` with the
+   issue number. It becomes `accepted` once the merged change or an ADR
+   reflects it.
