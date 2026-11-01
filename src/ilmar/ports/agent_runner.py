@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Port for coding agents."""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+from ilmar.domain.agent import AgentRequest, AgentResult
+from ilmar.domain.workspace import ContainerHandle
+from ilmar.ports.container_runtime import ContainerRuntime
+
+
+class AgentRunner(Protocol):
+    """Invokes a coding agent inside an already running sandbox.
+
+    The runner receives the runtime explicitly, so any agent adapter works with
+    any container runtime adapter. The runner translates the agent's own
+    output format into an ``AgentResult``; it never decides whether the work is
+    acceptable.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    def run(
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+    ) -> AgentResult: ...

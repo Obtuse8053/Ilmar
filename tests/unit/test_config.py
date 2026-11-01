@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from ilmar.config import PORT_NAMES, Limits, load_config, parse_config
+from ilmar.domain.errors import ConfigError
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE = Path("/srv/ilmar")
+
+
+def minimal() -> dict[str, Any]:
+    return {"adapters": {port: {"kind": "fake"} for port in PORT_NAMES}}
+
+
+def with_options(port: str, **options: Any) -> dict[str, Any]:
+    data = minimal()
+    data["adapters"][port]["options"] = options
+    return data
+
+
+def test_example_configuration_is_valid() -> None:
+    config = load_config(REPO_ROOT / "ilmar.example.toml")
+    assert config.adapters["task_provider"].kind == "github"
+    assert config.adapters["container_runtime"].kind == "podman"
+    assert config.adapters["agent_runner"].kind == "claude-code"
+    assert config.adapters["execution_store"].kind == "sqlite"
+    assert config.state_dir == REPO_ROOT / ".ilmar"
+
+
+def test_defaults() -> None:
+    config = parse_config(minimal(), base_dir=BASE)
+    assert config.limits == Limits()
+    assert config.state_dir == BASE / ".ilmar"
+    assert dict(config.adapters["agent_runner"].options) == {}
+
+
+def test_absolute_state_dir_is_kept() -> None:
+    data = minimal() | {"ilmar": {"state_dir": "/var/lib/ilmar"}}
+    assert parse_config(data, base_dir=BASE).state_dir == Path("/var/lib/ilmar")
+
+
+def test_options_are_read_only() -> None:
+    config = parse_config(with_options("execution_store", path="x.db"), base_dir=BASE)
+    options = config.adapters["execution_store"].options
+    assert options["path"] == "x.db"
+    with pytest.raises(TypeError):
+        options["path"] = "other.db"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("port", PORT_NAMES)
+def test_every_port_is_required(port: str) -> None:
+    data = minimal()
+    del data["adapters"][port]
+    with pytest.raises(ConfigError, match=port):
+        parse_config(data, base_dir=BASE)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda d: d.update(extra={}), "unknown key"),
+        (lambda d: d.update(ilmar={"colour": "blue"}), "unknown key"),
+        (lambda d: d.update(limits={"max_attempt": 2}), "unknown key"),
+        (lambda d: d["adapters"].update(scheduler={"kind": "x"}), "unknown key"),
+        (lambda d: d["adapters"]["task_provider"].update(token="x"), "unknown key"),
+        (lambda d: d["adapters"]["task_provider"].update(kind="GitHub"), "kind"),
+        (lambda d: d["adapters"]["task_provider"].pop("kind"), "kind"),
+        (lambda d: d["adapters"]["task_provider"].update(options="x"), "table"),
+        (lambda d: d.update(ilmar={"state_dir": ""}), "state_dir"),
+        (lambda d: d.update(limits={"max_attempts": 0}), "max_attempts"),
+        (lambda d: d.update(limits={"max_attempts": True}), "max_attempts"),
+        (lambda d: d.update(limits={"max_concurrent_executions": 1.5}), "max_concurrent"),
+        (lambda d: d.update(limits={"agent_timeout_seconds": -1}), "agent_timeout"),
+        (lambda d: d.update(limits={"agent_timeout_seconds": "1h"}), "agent_timeout"),
+    ],
+)
+def test_invalid_configuration_is_rejected(mutate: Any, message: str) -> None:
+    data = copy.deepcopy(minimal())
+    mutate(data)
+    with pytest.raises(ConfigError, match=message):
+        parse_config(data, base_dir=BASE)
+
+
+@pytest.mark.parametrize(
+    "key", ["token", "github_token", "api_key", "apiKey", "password", "client_secret"]
+)
+def test_inline_secrets_are_rejected(key: str) -> None:
+    with pytest.raises(ConfigError, match="looks like a secret"):
+        parse_config(with_options("source_control", **{key: "hunter2"}), base_dir=BASE)
+
+
+def test_nested_inline_secrets_are_rejected() -> None:
+    data = with_options("agent_runner", auth={"api_key": "sk-test"})
+    with pytest.raises(ConfigError, match=r"options\.auth"):
+        parse_config(data, base_dir=BASE)
+
+
+def test_secret_references_via_environment_are_allowed() -> None:
+    data = with_options("source_control", token_env="GITHUB_TOKEN")
+    config = parse_config(data, base_dir=BASE)
+    assert config.adapters["source_control"].options["token_env"] == "GITHUB_TOKEN"
+
+
+def test_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(tmp_path / "nope.toml")
+
+
+def test_invalid_toml(tmp_path: Path) -> None:
+    path = tmp_path / "ilmar.toml"
+    path.write_text("[adapters\n")
+    with pytest.raises(ConfigError, match="invalid TOML"):
+        load_config(path)
+
+
+def test_relative_state_dir_resolves_against_config_file(tmp_path: Path) -> None:
+    path = tmp_path / "conf" / "ilmar.toml"
+    path.parent.mkdir()
+    lines = ['[ilmar]\nstate_dir = "state"\n']
+    lines += [f'[adapters.{port}]\nkind = "fake"\n' for port in PORT_NAMES]
+    path.write_text("".join(lines))
+    assert load_config(path).state_dir == tmp_path / "conf" / "state"

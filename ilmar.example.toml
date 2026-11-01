@@ -1,0 +1,37 @@
+# Example Ilmar configuration. Copy to `ilmar.toml` and adjust.
+#
+# Each port is configured independently: `kind` selects the adapter and
+# `options` holds adapter-specific settings. Secrets are never written here;
+# options ending in `_env` name the environment variable that holds them.
+#
+# The github, podman and claude-code adapters arrive in milestone M2.
+# `ilmar config validate` checks structure only; it does not check that an
+# adapter kind is installed.
+
+[ilmar]
+state_dir = ".ilmar"
+
+[limits]
+max_attempts = 3
+max_concurrent_executions = 1
+agent_timeout_seconds = 3600
+
+[adapters.task_provider]
+kind = "github"
+options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", token_env = "GITHUB_TOKEN" }
+
+[adapters.source_control]
+kind = "github"
+options = { repository = "Obtuse8053/Ilmar", base_branch = "main", token_env = "GITHUB_TOKEN" }
+
+[adapters.container_runtime]
+kind = "podman"
+options = { image = "localhost/ilmar-agent:latest" }
+
+[adapters.agent_runner]
+kind = "claude-code"
+options = { api_key_env = "ANTHROPIC_API_KEY" }
+
+[adapters.execution_store]
+kind = "sqlite"
+options = { path = ".ilmar/executions.sqlite3" }

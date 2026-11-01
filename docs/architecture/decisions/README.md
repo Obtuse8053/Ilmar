@@ -1,0 +1,47 @@
+# Architecture decision records
+
+Each ADR records one significant decision. The format is a lightweight variant
+inspired by MADR ([R10]): problem, considered options, decision, consequences,
+sources, and the conditions under which to reconsider. ADRs are never deleted.
+A changed decision gets a new ADR, and the old one is marked superseded.
+
+| ADR | Title | Status |
+| --- | --- | --- |
+| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Proposed |
+| [0002](0002-ports-and-adapters.md) | Ports and adapters with an enforced dependency rule | Proposed |
+| [0003](0003-python-stdlib-first.md) | Python 3.11+, standard library first, no runtime dependencies in the core | Proposed |
+| [0004](0004-execution-state-machine.md) | Explicit execution state machine with versioned records | Proposed |
+| [0005](0005-sqlite-execution-store.md) | SQLite execution store with database-enforced single active execution | Proposed |
+| [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Proposed |
+| [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Proposed |
+| [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Proposed |
+
+Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. The M1
+ADRs stay Proposed until the maintainer approves the M1 pull request.
+
+## Template
+
+```markdown
+# ADR-NNNN: <decision as a short phrase>
+
+- Status: Proposed
+- Date: YYYY-MM-DD
+- Sources: [Rn], … (see docs/research/sources.md) · Findings: F-nnn, …
+
+## Context and problem
+What forces a decision, in a few sentences.
+
+## Considered options
+1. Option A
+2. Option B
+
+## Decision
+Chosen option: "Option B", because …
+
+## Consequences
+- Good: …
+- Bad: …
+
+## Revisit when
+Observable conditions or evidence that should reopen this decision.
+```
