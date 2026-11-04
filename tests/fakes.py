@@ -38,6 +38,7 @@ from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerInfo,
     ContainerSpec,
+    DirectoryIdentity,
     ResourceOwner,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
@@ -159,6 +160,12 @@ class FakeContainerRuntime:
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         if not spec.host_workspace.is_dir():
             raise ProviderError(f"workspace does not exist: {spec.host_workspace}")
+        info = spec.host_workspace.lstat()
+        if (
+            spec.host_workspace.is_symlink()
+            or DirectoryIdentity(info.st_dev, info.st_ino) != spec.workspace_identity
+        ):
+            raise OwnershipConflictError(f"{spec.host_workspace} is not the recorded workspace")
         existing = self._by_name(spec.name)
         if existing is not None:
             if existing.owner != spec.owner:
@@ -183,8 +190,19 @@ class FakeContainerRuntime:
         container = self._containers.get(handle.id)
         if container is None or not container.running:
             raise ProviderError(f"container is not running: {handle.id}")
-        spec = container.spec
         self.commands.append((handle.id, tuple(argv)))
+        result = self._interpret(container.spec, argv, timeout_seconds, env)
+        if result.timed_out:  # the whole container goes (port contract)
+            del self._containers[handle.id]
+        return result
+
+    def _interpret(
+        self,
+        spec: ContainerSpec,
+        argv: Sequence[str],
+        timeout_seconds: float,
+        env: Mapping[str, str] | None,
+    ) -> CommandResult:
         if argv and argv[0] in self._programs:
             return self._programs[argv[0]](argv, timeout_seconds, dict(env or {}))
         match list(argv):

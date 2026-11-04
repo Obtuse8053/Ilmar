@@ -26,20 +26,21 @@ import contextlib
 import errno
 import os
 import stat
-from dataclasses import dataclass
 from pathlib import Path
 
 from ilmar.domain.errors import OwnershipConflictError
+from ilmar.domain.workspace import DirectoryIdentity
+
+__all__ = [
+    "DirectoryIdentity",
+    "directory_identity",
+    "ensure_directory",
+    "remove_directory",
+    "require_canonical_root",
+    "verify_directory",
+]
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-
-
-@dataclass(frozen=True, slots=True)
-class DirectoryIdentity:
-    """Immutable identity of a directory: survives renames, changes if replaced."""
-
-    device: int
-    inode: int
 
 
 def require_canonical_root(root: Path) -> None:

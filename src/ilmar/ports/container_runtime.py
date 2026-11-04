@@ -27,11 +27,16 @@ class ContainerRuntime(Protocol):
       container that was replaced in between is not affected.
     * ``run`` reports the command's exit code and output; a non-zero exit is a
       normal result, not an exception.
-    * A command that exceeds ``timeout_seconds`` is killed and reported with
-      ``timed_out=True``.
+    * A command that exceeds ``timeout_seconds`` is reported with
+      ``timed_out=True``, and the whole container is stopped and removed: a
+      runtime cannot always find every process a command started, and nothing
+      may keep writing to the workspace afterwards (ADR-0014). The handle is
+      stale from then on.
     * ``stop`` is idempotent and removes the container. ``is_running`` is
       ``False`` afterwards, and ``run`` raises ``ProviderError``.
-    * Only ``spec.host_workspace`` is shared with the host.
+    * Only ``spec.host_workspace`` is shared with the host, and only if it
+      still has ``spec.workspace_identity``. Otherwise ``start`` raises
+      ``OwnershipConflictError`` and starts nothing.
     """
 
     @property

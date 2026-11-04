@@ -13,6 +13,7 @@ from ilmar.domain.tasks import Task, TaskRef
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerSpec,
+    DirectoryIdentity,
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
@@ -90,10 +91,17 @@ def test_terminal_states() -> None:
 
 
 OWNER = ResourceOwner(instance_id="i", execution_id="e", attempt=1, token="t")
+IDENT = DirectoryIdentity(1, 2)
 
 
 def test_container_spec_defaults_to_no_network(tmp_path: Path) -> None:
-    spec = ContainerSpec(image="img", host_workspace=tmp_path, name="ilmar-e-1", owner=OWNER)
+    spec = ContainerSpec(
+        image="img",
+        host_workspace=tmp_path,
+        name="ilmar-e-1",
+        owner=OWNER,
+        workspace_identity=IDENT,
+    )
     assert spec.network is NetworkPolicy.NONE
     assert str(spec.container_workdir) == "/workspace"
 
@@ -101,7 +109,9 @@ def test_container_spec_defaults_to_no_network(tmp_path: Path) -> None:
 @pytest.mark.parametrize("name", ["", "-leading-dash", "has space", "slash/inside", "x" * 129])
 def test_container_spec_rejects_invalid_names(tmp_path: Path, name: str) -> None:
     with pytest.raises(ValueError, match="container name"):
-        ContainerSpec(image="img", host_workspace=tmp_path, name=name, owner=OWNER)
+        ContainerSpec(
+            image="img", host_workspace=tmp_path, name=name, owner=OWNER, workspace_identity=IDENT
+        )
 
 
 @pytest.mark.parametrize(
