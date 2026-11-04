@@ -47,11 +47,20 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#8, the Claude Code `AgentRunner` (plan step 7). It runs in the
-`ALLOWLIST` sandbox from #40. #9, the verification stage, can follow on #7's
-candidate revisions. **Waiting for the maintainer's explicit go-ahead.**
+#9, the verification stage (plan step 8): candidate revisions from #7 are
+checked in a fresh `NONE` sandbox from #5. Then #10 (adapter registry) and
+#11 (coordinator loop, which closes M2). **Waiting for the maintainer's
+explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #8 finished: Claude Code `AgentRunner` (ADR-0017, proposed).
+  It uses documented print mode with a JSON result. The model credential is
+  passed only in the agent command's environment and redacted from
+  summaries. `COMPLETED` needs a clean exit, a parsed result and
+  `is_error == false`. There is an optional version pin and an operator-built
+  image recipe. The contract runs on the in-memory runtime and on real Podman;
+  an opt-in live test records the hosts contacted. Next recommended: #9.
 
 - 2026-11-04: #7 finished: GitHub `SourceControlProvider` on plumbing-only,
   hardened host git (ADR-0016, accepted). Workspaces are read as data into
