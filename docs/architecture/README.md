@@ -46,7 +46,10 @@ CANCELLED. Every change is versioned and logged.
 
 The sandbox gets the working copy and nothing else. The coordinator alone talks
 to the tracker and source-control platform, and only publishes after
-independent verification. See ADR-0006.
+independent verification. See ADR-0006. The sandbox profile (privileges,
+mounts, egress allow-list) is ADR-0011. ADR-0010 binds verification and
+publication to one immutable candidate revision. ADR-0012 keeps every external
+side effect recoverable.
 
 ## Milestones
 

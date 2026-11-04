@@ -30,7 +30,8 @@ Skip any step whose issue GitHub shows as finished.
 | Step | Issue | Depends on |
 | --- | --- | --- |
 | 1 | #2 Session-resume workflow | — |
-| 2 | #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner` | #2 |
+| 1a | #33 M2 design review (ADR-0010, ADR-0011, ADR-0012) | #2 |
+| 2 | #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner` | #33 |
 | 3 | #4 Safe workspace path derivation | #3 |
 | 4 | #6 GitHub `TaskProvider` | #3 |
 | 5 | #5 Podman `ContainerRuntime` and sandbox profile | #4 |
@@ -45,11 +46,25 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#3, the contract suites and fakes, once the maintainer approves. Every M2
-adapter is written against these contracts.
+#3, the contract suites and fakes, **waiting for the maintainer's explicit
+go-ahead**. #3 is where ADR-0010's port changes become executable
+contracts that every M2 adapter is then written against.
 
 ## Change log
 
+- 2026-11-04: M2 design review (#33). Proposed ADR-0010 (verify and publish
+  one immutable candidate revision; humans accept), ADR-0011 (sandbox isolation
+  and egress allow-listing) and ADR-0012 (recovery-safe side effects).
+  Registered sources R13–R19 and findings F-017–F-022. Added the review's
+  acceptance criteria to #3, #4, #5, #7, #8, #9, #11, #15, #18, #20 and #28,
+  pending maintainer approval. Review round 2: ADR-0010 trust boundary and
+  acceptance table (CI-config changes not published in M2); ADR-0011 per-execution
+  networks and required negative network tests; ADR-0012 ownership-verified
+  cleanup, resource ledger and fencing (#3, #4, #5, #7, #9, #11, #15, #16).
+  Final clarifications: three-level fencing (instance lock held for the
+  coordinator's lifetime, execution lease, immutable resource identity) and
+  three-way outcomes (pass/fail/inconclusive) for network tests. ADR-0010 to
+  ADR-0012 approved by the maintainer and accepted with PR #34.
 - 2026-11-04: Independent review of M1 and PR #32. Status data was
   de-duplicated: issue state lives only on GitHub, the plan only here, and
   roadmap/finding links are checked by tests. ADR-0001 to ADR-0008 marked

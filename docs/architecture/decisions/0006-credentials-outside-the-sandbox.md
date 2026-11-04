@@ -1,6 +1,6 @@
 # ADR-0006: Provider credentials stay outside the agent sandbox
 
-- Status: Accepted (PR #1, 2026-11-01)
+- Status: Accepted (PR #1, 2026-11-01); amended by ADR-0010 and ADR-0011
 - Date: 2026-11-01
 - Sources: [R1], [R4], [R5], [R7], [R11] · Findings: F-003, F-005
 

@@ -16,6 +16,9 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Accepted |
 | [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Accepted |
 | [0009](0009-issue-driven-workflow.md) | GitHub issues plus in-repository status as the development control plane | Accepted |
+| [0010](0010-acceptance-integrity.md) | Verify and publish one immutable candidate revision; humans accept | Accepted |
+| [0011](0011-sandbox-isolation-profile.md) | Sandbox isolation profile and egress allow-listing | Accepted |
+| [0012](0012-recovery-safe-side-effects.md) | Recovery-safe external side effects | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
