@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
+import urllib.parse
 
 import pytest
 
@@ -93,14 +95,74 @@ def test_claim_posts_one_marker_and_label_and_is_idempotent(api: FakeGitHub) -> 
     assert CLAIMED in api.issues[1].labels
 
 
-def test_human_claim_via_label_is_respected(api: FakeGitHub) -> None:
+HUMAN = "status:in-progress"
+
+
+def human_aware(api: FakeGitHub, instance: str = "a") -> GitHubTaskProvider:
+    """The configuration ilmar.example.toml uses for Ilmar's own repository."""
+    return provider(api, instance, human_claim_labels=(HUMAN,))
+
+
+def label_writes(api: FakeGitHub) -> list[str]:
+    """Every label Ilmar added or removed, by name."""
+    names = []
+    for request in api.requests:
+        if request.method == "POST" and request.url.endswith("/labels"):
+            names += json.loads(request.body or b"{}")["labels"]
+        elif request.method == "DELETE" and "/labels/" in request.url:
+            names.append(urllib.parse.unquote(request.url.rsplit("/labels/", 1)[1]))
+    return names
+
+
+def test_human_claim_label_is_respected(api: FakeGitHub) -> None:
     """A session following docs/workflow.md marks work in progress with a label only."""
-    api.issues[1].labels.add("status:in-progress")
-    p = provider(api, claimed_label="status:in-progress")
+    api.issues[1].labels.add(HUMAN)
+    p = human_aware(api)
     assert p.list_eligible() == ()
     assert p.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
     p.release(ref(1))
-    assert "status:in-progress" in api.issues[1].labels
+    assert HUMAN in api.issues[1].labels
+    assert label_writes(api) == []
+
+
+def test_human_label_added_during_our_claim_survives_release(api: FakeGitHub) -> None:
+    """Regression (PR #38 review): releasing must not erase a human's label-only claim."""
+    p = human_aware(api)
+    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED
+    api.issues[1].labels.add(HUMAN)  # a human starts on it while Ilmar holds it
+    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER  # we notice; no side effects
+    p.release(ref(1))
+    assert HUMAN in api.issues[1].labels
+    assert CLAIMED not in api.issues[1].labels
+    assert claims(api, 1) == []
+    assert p.list_eligible() == ()  # still the human's
+    assert set(label_writes(api)) == {CLAIMED}
+
+
+def test_human_label_added_during_back_off_survives_withdrawal(api: FakeGitHub) -> None:
+    """The overlap back-off path withdraws too; it must not touch the human's label."""
+    a = human_aware(api, "a")
+
+    def human_and_b_act_during_a_post(request: HttpRequest) -> None:
+        if request.method == "POST" and request.url.endswith("/comments"):
+            api.before.remove(human_and_b_act_during_a_post)
+            api.issues[1].labels.add(HUMAN)
+            api.comment(1, claim_comment("b"))
+
+    api.before.append(human_and_b_act_during_a_post)
+    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert HUMAN in api.issues[1].labels
+    assert set(label_writes(api)) == {CLAIMED}
+
+
+def test_the_claim_label_is_owned_by_ilmar(api: FakeGitHub) -> None:
+    """Ilmar adds and removes only claimed_label, through a whole claim cycle."""
+    api.issues[1].labels.add("bug")
+    p = human_aware(api)
+    p.claim(ref(1))
+    p.release(ref(1))
+    assert set(label_writes(api)) == {CLAIMED}
+    assert api.issues[1].labels == {READY, "bug"}
 
 
 @pytest.mark.parametrize(
@@ -245,9 +307,11 @@ def test_post_update(api: FakeGitHub) -> None:
         ({"repository": "not-a-repo"}, "owner/name"),
         ({"instance_id": "../x"}, "instance id"),
         ({"claimed_label": READY}, "differ"),
+        ({"claimed_label": HUMAN, "human_claim_labels": (HUMAN,)}, "owned by Ilmar"),
+        ({"claimed_label": "x", "excluded_labels": ("x",)}, "owned by Ilmar"),
     ],
 )
-def test_configuration_is_validated(kwargs: dict[str, str], message: str) -> None:
+def test_configuration_is_validated(kwargs: dict[str, object], message: str) -> None:
     settings = {"repository": "owner/repo", "instance_id": "a"} | kwargs
     with pytest.raises(ValueError, match=message):
         GitHubTaskProvider(GitHubClient(TOKEN, transport=FakeGitHub()), **settings)  # type: ignore[arg-type]

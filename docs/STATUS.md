@@ -56,7 +56,8 @@ building on #4). **Waiting for the maintainer's explicit go-ahead.**
   ADR-0013 (proposed) fixes the M2 threat model: one instance per repository
   and one coordinator per instance. Labels are workflow state, assignees mean
   human responsibility, and claim comments (instance plus unique token) are an
-  audit record, not a lock. A second instance is detected and both back off.
+  audit record, not a lock. `ilmar:claimed` is owned by Ilmar; human claim
+  labels such as `status:in-progress` are respected and never touched. A second instance is detected and both back off.
   Recovery is reconciled through the durable store (#12, #15). `integration`
   test marker introduced. Next recommended: #5.
 

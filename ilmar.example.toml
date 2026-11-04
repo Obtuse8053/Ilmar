@@ -18,9 +18,11 @@ agent_timeout_seconds = 3600
 
 [adapters.task_provider]
 kind = "github"
-# ADR-0013: aligned with docs/workflow.md so human sessions and Ilmar see the same claims.
-# Run exactly one Ilmar instance per repository: claims are detected, not locked.
-options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", claimed_label = "status:in-progress", excluded_labels = ["needs:maintainer", "status:blocked", "proposal"], token_env = "GITHUB_TOKEN" }
+# ADR-0013: claimed_label is owned by Ilmar (the only label it adds or removes).
+# Human sessions claim with status:in-progress (docs/workflow.md), which Ilmar
+# respects and never touches. Run exactly one Ilmar instance per repository:
+# claims are detected, not locked.
+options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", claimed_label = "ilmar:claimed", human_claim_labels = ["status:in-progress"], excluded_labels = ["needs:maintainer", "status:blocked", "proposal"], token_env = "GITHUB_TOKEN" }
 
 [adapters.source_control]
 kind = "github"

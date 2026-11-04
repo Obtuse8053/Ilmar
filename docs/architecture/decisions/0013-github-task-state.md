@@ -83,7 +83,16 @@ Chosen option: 5.
 
 - **Meaning of each mechanism:**
   - *Labels* carry workflow state: `eligible_label` (default `ilmar:ready`),
-    `claimed_label` (default `ilmar:claimed`) and `excluded_labels`.
+    `claimed_label` (default `ilmar:claimed`), `human_claim_labels` and
+    `excluded_labels`.
+  - *Label ownership.* A label records no author, so a shared label could not
+    tell Ilmar whether it may remove it. The rule is therefore conservative:
+    `claimed_label` is **owned by Ilmar**. It is the only label Ilmar ever adds
+    or removes, and humans never use it. Humans claim work with their own
+    labels (`human_claim_labels`, e.g. `status:in-progress`) or by assigning
+    someone. Ilmar reads those as "claimed by someone else" and never adds,
+    removes or reinterprets them. The configuration rejects a `claimed_label`
+    that is also a human claim or excluded label.
   - *Assignees* mean a human is responsible. Ilmar never assigns anyone, and
     with `skip_assigned` (on by default) it treats any assignee as "claimed by
     someone else".
@@ -97,13 +106,16 @@ Chosen option: 5.
   - with `eligible_label`;
   - with none of `excluded_labels`;
   - without `claimed_label`;
-  - with no assignees.
+  - with no assignees and none of `human_claim_labels`.
 - **Claim:**
-  1. Read the issue and its comments. If another instance's claim or an
-     assignee is present, the result is `CLAIMED_BY_OTHER`. If only our own
+  1. Read the issue and its comments. If another instance's claim, an
+     assignee or a human claim label is present, the result is
+     `CLAIMED_BY_OTHER`, even when we also hold a claim (a human started
+     while we held it). This check has no side effects. If only our own
      instance's claim is present, re-apply the label and return `CLAIMED`.
-     If `claimed_label` is present without a claim comment, the result is
-     `CLAIMED_BY_OTHER`: a human holds it.
+     If `claimed_label` is present without a claim comment, it is a leftover.
+     The result is conservatively `CLAIMED_BY_OTHER` until reconciliation or
+     a human clears it.
   2. Otherwise, post our claim comment and add `claimed_label`.
   3. Re-read the comments. If **any** other instance's claim is visible,
      withdraw ours and return `CLAIMED_BY_OTHER`. Both sides of an overlap
@@ -118,11 +130,13 @@ Chosen option: 5.
   - re-apply missing labels for claims that are backed.
 - **Release:** delete only our own instance's claim comments. Remove
   `claimed_label` only if no claim remains. Never touch a claim held by a human
-  or another instance.
+  or another instance. Human claim labels survive every release and back-off.
 - **Alignment with ADR-0009:** for Ilmar's own repository,
-  `claimed_label = "status:in-progress"`, the label sessions already use, and
-  `excluded_labels` include `needs:maintainer`, `status:blocked` and
-  `proposal` (`ilmar.example.toml`).
+  `claimed_label = "ilmar:claimed"` and
+  `human_claim_labels = ["status:in-progress"]`, the label sessions already
+  use. `excluded_labels` include `needs:maintainer`, `status:blocked` and
+  `proposal` (`ilmar.example.toml`). `docs/workflow.md` tells sessions to
+  treat `ilmar:claimed` as in progress and never to write it.
 - **Transport credential boundary:** a standard-library REST client.
   - The token comes from `token_env`.
   - Only `https` API URLs and non-empty tokens are accepted.
@@ -139,6 +153,9 @@ Chosen option: 5.
 - A controlled overlapping schedule forces both instances past the initial
   check before either posts. Both must back off, the label must be cleaned up,
   and the issue must be eligible again (`tests/unit/test_github_tasks.py`).
+- Human label ownership: a human adds `status:in-progress` while Ilmar holds
+  a claim. Releasing, and the overlap back-off path, leave it in place, and
+  across a whole cycle Ilmar writes no label other than `claimed_label`.
 - Redirect regression tests run against the real `urllib` transport with
   local servers. A cross-origin 302 is refused and the other origin receives
   no request at all. A same-origin redirect is followed with credentials
@@ -157,6 +174,9 @@ Chosen option: 5.
     claims back off, but detection depends on GitHub's read consistency, so
     even detection is not guaranteed. Configuration documentation must say
     this.
+  - Ilmar's claims and humans' claims use different labels, so there are two
+    "in progress" labels to look for. A human who applies `ilmar:claimed`
+    anyway is overriding the documented rule, and Ilmar may remove that label.
   - A claim costs several REST calls.
   - A claim left by a crashed instance blocks the issue until reconciliation
     or a human removes it.

@@ -48,14 +48,18 @@ protocol: at the start of each session, compare the plan with GitHub, and fix
   `status:blocked`, and `needs:maintainer` (waiting for a maintainer action or
   decision).
 - `ilmar:ready`: the issue is eligible for Ilmar itself to execute. Not used
-  before M4. Ilmar treats `status:in-progress` as "claimed by someone else"
-  (ADR-0013), so a session's claim and Ilmar's claim never collide.
+  before M4.
+- `ilmar:claimed`: Ilmar has claimed the issue. **Owned by Ilmar**: sessions
+  never add or remove it, and treat it like `status:in-progress`. Ilmar treats
+  `status:in-progress` and any assignee as "claimed by someone else" and never
+  adds or removes `status:in-progress` (ADR-0013). Labels carry no
+  provenance, so each side only writes its own label.
 
 ## Choosing the next task
 
 1. Take the first step of **Planned order** in `docs/STATUS.md` whose issue is
-   open on GitHub, is not `status:in-progress`, `status:blocked` or
-   `needs:maintainer`, and whose dependencies are closed.
+   open on GitHub, is not `status:in-progress`, `ilmar:claimed`,
+   `status:blocked` or `needs:maintainer`, and whose dependencies are closed.
 2. If no step qualifies, take an open `approved` maintenance issue (no
    milestone), highest priority first.
 3. Only `approved` issues are implemented. A `proposal` waits for the
@@ -72,7 +76,8 @@ protocol: at the start of each session, compare the plan with GitHub, and fix
    GitHub is right; correct `STATUS.md` in your next PR.
 2. List open PRs and in-progress issues:
    `gh api "repos/Obtuse8053/Ilmar/pulls?state=open"` and
-   `gh api "repos/Obtuse8053/Ilmar/issues?labels=status:in-progress"`.
+   `gh api "repos/Obtuse8053/Ilmar/issues?labels=status:in-progress"` (and
+   `labels=ilmar:claimed` once Ilmar runs on this repository).
    Address review feedback on open PRs before starting new work.
 3. Read the most recent handoff comment on the issue you are resuming.
 4. Claim the issue by adding the `status:in-progress` label.

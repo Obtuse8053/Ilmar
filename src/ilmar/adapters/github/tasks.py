@@ -14,9 +14,12 @@ State model:
 * **Eligible:** an open issue (not a pull request) carrying ``eligible_label``,
   none of ``excluded_labels``, not ``claimed_label``, and unassigned (unless
   ``skip_assigned`` is off).
-* ``claimed_label`` is the workflow state "taken". Assignees are human
-  responsibility; Ilmar never assigns, and treats any assignee as "claimed by
-  someone else".
+* ``claimed_label`` is the workflow state "taken by Ilmar". It is **owned by
+  Ilmar**: it is the only label Ilmar ever adds or removes, and it must not be
+  a label humans use. Labels carry no provenance, so humans claim work with
+  their own labels (``human_claim_labels``, e.g. ``status:in-progress``) or by
+  assigning someone. Ilmar never adds, removes or reinterprets those; any of
+  them, or any assignee, means "claimed by someone else". Ilmar never assigns.
 * A claim comment ``<!-- ilmar:claim instance=<id> token=<random> -->`` is an
   **audit record**, not a lock. Ownership is per instance. Whether the claim is
   still backed by an execution is decided by the instance's durable execution
@@ -55,6 +58,7 @@ class GitHubTaskProvider:
         eligible_label: str = "ilmar:ready",
         claimed_label: str = "ilmar:claimed",
         excluded_labels: Sequence[str] = (),
+        human_claim_labels: Sequence[str] = (),
         skip_assigned: bool = True,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
@@ -62,6 +66,11 @@ class GitHubTaskProvider:
             raise ValueError(f"repository must look like 'owner/name', got {repository!r}")
         if eligible_label == claimed_label:
             raise ValueError("eligible_label and claimed_label must differ")
+        if claimed_label in {*excluded_labels, *human_claim_labels}:
+            raise ValueError(
+                "claimed_label is owned by Ilmar and must not also be an excluded "
+                "or human claim label (ADR-0013)"
+            )
         self._client = client
         self._repository = repository
         self._instance = safe_identifier(instance_id, "instance id")
@@ -69,6 +78,7 @@ class GitHubTaskProvider:
         self._eligible = eligible_label
         self._claimed = claimed_label
         self._excluded = frozenset(excluded_labels)
+        self._human_claims = frozenset(human_claim_labels)
         self._skip_assigned = skip_assigned
         self._new_token = new_token
 
@@ -101,12 +111,14 @@ class GitHubTaskProvider:
             return ClaimOutcome.NOT_ELIGIBLE
         claims = self._active_claims(number)
         others = [c for c in claims if c[1] != self._instance]
-        if others or self._assigned(issue):
+        if others or self._claimed_by_human(issue):
             return ClaimOutcome.CLAIMED_BY_OTHER
         if claims:  # only ours: held by this instance (reconciled by the coordinator)
             self._add_label(number)
             return ClaimOutcome.CLAIMED
         if self._claimed in _labels(issue):
+            # Our label without any claim comment: a leftover. Stay conservative;
+            # reconciliation (#12) or a human clears it.
             return ClaimOutcome.CLAIMED_BY_OTHER
         if not self._has_eligible_labels(issue):
             return ClaimOutcome.NOT_ELIGIBLE
@@ -155,16 +167,22 @@ class GitHubTaskProvider:
     def _assigned(self, issue: Any) -> bool:
         return self._skip_assigned and bool(issue.get("assignees"))
 
+    def _claimed_by_human(self, issue: Any) -> bool:
+        return self._assigned(issue) or bool(_labels(issue) & self._human_claims)
+
     def _is_eligible(self, issue: Any) -> bool:
         return (
             self._is_open_task(issue)
             and self._has_eligible_labels(issue)
             and self._claimed not in _labels(issue)
-            and not self._assigned(issue)
+            and not self._claimed_by_human(issue)
         )
 
     def _withdraw(self, number: int, comment_ids: list[int]) -> None:
-        """Delete our claim comments; drop the label once no claim remains."""
+        """Delete our claim comments; drop Ilmar's own label once no claim remains.
+
+        Only ``claimed_label`` is ever removed; human claim labels are never touched.
+        """
         for comment_id in comment_ids:
             self._delete_comment(comment_id)
         if not self._active_claims(number):
