@@ -1,6 +1,7 @@
 # ADR-0004: Explicit execution state machine with versioned records
 
-- Status: Accepted (PR #1, 2026-11-01)
+- Status: Accepted (PR #1, 2026-11-01); amended by ADR-0010 (proposed) and
+  ADR-0012 (proposed)
 - Date: 2026-11-01
 - Sources: [R1], [R3], [R7], [R9] · Findings: F-001, F-002, F-004, F-005, F-006
 

@@ -84,7 +84,11 @@ Additional rules:
   `tests/contracts/`. Provider-specific behaviour goes in additional
   integration tests, not in the contract.
 - An agent declaring success is never sufficient evidence. Acceptance requires
-  deterministic checks (tests, linters, CI status).
+  deterministic checks run by Ilmar's own verification. What is published must
+  be exactly the verified candidate revision (ADR-0010).
+- Host-side git never runs in an agent-written repository. Agent output is
+  frozen as plain file content into a coordinator-owned repository
+  (ADR-0010).
 - Source-control and task-tracker credentials never enter the agent sandbox.
   Pushing, opening change requests and talking to task trackers happen in the
   coordinator process (ADR-0006). The coding agent's own model credential is

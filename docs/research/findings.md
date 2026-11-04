@@ -200,3 +200,80 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Recommendation: a maintainer should verify the URL and correct MANIFEST §9.
   The manifest is a sensitive file, so the agent did not change it.
 - Status: proposed (#27, approved)
+
+### F-017: Running git on an agent-written repository can execute code on the host
+
+- Evidence: **Established** · Sources: [R17]
+- Observation: Git trusts repository-local configuration and hooks. Settings
+  such as `core.fsmonitor`, `core.hooksPath`, pagers and diff textconv drivers
+  run commands during ordinary operations such as `status`, `diff` and
+  `commit`. Git maintainers describe this as outside Git's security boundary.
+- Implication: if the coordinator runs git in the agent's workspace, a
+  prompt-injected agent can run code on the host, where the credentials are.
+- Recommendation: the host never uses the agent's `.git`. It freezes the
+  working tree as plain content into a coordinator-owned repository, using
+  hardened git invocations.
+- Status: open (decision proposed in ADR-0010; implementation criteria added
+  to #3, #7) · Affects: ADR-0006, ADR-0010
+
+### F-018: Claude Code needs only a small, documented egress set when preinstalled
+
+- Evidence: **Established** (vendor's primary documentation) · Sources:
+  [R13], [R15]
+- Observation: model calls, feature flags and the WebFetch preflight go to
+  `api.anthropic.com`. Login, installer, plugin and telemetry hosts are needed
+  only for those features, and non-essential traffic can be switched off.
+  `HTTPS_PROXY` and `NO_PROXY` are honoured; SOCKS is not.
+- Implication: a preinstalled, API-key-authenticated agent behind an HTTPS
+  proxy that allows only the model endpoint should work. The documented list
+  changes over time.
+- Recommendation: allow only the model endpoint, disable non-essential
+  traffic, and record the hosts actually contacted in an opt-in integration
+  test (#8).
+- Status: open (ADR-0011) · Affects: ADR-0011
+
+### F-019: An LLM gateway can keep the real model credential out of the sandbox
+
+- Evidence: **Emerging** (the gateway capability is documented in [R14];
+  using it to isolate credentials is our own inference) · Sources: [R14]
+- Observation: Claude Code can send all model traffic to an operator-run
+  gateway, authenticated with a gateway-issued token.
+- Implication: a host-side gateway could issue per-execution, budget-limited,
+  revocable tokens. That would remove ADR-0006's model-key exception and
+  provide cost metering.
+- Recommendation: evaluate with execution budgets in M3. Not needed for M2.
+- Status: open (criterion added to #18) · Affects: ADR-0006, ADR-0011
+
+### F-020: Enforce egress outside the sandbox rather than with an in-container firewall
+
+- Evidence: **Emerging** · Sources: [R16], [R18]
+- Observation: the reference devcontainer enforces default-deny egress with
+  iptables inside the container, which needs `NET_ADMIN`/`NET_RAW`. Container
+  runtimes also offer internal networks with no external route.
+- Implication: an internal network plus a host-side filtering proxy gives the
+  same allow-list with no network capabilities in the sandbox.
+- Status: open (ADR-0011) · Affects: ADR-0011
+
+### F-021: Agent CLI exit status may not reflect failure
+
+- Evidence: **Experimental** (one secondary report, from an older version) ·
+  Sources: [R15], [R19]
+- Observation: one report found non-interactive Claude Code exiting with 0 on
+  errors. The documented JSON output carries a result type and an error flag.
+- Implication: `AgentRunner` must derive `AgentOutcome` from the structured
+  result as well as the exit status. Either way the outcome is only advisory
+  (F-004).
+- Recommendation: cover this in the #8 contract and integration tests.
+- Status: open (criterion added to #8) · Affects: ADR-0010
+
+### F-022: Accept and publish one immutable artefact
+
+- Evidence: **Established** (long-standing build-and-release practice: build
+  once, then promote the same artefact) · Sources: none external
+- Observation: verifying one thing and shipping another, such as a rebuilt or
+  re-committed working copy, voids the verification.
+- Implication: M1's `publish_branch` commits at publish time, so verification
+  and publication are not bound to the same bytes.
+- Recommendation: bind verification and publication to a commit id (ADR-0010).
+- Status: open (ADR-0010; criteria added to #3, #7, #9) · Affects: ADR-0004,
+  ADR-0010
