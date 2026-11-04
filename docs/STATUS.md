@@ -54,13 +54,14 @@ explicit go-ahead.**
 
 ## Change log
 
-- 2026-11-04: #8 finished: Claude Code `AgentRunner` (ADR-0017, proposed).
+- 2026-11-04: #8 finished: Claude Code `AgentRunner` (ADR-0017, accepted).
   It uses documented print mode with a JSON result. The model credential is
   passed only in the agent command's environment and redacted from
   summaries. `COMPLETED` needs a clean exit, a parsed result and
   `is_error == false`. There is an optional version pin and an operator-built
   image recipe. The contract runs on the in-memory runtime and on real Podman;
-  an opt-in live test records the hosts contacted. Next recommended: #9.
+  an opt-in live test records the hosts contacted. It must pass before any
+  unattended operation (#44, blocks #20). Next recommended: #9.
 
 - 2026-11-04: #7 finished: GitHub `SourceControlProvider` on plumbing-only,
   hardened host git (ADR-0016, accepted). Workspaces are read as data into

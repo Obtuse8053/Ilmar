@@ -1,6 +1,6 @@
 # ADR-0017: Claude Code agent runner
 
-- Status: Proposed
+- Status: Accepted (PR #43, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R13], [R15], [R19] · Findings: F-018, F-021
 - Implements: ADR-0011 §4 and §6 for Claude Code (#8)
@@ -120,6 +120,9 @@ Credential delivery:
     and a reduced capability.
   - Building the agent image needs npm and Anthropic's terms, outside CI.
   - The live test costs a few cents and needs a real key, so it is opt-in.
+  - Maintainer decision on acceptance: the adapter is not operationally
+    ready, and no unattended run may be enabled, until the live smoke test
+    has passed at the pinned version (#44).
 
 ## Revisit when
 
