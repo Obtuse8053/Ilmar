@@ -46,11 +46,16 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#3, the contract suites and fakes, **waiting for the maintainer's explicit
-go-ahead**. #3 is where ADR-0010's port changes become executable
-contracts that every M2 adapter is then written against.
+#4, safe workspace path derivation. #6, the GitHub `TaskProvider`, can run in
+parallel. Both build on the contracts from #3. **Waiting for the maintainer's
+explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #3 finished: contract suites for all five ports, with
+  ADR-0010/0012 port changes (immutable candidate revisions, expected-head
+  leases, owner-checked containers, structured agent outcomes). Next
+  recommended: #4.
 
 - 2026-11-04: M2 design review (#33). Proposed ADR-0010 (verify and publish
   one immutable candidate revision; humans accept), ADR-0011 (sandbox isolation
