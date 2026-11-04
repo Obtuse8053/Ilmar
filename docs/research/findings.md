@@ -321,3 +321,18 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Status: accepted (ADR-0015; implemented by #40) · Affects: ADR-0011,
   ADR-0015
 
+### F-026: Git porcelain applies tree attributes; plumbing does not
+
+- Evidence: **Established** (git documentation [R22]; observed in the #7
+  contract run) · Sources: [R17], [R22]
+- Observation: `checkout` runs `smudge` filters and `archive` applies
+  `export-subst` and `export-ignore`, both chosen by `.gitattributes` in the
+  tree being handled. Worktree commands also read hooks and fsmonitor.
+  `fast-import`, `ls-tree`, `cat-file` and `diff-tree --name-only` do none of
+  this. Configuration passed through `GIT_CONFIG_COUNT` overrides every
+  configuration file.
+- Implication: an orchestrator that must treat agent output as data should
+  move trees with plumbing only, in a scrubbed environment.
+- Status: accepted (ADR-0016; implemented by #7) · Affects: ADR-0010,
+  ADR-0016
+

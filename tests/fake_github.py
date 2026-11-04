@@ -58,6 +58,11 @@ class FakeGitHub:
         self.labels_created: set[str] = set()
         self._comment_ids = itertools.count(1000)
         self.before: list[Callable[[HttpRequest], None]] = []
+        self.pulls: dict[int, dict[str, Any]] = {}
+        self._pull_numbers = itertools.count(500)
+        self.head_sha: Callable[[str], str] = lambda branch: "a" * 40
+        self.check_runs: dict[str, list[dict[str, Any]]] = {}
+        self.statuses: dict[str, list[dict[str, Any]]] = {}
 
     # -- test helpers ----------------------------------------------------
 
@@ -71,6 +76,21 @@ class FakeGitHub:
         comment_id = next(self._comment_ids)
         self.comments[number].append({"id": comment_id, "body": body, "user": {"login": user}})
         return comment_id
+
+    def add_pull(self, head: str, base: str = "main", body: str = "", state: str = "open") -> int:
+        """A pull request opened by someone (no Ilmar marker unless ``body`` has one)."""
+        number = next(self._pull_numbers)
+        owner = self.repository.split("/")[0]
+        self.pulls[number] = {
+            "number": number,
+            "title": f"PR {number}",
+            "body": body,
+            "state": state,
+            "html_url": f"https://github.com/{self.repository}/pull/{number}",
+            "head": {"ref": head, "label": f"{owner}:{head}"},
+            "base": {"ref": base},
+        }
+        return number
 
     # -- transport -------------------------------------------------------
 
@@ -141,7 +161,41 @@ class FakeGitHub:
                 return _json(404, {"message": "Label does not exist"})
             issue.labels.discard(name)
             return _json(200, [{"name": n} for n in sorted(issue.labels)])
+        if path == "/pulls":
+            if method == "GET":
+                found = [
+                    self._pull_json(p)
+                    for p in self.pulls.values()
+                    if p["state"] == query.get("state", "open")
+                    and ("head" not in query or p["head"]["label"] == query["head"])
+                ]
+                return self._page(found, query, full_url)
+            if method == "POST":
+                if any(
+                    p["state"] == "open" and p["head"]["ref"] == body["head"]
+                    for p in self.pulls.values()
+                ):
+                    return _json(422, {"message": "A pull request already exists"})
+                number = self.add_pull(body["head"], body["base"], body["body"])
+                self.pulls[number]["title"] = body["title"]
+                return _json(201, self._pull_json(self.pulls[number]))
+        if match := re.fullmatch(r"/pulls/(\d+)", path):
+            pull = self.pulls.get(int(match.group(1)))
+            if pull is None:
+                return _json(404, {"message": "Not Found"})
+            if method == "PATCH":
+                pull.update({k: v for k, v in body.items() if k in {"title", "body"}})
+            return _json(200, self._pull_json(pull))
+        if match := re.fullmatch(r"/commits/([0-9a-f]{40})/check-runs", path):
+            runs = self.check_runs.get(match.group(1), [])
+            return _json(200, {"total_count": len(runs), "check_runs": runs})
+        if match := re.fullmatch(r"/commits/([0-9a-f]{40})/status", path):
+            return _json(200, {"statuses": self.statuses.get(match.group(1), [])})
         return _json(404, {"message": f"unsupported in fake: {method} {path}"})
+
+    def _pull_json(self, pull: dict[str, Any]) -> dict[str, Any]:
+        head = dict(pull["head"]) | {"sha": self.head_sha(pull["head"]["ref"])}
+        return dict(pull) | {"head": head}
 
     def _page(self, items: list[Any], query: dict[str, str], full_url: str) -> HttpResponse:
         size = min(int(query.get("per_page", "30")), self.page_size)

@@ -26,6 +26,8 @@ options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", cla
 
 [adapters.source_control]
 kind = "github"
+# ADR-0016: use a token with contents and pull-request write access and *no*
+# workflow permission, so CI-configuration changes can never be pushed by Ilmar.
 options = { repository = "Obtuse8053/Ilmar", base_branch = "main", token_env = "GITHUB_TOKEN" }
 
 [adapters.container_runtime]
