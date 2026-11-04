@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import os
+import resource
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from ilmar.core import safe_fs
 from ilmar.core.safe_fs import (
     DirectoryIdentity,
     directory_identity,
@@ -99,7 +103,7 @@ def test_remove_refuses_when_the_target_is_a_symlink(root: Path, outside: Path) 
     target = root / "exec" / "1"
     target.symlink_to(outside)
     fake = DirectoryIdentity(outside.stat().st_dev, outside.stat().st_ino)
-    with pytest.raises(OwnershipConflictError, match="not a plain directory"):
+    with pytest.raises(OwnershipConflictError, match="symlink"):
         remove_directory(target, root=root, expected=fake)
     assert (outside / "precious.txt").exists()
     assert target.is_symlink()
@@ -147,3 +151,104 @@ def test_root_must_not_be_a_symlink(tmp_path: Path, outside: Path) -> None:
     link.symlink_to(outside)
     with pytest.raises(OwnershipConflictError, match="root"):
         ensure_directory(link / "x", root=link)
+
+
+# -- adversarial races (PR #37 review) ----------------------------------------
+
+
+def test_swap_after_verification_cannot_redirect_deletion(
+    root: Path, outside: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verified directory is renamed away and a foreign one put in its place
+    between the identity check and the deletion: the foreign one survives."""
+    target = root / "exec" / "1"
+    identity = ensure_directory(target, root=root)
+    (target / "ours.txt").write_text("ours\n")
+    real_clear = safe_fs._clear
+
+    def swap_then_clear(fd: int) -> None:
+        target.rename(root / "exec" / "moved")
+        target.mkdir()
+        (target / "foreign.txt").write_text("not ours\n")
+        real_clear(fd)
+
+    monkeypatch.setattr(safe_fs, "_clear", swap_then_clear)
+    with pytest.raises(OwnershipConflictError, match="replaced during deletion"):
+        remove_directory(target, root=root, expected=identity)
+    assert (target / "foreign.txt").read_text() == "not ours\n"
+    assert list((root / "exec" / "moved").iterdir()) == []  # only the verified inode was cleared
+
+
+def test_swap_to_symlink_after_verification_deletes_nothing_outside(
+    root: Path, outside: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = root / "exec" / "1"
+    identity = ensure_directory(target, root=root)
+    real_clear = safe_fs._clear
+
+    def swap_then_clear(fd: int) -> None:
+        target.rename(root / "exec" / "moved")
+        target.symlink_to(outside)
+        real_clear(fd)
+
+    monkeypatch.setattr(safe_fs, "_clear", swap_then_clear)
+    with pytest.raises(OwnershipConflictError, match="replaced during deletion"):
+        remove_directory(target, root=root, expected=identity)
+    assert (outside / "precious.txt").read_text() == "must survive\n"
+    assert target.is_symlink()
+
+
+def test_subdirectory_swapped_for_symlink_mid_deletion_is_not_followed(
+    root: Path, outside: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = root / "exec" / "1"
+    identity = ensure_directory(target / "sub", root=root)
+    (target / "sub" / "file.txt").write_text("x")
+    real_open_child = safe_fs._open_child
+
+    def swap_then_open(parent_fd: int, name: str, full: Path) -> int:
+        if name == "sub" and (target / "sub").is_dir() and not (target / "sub").is_symlink():
+            (target / "sub").rename(target / "sub-moved")
+            (target / "sub").symlink_to(outside)
+        return real_open_child(parent_fd, name, full)
+
+    monkeypatch.setattr(safe_fs, "_open_child", swap_then_open)
+    with pytest.raises(OwnershipConflictError):
+        remove_directory(target, root=root, expected=identity)
+    assert (outside / "precious.txt").read_text() == "must survive\n"
+
+
+DEPTH = 1500  # deeper than Python's recursion limit; one descriptor per level
+
+
+@pytest.fixture
+def enough_descriptors() -> Iterator[None]:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    needed = DEPTH + 100
+    if soft >= needed:
+        yield
+        return
+    if hard != resource.RLIM_INFINITY and hard < needed:
+        pytest.skip(f"needs {needed} file descriptors, hard limit is {hard}")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+@pytest.mark.usefixtures("enough_descriptors")
+def test_very_deep_trees_are_deleted_without_recursion(root: Path) -> None:
+    target = root / "exec" / "1"
+    identity = ensure_directory(target, root=root)
+    fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    for _ in range(DEPTH):
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    leaf = os.open("leaf.txt", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd)
+    os.close(leaf)
+    os.close(fd)
+    assert remove_directory(target, root=root, expected=identity)
+    assert not target.exists()

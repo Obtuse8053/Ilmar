@@ -54,8 +54,8 @@ maintainer's explicit go-ahead.**
 
 - 2026-11-04: #4 finished: deterministic, collision-resistant names
   (branch, container); host layout with separate mountable and
-  coordinator-only roots; symlink-safe directory creation and deletion with
-  device/inode checks; containment cases in the ContainerRuntime and
+  coordinator-only roots; symlink-safe directory creation, verification and
+  descriptor-bound deletion; an `authorize_mount` gate before every mount; containment cases in the ContainerRuntime and
   SourceControlProvider contracts. Next recommended: #6.
 
 - 2026-11-04: #3 finished: contract suites for all five ports, with

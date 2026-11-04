@@ -73,12 +73,16 @@ reaches a path.
   Every slug uses only `[A-Za-z0-9._-]` and ends in a hash of the full task
   reference, so hostile or look-alike task keys cannot traverse directories or
   collide.
-- `WorkspaceLayout.check_mountable` refuses anything outside `workspaces/`,
-  and anything under `coordinator/`.
-- `ilmar.core.safe_fs` creates and deletes these directories one component at
-  a time without following symlinks. A directory is deleted only if its
-  device and inode still match what was recorded (ADR-0012). The resource
-  ledger (#11) decides which directories an execution may delete.
+- `WorkspaceLayout.check_mountable` is a lexical pre-check only: it refuses
+  anything outside `workspaces/` and anything under `coordinator/`. The gate
+  before every mount is `ilmar.core.mounts.authorize_mount`, which also walks
+  the real filesystem from a canonical root with `O_NOFOLLOW` and requires the
+  recorded directory identity.
+- `ilmar.core.safe_fs` creates, verifies and deletes these directories one
+  component at a time without following symlinks. Deletion is bound to the
+  verified directory's open descriptor rather than its name (ADR-0012
+  clarification). The resource ledger (#11) decides which directories an
+  execution may delete.
 
 ## Milestones
 

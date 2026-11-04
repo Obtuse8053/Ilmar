@@ -129,3 +129,32 @@ Chosen option: 3. The rules for M2 code:
   distributed lease, and fencing tokens would have to be checked by the
   external systems themselves.
 - #15 finds a state with no safe recovery action.
+
+## Clarification (2026-11-04, PR #37 review)
+
+How rule 3 ("ownership verification before replacing or deleting") and the
+directory part of level 3 ("immutable resource identity") are implemented for
+host directories:
+
+- **Deletion is bound to the verified directory, not its name.** The
+  directory is opened with `O_NOFOLLOW` and the *open descriptor* is checked
+  against the recorded device and inode. Its contents are then deleted through
+  descriptors of verified directories, and symlinks are unlinked as entries.
+  Only the final step, removing the emptied directory's name, goes by name, and
+  it uses `rmdir`. If the name was swapped in between, `rmdir` can at most
+  remove an empty directory and otherwise fails as a conflict. Content outside
+  the verified directory is never deleted.
+- **A lexical check never authorizes a mount on its own.**
+  `WorkspaceLayout.check_mountable` is a lexical pre-check.
+  `ilmar.core.mounts.authorize_mount` must be called immediately before
+  mounting. It requires a canonical workspaces root (no symlinked ancestors),
+  walks every component with `O_NOFOLLOW`, and requires the recorded identity.
+- **Threat model and remaining window.** Directories above a workspace are
+  created by the coordinator with mode `0700` and are never mounted. Only a
+  host-level actor with write access to the state directory could swap them
+  after authorization and before the runtime mounts by name, and that is out
+  of scope. As a detective control, the runtime adapter re-checks the mounted
+  directory's identity from inside the started container and stops it on a
+  mismatch (#5).
+
+The decision is unchanged.

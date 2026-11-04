@@ -65,10 +65,12 @@ class WorkspaceLayout:
         return self.coordinator_root / "repos" / provider / digest
 
     def check_mountable(self, path: Path) -> Path:
-        """Return ``path`` if it may be mounted into a sandbox, else raise ``ValueError``.
+        """Lexical pre-check: ``path`` is strictly inside ``workspaces_root``,
+        normalised, and not inside ``coordinator_root``; else ``ValueError``.
 
-        Mountable means: strictly inside ``workspaces_root``, lexically
-        normalised, and not inside ``coordinator_root``.
+        This cannot see symlinks and is **not** sufficient to authorise a
+        mount. Use :func:`ilmar.core.mounts.authorize_mount` immediately before
+        mounting.
         """
         if not path.is_absolute() or ".." in path.parts or path != Path(*path.parts):
             raise ValueError(f"mount path must be absolute and normalised: {path}")

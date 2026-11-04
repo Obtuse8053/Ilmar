@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Create and delete host directories without following symlinks (ADR-0012).
+"""Create, verify and delete host directories without following symlinks (ADR-0012).
 
-Workspaces are written by untrusted agents. Any directory they can write may
-contain symlinks pointing anywhere on the host, and an attacker could also try
-to swap a directory for a symlink between a check and an operation. These
-helpers therefore:
+Workspaces are written by untrusted agents, and their directories may contain
+symlinks pointing anywhere on the host. These helpers:
 
-* walk from the root one component at a time with ``O_NOFOLLOW`` directory
-  file descriptors, so no symlink is followed at any level;
-* identify directories by device and inode, and delete one only if it is still
-  the directory that was recorded when it was created;
-* delete with ``shutil.rmtree`` relative to a directory file descriptor. On
-  platforms where that is symlink-attack resistant it never follows links
-  inside the tree.
+* walk from a canonical root one component at a time using directory file
+  descriptors opened with ``O_NOFOLLOW``, so no symlink is followed at any
+  level;
+* identify directories by device and inode;
+* delete through file descriptors bound to the verified directory (see
+  :func:`remove_directory`), never by re-resolving a path.
 
-Deciding *whether* a directory may be deleted (it belongs to this execution, as
-recorded in the resource ledger) is the caller's job (#11); these helpers make
-the deletion itself safe.
+**Threat model.** Components *above* a workspace (the root, ``<execution>/``
+and ``<attempt>/``) are created by the coordinator with mode ``0700``, and no
+sandbox ever mounts them. Only a host-level actor with write access to the
+state directory could change them, and that is outside the threat model.
+Agents control only the *contents* of the directory mounted into their
+sandbox. Deciding *whether* a directory may be deleted or mounted (it belongs
+to this execution, as the resource ledger records) is the caller's job (#11).
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
-import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +42,18 @@ class DirectoryIdentity:
     inode: int
 
 
+def require_canonical_root(root: Path) -> None:
+    """Refuse a root that is, or lies beneath, a symlink.
+
+    Opening each component with ``O_NOFOLLOW`` only protects components
+    *below* the root. The root itself must therefore be its own canonical path.
+    """
+    if not root.is_absolute() or os.path.realpath(root) != str(root):
+        raise OwnershipConflictError(f"root {root} is not a canonical path (symlink involved)")
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise OwnershipConflictError(f"root {root} is not a directory")
+
+
 def ensure_directory(path: Path, *, root: Path) -> DirectoryIdentity:
     """Create ``path`` and any missing parents below ``root``; return its identity.
 
@@ -57,62 +69,150 @@ def ensure_directory(path: Path, *, root: Path) -> DirectoryIdentity:
             child = _open_child(fd, name, path)
             os.close(fd)
             fd = child
-        info = os.fstat(fd)
-        return DirectoryIdentity(info.st_dev, info.st_ino)
+        return _identity(fd)
     finally:
         os.close(fd)
 
 
 def directory_identity(path: Path, *, root: Path) -> DirectoryIdentity | None:
     """The identity of ``path``, or ``None`` if it does not exist."""
-    parts = _relative_parts(path, root)
-    fd = _open_root(root)
     try:
-        for name in parts:
-            try:
-                child = _open_child(fd, name, path)
-            except FileNotFoundError:
-                return None
-            os.close(fd)
-            fd = child
-        info = os.fstat(fd)
-        return DirectoryIdentity(info.st_dev, info.st_ino)
+        fd = _open_path(path, root)
+    except FileNotFoundError:
+        return None
+    try:
+        return _identity(fd)
+    finally:
+        os.close(fd)
+
+
+def verify_directory(path: Path, *, root: Path, expected: DirectoryIdentity) -> None:
+    """Check that ``path`` is reachable from ``root`` without symlinks and is ``expected``.
+
+    Used immediately before mounting (see :func:`ilmar.core.mounts.authorize_mount`).
+    Raises ``OwnershipConflictError`` on a symlink, a non-directory, a missing
+    directory or a different identity.
+    """
+    require_canonical_root(root)
+    try:
+        fd = _open_path(path, root)
+    except FileNotFoundError as exc:
+        raise OwnershipConflictError(f"{path} does not exist") from exc
+    try:
+        if _identity(fd) != expected:
+            raise OwnershipConflictError(f"{path} is not the recorded directory")
     finally:
         os.close(fd)
 
 
 def remove_directory(path: Path, *, root: Path, expected: DirectoryIdentity) -> bool:
-    """Delete the tree at ``path`` if it is still the ``expected`` directory.
+    """Delete the directory at ``path`` if it is the ``expected`` directory.
 
-    Returns ``False`` if it no longer exists (idempotent). Raises
-    ``OwnershipConflictError``, deleting nothing, if ``path`` or any parent is a
-    symlink or not a directory, or if the directory was replaced.
+    Returns ``False`` if nothing exists at ``path`` (idempotent). The deletion
+    is bound to the verified directory, not to its name:
+
+    1. The directory is opened with ``O_NOFOLLOW``, and *that open descriptor*
+       is checked against ``expected``. A swap before the open is detected; a
+       swap after it cannot redirect the descriptor.
+    2. All contents are deleted relative to descriptors of verified
+       directories. Each subdirectory is opened with ``O_NOFOLLOW`` and checked
+       against the entry that was listed, so symlinks are unlinked as links and
+       never followed.
+    3. Finally the now-empty directory's *name* is removed with ``rmdir``. If
+       the name was swapped after step 1, ``rmdir`` can only remove an empty
+       directory, and fails on anything else. Content outside the verified
+       directory is never deleted. In that case ``OwnershipConflictError`` is
+       raised.
     """
-    if not shutil.rmtree.avoids_symlink_attacks:
-        raise RuntimeError("this platform cannot delete directory trees safely")
     parts = _relative_parts(path, root)
     *parents, last = parts
-    fd = _open_root(root)
+    parent_fd = _open_root(root)
     try:
         for name in parents:
             try:
-                child = _open_child(fd, name, path)
+                child = _open_child(parent_fd, name, path)
             except FileNotFoundError:
                 return False
-            os.close(fd)
-            fd = child
+            os.close(parent_fd)
+            parent_fd = child
         try:
-            info = os.stat(last, dir_fd=fd, follow_symlinks=False)
+            target_fd = _open_child(parent_fd, last, path)
         except FileNotFoundError:
             return False
-        if not stat.S_ISDIR(info.st_mode):
-            raise OwnershipConflictError(f"{path} is not a plain directory; not deleting it")
-        if DirectoryIdentity(info.st_dev, info.st_ino) != expected:
-            raise OwnershipConflictError(f"{path} was replaced since it was recorded")
-        shutil.rmtree(last, dir_fd=fd)
+        try:
+            if _identity(target_fd) != expected:
+                raise OwnershipConflictError(f"{path} was replaced since it was recorded")
+            _clear(target_fd)
+        finally:
+            os.close(target_fd)
+        try:
+            os.rmdir(last, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
+                raise OwnershipConflictError(
+                    f"{path} was replaced during deletion; the replacement was left untouched"
+                ) from exc
+            raise
         return True
     finally:
+        os.close(parent_fd)
+
+
+def _clear(dir_fd: int) -> None:
+    """Delete everything inside the directory open at ``dir_fd``, iteratively.
+
+    Every level is reached through a descriptor of a directory whose identity
+    matched the entry that was listed. Files and symlinks are unlinked as
+    entries. Emptied subdirectories are removed with ``rmdir``, which can only
+    ever remove an empty directory.
+
+    One descriptor is held per level of depth. A tree deeper than the process's
+    descriptor limit makes deletion fail with ``OSError`` (``EMFILE``),
+    leaving the rest in place: it fails safe, never unsafe.
+    """
+    stack: list[tuple[int, list[str], str]] = [(dir_fd, os.listdir(dir_fd), "")]
+    try:
+        while stack:
+            fd, names, own_name = stack[-1]
+            if not names:
+                stack.pop()
+                if stack:
+                    os.close(fd)
+                    os.rmdir(own_name, dir_fd=stack[-1][0])
+                continue
+            name = names.pop()
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                os.unlink(name, dir_fd=fd)
+                continue
+            child = _open_child(fd, name, Path(name))
+            if _identity(child) != DirectoryIdentity(info.st_dev, info.st_ino):
+                os.close(child)
+                raise OwnershipConflictError(f"{name!r} changed while being deleted")
+            stack.append((child, os.listdir(child), name))
+    finally:
+        for fd, _, _ in stack[1:]:
+            os.close(fd)
+
+
+def _open_path(path: Path, root: Path) -> int:
+    fd = _open_root(root)
+    try:
+        for name in _relative_parts(path, root):
+            child = _open_child(fd, name, path)
+            os.close(fd)
+            fd = child
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def _identity(fd: int) -> DirectoryIdentity:
+    info = os.fstat(fd)
+    return DirectoryIdentity(info.st_dev, info.st_ino)
 
 
 def _relative_parts(path: Path, root: Path) -> tuple[str, ...]:
