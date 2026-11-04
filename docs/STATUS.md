@@ -53,7 +53,7 @@ building on #4). **Waiting for the maintainer's explicit go-ahead.**
 
 - 2026-11-04: #6 finished: GitHub `TaskProvider` on a standard-library REST
   client (REST only; token kept to the API origin, including on redirects).
-  ADR-0013 (proposed) fixes the M2 threat model: one instance per repository
+  ADR-0013 (accepted) fixes the M2 threat model: one instance per repository
   and one coordinator per instance. Labels are workflow state, assignees mean
   human responsibility, and claim comments (instance plus unique token) are an
   audit record, not a lock. `ilmar:claimed` is owned by Ilmar; human claim

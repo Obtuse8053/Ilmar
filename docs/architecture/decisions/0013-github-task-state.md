@@ -1,6 +1,6 @@
 # ADR-0013: GitHub task state under a single-coordinator deployment
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-04
 - Sources: [R1], [R11], [R20] · Findings: F-015
 
