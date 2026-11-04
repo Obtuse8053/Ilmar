@@ -277,3 +277,29 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Recommendation: bind verification and publication to a commit id (ADR-0010).
 - Status: accepted (ADR-0010; implemented by #3, #7, #9) · Affects:
   ADR-0004, ADR-0010
+
+### F-023: Rootless Podman trades workspace ownership against escape containment
+
+- Evidence: **Established** for the mechanism (primary Podman documentation,
+  [R21], and observed in CI on Podman 4.9); the trade-off is our assessment ·
+  Sources: [R21]
+- Observation: rootless Podman maps container root to the invoking user. A
+  non-root container user is a sub-UID on the host unless `keep-id` maps the
+  invoking user onto it. Without `keep-id`, the host account cannot manage the
+  files the sandbox writes; with it, a full escape lands as that account.
+- Implication: an orchestrator that reads and deletes sandbox output needs
+  `keep-id` or idmapped mounts. Idmapped mounts would combine both properties
+  but are not dependable in rootless Podman 4.9.
+- Status: accepted (ADR-0014; implemented by #5) · Affects: ADR-0011, ADR-0014
+
+### F-024: `podman exec` cannot bound a command's lifetime
+
+- Evidence: **Established** (primary Podman documentation lists no exec
+  timeout or exec-session kill; [R21]) · Sources: [R21]
+- Observation: killing the `podman exec` client leaves the process inside the
+  container running. Exit status 125 can come from Podman or from the command.
+- Implication: a runtime that must guarantee nothing keeps writing after a
+  timeout has to stop the whole container.
+- Status: accepted (ADR-0014; port contract changed in #5) · Affects:
+  ADR-0014, the `ContainerRuntime` port
+
