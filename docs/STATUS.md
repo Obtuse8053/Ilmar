@@ -46,11 +46,17 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#4, safe workspace path derivation. #6, the GitHub `TaskProvider`, can run in
-parallel. Both build on the contracts from #3. **Waiting for the maintainer's
-explicit go-ahead.**
+#6, the GitHub `TaskProvider` (plan step 4). After it comes #5, the Podman
+`ContainerRuntime`, which builds on #4's layout. **Waiting for the
+maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #4 finished: deterministic, collision-resistant names
+  (branch, container); host layout with separate mountable and
+  coordinator-only roots; symlink-safe directory creation, verification and
+  descriptor-bound deletion; an `authorize_mount` gate before every mount; containment cases in the ContainerRuntime and
+  SourceControlProvider contracts. Next recommended: #6.
 
 - 2026-11-04: #3 finished: contract suites for all five ports, with
   ADR-0010/0012 port changes (immutable candidate revisions, expected-head

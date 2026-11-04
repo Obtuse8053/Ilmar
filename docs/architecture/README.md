@@ -51,6 +51,39 @@ mounts, egress allow-list) is ADR-0011. ADR-0010 binds verification and
 publication to one immutable candidate revision. ADR-0012 keeps every external
 side effect recoverable.
 
+## Host directory layout
+
+Computed purely by `ilmar.core.layout.WorkspaceLayout`. No task text ever
+reaches a path.
+
+```
+<state_dir>/
+├── workspaces/                     may be mounted into sandboxes
+│   └── <execution-id>/<attempt>/
+│       ├── agent/                  agent workspace (agent sandbox)
+│       └── verify-<run>/           fresh checkout per verification run
+└── coordinator/                    never mounted
+    └── repos/<provider>/<hash>/    coordinator-owned git repository
+```
+
+- `ilmar.core.naming` derives names from identifiers:
+  - the branch, `ilmar/<slug>-<hash>`;
+  - the container, `ilmar-<instance>-<execution>-<attempt>`.
+
+  Every slug uses only `[A-Za-z0-9._-]` and ends in a hash of the full task
+  reference, so hostile or look-alike task keys cannot traverse directories or
+  collide.
+- `WorkspaceLayout.check_mountable` is a lexical pre-check only: it refuses
+  anything outside `workspaces/` and anything under `coordinator/`. The gate
+  before every mount is `ilmar.core.mounts.authorize_mount`, which also walks
+  the real filesystem from a canonical root with `O_NOFOLLOW` and requires the
+  recorded directory identity.
+- `ilmar.core.safe_fs` creates, verifies and deletes these directories one
+  component at a time without following symlinks. Deletion is bound to the
+  verified directory's open descriptor rather than its name (ADR-0012
+  clarification). The resource ledger (#11) decides which directories an
+  execution may delete.
+
 ## Milestones
 
 Milestone scope and status are tracked in [`../roadmap.md`](../roadmap.md).
