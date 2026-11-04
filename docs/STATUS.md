@@ -53,6 +53,9 @@ adapter is written against these contracts.
 - 2026-11-04: Independent review of M1 and PR #32. Status data was
   de-duplicated: issue state lives only on GitHub, the plan only here, and
   roadmap/finding links are checked by tests. ADR-0001 to ADR-0008 marked
-  Accepted. Added the `needs:maintainer` label.
+  Accepted. Added the `needs:maintainer` label. Second review round:
+  `STATUS.md` is edited only when the plan changes; ADR status flips get their
+  own CI run before a SHA-pinned merge; the limits of the offline doc tests are
+  documented, and a live check is proposed (#35).
 - 2026-11-01: M1 merged (#1). Backlog approved and opened as issues #2–#31
   with milestones and labels. Started #2.

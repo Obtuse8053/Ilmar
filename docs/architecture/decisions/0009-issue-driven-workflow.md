@@ -53,12 +53,19 @@ use.
 - Good: any session can resume by reading `STATUS.md`, open PRs and issues. The
   workflow the humans and agents use now is the specification for Ilmar's own
   workflow later.
-- Bad: the plan in `STATUS.md` changes only through PRs. Two parallel PRs
-  that both edit `STATUS.md` will conflict; keep its edits small.
+- Bad: `STATUS.md` is maintained by hand. Only PRs that change the plan, the
+  milestone or the recommended next task edit it, so routine parallel PRs do
+  not conflict there. Two plan-changing PRs still can.
+- Bad: the documentation tests are offline. They prove internal consistency,
+  not agreement with GitHub. Sessions compare the plan with live issue state
+  when they start, and automating that is proposed in #35.
 
 ## Revisit when
 
 - The GitHub `TaskProvider` (#6) settles its state model. Align the labels
   with it.
-- `STATUS.md` conflicts or drift become frequent. Then generate it from issues.
+- `STATUS.md` conflicts or drift become frequent. Then generate the plan from
+  issue data, for example milestone order plus dependency fields.
+- The GitHub `TaskProvider` (#6) exists. Then reconsider #35 (a live reference
+  check).
 - Ilmar runs its own backlog (#20). Decide which steps it takes over.

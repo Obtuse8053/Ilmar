@@ -20,9 +20,16 @@ restate it.
 | Which milestone is current | `docs/STATUS.md` (GitHub milestones show open or closed) |
 | Milestone scope | `MANIFEST.md` §10 and each milestone's description on GitHub |
 | Why something is built this way | `docs/architecture/decisions/` |
-| Evidence, and which finding led to which issue | `docs/research/findings.md`. `docs/roadmap.md` lists the same links, and a test keeps the two consistent |
+| Evidence, and which finding led to which issue | `docs/research/findings.md`. `docs/roadmap.md` lists the same links, and a test keeps the two consistent with each other |
+| History of individual changes | Git history and merged PRs on GitHub |
 
 Issue numbers are stable IDs and may be cited anywhere. Issue *state* may not.
+
+**Limits.** The documentation tests run offline. They check that the documents
+agree with *each other* and that `STATUS.md` does not copy issue state. They
+cannot see GitHub. Agreement with live issue state comes from the session
+protocol: at the start of each session, compare the plan with GitHub, and fix
+`STATUS.md` if they differ. Proposal #35 would automate that check.
 
 ## Labels and milestones
 
@@ -60,6 +67,8 @@ Issue numbers are stable IDs and may be cited anywhere. Issue *state* may not.
 **Start**
 
 1. `git fetch origin main:refs/remotes/origin/main` and read `docs/STATUS.md`.
+   Check its Planned order against live issue state on GitHub. If they differ,
+   GitHub is right; correct `STATUS.md` in your next PR.
 2. List open PRs and in-progress issues:
    `gh api "repos/Obtuse8053/Ilmar/pulls?state=open"` and
    `gh api "repos/Obtuse8053/Ilmar/issues?labels=status:in-progress"`.
@@ -75,16 +84,26 @@ sources and findings for research.
 
 **Finish**
 
-1. Update `docs/STATUS.md` in the same PR: a change log entry, plus the plan or
-   recommended next task if they changed. Do not record issue state there.
-   Update finding statuses and `docs/roadmap.md` together if they changed.
+1. Edit `docs/STATUS.md` **only** if the current milestone, the planned order
+   or the recommended next task changed, and then add a dated change-log entry.
+   Routine PRs leave it alone; their history is the git log. This keeps
+   parallel PRs from conflicting there. Never record issue state in it. Update
+   finding statuses and `docs/roadmap.md` together if they changed.
 2. Open the PR with the template. The body says `Closes #<issue>`. Name the
    sensitive areas it touches.
 3. **Never merge on your own initiative.** Merge only when the maintainer
-   explicitly asks for that specific PR to be merged, CI is green, and GitHub
-   reports it as mergeable. Just before merging, change any ADR the PR
-   introduces from `Proposed` to `Accepted` (the maintainer's approval is the
-   acceptance). Use a merge commit.
+   explicitly asks for that specific PR to be merged. Then:
+   1. If the PR introduces ADRs, push one commit that changes only their
+      status from `Proposed` to `Accepted` (the maintainer's approval is the
+      acceptance).
+   2. Wait until CI passes on the PR's current head commit and GitHub reports
+      the PR as mergeable.
+   3. Merge with a merge commit, pinned to that head:
+      `gh api -X PUT repos/Obtuse8053/Ilmar/pulls/<n>/merge -f merge_method=merge -f sha=<head-sha>`.
+      GitHub refuses the merge if the head moved, so the merged code is exactly
+      what CI verified.
+   4. If anything other than the status flip changed after approval, ask the
+      maintainer again.
 4. If the session ends before the work is done, push the branch and leave a
    handoff comment on the issue. Say what is done, what is next, and anything
    surprising.

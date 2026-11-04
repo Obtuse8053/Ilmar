@@ -19,8 +19,9 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
-approves that PR, and the status is changed in the PR just before it is merged
-(`docs/workflow.md`). ADR-0001 to ADR-0008 were accepted with PR #1.
+approves that PR. The status change is pushed to the PR as its own commit, and
+the PR is merged only after CI passes on that commit (`docs/workflow.md`,
+"Finish"). ADR-0001 to ADR-0008 were accepted with PR #1.
 
 ## Template
 

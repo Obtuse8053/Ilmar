@@ -37,7 +37,7 @@ the repository or the issues, add it there.
 | `tests/architecture/` | Tests that enforce the dependency rules and repository policy. |
 | `docs/architecture/` | Architecture overview and decision records (`decisions/`). |
 | `docs/research/` | Source registry, findings and the research review process. |
-| `docs/STATUS.md` | Current milestone, in-progress work, ordered next issues, change log. |
+| `docs/STATUS.md` | Current milestone, planned order, recommended next task, change log. Issue state lives on GitHub. |
 | `docs/workflow.md` | Labels, milestones, session protocol, milestone close-out. |
 | `docs/roadmap.md` | Milestone status and approved improvements, linked to issues. |
 | `scripts/` | Small standard-library helper scripts used by CI. |
@@ -147,10 +147,12 @@ The process and formats are in `docs/research/README.md`. The rules:
 4. Write or update an ADR in `docs/architecture/decisions/` for any decision
    that changes the architecture, a port contract, persistence format, security
    boundary or dependency policy.
-5. Update `docs/STATUS.md`. Open a pull request using the template, with
+5. Update `docs/STATUS.md` only if the plan, the milestone or the recommended
+   next task changed. Open a pull request using the template, with
    `Closes #<issue>`, and fill in the provenance section.
 6. **Never merge on your own initiative.** Merge only when the maintainer
-   explicitly asks for that specific PR, and only once CI is green.
+   explicitly asks for that specific PR, and only once CI is green on the exact
+   commit being merged (`docs/workflow.md`, "Finish").
 
 ### Sensitive areas
 
