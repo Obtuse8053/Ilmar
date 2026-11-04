@@ -1,6 +1,6 @@
 # ADR-0008: In-repository research knowledge base and review process
 
-- Status: Proposed
+- Status: Accepted (PR #1, 2026-11-01)
 - Date: 2026-11-01
 - Sources: [R2], [R10] · Findings: F-007, F-016
 

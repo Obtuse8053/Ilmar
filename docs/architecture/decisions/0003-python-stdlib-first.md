@@ -1,6 +1,6 @@
 # ADR-0003: Python 3.11+, standard library first, no runtime dependencies in the core
 
-- Status: Proposed
+- Status: Accepted (PR #1, 2026-11-01)
 - Date: 2026-11-01
 - Sources: [R6]
 

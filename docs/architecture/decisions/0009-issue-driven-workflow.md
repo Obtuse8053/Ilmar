@@ -27,9 +27,12 @@ Chosen option: 3. The process is described in `docs/workflow.md`.
 
 - Issues are the units of work. Milestones follow MANIFEST §10. Labels encode
   priority, type, approval, sensitivity and status.
-- `docs/STATUS.md` is the resume point on `main`: current milestone, in-progress
-  work, an ordered Next up list, decisions needed, and a change log. Every PR
-  updates it.
+- `docs/STATUS.md` is the resume point on `main`. It holds only what GitHub
+  cannot: the current milestone, the planned order with dependencies, the
+  recommended next task, and a change log. Issue state is never copied into it.
+  Each fact has a single owner (`docs/workflow.md`, "Sources of truth"), and
+  stable IDs that are repeated, such as finding-to-issue links, are checked by
+  tests.
 - Handoff comments on issues bridge interrupted sessions. Durable progress
   artefacts are what let long-running agent work resume ([R3]). Keeping plans
   and status in the repository follows [R2]'s practice of treating the
@@ -50,8 +53,8 @@ use.
 - Good: any session can resume by reading `STATUS.md`, open PRs and issues. The
   workflow the humans and agents use now is the specification for Ilmar's own
   workflow later.
-- Bad: `STATUS.md` reflects `main`, so it lags open PRs. Live state comes from
-  labels and PRs. Two parallel PRs that both edit `STATUS.md` will conflict.
+- Bad: the plan in `STATUS.md` changes only through PRs. Two parallel PRs
+  that both edit `STATUS.md` will conflict; keep its edits small.
 
 ## Revisit when
 

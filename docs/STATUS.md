@@ -1,45 +1,58 @@
 # Status
 
-The resume point for any session. Update it in every PR, following
-`docs/workflow.md`. The live state is also in open PRs and in issues labelled
-`status:in-progress`.
+The resume point for any session (ADR-0009). This file holds only what GitHub
+cannot: the planned order of work, the recommended next task, and a history of
+changes. **Issue state** (open or closed, priority, labels, who is working on
+what) **lives only on GitHub.** If this file and GitHub disagree about an issue,
+GitHub is right; fix this file in your next PR. See `docs/workflow.md`,
+"Sources of truth".
 
 ## Current milestone
 
-**M2 End-to-end execution:** GitHub issue → Podman → Claude Code → tests → pull
-request ([milestone](https://github.com/Obtuse8053/Ilmar/milestone/2)).
+**M2 End-to-end execution**
+([milestone](https://github.com/Obtuse8053/Ilmar/milestone/2)). M1 was merged
+in PR #1.
 
-M1 Foundation is complete (PR #1, merged 2026-11-01).
+## Live state (query, don't copy)
 
-## In progress
+- Work in progress:
+  [open PRs](https://github.com/Obtuse8053/Ilmar/pulls) and
+  [`status:in-progress` issues](https://github.com/Obtuse8053/Ilmar/issues?q=is%3Aopen+label%3Astatus%3Ain-progress)
+- Waiting on the maintainer:
+  [`needs:maintainer` issues](https://github.com/Obtuse8053/Ilmar/issues?q=is%3Aopen+label%3Aneeds%3Amaintainer)
+- Milestone progress: the milestone page linked above
 
-- #2 Session-resume workflow: this PR.
+## Planned order (M2)
 
-## Next up
+Dependency order for M2. This plan is owned here; issues do not repeat it.
+Skip any step whose issue GitHub shows as finished.
 
-In order. Each item lists its prerequisites.
+| Step | Issue | Depends on |
+| --- | --- | --- |
+| 1 | #2 Session-resume workflow | — |
+| 2 | #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner` | #2 |
+| 3 | #4 Safe workspace path derivation | #3 |
+| 4 | #6 GitHub `TaskProvider` | #3 |
+| 5 | #5 Podman `ContainerRuntime` and sandbox profile | #4 |
+| 6 | #7 GitHub `SourceControlProvider` | #3, #4 |
+| 7 | #8 Claude Code `AgentRunner` | #3, #5 |
+| 8 | #9 Verification stage | #5, #7 |
+| 9 | #10 Adapter registry | before #11 |
+| 10 | #11 Coordinator loop and end-to-end test (closes M2) | all of the above |
 
-1. #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner`
-2. #4 Safe workspace path derivation (after #3)
-3. #6 GitHub `TaskProvider` (after #3). Can run in parallel with #4 and #5.
-4. #5 Podman `ContainerRuntime` and the network-policy ADR (after #4)
-5. #7 GitHub `SourceControlProvider` (after #3, #4)
-6. #8 Claude Code `AgentRunner` (after #3, #5)
-7. #9 Verification stage (after #5)
-8. #10 Adapter registry (any time before #11)
-9. #11 Coordinator loop and end-to-end test (after all of the above). Closes M2.
+Steps 3 and 4 can run in parallel. Maintenance issues without a milestone can
+fill any gaps between M2 steps.
 
-Maintenance, any time: #26 (LICENSE check), #28 (secret scanning), and the
-other issues without a milestone.
+## Recommended next task
 
-## Decisions needed from the maintainer
-
-- #26: verify `LICENSE` against apache.org (the agent could not reach it).
-- #27: correct the R3 URL in `MANIFEST.md` §9.
-- #28: enable secret scanning and push protection in the repository settings.
-- Confirm the copyright holder named in `NOTICE` ("The Ilmar Authors").
+#3, the contract suites and fakes, once the maintainer approves. Every M2
+adapter is written against these contracts.
 
 ## Change log
 
+- 2026-11-04: Independent review of M1 and PR #32. Status data was
+  de-duplicated: issue state lives only on GitHub, the plan only here, and
+  roadmap/finding links are checked by tests. ADR-0001 to ADR-0008 marked
+  Accepted. Added the `needs:maintainer` label.
 - 2026-11-01: M1 merged (#1). Backlog approved and opened as issues #2–#31
   with milestones and labels. Started #2.

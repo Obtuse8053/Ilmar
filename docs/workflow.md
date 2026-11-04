@@ -5,16 +5,24 @@ new session, human or agent, can continue from the repository and GitHub alone
 (ADR-0009). Later, Ilmar will run this same workflow itself through its GitHub
 adapters (issue #20).
 
-## Where things live
+## Sources of truth
 
-| Question | Source of truth |
+Each fact has exactly one owner. Other places may *link* to it, but must not
+restate it.
+
+| Fact | Owner |
 | --- | --- |
-| What must Ilmar be? | `MANIFEST.md` |
-| What rules apply to changes? | `AGENTS.md` |
-| Where are we right now? | `docs/STATUS.md` (on `main`) plus open PRs and `status:in-progress` issues |
-| What is planned, and in which milestone? | [GitHub issues](https://github.com/Obtuse8053/Ilmar/issues) and milestones; summarised in `docs/roadmap.md` |
-| Why is it built this way? | `docs/architecture/decisions/` |
-| What evidence informs it? | `docs/research/` |
+| What Ilmar must be | `MANIFEST.md` |
+| Rules for changes | `AGENTS.md` |
+| Issue state: open/closed, priority, labels, milestone, who is working on it | **GitHub issues** |
+| Work in progress | Open PRs and `status:in-progress` issues on **GitHub** |
+| Planned order and dependencies of the current milestone, recommended next task | `docs/STATUS.md` |
+| Which milestone is current | `docs/STATUS.md` (GitHub milestones show open or closed) |
+| Milestone scope | `MANIFEST.md` §10 and each milestone's description on GitHub |
+| Why something is built this way | `docs/architecture/decisions/` |
+| Evidence, and which finding led to which issue | `docs/research/findings.md`. `docs/roadmap.md` lists the same links, and a test keeps the two consistent |
+
+Issue numbers are stable IDs and may be cited anywhere. Issue *state* may not.
 
 ## Labels and milestones
 
@@ -29,21 +37,23 @@ adapters (issue #20).
   - `approved`: the maintainer approved it.
   - `research`: a review or investigation.
   - `sensitive`: touches an AGENTS.md §6 area and needs explicit human approval.
-- **Status:** `status:in-progress` (a session has claimed it) and
-  `status:blocked`.
+- **Status:** `status:in-progress` (a session has claimed it),
+  `status:blocked`, and `needs:maintainer` (waiting for a maintainer action or
+  decision).
 - `ilmar:ready`: the issue is eligible for Ilmar itself to execute. Not used
   before M4.
 
 ## Choosing the next task
 
-1. If `docs/STATUS.md` has a **Next up** list, take the first open issue on it
-   that is not `status:in-progress` or `status:blocked`.
-2. Otherwise, take the lowest-numbered open `approved` issue with the highest
-   priority in the current milestone.
-3. Skip issues whose prerequisites (named in the issue or in Next up) are not
-   merged yet.
-4. Only `approved` issues are implemented. A `proposal` waits for the
+1. Take the first step of **Planned order** in `docs/STATUS.md` whose issue is
+   open on GitHub, is not `status:in-progress`, `status:blocked` or
+   `needs:maintainer`, and whose dependencies are closed.
+2. If no step qualifies, take an open `approved` maintenance issue (no
+   milestone), highest priority first.
+3. Only `approved` issues are implemented. A `proposal` waits for the
    maintainer.
+4. If the maintainer has not yet approved the recommended next task, ask before
+   starting it.
 
 ## Session protocol
 
@@ -65,14 +75,16 @@ sources and findings for research.
 
 **Finish**
 
-1. Update `docs/STATUS.md` in the same PR: change log entry, in-progress state
-   and Next up. Also update `docs/roadmap.md` and finding statuses if they
-   changed.
+1. Update `docs/STATUS.md` in the same PR: a change log entry, plus the plan or
+   recommended next task if they changed. Do not record issue state there.
+   Update finding statuses and `docs/roadmap.md` together if they changed.
 2. Open the PR with the template. The body says `Closes #<issue>`. Name the
    sensitive areas it touches.
 3. **Never merge on your own initiative.** Merge only when the maintainer
    explicitly asks for that specific PR to be merged, CI is green, and GitHub
-   reports it as mergeable. Use a merge commit.
+   reports it as mergeable. Just before merging, change any ADR the PR
+   introduces from `Proposed` to `Accepted` (the maintainer's approval is the
+   acceptance). Use a merge commit.
 4. If the session ends before the work is done, push the branch and leave a
    handoff comment on the issue. Say what is done, what is next, and anything
    surprising.
@@ -84,8 +96,9 @@ When the last issue of a milestone is merged:
 1. Close the GitHub milestone and update `docs/roadmap.md`.
 2. Split the next milestone's epics into issues. Open them with the
    `proposal` label for maintainer approval.
-3. Record the recommended next task in `docs/STATUS.md` and in the final PR or
-   a comment. Then stop and wait for the maintainer's approval.
+3. Replace **Planned order** in `docs/STATUS.md` with the next milestone's plan
+   and record the recommended next task. Then stop and wait for the
+   maintainer's approval.
 
 ## Notes for Claude Code cloud sessions
 

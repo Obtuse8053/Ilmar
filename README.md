@@ -4,9 +4,8 @@ Ilmar is an open-source, provider-independent software factory. It turns
 development tasks into verified code changes using existing autonomous coding
 agents, and is being built to eventually develop and maintain itself.
 
-> **Status:** pre-alpha. M1 (Foundation) is done and M2 (end-to-end execution)
-> is in progress; see [`docs/STATUS.md`](docs/STATUS.md). Nothing here runs
-> tasks end to end yet.
+> **Status:** pre-alpha. Nothing here runs tasks end to end yet. For current
+> progress, see [`docs/STATUS.md`](docs/STATUS.md).
 
 ## What exists today
 

@@ -7,18 +7,20 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 
 | ADR | Title | Status |
 | --- | --- | --- |
-| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Proposed |
-| [0002](0002-ports-and-adapters.md) | Ports and adapters with an enforced dependency rule | Proposed |
-| [0003](0003-python-stdlib-first.md) | Python 3.11+, standard library first, no runtime dependencies in the core | Proposed |
-| [0004](0004-execution-state-machine.md) | Explicit execution state machine with versioned records | Proposed |
-| [0005](0005-sqlite-execution-store.md) | SQLite execution store with database-enforced single active execution | Proposed |
-| [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Proposed |
-| [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Proposed |
-| [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Proposed |
+| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
+| [0002](0002-ports-and-adapters.md) | Ports and adapters with an enforced dependency rule | Accepted |
+| [0003](0003-python-stdlib-first.md) | Python 3.11+, standard library first, no runtime dependencies in the core | Accepted |
+| [0004](0004-execution-state-machine.md) | Explicit execution state machine with versioned records | Accepted |
+| [0005](0005-sqlite-execution-store.md) | SQLite execution store with database-enforced single active execution | Accepted |
+| [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Accepted |
+| [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Accepted |
+| [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Accepted |
 | [0009](0009-issue-driven-workflow.md) | GitHub issues plus in-repository status as the development control plane | Proposed |
 
-Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. The M1
-ADRs stay Proposed until the maintainer approves the M1 pull request.
+Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
+is Proposed while its PR is open. It becomes Accepted when the maintainer
+approves that PR, and the status is changed in the PR just before it is merged
+(`docs/workflow.md`). ADR-0001 to ADR-0008 were accepted with PR #1.
 
 ## Template
 

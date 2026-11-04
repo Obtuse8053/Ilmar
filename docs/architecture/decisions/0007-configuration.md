@@ -1,6 +1,6 @@
 # ADR-0007: TOML configuration with per-port adapters and no inline secrets
 
-- Status: Proposed
+- Status: Accepted (PR #1, 2026-11-01)
 - Date: 2026-11-01
 - Sources: [R1], [R11] · Findings: F-014
 
