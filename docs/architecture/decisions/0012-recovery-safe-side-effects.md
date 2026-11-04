@@ -51,11 +51,36 @@ Chosen option: 3. The rules for M2 code:
      resolve under the configured root. Symlinks are never followed during
      deletion. Ownership markers live in the coordinator's store, not in
      directories the agent can write.
-   - **Fencing.** Each instance takes an exclusive lock on its state directory,
-     so only one coordinator runs per instance. A coordinator touches an
-     execution's resources only after a successful versioned write to that
-     execution (ADR-0004). A stale actor's next write fails with
-     `ConcurrencyConflictError`, and it must stop.
+   - **Fencing.** In this single-coordinator design, ownership is held, not
+     merely checked. A version check alone could go stale between the check
+     and the operation, so the guarantee rests on three levels:
+     1. **Instance.** The coordinator takes an exclusive OS lock on a file in
+        its state directory (which must be on a local filesystem, ADR-0005)
+        and holds it for its whole lifetime. Only the kernel releases it, when
+        the process exits. Ownership of an instance therefore cannot change
+        while the holder is alive, so no stale coordinator can run alongside
+        a new one. Every command that changes anything, including manual CLI
+        commands, needs this lock. Read-only commands do not.
+     2. **Execution.** Inside the coordinator, at most one worker owns an
+        execution at a time, through an in-process lease. Before each
+        sensitive operation, the worker checks that it still holds the lease,
+        that it still holds the instance lock, and that the stored execution
+        version equals its last write. The lease cannot be taken from it
+        between the check and the operation. Sensitive operations are: start,
+        replace, stop or remove a container or network; claim or release a
+        task; freeze a candidate; push; upsert a change request; delete a
+        workspace.
+     3. **Resource.** The operation itself targets the resource's *immutable*
+        identity, captured during the ownership check: the container or
+        network id whose labels matched, not its name; a push with an
+        expected-head lease; a workspace directory confirmed by device and
+        inode, deleted without following symlinks. If the identity changed,
+        the operation fails as a conflict instead of acting on a replacement.
+
+     If any check fails, the worker performs no further side effects for that
+     execution. It records the conflict and stops. This needs no distributed
+     consensus, because there is exactly one coordinator per instance and one
+     owner per execution.
    - A retry (a new attempt) creates new resources under new names. It may
      clean up the previous attempt's resources only through the ledger and
      only after verifying ownership. It never touches resources of another
@@ -101,5 +126,6 @@ Chosen option: 3. The rules for M2 code:
 ## Revisit when
 
 - Coordinators run on several hosts. The per-instance lock would then need a
-  distributed lease.
+  distributed lease, and fencing tokens would have to be checked by the
+  external systems themselves.
 - #15 finds a state with no safe recovery action.

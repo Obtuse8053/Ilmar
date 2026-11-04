@@ -46,8 +46,8 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#3, the contract suites and fakes, once the maintainer approves the design
-review (#33, PR #34). #3 is where ADR-0010's port changes become executable
+#3, the contract suites and fakes, **waiting for the maintainer's explicit
+go-ahead**. #3 is where ADR-0010's port changes become executable
 contracts that every M2 adapter is then written against.
 
 ## Change log
@@ -61,6 +61,10 @@ contracts that every M2 adapter is then written against.
   acceptance table (CI-config changes not published in M2); ADR-0011 per-execution
   networks and required negative network tests; ADR-0012 ownership-verified
   cleanup, resource ledger and fencing (#3, #4, #5, #7, #9, #11, #15, #16).
+  Final clarifications: three-level fencing (instance lock held for the
+  coordinator's lifetime, execution lease, immutable resource identity) and
+  three-way outcomes (pass/fail/inconclusive) for network tests. ADR-0010 to
+  ADR-0012 approved by the maintainer and accepted with PR #34.
 - 2026-11-04: Independent review of M1 and PR #32. Status data was
   de-duplicated: issue state lives only on GitHub, the plan only here, and
   roadmap/finding links are checked by tests. ADR-0001 to ADR-0008 marked

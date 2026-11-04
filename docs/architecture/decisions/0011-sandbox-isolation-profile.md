@@ -91,11 +91,39 @@ implemented and tested in #5.
 9. **Required negative integration tests.** These are opt-in
    (`pytest -m integration`), run in CI on a runner with the container
    runtime, and **must pass before #5 merges**. Each attempt runs from inside
-   a sandbox and must fail. Each target also gets a positive control that
-   reaches it *from the host*, so a failure inside the sandbox proves the
-   isolation rather than a missing network. The suite runs for `NONE` and for
-   `ALLOWLIST`, with the allowed host's proxied `CONNECT` as the only positive
-   case.
+   a sandbox and must fail. The suite runs for `NONE` and for `ALLOWLIST`,
+   with the allowed host's proxied `CONNECT` as the only positive case.
+
+   **Controls and outcomes.** A blocked connection only proves isolation if
+   the target would otherwise have answered. Each reachability case therefore
+   has a three-way outcome:
+   - **Control.** Just before the sandbox attempt, the same target (address,
+     protocol and port) is contacted *from the host*. It must answer with a
+     per-run nonce, which proves a genuine round trip rather than a captive
+     portal, middlebox or reused cache.
+   - **pass:** the control succeeded and the sandbox attempt failed.
+   - **fail:** the sandbox attempt succeeded. Isolation is broken.
+   - **inconclusive:** the control failed, so the target is unavailable here.
+     This is reported with its reason and is **never counted as a pass**.
+
+   Required cases use targets the test sets up itself, so the controls do not
+   depend on the internet:
+   - a TCP/UDP echo service on a host address (IPv4, and IPv6 ULA when the
+     host has IPv6);
+   - a DNS server on the host;
+   - a listener in a second sandbox;
+   - the proxy's own ports.
+
+   If a required case is inconclusive, the CI job **fails**. Cases that depend
+   on outside targets (public resolvers, DoH, a public IP) are optional: they
+   may be inconclusive but are always listed in the report. If the host has no
+   IPv6, the reachability cases for IPv6 are inconclusive. The structural
+   assertions below still apply.
+
+   **Structural assertions** need no target. Inside the sandbox they check:
+   only the expected interfaces exist; there is no IPv6 global address or
+   default route; there is no default IPv4 route in `NONE` mode; no resolver
+   is configured; and there are no capabilities.
    - **DNS:**
      - no resolver is configured or reachable;
      - UDP and TCP queries to public resolvers on port 53 fail;
