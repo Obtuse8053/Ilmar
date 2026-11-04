@@ -72,7 +72,7 @@ ignore = []
 
 [tool.ruff.lint.isort]
 known-first-party = ["ilmar"]
-known-local-folder = ["contracts", "fake_github", "fake_podman", "fakes", "helpers", "license_inventory"]
+known-local-folder = ["contracts", "fake_github", "fake_podman", "fakes", "helpers", "integration", "license_inventory"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

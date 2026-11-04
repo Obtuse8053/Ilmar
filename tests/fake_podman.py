@@ -42,6 +42,8 @@ class FakeContainer:
     run_args: list[str]
     env: dict[str, str]
     running: bool = True
+    networks: dict[str, str] = field(default_factory=dict)  # name -> IPv4 address
+    logs: str = ""
 
 
 @dataclass
@@ -53,9 +55,25 @@ class Call:
 
 
 @dataclass
+class FakeNetwork:
+    name: str
+    labels: dict[str, str]
+    subnet: str
+    internal: bool
+    dns_enabled: bool
+    hosts: int = 1
+
+
+@dataclass
 class FakePodman:
     rootless: bool = True
     rm_behaviour: str = "ok"  # "ok", "fail" (exit 125, container stays) or "hang"
+    proxy_ready: bool = True
+    networks: dict[str, FakeNetwork] = field(
+        default_factory=lambda: {
+            "podman": FakeNetwork("podman", {}, "10.88.0.0/16", internal=False, dns_enabled=False)
+        }
+    )
     containers: dict[str, FakeContainer] = field(default_factory=dict)
     calls: list[Call] = field(default_factory=list)
     _counter: itertools.count[int] = field(default_factory=lambda: itertools.count(1))
@@ -78,6 +96,13 @@ class FakePodman:
             return self._run(rest, call)
         if command == "exec":
             return self._exec(rest, call, timeout)
+        if command == "network":
+            return self._network(rest)
+        if command == "logs":
+            container = self.containers.get(rest[-1])
+            if container is None:
+                return Completed(125, "", "Error: no such container\n")
+            return Completed(0, "", container.logs)
         if command == "rm":
             if self.rm_behaviour == "fail":
                 return Completed(125, "", "Error: cannot remove container: device busy\n")
@@ -145,6 +170,11 @@ class FakePodman:
                 "Name": container.name,
                 "State": {"Running": container.running, "Pid": container.pid},
                 "Config": {"Labels": container.labels},
+                "NetworkSettings": {
+                    "Networks": {
+                        name: {"IPAddress": address} for name, address in container.networks.items()
+                    }
+                },
             }
         ]
         return Completed(0, json.dumps(data), "")
@@ -156,6 +186,10 @@ class FakePodman:
         labels = dict(rest[i + 1].split("=", 1) for i, arg in enumerate(rest) if arg == "--label")
         mount = dict(part.split("=", 1) for part in rest[rest.index("--mount") + 1].split(","))
         env = _read_env_file(rest, call)
+        networks = [rest[i + 1] for i, arg in enumerate(rest) if arg == "--network"]
+        for network in networks:
+            if network not in self.networks:
+                return Completed(125, "", f"Error: unable to find network {network}\n")
         container = self._new(
             name,
             labels,
@@ -164,7 +198,50 @@ class FakePodman:
             rest,
             env,
         )
+        for network in networks:
+            fake = self.networks[network]
+            fake.hosts += 1
+            base = fake.subnet.split("/")[0].rsplit(".", 1)[0]
+            container.networks[network] = f"{base}.{fake.hosts}"
+        if self.proxy_ready and "python3" in rest:
+            container.logs = "ilmar-egress READY listen=0.0.0.0:3128\n"
         return Completed(0, container.id + "\n", "")
+
+    def _network(self, rest: list[str]) -> Completed:
+        action, name = rest[0], rest[-1]
+        if action == "create":
+            if name in self.networks:
+                return Completed(125, "", f"Error: network name {name} already used\n")
+            labels = dict(
+                rest[i + 1].split("=", 1) for i, arg in enumerate(rest) if arg == "--label"
+            )
+            subnet = f"10.89.{len(self.networks)}.0/24"
+            self.networks[name] = FakeNetwork(
+                name, labels, subnet, "--internal" in rest, "--disable-dns" not in rest
+            )
+            return Completed(0, name + "\n", "")
+        network = self.networks.get(name)
+        if action == "exists":
+            return Completed(0 if network else 1, "", "")
+        if network is None:
+            return Completed(125, "", f"Error: unable to find network {name}: network not found\n")
+        if action == "inspect":
+            data = [
+                {
+                    "name": network.name,
+                    "labels": network.labels,
+                    "subnets": [{"subnet": network.subnet}],
+                    "internal": network.internal,
+                    "dns_enabled": network.dns_enabled,
+                }
+            ]
+            return Completed(0, json.dumps(data), "")
+        if action == "rm":
+            if any(name in c.networks for c in self.containers.values()):
+                return Completed(2, "", f"Error: network {name} is being used\n")
+            del self.networks[name]
+            return Completed(0, name + "\n", "")
+        return Completed(125, "", f"Error: unsupported network action {action}\n")
 
     def _exec(self, rest: list[str], call: Call, timeout: float) -> Completed:
         _read_env_file(rest, call)

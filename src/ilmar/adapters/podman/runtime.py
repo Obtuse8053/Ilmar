@@ -21,9 +21,13 @@ short, every sandbox:
   ``--http-proxy=false``), and values travel in a private ``--env-file``, not
   on the command line;
 * has network ``none`` (only loopback, no routes, no Podman-managed
-  ``/etc/hosts``). ``UNRESTRICTED`` is refused unless the runtime was
-  constructed with ``allow_unrestricted_network=True`` (a trusted or
-  development deployment), and is then logged as a warning.
+  ``/etc/hosts``). Under ``ALLOWLIST`` (ADR-0015) it sits alone on its own
+  ``--internal`` network without DNS, IPv6 or hosts entries, whose only other
+  member is an egress proxy sidecar (:mod:`egress_proxy`) that allows
+  ``CONNECT <listed-host>:443`` only; ``HTTPS_PROXY`` points at it.
+  ``UNRESTRICTED`` is refused unless the runtime was constructed with
+  ``allow_unrestricted_network=True`` (a trusted or development deployment),
+  and is then logged as a warning.
   ``ALLOWLIST`` arrives with the filtering proxy (ADR-0011 §5).
 
 The ``podman`` process itself runs with a minimal environment
@@ -41,6 +45,7 @@ to go (after a command timeout, or to be replaced) cannot be confirmed gone,
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -55,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ilmar.adapters.podman import egress_proxy
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.mounts import authorize_mount
 from ilmar.domain.errors import (
@@ -86,6 +92,14 @@ LABEL_INSTANCE = "io.ilmar.owner.instance"
 LABEL_EXECUTION = "io.ilmar.owner.execution"
 LABEL_ATTEMPT = "io.ilmar.owner.attempt"
 LABEL_TOKEN = "io.ilmar.owner.token"  # noqa: S105 - a label key, not a secret
+LABEL_ROLE = "io.ilmar.role"
+ROLE_SANDBOX = "sandbox"
+ROLE_EGRESS_PROXY = "egress-proxy"
+ROLE_EGRESS_NETWORK = "egress-network"
+EGRESS_PROXY_SUFFIX = "-egress"
+EGRESS_NETWORK_SUFFIX = "-net"
+_PROXY_SCRIPT = "/ilmar-egress-proxy.py"
+_MAX_ALLOWLIST_NAME = 120
 
 PODMAN_ENVIRONMENT = (
     "PATH",
@@ -163,6 +177,39 @@ def proc_root_identity(pid: int, path: PurePosixPath) -> DirectoryIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class EgressSettings:
+    """How ``ALLOWLIST`` sandboxes reach their listed hosts (ADR-0015).
+
+    ``proxy_image`` must provide ``python3`` (3.11 or later); the proxy code is
+    mounted read-only from this package. ``egress_network`` is the Podman
+    network the proxy uses to reach the outside. ``extra_hosts`` pins hostnames
+    to addresses in the proxy's ``/etc/hosts`` (for example a private LLM
+    gateway); it never widens the allow-list.
+    """
+
+    proxy_image: str
+    egress_network: str = "podman"
+    proxy_port: int = 3128
+    ready_timeout: float = 20.0
+    extra_hosts: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not _IMAGE.match(self.proxy_image):
+            raise ValueError(f"invalid proxy image reference: {self.proxy_image!r}")
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", self.egress_network):
+            raise ValueError(f"invalid network name: {self.egress_network!r}")
+        if not 1024 <= self.proxy_port <= 65535:
+            raise ValueError("proxy_port must be an unprivileged port")
+        pinned = {}
+        for host, address in self.extra_hosts.items():
+            name = egress_proxy.hostname(host)
+            if name is None:
+                raise ValueError(f"extra_hosts: not a hostname: {host!r}")
+            pinned[name] = str(ipaddress.ip_address(address))
+        object.__setattr__(self, "extra_hosts", pinned)
+
+
+@dataclass(frozen=True, slots=True)
 class SandboxProfile:
     """Deployment settings of the ADR-0011 profile that ``ContainerSpec`` leaves open."""
 
@@ -202,6 +249,8 @@ class PodmanRuntime:
         mount_probe: MountProbe = proc_root_identity,
         clock: Callable[[], float] = time.monotonic,
         allow_unrestricted_network: bool = False,
+        egress: EgressSettings | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._layout = layout
         self._podman = podman
@@ -214,6 +263,8 @@ class PodmanRuntime:
         self._clock = clock
         self._rootless_checked = False
         self._allow_unrestricted = allow_unrestricted_network
+        self._egress = egress
+        self._sleep = sleep
         # Workspace identity -> containers that must be confirmed gone first.
         self._quarantine: dict[DirectoryIdentity, set[str]] = {}
         self._mounted: dict[str, DirectoryIdentity] = {}
@@ -226,7 +277,7 @@ class PodmanRuntime:
 
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         self._require_rootless()
-        self._check_network(spec.network)
+        self._check_network(spec)
         env = self._container_env(spec.env)
         if not _IMAGE.match(spec.image):
             raise ValueError(f"invalid image reference: {spec.image!r}")
@@ -238,21 +289,37 @@ class PodmanRuntime:
         if existing is not None:
             if existing.owner != spec.owner:
                 raise OwnershipConflictError(f"container {spec.name} is owned by someone else")
-            self._remove(existing.handle.id, spec.name)
+            self._remove_sandbox(existing.handle.id, spec.name)
+        else:
+            self._remove_sidecars(spec.name, spec.owner)  # leftovers of a crashed start
 
-        # Immediately before the mount: the actual directory, not just the path.
-        authorize_mount(self._layout, spec.host_workspace, spec.workspace_identity)
-        with self._env_file(env) as env_file:
-            started = self._podman_call(self._run_arguments(spec, env_file))
-        self._expect_success(started, "run")
+        network_args = self._network_arguments(spec.network, spec.name)
+        if spec.network is NetworkPolicy.ALLOWLIST:
+            try:
+                proxy_url = self._start_egress(spec)
+            except BaseException:
+                self._remove_sidecars(spec.name, spec.owner)
+                raise
+            env |= {"HTTPS_PROXY": proxy_url, "https_proxy": proxy_url}
+
+        try:
+            # Immediately before the mount: the actual directory, not just the path.
+            authorize_mount(self._layout, spec.host_workspace, spec.workspace_identity)
+            with self._env_file(env) as env_file:
+                started = self._podman_call(self._run_arguments(spec, env_file, network_args))
+            self._expect_success(started, "run")
+        except BaseException:
+            self._remove_sidecars(spec.name, spec.owner)
+            raise
         container_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
         if not _CONTAINER_ID.match(container_id):
+            self._remove_sidecars(spec.name, spec.owner)
             raise ProviderError("podman run did not report a container ID")
         self._mounted[container_id] = spec.workspace_identity
         try:
             self._verify_mount(container_id, spec)
         except BaseException:
-            self._remove(container_id, spec.name)
+            self._remove_sandbox(container_id, spec.name)
             raise
         return ContainerHandle(runtime=self._name, id=container_id, name=spec.name)
 
@@ -317,7 +384,7 @@ class PodmanRuntime:
             # Processes the command started may still run; nothing may keep
             # writing to the workspace, so the whole container goes (ADR-0014).
             # If that cannot be confirmed, ContainmentError propagates.
-            self._remove(container_id, handle.name)
+            self._remove_sandbox(container_id, handle.name)
             return CommandResult(
                 TIMED_OUT_EXIT_CODE, done.stdout, done.stderr, duration, timed_out=True
             )
@@ -335,11 +402,13 @@ class PodmanRuntime:
             return
         if _owner(details) != owner:
             raise OwnershipConflictError(f"container {handle.name} is owned by someone else")
-        self._remove(container_id, handle.name)
+        self._remove_sandbox(container_id, handle.name)
 
     # -- podman arguments --------------------------------------------------
 
-    def _run_arguments(self, spec: ContainerSpec, env_file: str | None) -> list[str]:
+    def _run_arguments(
+        self, spec: ContainerSpec, env_file: str | None, network_args: Sequence[str]
+    ) -> list[str]:
         profile = self._profile
         limits = _merge_limits(spec.limits, profile.default_limits)
         workdir = spec.container_workdir
@@ -371,8 +440,7 @@ class PodmanRuntime:
         ]
         if env_file:
             args += ["--env-file", env_file]
-        if spec.network is NetworkPolicy.NONE:
-            args += ["--network=none", "--no-hosts"]
+        args += network_args
         if limits.max_processes is not None:
             args += ["--pids-limit", str(limits.max_processes)]
         if limits.memory_mb is not None:
@@ -381,9 +449,26 @@ class PodmanRuntime:
             args += ["--cpus", f"{limits.cpus:g}"]
         if profile.init:
             args.append("--init")
-        for key, value in _owner_labels(spec.owner).items():
+        for key, value in (_owner_labels(spec.owner) | {LABEL_ROLE: ROLE_SANDBOX}).items():
             args += ["--label", f"{key}={value}"]
         return [*args, spec.image, *profile.keepalive]
+
+    @staticmethod
+    def _network_arguments(network: NetworkPolicy, name: str) -> list[str]:
+        if network is NetworkPolicy.NONE:
+            return ["--network=none", "--no-hosts"]
+        if network is NetworkPolicy.ALLOWLIST:
+            return [
+                "--network",
+                name + EGRESS_NETWORK_SUFFIX,
+                "--dns=none",
+                "--no-hosts",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "--sysctl",
+                "net.ipv6.conf.default.disable_ipv6=1",
+            ]
+        return []  # UNRESTRICTED: Podman's default network (opted in)
 
     def _container_env(self, env: Mapping[str, str], *, with_home: bool = True) -> dict[str, str]:
         result = {"HOME": str(self._profile.home)} if with_home else {}
@@ -395,7 +480,14 @@ class PodmanRuntime:
             result[key] = value
         return result
 
-    def _check_network(self, network: NetworkPolicy) -> None:
+    def _check_network(self, spec: ContainerSpec) -> None:
+        network = spec.network
+        if network is NetworkPolicy.ALLOWLIST:
+            if self._egress is None:
+                raise ProviderError("ALLOWLIST needs EgressSettings for this runtime")
+            if len(spec.name) > _MAX_ALLOWLIST_NAME:
+                raise ValueError(f"container name too long for ALLOWLIST: {spec.name}")
+            return
         if network is NetworkPolicy.UNRESTRICTED:
             if not self._allow_unrestricted:
                 raise PolicyViolationError(
@@ -463,6 +555,137 @@ class PodmanRuntime:
             container_id=container_id,
             name=name,
         )
+
+    def _remove_sandbox(self, container_id: str, name: str) -> None:
+        """Remove a sandbox (confirmed, else quarantine) and then its egress sidecar."""
+        details = self._inspect(container_id)
+        owner = _owner(details) if details is not None else None
+        self._remove(container_id, name)
+        if owner is not None:
+            self._remove_sidecars(name, owner)
+
+    # -- ALLOWLIST egress sidecar (ADR-0015) ---------------------------------
+
+    def _start_egress(self, spec: ContainerSpec) -> str:
+        """Create the internal network and the proxy; return the proxy URL."""
+        settings = self._egress
+        if settings is None:
+            raise ProviderError("ALLOWLIST needs EgressSettings for this runtime")
+        network = spec.name + EGRESS_NETWORK_SUFFIX
+        proxy_name = spec.name + EGRESS_PROXY_SUFFIX
+        labels = _owner_labels(spec.owner)
+
+        create = ["network", "create", "--internal", "--disable-dns"]
+        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_NETWORK}).items():
+            create += ["--label", f"{key}={value}"]
+        self._expect_success(self._podman_call([*create, network]), "network create")
+        subnets = [
+            str(entry.get("subnet", ""))
+            for entry in self._network(network).get("subnets") or []
+            if ":" not in str(entry.get("subnet", ""))
+        ]
+        if not subnets or not all(subnets):
+            raise ProviderError(f"network {network} has no IPv4 subnet")
+
+        script = Path(egress_proxy.__file__).resolve()
+        if _UNSAFE_IN_MOUNT.search(str(script)):
+            raise ProviderError(f"proxy script path not usable in a mount option: {script}")
+        args = [
+            "run",
+            "--detach",
+            "--name",
+            proxy_name,
+            "--pull=never",
+            "--user",
+            "65534:65534",
+            "--cap-drop=all",
+            "--security-opt=no-new-privileges",
+            "--read-only",
+            "--read-only-tmpfs=false",
+            "--env-host=false",
+            "--http-proxy=false",
+            "--network",
+            network,
+            "--network",
+            settings.egress_network,
+            "--mount",
+            f"type=bind,source={script},destination={_PROXY_SCRIPT},ro=true",
+            "--pids-limit",
+            "256",
+            "--memory",
+            "256m",
+            "--log-driver=k8s-file",
+            "--init",
+        ]
+        for host, address in sorted(settings.extra_hosts.items()):
+            args += ["--add-host", f"{host}:{address}"]
+        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_PROXY}).items():
+            args += ["--label", f"{key}={value}"]
+        args += [
+            settings.proxy_image,
+            "python3",
+            "-I",
+            _PROXY_SCRIPT,
+            "--listen",
+            f"0.0.0.0:{settings.proxy_port}",
+            "--allow",
+            ",".join(spec.allowed_hosts),
+            "--clients",
+            ",".join(subnets),
+        ]
+        started = self._podman_call(args)
+        self._expect_success(started, "run (egress proxy)")
+        proxy_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
+        if not _CONTAINER_ID.match(proxy_id):
+            raise ProviderError("podman run did not report the egress proxy's ID")
+        address = self._wait_for_proxy(proxy_id, network, settings.ready_timeout)
+        return f"http://{address}:{settings.proxy_port}"
+
+    def _wait_for_proxy(self, proxy_id: str, network: str, timeout: float) -> str:
+        deadline = self._clock() + timeout
+        while True:
+            logs = self._podman_call(["logs", proxy_id])
+            ready = "ilmar-egress READY" in logs.stdout + logs.stderr
+            details = self._inspect(proxy_id)
+            if details is None or not details.get("State", {}).get("Running"):
+                raise ProviderError("the egress proxy exited during start")
+            if ready:
+                networks = (details.get("NetworkSettings") or {}).get("Networks") or {}
+                address = str((networks.get(network) or {}).get("IPAddress") or "")
+                if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", address):
+                    raise ProviderError("the egress proxy has no IPv4 address on its network")
+                return address
+            if self._clock() >= deadline:
+                raise ProviderError("the egress proxy did not become ready")
+            self._sleep(0.2)
+
+    def _network(self, name: str) -> dict[str, Any]:
+        done = self._podman_call(["network", "inspect", name])
+        self._expect_success(done, "network inspect")
+        entries = _json_list(done.stdout, "network inspect")
+        if len(entries) != 1:
+            raise ProviderError(f"network {name} not found")
+        return entries[0]
+
+    def _remove_sidecars(self, name: str, owner: ResourceOwner) -> None:
+        """Remove the egress proxy and network of sandbox ``name`` if ``owner`` owns them."""
+        proxy = self.find(name + EGRESS_PROXY_SUFFIX)
+        if proxy is not None:
+            if proxy.owner != owner:
+                _LOG.warning("not removing %s: owned by someone else", proxy.handle.name)
+            else:
+                self._remove(proxy.handle.id, proxy.handle.name)
+        network = name + EGRESS_NETWORK_SUFFIX
+        if self._podman_call(["network", "exists", network]).returncode != 0:
+            return
+        labels = self._network(network).get("labels") or {}
+        if _owner({"Config": {"Labels": labels}}) != owner:
+            _LOG.warning("not removing network %s: owned by someone else", network)
+            return
+        removed = self._podman_call(["network", "rm", network])
+        if self._podman_call(["network", "exists", network]).returncode == 0:
+            self._expect_success(removed, "network rm")
+            raise ProviderError(f"network {network} could not be removed")
 
     def _forget(self, container_id: str) -> None:
         workspace = self._mounted.pop(container_id, None)

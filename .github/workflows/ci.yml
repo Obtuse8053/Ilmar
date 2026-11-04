@@ -41,13 +41,15 @@ jobs:
         run: ilmar config validate ilmar.example.toml
 
   podman:
-    # Real rootless Podman: the ContainerRuntime contract and the ADR-0011
-    # sandbox profile (#5). ILMAR_TEST_PODMAN_REQUIRED turns a skip into a failure.
+    # Real rootless Podman: the ContainerRuntime contract, the ADR-0011 sandbox
+    # profile (#5) and the §9 network suite with the egress proxy (#40).
+    # ILMAR_TEST_PODMAN_REQUIRED turns a skip into a failure.
     name: Podman sandbox (integration)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       ILMAR_TEST_PODMAN_IMAGE: docker.io/library/alpine:3.20
+      ILMAR_TEST_PODMAN_PROXY_IMAGE: docker.io/library/python:3.12-alpine
       ILMAR_TEST_PODMAN_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
@@ -62,12 +64,19 @@ jobs:
         run: |
           podman version
           podman info --format 'rootless={{.Host.Security.Rootless}} cgroups={{.Host.CgroupsVersion}} manager={{.Host.CgroupManager}} runtime={{.Host.OCIRuntime.Name}} network={{.Host.NetworkBackend}}'
-      - name: Pull the test image
+      - name: Pull the test images
         run: |
-          podman pull "$ILMAR_TEST_PODMAN_IMAGE"
-          podman image inspect --format 'digest={{.Digest}}' "$ILMAR_TEST_PODMAN_IMAGE"
+          for image in "$ILMAR_TEST_PODMAN_IMAGE" "$ILMAR_TEST_PODMAN_PROXY_IMAGE"; do
+            podman pull "$image"
+            podman image inspect --format "$image digest={{.Digest}}" "$image"
+          done
+      - name: Let the tests bind self-hosted targets on ports 53, 80 and 443
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
       - name: Podman integration tests
-        run: pytest -m integration tests/integration/test_podman_runtime.py -v -rs
+        run: >-
+          pytest -m integration -v -rs
+          tests/integration/test_podman_runtime.py
+          tests/integration/test_podman_egress.py
 
   licenses:
     name: Dependency licenses
