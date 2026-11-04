@@ -18,7 +18,8 @@ agent_timeout_seconds = 3600
 
 [adapters.task_provider]
 kind = "github"
-options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", token_env = "GITHUB_TOKEN" }
+# ADR-0013: aligned with docs/workflow.md so human sessions and Ilmar see the same claims.
+options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", claimed_label = "status:in-progress", excluded_labels = ["needs:maintainer", "status:blocked", "proposal"], token_env = "GITHUB_TOKEN" }
 
 [adapters.source_control]
 kind = "github"

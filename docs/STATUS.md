@@ -46,11 +46,16 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#6, the GitHub `TaskProvider` (plan step 4). After it comes #5, the Podman
-`ContainerRuntime`, which builds on #4's layout. **Waiting for the
-maintainer's explicit go-ahead.**
+#5, the Podman `ContainerRuntime` and the sandbox profile (plan step 5,
+building on #4). **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #6 finished: GitHub `TaskProvider` on a standard-library REST
+  client (REST only, token kept to the API host). State model in ADR-0013
+  (proposed): labels for visibility, claim comments for ownership, and races
+  resolved by comment order. `integration` test marker introduced. Next
+  recommended: #5.
 
 - 2026-11-04: #4 finished: deterministic, collision-resistant names
   (branch, container); host layout with separate mountable and

@@ -48,7 +48,8 @@ protocol: at the start of each session, compare the plan with GitHub, and fix
   `status:blocked`, and `needs:maintainer` (waiting for a maintainer action or
   decision).
 - `ilmar:ready`: the issue is eligible for Ilmar itself to execute. Not used
-  before M4.
+  before M4. Ilmar treats `status:in-progress` as "claimed by someone else"
+  (ADR-0013), so a session's claim and Ilmar's claim never collide.
 
 ## Choosing the next task
 
