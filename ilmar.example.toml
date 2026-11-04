@@ -32,10 +32,12 @@ options = { repository = "Obtuse8053/Ilmar", base_branch = "main", token_env = "
 
 [adapters.container_runtime]
 kind = "podman"
-options = { image = "localhost/ilmar-agent:latest" }
+options = { image = "localhost/ilmar-claude-code:pinned" }
 
 [adapters.agent_runner]
 kind = "claude-code"
+# ADR-0017: the only secret in the agent sandbox; passed per command, never stored.
+# Build the image from images/claude-code/Containerfile at a pinned version.
 options = { api_key_env = "ANTHROPIC_API_KEY" }
 
 [adapters.execution_store]
