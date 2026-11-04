@@ -57,3 +57,16 @@ before there is a second adapter.
   importable `ilmar.testing` package and add entry-point discovery.
 - A port needs provider-specific escape hatches more than once. That signals
   the abstraction is wrong.
+
+## Update (2026-11-04, #3)
+
+All five ports now have contract suites in `tests/contracts/`, and the test
+fakes pass every one of them. Following ADR-0010 and ADR-0012:
+
+- `SourceControlProvider` replaces `publish_branch` with `freeze_candidate`,
+  `checkout_revision`, `publish_revision` (with an expected-head lease) and
+  `branch_head`.
+- `ContainerRuntime` operations check ownership (`ResourceOwner`) and act on
+  immutable container ids.
+
+The decision above is unchanged.

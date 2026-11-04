@@ -7,9 +7,16 @@ from pathlib import Path
 import pytest
 
 from ilmar.domain.agent import AgentRequest
+from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.tasks import Task, TaskRef
-from ilmar.domain.workspace import CommandResult, ContainerSpec, NetworkPolicy, ResourceLimits
+from ilmar.domain.workspace import (
+    CommandResult,
+    ContainerSpec,
+    NetworkPolicy,
+    ResourceLimits,
+    ResourceOwner,
+)
 
 from helpers import at
 
@@ -82,10 +89,47 @@ def test_terminal_states() -> None:
     }
 
 
+OWNER = ResourceOwner(instance_id="i", execution_id="e", attempt=1, token="t")
+
+
 def test_container_spec_defaults_to_no_network(tmp_path: Path) -> None:
-    spec = ContainerSpec(image="img", host_workspace=tmp_path)
+    spec = ContainerSpec(image="img", host_workspace=tmp_path, name="ilmar-e-1", owner=OWNER)
     assert spec.network is NetworkPolicy.NONE
     assert str(spec.container_workdir) == "/workspace"
+
+
+@pytest.mark.parametrize("name", ["", "-leading-dash", "has space", "slash/inside", "x" * 129])
+def test_container_spec_rejects_invalid_names(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="container name"):
+        ContainerSpec(image="img", host_workspace=tmp_path, name=name, owner=OWNER)
+
+
+@pytest.mark.parametrize(
+    ("instance", "execution", "attempt", "token"),
+    [("", "e", 1, "t"), ("i", "", 1, "t"), ("i", "e", 0, "t"), ("i", "e", 1, "")],
+)
+def test_resource_owner_validation(instance: str, execution: str, attempt: int, token: str) -> None:
+    with pytest.raises(ValueError, match=r"non-empty|attempt"):
+        ResourceOwner(instance_id=instance, execution_id=execution, attempt=attempt, token=token)
+
+
+def test_candidate_revision_accepts_sorted_relative_paths() -> None:
+    candidate = CandidateRevision("r2", "r1", ("a.txt", "src/b.py"))
+    assert candidate.changed_paths == ("a.txt", "src/b.py")
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [("b", "a"), ("a", "a"), ("/abs",), ("../up",), ("./dot",), ("",)],
+)
+def test_candidate_revision_rejects_bad_changed_paths(paths: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="changed"):
+        CandidateRevision("r2", "r1", paths)
+
+
+def test_candidate_revision_requires_revisions() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        CandidateRevision("", "r1")
 
 
 @pytest.mark.parametrize("field", ["cpus", "memory_mb", "max_processes"])

@@ -3,6 +3,7 @@
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import (
+    CandidateRevision,
     ChangeRequest,
     ChangeRequestSpec,
     CheckResult,
@@ -15,15 +16,18 @@ from ilmar.domain.tasks import ClaimOutcome, Task, TaskRef
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
+    ContainerInfo,
     ContainerSpec,
     NetworkPolicy,
     ResourceLimits,
+    ResourceOwner,
 )
 
 __all__ = [
     "AgentOutcome",
     "AgentRequest",
     "AgentResult",
+    "CandidateRevision",
     "ChangeRequest",
     "ChangeRequestSpec",
     "CheckResult",
@@ -32,12 +36,14 @@ __all__ = [
     "ClaimOutcome",
     "CommandResult",
     "ContainerHandle",
+    "ContainerInfo",
     "ContainerSpec",
     "Execution",
     "ExecutionState",
     "NetworkPolicy",
     "RepositoryRef",
     "ResourceLimits",
+    "ResourceOwner",
     "Task",
     "TaskRef",
     "Transition",

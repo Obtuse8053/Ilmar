@@ -153,3 +153,15 @@ Promoting one immutable build artefact is long-standing practice (F-022).
   much `unchanged-checks` should count.
 - Self-hosting (M4) needs Ilmar to change its own CI. Revisit the
   `ci-config-modified` rule together with approval policies (#20).
+
+## Clarification (2026-11-04, PR #36 review)
+
+Publishing is **fast-forward only**. When the task branch already exists,
+`candidate_revision` must descend from its current head as well as match the
+expected-head lease. Otherwise `NonFastForwardError` is raised and the branch
+is left unchanged. An interrupted or retried task resumes from the branch
+head (`checkout` returns that head as the base), so legitimate publishes are
+always fast-forwards. Rewriting published history, for example by rebasing
+onto an updated `main`, is not something Ilmar does in M2. If it is ever
+needed, it requires its own decision. This clarifies §6 ("never overwrites");
+the decision is unchanged.

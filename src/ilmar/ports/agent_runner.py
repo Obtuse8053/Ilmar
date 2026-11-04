@@ -16,7 +16,13 @@ class AgentRunner(Protocol):
     The runner receives the runtime explicitly, so any agent adapter works with
     any container runtime adapter. The runner translates the agent's own
     output format into an ``AgentResult``; it never decides whether the work is
-    acceptable.
+    acceptable (ADR-0010).
+
+    Contract (see ``tests/contracts/agent_runner.py``): all commands run in the
+    given container; ``COMPLETED`` requires both a clean exit and a structured
+    result reporting success (the exit status alone is not trusted, F-021);
+    exceeding the request's timeout yields ``TIMED_OUT``; runs are repeatable
+    without hidden state.
     """
 
     @property
