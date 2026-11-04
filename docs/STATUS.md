@@ -54,14 +54,17 @@ maintainer's explicit go-ahead.**
 
 ## Change log
 
-- 2026-11-04: #5 finished (part 1): rootless Podman `ContainerRuntime` with
-  the ADR-0011 profile and network `NONE`. ADR-0014 (proposed) records the
+- 2026-11-04: #5 part 1 merged (PR #39); #5 stays open until #40 completes
+  the remaining sandbox requirements. Rootless Podman `ContainerRuntime` with
+  the ADR-0011 profile and network `NONE`. ADR-0014 (accepted) records the
   Podman mapping: a `keep-id` non-root user, the runtime enforcing the
   recorded workspace identity before and after start, and a timed-out command
   removing its container (a port contract change). The contract, profile and
-  network `NONE` checks run against real Podman in a new CI job. The
-  allow-list proxy and the full §9 suite were split into #40. Next
-  recommended: #40.
+  network `NONE` checks run against real Podman in a new CI job.
+  `UNRESTRICTED` needs a deployment opt-in; an unconfirmed removal raises
+  `ContainmentError` and quarantines the workspace (restart-safe quarantine is
+  part of #12 and #15). The allow-list proxy and the full §9 suite were split
+  into #40. Next recommended: #40.
 
 - 2026-11-04: #6 finished: GitHub `TaskProvider` on a standard-library REST
   client (REST only; token kept to the API origin, including on redirects).

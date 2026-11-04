@@ -1,6 +1,6 @@
 # ADR-0014: Podman runtime mapping, workspace identity and command timeouts
 
-- Status: Proposed
+- Status: Accepted (PR #39, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R18], [R21] · Findings: F-020, F-023, F-024
 - Implements: ADR-0011 (profile), ADR-0012 (ownership and mount identity) for Podman
