@@ -428,7 +428,7 @@ def test_the_same_probe_reaches_the_target_without_isolation(layout: WorkspaceLa
     """
     target = host_ipv4()
     assert target is not None, "inconclusive: the host has no non-loopback IPv4 address"
-    runtime = PodmanRuntime(layout=layout)
+    runtime = PodmanRuntime(layout=layout, allow_unrestricted_network=True)
     workspace = make_workspace(layout, "exec-open")
     handle = runtime.start(
         ContainerSpec(

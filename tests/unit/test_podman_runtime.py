@@ -20,7 +20,12 @@ from ilmar.adapters.podman.runtime import (
 )
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.safe_fs import ensure_directory
-from ilmar.domain.errors import OwnershipConflictError, ProviderError
+from ilmar.domain.errors import (
+    ContainmentError,
+    OwnershipConflictError,
+    PolicyViolationError,
+    ProviderError,
+)
 from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
@@ -153,7 +158,9 @@ def test_unrestricted_network_is_explicit_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        runtime(layout, podman).start(spec(workspace, network=NetworkPolicy.UNRESTRICTED))
+        runtime(layout, podman, allow_unrestricted_network=True).start(
+            spec(workspace, network=NetworkPolicy.UNRESTRICTED)
+        )
     args = run_args(podman)
     assert not any(a.startswith("--network") for a in args)
     assert "UNRESTRICTED" in caplog.text
@@ -264,7 +271,7 @@ def test_post_start_identity_mismatch_removes_the_container(
     with pytest.raises(OwnershipConflictError, match="mounted"):
         rt.start(spec(workspace))
     assert podman.containers == {}
-    assert podman.commands()[-1] == "rm"
+    assert "rm" in podman.commands()
 
 
 def test_post_start_probe_failure_fails_closed(
@@ -315,7 +322,7 @@ def test_timeout_removes_the_container(
     handle = rt.start(spec(workspace))
     result = rt.run(handle, ["sleep", "60"], timeout_seconds=1)
     assert result.timed_out
-    assert podman.commands()[-1] == "rm"
+    assert "rm" in podman.commands()
     assert podman.containers == {}
 
 
@@ -366,3 +373,83 @@ def test_proc_root_identity_refuses_a_symlink(tmp_path: Path) -> None:
     link.symlink_to(tmp_path)
     with pytest.raises(OwnershipConflictError):
         proc_root_identity(os.getpid(), PurePosixPath(str(link)))
+
+
+# -- PR #39 review: default-deny egress, fail-closed removal -----------------------
+
+
+def test_unrestricted_network_is_denied_by_default(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    with pytest.raises(PolicyViolationError, match="not permitted"):
+        runtime(layout, podman).start(spec(workspace, network=NetworkPolicy.UNRESTRICTED))
+    assert "run" not in podman.commands()
+
+
+@pytest.mark.parametrize("behaviour", ["fail", "hang"])
+def test_unconfirmed_removal_after_timeout_fails_closed_and_quarantines(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, behaviour: str
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    podman.rm_behaviour = behaviour
+    with pytest.raises(ContainmentError) as caught:
+        rt.run(handle, ["sleep", "60"], timeout_seconds=1)
+    assert caught.value.container_id == handle.id
+    assert handle.id in podman.containers  # still there: reported, not assumed gone
+
+    # The workspace stays quarantined while removal cannot be confirmed ...
+    runs_before = podman.commands().count("run")
+    with pytest.raises(ContainmentError):
+        rt.start(spec(workspace))
+    assert podman.commands().count("run") == runs_before
+
+    # ... and is released once a retry confirms the container is gone.
+    podman.rm_behaviour = "ok"
+    replacement = rt.start(spec(workspace))
+    assert handle.id not in podman.containers
+    assert replacement.id != handle.id
+
+
+def test_quarantine_is_per_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    podman.rm_behaviour = "fail"
+    with pytest.raises(ContainmentError):
+        rt.run(handle, ["sleep", "60"], timeout_seconds=1)
+    podman.rm_behaviour = "ok"
+    other = layout.agent_workspace("exec-2", 1)
+    other_spec = spec(
+        (other, ensure_directory(other, root=layout.workspaces_root)), name="ilmar-exec-2-1"
+    )
+    assert rt.start(other_spec).name == "ilmar-exec-2-1"
+
+
+def test_failed_stop_is_a_containment_error(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    podman.rm_behaviour = "fail"
+    with pytest.raises(ContainmentError):
+        rt.stop(handle, owner=OWNER)
+    assert rt.is_running(handle)
+    podman.rm_behaviour = "ok"
+    rt.stop(handle, owner=OWNER)
+    assert not rt.is_running(handle)
+
+
+def test_quarantined_workspace_is_refused_under_any_container_name(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    podman.rm_behaviour = "fail"
+    with pytest.raises(ContainmentError):
+        rt.run(handle, ["sleep", "60"], timeout_seconds=1)
+    runs_before = podman.commands().count("run")
+    with pytest.raises(ContainmentError):
+        rt.start(spec(workspace, name="ilmar-exec-1-verify"))
+    assert podman.commands().count("run") == runs_before

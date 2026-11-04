@@ -31,7 +31,13 @@ class ContainerRuntime(Protocol):
       ``timed_out=True``, and the whole container is stopped and removed: a
       runtime cannot always find every process a command started, and nothing
       may keep writing to the workspace afterwards (ADR-0014). The handle is
-      stale from then on.
+      stale from then on. If removal cannot be confirmed, ``run`` raises
+      ``ContainmentError`` instead, and the runtime refuses to mount that
+      workspace again until a later ``stop`` or ``start`` confirms the
+      container is gone.
+    * ``NetworkPolicy.UNRESTRICTED`` is refused with ``PolicyViolationError``
+      unless the runtime was explicitly configured to permit it (a trusted or
+      development deployment). A ``ContainerSpec`` alone never grants it.
     * ``stop`` is idempotent and removes the container. ``is_running`` is
       ``False`` afterwards, and ``run`` raises ``ProviderError``.
     * Only ``spec.host_workspace`` is shared with the host, and only if it

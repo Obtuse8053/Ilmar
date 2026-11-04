@@ -30,6 +30,7 @@ from ilmar.domain.errors import (
     LeaseConflictError,
     NonFastForwardError,
     OwnershipConflictError,
+    PolicyViolationError,
     ProviderError,
 )
 from ilmar.domain.tasks import ClaimOutcome, Task, TaskRef
@@ -39,6 +40,7 @@ from ilmar.domain.workspace import (
     ContainerInfo,
     ContainerSpec,
     DirectoryIdentity,
+    NetworkPolicy,
     ResourceOwner,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
@@ -135,8 +137,9 @@ class FakeContainerRuntime:
     * ``[program, ...]`` for any program registered with :meth:`register`.
     """
 
-    def __init__(self, *, name: str = "fake") -> None:
+    def __init__(self, *, name: str = "fake", allow_unrestricted_network: bool = False) -> None:
         self._name = name
+        self._allow_unrestricted = allow_unrestricted_network
         self._ids = itertools.count(1)
         self._containers: dict[str, _FakeContainer] = {}  # by immutable id
         self._programs: dict[str, ProgramHandler] = {}
@@ -158,6 +161,8 @@ class FakeContainerRuntime:
     # -- ContainerRuntime ------------------------------------------------
 
     def start(self, spec: ContainerSpec) -> ContainerHandle:
+        if spec.network is NetworkPolicy.UNRESTRICTED and not self._allow_unrestricted:
+            raise PolicyViolationError("unrestricted network is not permitted here")
         if not spec.host_workspace.is_dir():
             raise ProviderError(f"workspace does not exist: {spec.host_workspace}")
         info = spec.host_workspace.lstat()

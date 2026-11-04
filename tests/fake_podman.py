@@ -55,6 +55,7 @@ class Call:
 @dataclass
 class FakePodman:
     rootless: bool = True
+    rm_behaviour: str = "ok"  # "ok", "fail" (exit 125, container stays) or "hang"
     containers: dict[str, FakeContainer] = field(default_factory=dict)
     calls: list[Call] = field(default_factory=list)
     _counter: itertools.count[int] = field(default_factory=lambda: itertools.count(1))
@@ -78,6 +79,10 @@ class FakePodman:
         if command == "exec":
             return self._exec(rest, call, timeout)
         if command == "rm":
+            if self.rm_behaviour == "fail":
+                return Completed(125, "", "Error: cannot remove container: device busy\n")
+            if self.rm_behaviour == "hang":
+                return Completed(TIMED_OUT_EXIT_CODE, "", "", timed_out=True)
             self.containers.pop(rest[-1], None)
             return Completed(0, rest[-1] + "\n", "")
         return Completed(125, "", f"Error: unsupported in fake: {args}\n")

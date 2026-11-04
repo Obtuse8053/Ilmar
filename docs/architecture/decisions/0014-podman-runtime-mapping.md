@@ -61,9 +61,14 @@ Timeouts:
 - **Network `NONE`:** `--network=none --no-hosts`: only loopback, no route,
   and no `host.containers.internal` entry. (`--dns=none` is rejected together
   with `--network=none` by Podman 4.9. The integration tests check that no
-  resolver is configured.) `UNRESTRICTED`
-  uses Podman's default network and is logged as a warning. `ALLOWLIST`
-  follows with the filtering proxy (#40).
+  resolver is configured.) `ALLOWLIST` follows with the filtering proxy
+  (#40).
+- **`UNRESTRICTED` is default-deny (port contract):** a `ContainerSpec` alone
+  never grants it. The runtime refuses it with `PolicyViolationError` unless
+  the deployment constructed it with `allow_unrestricted_network=True`, an
+  explicit trusted or development opt-in. Even then it is logged as a
+  warning. An untrusted agent cannot obtain unrestricted egress through a
+  spec.
 - **Environment:**
   - The container gets only `ContainerSpec.env` plus `HOME`.
   - `--env-host=false` and `--http-proxy=false` are explicit, so neither host
@@ -91,6 +96,18 @@ Timeouts:
   The `podman` client runs in its own process group, and the whole group is
   killed. Callers treat a timeout as the end of that sandbox, and the
   coordinator starts a new one if it retries.
+- **Removal is confirmed, or it fails closed.** Every removal (after a
+  timeout, on replacement, on `stop`, after a failed mount check) is followed
+  by an `inspect` of the ID. If `podman rm` fails or times out and the
+  container is not confirmed gone:
+  - a `ContainmentError` is raised (carrying the container ID and name),
+    rather than a timeout result that would imply the sandbox is gone;
+  - the workspace is **quarantined**: no `start`, under any container name,
+    mounts it until a retry confirms the container is gone;
+  - the coordinator must record the container in the resource ledger as
+    "removal pending" and must not reuse, mount or freeze that workspace until
+    reconciliation confirms removal (#12, #15). The in-process quarantine does
+    not survive a restart; the ledger does.
 - **Identity of operations:** every operation uses the full 64-hex container
   ID. Names are looked up with an anchored `ps` filter and then compared
   exactly. Replacement and removal first check the ownership labels
@@ -125,6 +142,9 @@ Timeouts:
     limits the damage.
   - A timeout costs the sandbox. Short checks that can time out should run in
     their own container.
+  - A failed removal blocks that workspace until removal is confirmed, which
+    may need an operator.
+  - Development setups that want open networking must opt in explicitly.
   - Images must provide `sleep` (the keep-alive command), and must be
     provisioned before use because nothing is pulled at run time.
   - `podman exec` exit status 125 is ambiguous: it can come from Podman or

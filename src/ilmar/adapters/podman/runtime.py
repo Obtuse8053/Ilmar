@@ -21,8 +21,9 @@ short, every sandbox:
   ``--http-proxy=false``), and values travel in a private ``--env-file``, not
   on the command line;
 * has network ``none`` (only loopback, no routes, no Podman-managed
-  ``/etc/hosts``) unless the spec asks for ``UNRESTRICTED``, which is logged as
-  a warning.
+  ``/etc/hosts``). ``UNRESTRICTED`` is refused unless the runtime was
+  constructed with ``allow_unrestricted_network=True`` (a trusted or
+  development deployment), and is then logged as a warning.
   ``ALLOWLIST`` arrives with the filtering proxy (ADR-0011 §5).
 
 The ``podman`` process itself runs with a minimal environment
@@ -30,6 +31,11 @@ The ``podman`` process itself runs with a minimal environment
 
 Operations act on the full 64-hex container ID, never on a name. Replacing or
 removing a container first checks its ownership labels (ADR-0012).
+
+Removal is confirmed by inspecting the ID afterwards. If a container that had
+to go (after a command timeout, or to be replaced) cannot be confirmed gone,
+``ContainmentError`` is raised and its workspace is *quarantined*: no later
+``start`` mounts that workspace until removal is confirmed (ADR-0014).
 """
 
 from __future__ import annotations
@@ -51,7 +57,12 @@ from typing import Any
 
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.mounts import authorize_mount
-from ilmar.domain.errors import OwnershipConflictError, ProviderError
+from ilmar.domain.errors import (
+    ContainmentError,
+    OwnershipConflictError,
+    PolicyViolationError,
+    ProviderError,
+)
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
@@ -190,6 +201,7 @@ class PodmanRuntime:
         executor: Executor = subprocess_executor,
         mount_probe: MountProbe = proc_root_identity,
         clock: Callable[[], float] = time.monotonic,
+        allow_unrestricted_network: bool = False,
     ) -> None:
         self._layout = layout
         self._podman = podman
@@ -201,6 +213,10 @@ class PodmanRuntime:
         self._mount_probe = mount_probe
         self._clock = clock
         self._rootless_checked = False
+        self._allow_unrestricted = allow_unrestricted_network
+        # Workspace identity -> containers that must be confirmed gone first.
+        self._quarantine: dict[DirectoryIdentity, set[str]] = {}
+        self._mounted: dict[str, DirectoryIdentity] = {}
 
     @property
     def name(self) -> str:
@@ -217,11 +233,12 @@ class PodmanRuntime:
         if _UNSAFE_IN_MOUNT.search(str(spec.host_workspace)):
             raise ValueError(f"workspace path not usable in a mount option: {spec.host_workspace}")
 
+        self._release_quarantine(spec.workspace_identity, spec.name)
         existing = self.find(spec.name)
         if existing is not None:
             if existing.owner != spec.owner:
                 raise OwnershipConflictError(f"container {spec.name} is owned by someone else")
-            self._remove(existing.handle.id)
+            self._remove(existing.handle.id, spec.name)
 
         # Immediately before the mount: the actual directory, not just the path.
         authorize_mount(self._layout, spec.host_workspace, spec.workspace_identity)
@@ -231,10 +248,11 @@ class PodmanRuntime:
         container_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
         if not _CONTAINER_ID.match(container_id):
             raise ProviderError("podman run did not report a container ID")
+        self._mounted[container_id] = spec.workspace_identity
         try:
             self._verify_mount(container_id, spec)
         except BaseException:
-            self._remove(container_id)
+            self._remove(container_id, spec.name)
             raise
         return ContainerHandle(runtime=self._name, id=container_id, name=spec.name)
 
@@ -298,7 +316,8 @@ class PodmanRuntime:
         if done.timed_out:
             # Processes the command started may still run; nothing may keep
             # writing to the workspace, so the whole container goes (ADR-0014).
-            self._remove(container_id)
+            # If that cannot be confirmed, ContainmentError propagates.
+            self._remove(container_id, handle.name)
             return CommandResult(
                 TIMED_OUT_EXIT_CODE, done.stdout, done.stderr, duration, timed_out=True
             )
@@ -316,7 +335,7 @@ class PodmanRuntime:
             return
         if _owner(details) != owner:
             raise OwnershipConflictError(f"container {handle.name} is owned by someone else")
-        self._remove(container_id)
+        self._remove(container_id, handle.name)
 
     # -- podman arguments --------------------------------------------------
 
@@ -378,6 +397,11 @@ class PodmanRuntime:
 
     def _check_network(self, network: NetworkPolicy) -> None:
         if network is NetworkPolicy.UNRESTRICTED:
+            if not self._allow_unrestricted:
+                raise PolicyViolationError(
+                    "unrestricted network access is not permitted by this deployment "
+                    "(PodmanRuntime(allow_unrestricted_network=True) is a trusted opt-in)"
+                )
             _LOG.warning("starting a sandbox with UNRESTRICTED network access (ADR-0011)")
         elif network is not NetworkPolicy.NONE:
             raise ProviderError(f"network policy {network.value} is not supported yet")
@@ -414,10 +438,43 @@ class PodmanRuntime:
         details = self._inspect(container_id)
         return details is not None and bool(details.get("State", {}).get("Running"))
 
-    def _remove(self, container_id: str) -> None:
-        done = self._podman_call(["rm", "--force", "--time", "0", container_id])
-        if done.returncode != 0 and self._inspect(container_id) is not None:
-            self._expect_success(done, "rm")
+    def _remove(self, container_id: str, name: str) -> None:
+        """Remove ``container_id`` and confirm it is gone, or quarantine its workspace."""
+        try:
+            done = self._executor(
+                [self._podman, "rm", "--force", "--time", "0", container_id],
+                self._environ,
+                _CONTROL_TIMEOUT,
+            )
+            gone = self._inspect(container_id) is None
+        except ProviderError:
+            done, gone = None, False
+        if gone:
+            self._forget(container_id)
+            return
+        workspace = self._mounted.get(container_id)
+        if workspace is not None:
+            self._quarantine.setdefault(workspace, set()).add(container_id)
+        reason = "timed out" if done is None or done.timed_out else f"exit {done.returncode}"
+        _LOG.error("could not confirm removal of %s (%s): %s", name, container_id, reason)
+        raise ContainmentError(
+            f"container {name} could not be confirmed removed ({reason}); its workspace "
+            "must not be reused until removal is confirmed",
+            container_id=container_id,
+            name=name,
+        )
+
+    def _forget(self, container_id: str) -> None:
+        workspace = self._mounted.pop(container_id, None)
+        if workspace is not None and workspace in self._quarantine:
+            self._quarantine[workspace].discard(container_id)
+            if not self._quarantine[workspace]:
+                del self._quarantine[workspace]
+
+    def _release_quarantine(self, workspace: DirectoryIdentity, name: str) -> None:
+        """Retry removal of quarantined containers; refuse the workspace if any remain."""
+        for container_id in sorted(self._quarantine.get(workspace, ())):
+            self._remove(container_id, name)
 
     def _verify_mount(self, container_id: str, spec: ContainerSpec) -> None:
         details = self._inspect(container_id)

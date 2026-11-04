@@ -9,16 +9,18 @@ remove a container, and operations act on the immutable id.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
-from ilmar.domain.errors import OwnershipConflictError, ProviderError
+from ilmar.domain.errors import OwnershipConflictError, PolicyViolationError, ProviderError
 from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
     DirectoryIdentity,
+    NetworkPolicy,
     ResourceOwner,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
@@ -145,6 +147,15 @@ class ContainerRuntimeContract:
         result = runtime.run(container, self.write_file("out.txt", "done"), timeout_seconds=30)
         assert result.succeeded
         assert (workspace / "out.txt").read_text().strip() == "done"
+
+    # -- network policy (PR #39 review) -------------------------------------
+
+    def test_unrestricted_network_needs_a_deployment_opt_in(
+        self, runtime: ContainerRuntime, spec: ContainerSpec
+    ) -> None:
+        with pytest.raises(PolicyViolationError):
+            runtime.start(dataclasses.replace(spec, network=NetworkPolicy.UNRESTRICTED))
+        assert runtime.find(NAME) is None
 
     # -- workspace containment (#4) ----------------------------------------
 
