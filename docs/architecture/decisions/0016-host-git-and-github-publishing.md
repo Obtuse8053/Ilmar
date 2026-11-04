@@ -1,6 +1,6 @@
 # ADR-0016: Plumbing-only host git and GitHub publishing
 
-- Status: Proposed
+- Status: Accepted (PR #42, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R17], [R20], [R22] · Findings: F-022, F-026
 - Implements: ADR-0006 and ADR-0010 for GitHub (#7)

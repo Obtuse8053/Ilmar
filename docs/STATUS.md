@@ -54,7 +54,7 @@ candidate revisions. **Waiting for the maintainer's explicit go-ahead.**
 ## Change log
 
 - 2026-11-04: #7 finished: GitHub `SourceControlProvider` on plumbing-only,
-  hardened host git (ADR-0016, proposed). Workspaces are read as data into
+  hardened host git (ADR-0016, accepted). Workspaces are read as data into
   `fast-import` and written back from `ls-tree`/`cat-file`. The token is a
   scoped header passed through the environment only. Publishing uses a lease,
   is fast-forward only and confirms the remote head; CI-configuration changes
