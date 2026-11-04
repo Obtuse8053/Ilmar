@@ -86,7 +86,7 @@ def servers(host_ip: str) -> Iterator[dict[str, EchoServer]]:
     try:
         for key, (port, udp) in wanted.items():
             try:
-                started[key] = EchoServer("0.0.0.0", port, secrets.token_hex(8), udp=udp)  # noqa: S104
+                started[key] = EchoServer(host_ip, port, secrets.token_hex(8), udp=udp)
             except PermissionError:
                 pytest.fail(
                     f"cannot bind {key} on the host; allow it with "
