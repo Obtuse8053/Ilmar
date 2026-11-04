@@ -1,6 +1,6 @@
 # ADR-0009: GitHub issues plus in-repository status as the development control plane
 
-- Status: Proposed
+- Status: Accepted (PR #32, 2026-11-04)
 - Date: 2026-11-01
 - Sources: [R1], [R2], [R3], [R11] · Findings: F-006, F-007, F-015
 

@@ -15,7 +15,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0006](0006-credentials-outside-the-sandbox.md) | Provider credentials stay outside the agent sandbox | Accepted |
 | [0007](0007-configuration.md) | TOML configuration with per-port adapters and no inline secrets | Accepted |
 | [0008](0008-research-knowledge-base.md) | In-repository research knowledge base and review process | Accepted |
-| [0009](0009-issue-driven-workflow.md) | GitHub issues plus in-repository status as the development control plane | Proposed |
+| [0009](0009-issue-driven-workflow.md) | GitHub issues plus in-repository status as the development control plane | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
