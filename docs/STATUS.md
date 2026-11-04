@@ -57,7 +57,10 @@ contracts that every M2 adapter is then written against.
   and egress allow-listing) and ADR-0012 (recovery-safe side effects).
   Registered sources R13–R19 and findings F-017–F-022. Added the review's
   acceptance criteria to #3, #4, #5, #7, #8, #9, #11, #15, #18, #20 and #28,
-  pending maintainer approval.
+  pending maintainer approval. Review round 2: ADR-0010 trust boundary and
+  acceptance table (CI-config changes not published in M2); ADR-0011 per-execution
+  networks and required negative network tests; ADR-0012 ownership-verified
+  cleanup, resource ledger and fencing (#3, #4, #5, #7, #9, #11, #15, #16).
 - 2026-11-04: Independent review of M1 and PR #32. Status data was
   de-duplicated: issue state lives only on GitHub, the plan only here, and
   roadmap/finding links are checked by tests. ADR-0001 to ADR-0008 marked

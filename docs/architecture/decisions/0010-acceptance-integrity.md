@@ -52,28 +52,70 @@ Promoting one immutable build artefact is long-standing practice (F-022).
    repository.
 3. **Verify.** VERIFYING checks out `candidate_revision` from the
    coordinator's repository into a fresh directory and a fresh sandbox
-   (ADR-0011). The required checks come from a verification policy outside
-   the candidate, namely Ilmar's configuration. Each attempt produces an
-   **evidence record** containing:
+   (ADR-0011: network `NONE`, no credentials). The required checks come from a
+   verification policy in Ilmar's configuration, never from the candidate.
+4. **Trust boundary.** The policy decides *what* runs and how results are
+   read. It cannot make candidate code trustworthy. Every artefact is
+   therefore in one of three classes:
+
+   | Class | Examples | Trusted for |
+   | --- | --- | --- |
+   | **Ilmar-controlled** | Verification policy (commands, timeouts, required checks, protected and check-influencing paths), the sandbox, the harness that runs commands and reads exit status | Everything |
+   | **Independent checks** | Checks Ilmar runs itself on the candidate's tree or diff as *data*, executing nothing from the candidate: protected-path and check-influencing-path detection, forbidden file types, size limits, licence/SPDX headers, secret scanning | Pass/fail on their own |
+   | **Candidate-executed checks** | Policy commands such as `pytest`, `ruff` or `make test`. They run code the candidate controls: tests, `conftest.py`, plugins, tool configuration in `pyproject.toml`, `setup.cfg` or `tox.ini`, build scripts, dependency manifests, and the code under test, which can patch the test runner at import time | Detecting honest mistakes; **not** proof against a deliberately subverted candidate |
+
+   Rules:
+   - Pass/fail of a candidate-executed check comes only from the exit status
+     and timeout measured by the harness. Reports written by the candidate
+     (JUnit XML, coverage files) are informational, never a verdict.
+   - Candidate-executed code runs only in the verification sandbox: no
+     network, no credentials, discarded afterwards. The worst it can do is lie
+     about its result.
+   - Resistance to an adversarial candidate comes from the sandbox,
+     independent checks, the CI-configuration rule below and human review.
+     Checks the agent cannot see, such as holdout scenarios (F-005, [R7]),
+     are the planned strengthening.
+5. **How modified tests and CI configuration affect evidence and acceptance.**
+   The policy lists **check-influencing paths**: by default tests, test and
+   tool configuration, build scripts, dependency manifests and lock files,
+   and any repository file that verification reads. It also lists **CI
+   configuration paths**, by default `.github/`. The diff from
+   `base_revision` decides the outcome:
+
+   | Candidate diff | Required checks | Outcome | Evidence `independence` |
+   | --- | --- | --- | --- |
+   | Any | An independent or candidate-executed required check fails | Not published (RETRY_WAIT or FAILED) | — |
+   | Touches no check-influencing or CI paths | All pass | Published | `unchanged-checks`: the candidate passed the base revision's own checks |
+   | Touches check-influencing paths | All pass | Published, with `requires_human_review` and a change-request label | `modified-checks`, listing the paths: the checks were partly written by the agent |
+   | Touches CI configuration paths | Any | **Not published in M2.** FAILED, with reason `ci-config-modified` and a note on the task; a human takes over | `ci-config-modified` |
+
+   CI configuration is blocked rather than just flagged because pushing it
+   would run agent-written workflows, which may have access to repository
+   secrets, before any human looks. As defence in depth, the publishing
+   credential lacks permission to write workflow files (#7). CI results on a
+   change request are never verification evidence. They are recorded as
+   advisory external signals.
+
+   Each attempt produces an **evidence record** containing:
    - the base and candidate revisions and the policy's hash;
-   - for each check: the command, exit status, duration and an output digest;
-   - the protected paths the change touched;
+   - for each check: its class, command, exit status, duration and an output
+     digest;
+   - the check-influencing, CI and protected paths the change touched;
+   - `independence`, one of the values in the table above;
+   - `requires_human_review`, with its reasons;
    - the agent's self-reported outcome, labelled as reported.
-4. **Protected paths.** The policy lists paths whose change needs human review,
-   such as tests, CI configuration (`.github/`), the verification policy and
-   `AGENTS.md`. A candidate that touches them can still be verified and
-   published. Its evidence then carries `requires_human_review` with the
-   reasons, and the change request is labelled. If CI configuration changed,
-   CI results on the change request never count as verification.
-5. **Publish.** PUBLISHING pushes exactly `candidate_revision` to the task
+
+   A change to a protected path from the policy, such as `AGENTS.md` or the
+   verification policy itself, adds `requires_human_review` in every case.
+6. **Publish.** PUBLISHING pushes exactly `candidate_revision` to the task
    branch, with no commit at publish time, using an expected-head lease. It
    then confirms that the remote head equals the candidate. If the remote
    branch moved unexpectedly, for example because a human pushed to it,
    publishing stops for human attention and never overwrites.
-6. **Reported versus accepted.** `AgentResult` is advisory. It can end an
+7. **Reported versus accepted.** `AgentResult` is advisory. It can end an
    attempt early but can neither skip VERIFYING nor stand in for it (F-004).
    Exit codes are not trusted on their own (F-021).
-7. **Approval.** During bootstrap, accepting a change into the default branch
+8. **Approval.** During bootstrap, accepting a change into the default branch
    is human-only. No port has a merge operation, and branch protection on
    `main` blocks direct pushes (#28). SUCCEEDED means "verified change request
    published", never "accepted". Configurable approval policies (#20) are a
@@ -86,8 +128,13 @@ Promoting one immutable build artefact is long-standing practice (F-022).
   never runs agent-controlled git configuration. The evidence record gives
   future approval policies something to work from.
 - Bad: one extra checkout and container per attempt. Host-side git needs
-  careful implementation and tests. The protected-path list must be
-  maintained.
+  careful implementation and tests. The protected-path and check-influencing
+  path lists must be maintained.
+- Bad (stated honestly): when the candidate's own tests pass, that proves
+  little against a deliberately subverted candidate. Code under test can
+  tamper with its test run even if no test file changed. `unchanged-checks`
+  guards against careless test weakening, not against an adversary.
+- Bad: in M2, any task that needs a CI change cannot be completed by Ilmar.
 - Port and domain changes, implemented by issues rather than this ADR:
   - `SourceControlProvider.publish_branch` is replaced by operations that
     freeze a candidate, check out a revision, and publish an exact revision
@@ -101,4 +148,8 @@ Promoting one immutable build artefact is long-standing practice (F-022).
 - Attestation or signed commits are needed (M6).
 - Approval policies are designed (#20).
 - Tests of protected paths need finer rules, such as running the base
-  revision's tests against the candidate.
+  revision's tests against the candidate (a "baseline run").
+- Holdout checks hidden from the agent become available (F-005). Reassess how
+  much `unchanged-checks` should count.
+- Self-hosting (M4) needs Ilmar to change its own CI. Revisit the
+  `ci-config-modified` rule together with approval policies (#20).
