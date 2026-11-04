@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import re
+import threading
+
 import pytest
 
 from ilmar.adapters.github import GitHubClient, GitHubTaskProvider
@@ -120,28 +123,91 @@ def test_claim_of_unknown_or_foreign_task_is_not_eligible(api: FakeGitHub) -> No
     assert provider(api).claim(TaskRef("github", "other/repo#1")) is ClaimOutcome.NOT_ELIGIBLE
 
 
-def test_race_won_by_the_earlier_claim(api: FakeGitHub) -> None:
-    """Instance b posts its claim just after a's; a re-reads and still wins."""
-    a, b = provider(api, "a"), provider(api, "b")
-    fired: list[bool] = []
-
-    def b_claims_right_after_a_posts(request: HttpRequest) -> None:
-        if request.method == "POST" and request.url.endswith("/comments") and not fired:
-            fired.append(True)
-            api.before.remove(b_claims_right_after_a_posts)
-            api.comment(1, claim_comment("b"))  # lands *before* a's (lower id)
-
-    api.before.append(b_claims_right_after_a_posts)
-    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER  # b's comment is older
-    assert claims(api, 1) == [claim_comment("b")]  # a withdrew its own claim
-    assert b.claim(ref(1)) is ClaimOutcome.CLAIMED
+def test_claim_marker_carries_a_unique_token(api: FakeGitHub) -> None:
+    api.add_issue(2, labels={READY})
+    p = provider(api)
+    p.claim(ref(1))
+    p.claim(ref(2))
+    tokens = [re.search(r"token=([0-9a-f]+)", body).group(1) for body in iter_claims(api)]  # type: ignore[union-attr]
+    assert len(tokens) == 2
+    assert len(set(tokens)) == 2
+    assert all(len(token) == 32 for token in tokens)
 
 
-def test_race_loser_sees_the_winner(api: FakeGitHub) -> None:
+def test_claim_appearing_mid_claim_makes_us_back_off(api: FakeGitHub) -> None:
+    """Another instance's claim shows up between our check and our re-read."""
+    a = provider(api, "a")
+
+    def b_claims_during_a_post(request: HttpRequest) -> None:
+        if request.method == "POST" and request.url.endswith("/comments"):
+            api.before.remove(b_claims_during_a_post)
+            api.comment(1, claim_comment("b"))
+
+    api.before.append(b_claims_during_a_post)
+    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert claims(api, 1) == [claim_comment("b")]  # a withdrew; b's claim untouched
+    assert CLAIMED in api.issues[1].labels  # still visibly taken (by b)
+
+
+def test_overlapping_claims_on_a_controlled_schedule_never_both_succeed(api: FakeGitHub) -> None:
+    """Both instances pass the initial check before either posts (ADR-0013).
+
+    Request order is forced: a GET issue, a GET comments, b GET issue, b GET
+    comments, a POST comment, b POST comment, a POST label, b POST label, then
+    both re-read. Both see each other, both back off, and the label is cleaned up.
+    """
+    order = ["a", "a", "b", "b", "a", "b", "a", "b", "a", "b"]
+    schedule = Schedule(order)
+    api.before.append(schedule.gate)
+    results: dict[str, ClaimOutcome] = {}
+
+    def run(instance: str) -> None:
+        results[instance] = provider(api, instance).claim(ref(1))
+
+    threads = [threading.Thread(target=run, args=(i,), name=i) for i in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(t.is_alive() for t in threads), "schedule deadlocked"
+    assert schedule.followed, schedule.log
+    issue, comments = "GET owner/repo/issues/1", "GET owner/repo/issues/1/comments?per_page=100"
+    post, label = "POST owner/repo/issues/1/comments", "POST owner/repo/issues/1/labels"
+    assert schedule.log == [
+        f"a {issue}",
+        f"a {comments}",
+        f"b {issue}",
+        f"b {comments}",
+        f"a {post}",
+        f"b {post}",
+        f"a {label}",
+        f"b {label}",
+        f"a {comments}",
+        f"b {comments}",
+    ]  # both passed the initial check before either posted
+    assert ClaimOutcome.CLAIMED not in results.values()
+    assert results == {"a": ClaimOutcome.CLAIMED_BY_OTHER, "b": ClaimOutcome.CLAIMED_BY_OTHER}
+    assert claims(api, 1) == []
+    assert CLAIMED not in api.issues[1].labels
+    assert len(provider(api, "a").list_eligible()) == 1  # nothing is stuck
+
+
+def test_sequential_second_instance_sees_the_first(api: FakeGitHub) -> None:
     a, b = provider(api, "a"), provider(api, "b")
     assert a.claim(ref(1)) is ClaimOutcome.CLAIMED
     assert b.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
     assert len(claims(api, 1)) == 1
+
+
+def test_ownership_is_per_instance_across_restarts(api: FakeGitHub) -> None:
+    """A restarted coordinator of the same instance recognises its claim; whether
+    an execution still backs it is decided by the durable store (#12, #15)."""
+    provider(api, "a").claim(ref(1))
+    restarted = provider(api, "a")
+    assert restarted.claim(ref(1)) is ClaimOutcome.CLAIMED
+    assert len(claims(api, 1)) == 1
+    restarted.release(ref(1))
+    assert claims(api, 1) == []
 
 
 def test_release_removes_only_our_claim(api: FakeGitHub) -> None:
@@ -185,3 +251,37 @@ def test_configuration_is_validated(kwargs: dict[str, str], message: str) -> Non
     settings = {"repository": "owner/repo", "instance_id": "a"} | kwargs
     with pytest.raises(ValueError, match=message):
         GitHubTaskProvider(GitHubClient(TOKEN, transport=FakeGitHub()), **settings)  # type: ignore[arg-type]
+
+
+def iter_claims(api: FakeGitHub) -> list[str]:
+    return [
+        c["body"]
+        for comments in api.comments.values()
+        for c in comments
+        if "ilmar:claim" in c["body"]
+    ]
+
+
+class Schedule:
+    """Forces the order in which actor threads (named by instance) may send requests."""
+
+    def __init__(self, order: list[str]) -> None:
+        self._order = list(order)
+        self._condition = threading.Condition()
+        self.log: list[str] = []
+        self.followed = True
+
+    def gate(self, request: HttpRequest) -> None:
+        actor = threading.current_thread().name
+        with self._condition:
+            if not self._order:
+                return
+            if not self._condition.wait_for(
+                lambda: not self._order or self._order[0] == actor, timeout=5
+            ):
+                self.followed = False
+                return
+            if self._order:
+                self._order.pop(0)
+                self.log.append(f"{actor} {request.method} {request.url.split('/repos/')[1]}")
+            self._condition.notify_all()

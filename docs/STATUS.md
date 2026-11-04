@@ -52,10 +52,13 @@ building on #4). **Waiting for the maintainer's explicit go-ahead.**
 ## Change log
 
 - 2026-11-04: #6 finished: GitHub `TaskProvider` on a standard-library REST
-  client (REST only, token kept to the API host). State model in ADR-0013
-  (proposed): labels for visibility, claim comments for ownership, and races
-  resolved by comment order. `integration` test marker introduced. Next
-  recommended: #5.
+  client (REST only; token kept to the API origin, including on redirects).
+  ADR-0013 (proposed) fixes the M2 threat model: one instance per repository
+  and one coordinator per instance. Labels are workflow state, assignees mean
+  human responsibility, and claim comments (instance plus unique token) are an
+  audit record, not a lock. A second instance is detected and both back off.
+  Recovery is reconciled through the durable store (#12, #15). `integration`
+  test marker introduced. Next recommended: #5.
 
 - 2026-11-04: #4 finished: deterministic, collision-resistant names
   (branch, container); host layout with separate mountable and

@@ -43,13 +43,47 @@ class HttpResponse:
 Transport = Callable[[HttpRequest], HttpResponse]
 
 
+class CrossOriginRedirectError(ProviderError):
+    """A redirect pointed to a different origin; it was refused, credentials and all."""
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme.lower(), (parts.hostname or "").lower(), parts.port
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only within the same origin (scheme, host and port).
+
+    ``urllib`` copies request headers, including ``Authorization``, onto a
+    redirected request. A redirect to any other origin is refused, so the token
+    can never be forwarded.
+    """
+
+    max_redirections = 3
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if _origin(newurl) != _origin(req.full_url):
+            raise CrossOriginRedirectError("GitHub redirected to another origin; refusing")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def urllib_transport(request: HttpRequest, *, timeout: float = 30.0) -> HttpResponse:
-    """Real transport. Honours ``HTTPS_PROXY`` through ``urllib``'s defaults."""
+    """Real transport. Honours ``HTTPS_PROXY``. Follows same-origin redirects only."""
+    opener = urllib.request.build_opener(_SameOriginRedirects())
     raw = urllib.request.Request(  # noqa: S310 - the scheme is checked by GitHubClient
         request.url, data=request.body, headers=dict(request.headers), method=request.method
     )
     try:
-        with urllib.request.urlopen(raw, timeout=timeout) as response:  # noqa: S310
+        with opener.open(raw, timeout=timeout) as response:
             return HttpResponse(response.status, dict(response.headers), response.read())
     except urllib.error.HTTPError as error:
         return HttpResponse(error.code, dict(error.headers or {}), error.read() or b"")

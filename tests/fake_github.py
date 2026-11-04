@@ -160,8 +160,8 @@ def _json(status: int, data: Any, headers: dict[str, str] | None = None) -> Http
     return HttpResponse(status, headers or {}, json.dumps(data).encode())
 
 
-def claim_comment(instance: str) -> str:
-    return f"Claimed.\n\n<!-- ilmar:claim instance={instance} -->"
+def claim_comment(instance: str, token: str = "0" * 32) -> str:
+    return f"Claimed.\n\n<!-- ilmar:claim instance={instance} token={token} -->"
 
 
 def labelled(*names: str) -> set[str]:

@@ -1,4 +1,4 @@
-# ADR-0013: GitHub task state: labels for visibility, claim comments for ownership
+# ADR-0013: GitHub task state under a single-coordinator deployment
 
 - Status: Proposed
 - Date: 2026-11-04
@@ -13,70 +13,165 @@ The GitHub `TaskProvider` (#6) must:
 - respect work humans have claimed.
 
 It may use the REST API only, because GraphQL, and with it Projects v2, is
-unavailable in some environments Ilmar runs in. GitHub has no compare-and-set
-for labels or assignees, so two Ilmar instances could race for the same issue.
-ADR-0009's "Revisit when" asks for the labels to be aligned with this state
-model.
+unavailable in some environments Ilmar runs in.
+
+GitHub REST has no compare-and-set for labels, assignees or comments. Any claim
+built from them is check-then-act: two writers can both pass the check before
+either writes. A first draft of this ADR resolved races by "earliest comment
+wins". Review of PR #38 showed that this is not an exclusive lock:
+- reads after a write are not guaranteed to be consistent;
+- a loser that crashes before withdrawing leaves two claims;
+- an instance does not know whether a claim it sees is still backed by a live
+  execution.
+
+So the question is not "which lock?" but "which threat model does M2 have to
+meet?".
+
+ADR-0009's "Revisit when" also asks for the labels to be aligned with this
+state model.
+
+## Threat model
+
+**In scope.** One Ilmar instance per repository, and one coordinator process
+per instance. ADR-0012 already enforces the second half with the instance OS
+lock, held for the coordinator's lifetime.
+
+Within that deployment, duplicate execution is prevented by the coordinator's
+durable store, not by GitHub:
+- the in-process execution lease (ADR-0012);
+- the write-ahead execution record;
+- reconciliation (#12, #15).
+
+GitHub state is a projection of that store, made visible to humans.
+
+Other actors are also in scope. Ilmar must not take work that is visibly
+claimed by:
+- human maintainers, or sessions following `docs/workflow.md`, who use labels
+  and assignees;
+- a second, misconfigured Ilmar instance.
+
+**Out of scope for M2:** several instances deliberately sharing one repository.
+The adapter **detects** a second instance and **backs off**, but it does not
+guarantee mutual exclusion between instances. A deployment with several
+instances per repository needs an authoritative lease (see Revisit when) and a
+new ADR.
 
 ## Considered options
 
-1. **Assignee as the claim.** Assignment is not atomic either, and all
-   instances usually share one bot account, so instances cannot be told apart.
-2. **One `state:<name>` label per issue** ([R11]). Visible, but a label carries
-   no owner identity and cannot resolve a race.
+1. **Comments as an authoritative lock** (the first draft). Rejected: there is
+   no atomicity, and the outcome depends on read-after-write consistency.
+2. **Assignee as the claim.** Assignment is not atomic either, and instances
+   usually share one bot account, so instances cannot be told apart.
+   Assignment also signals *human* responsibility.
 3. **A Projects v2 status field.** GraphQL only, so it is ruled out.
-4. **Labels for visibility, plus claim comments carrying an instance marker
-   for ownership.** Races are resolved by comment order, which GitHub assigns.
+4. **A git ref as a lease.** Create a ref such as `refs/ilmar/claims/<issue>`;
+   creating a ref that already exists fails. This may be the only atomic
+   create-if-absent primitive in GitHub REST. It is Experimental: unverified,
+   it needs `contents: write`, and it adds cleanup and expiry problems.
+   It is deferred until several instances are in scope.
+5. **Single-coordinator constraint, with GitHub as a visible projection.**
+   Each GitHub mechanism has one meaning:
+   - labels are workflow state;
+   - assignees are human responsibility;
+   - comments are an audit record.
+
+   Cross-instance claims are detected and Ilmar backs off.
 
 ## Decision
 
-Chosen option: 4.
+Chosen option: 5.
 
+- **Meaning of each mechanism:**
+  - *Labels* carry workflow state: `eligible_label` (default `ilmar:ready`),
+    `claimed_label` (default `ilmar:claimed`) and `excluded_labels`.
+  - *Assignees* mean a human is responsible. Ilmar never assigns anyone, and
+    with `skip_assigned` (on by default) it treats any assignee as "claimed by
+    someone else".
+  - *Claim comments* are an audit record, not a lock. They carry
+    `<!-- ilmar:claim instance=<id> token=<128-bit random hex> -->`. The
+    instance identifies the owner. The token identifies this particular claim,
+    so audits and reconciliation can tell one claim from another, including a
+    re-claim after a release.
 - **Eligible:**
   - an open issue, not a pull request (the issues API returns both);
-  - with `eligible_label` (default `ilmar:ready`);
+  - with `eligible_label`;
   - with none of `excluded_labels`;
-  - without `claimed_label` (default `ilmar:claimed`);
-  - with no assignees (`skip_assigned`, on by default).
+  - without `claimed_label`;
+  - with no assignees.
 - **Claim:**
-  1. Post a comment with `<!-- ilmar:claim instance=<id> -->` and add
-     `claimed_label`.
-  2. Re-read the comments: the **earliest** active claim wins.
-  3. The loser deletes its own comment and gets `CLAIMED_BY_OTHER`.
-
-  Claiming again as the holder is idempotent.
-- **Claimed by someone else:** `claimed_label` without our marker (a human, or
-  a session following `docs/workflow.md`), another instance's claim comment, or
-  an assignee.
-- **Release:** delete only our own claim comments. Remove `claimed_label` only
-  if no other claim remains. Never touch a claim we do not hold.
+  1. Read the issue and its comments. If another instance's claim or an
+     assignee is present, the result is `CLAIMED_BY_OTHER`. If only our own
+     instance's claim is present, re-apply the label and return `CLAIMED`.
+     If `claimed_label` is present without a claim comment, the result is
+     `CLAIMED_BY_OTHER`: a human holds it.
+  2. Otherwise, post our claim comment and add `claimed_label`.
+  3. Re-read the comments. If **any** other instance's claim is visible,
+     withdraw ours and return `CLAIMED_BY_OTHER`. Both sides of an overlap
+     therefore back off. Nobody "wins", and the issue becomes eligible again.
+     That is the safe outcome for what is, by this ADR, a misconfiguration.
+- **Ownership is per instance, and recovery runs through the durable store.**
+  A restarted coordinator of the same instance recognises its own claims.
+  Whether a claim is still *backed* is decided by the store, not by GitHub.
+  Reconciliation (#12, #15) must:
+  - release claims held by this instance that have no non-terminal execution
+    record;
+  - re-apply missing labels for claims that are backed.
+- **Release:** delete only our own instance's claim comments. Remove
+  `claimed_label` only if no claim remains. Never touch a claim held by a human
+  or another instance.
 - **Alignment with ADR-0009:** for Ilmar's own repository,
   `claimed_label = "status:in-progress"`, the label sessions already use, and
   `excluded_labels` include `needs:maintainer`, `status:blocked` and
-  `proposal`. Human sessions and Ilmar then see the same claims
-  (`ilmar.example.toml`).
-- **Transport:** a standard-library REST client. The token comes from
-  `token_env`. The client sends the token only to the configured HTTPS API
-  host, refuses pagination links to other hosts, and keeps the token out of
-  error messages.
+  `proposal` (`ilmar.example.toml`).
+- **Transport credential boundary:** a standard-library REST client.
+  - The token comes from `token_env`.
+  - Only `https` API URLs and non-empty tokens are accepted.
+  - Pagination links to another host are refused.
+  - Redirects are followed only within the same origin (scheme, host and
+    port), at most three times. A redirect to any other origin is refused
+    before a request is sent, so credentials never leave the API origin.
+  - Error messages never contain the token.
+
+## Verification
+
+- The shared `TaskProviderContract` runs against the adapter over an in-memory
+  REST fake with pagination.
+- A controlled overlapping schedule forces both instances past the initial
+  check before either posts. Both must back off, the label must be cleaned up,
+  and the issue must be eligible again (`tests/unit/test_github_tasks.py`).
+- Redirect regression tests run against the real `urllib` transport with
+  local servers. A cross-origin 302 is refused and the other origin receives
+  no request at all. A same-origin redirect is followed with credentials
+  (`tests/unit/test_github_client.py`).
+- An opt-in live test (`pytest -m integration`) exercises a real repository.
 
 ## Consequences
 
-- Good: no GraphQL and no extra dependency. Claims are visible to humans and
-  carry an owner. Concurrent instances converge on one owner. Human claims are
-  respected.
+- Good:
+  - No GraphQL and no extra dependency.
+  - Each GitHub mechanism has one meaning that humans can read.
+  - Humans' claims are respected.
+  - The guarantee Ilmar relies on comes from its own store, which it controls.
 - Bad:
+  - Running two instances against one repository is unsupported. Overlapping
+    claims back off, but detection depends on GitHub's read consistency, so
+    even detection is not guaranteed. Configuration documentation must say
+    this.
   - A claim costs several REST calls.
-  - A claim comment left by a crashed instance blocks the issue until it is
-    reconciled (#12) or a human removes it.
-  - Anyone with comment access could forge a claim marker. That can only make
-    Ilmar step back, or take a claim it would otherwise race for, so it never
-    leads to duplicate work by different instances.
+  - A claim left by a crashed instance blocks the issue until reconciliation
+    or a human removes it.
+  - On a public repository anyone can post a comment containing a claim
+    marker. That can only make Ilmar step back (denial of progress, never
+    duplicate work), and a maintainer can delete the comment. Filtering
+    markers by comment author is a possible hardening (Revisit when).
 
 ## Revisit when
 
-- Reconciliation (#12) needs to expire stale claims, for example by age plus
-  liveness.
+- More than one instance per repository is required. Evaluate an
+  authoritative lease, for example git-ref create-if-absent (option 4), with
+  expiry and fencing. That needs a new ADR.
+- Forged claim markers cause real disruption. Then count only markers from the
+  instance's own bot login, or from trusted author associations.
 - GitHub offers conditional (compare-and-set) label or assignee updates over
   REST.
 - A tracker that supports atomic transitions (#23) shows whether this

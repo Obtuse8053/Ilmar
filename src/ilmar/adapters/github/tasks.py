@@ -1,29 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """GitHub Issues as an Ilmar ``TaskProvider`` (ADR-0013).
 
+**Threat model (M2).** Exactly one active coordinator per Ilmar instance
+(ADR-0012) and one instance per repository. GitHub's REST API offers no atomic
+compare-and-set for labels, assignees or comments, so nothing here is an
+exclusive lock between instances. Duplicate work *within* an instance is
+prevented by the execution store (ADR-0005). A second instance on the same
+repository is a misconfiguration, which this adapter *detects* and backs off
+from but cannot fully prevent.
+
 State model:
 
 * **Eligible:** an open issue (not a pull request) carrying ``eligible_label``,
-  none of ``excluded_labels``, not ``claimed_label``, and with no assignees
-  (unless ``skip_assigned`` is off).
-* **Claimed by this instance:** a claim comment carrying this instance's
-  marker. ``claimed_label`` is added so humans and other tools can see it.
-* **Claimed by someone else:** ``claimed_label`` without our marker (a human
-  or another tool, such as a session following ``docs/workflow.md``), an
-  earlier claim comment from another instance, or an assignee.
-
-GitHub has no compare-and-set for labels. Two instances racing for the same
-issue are resolved by their claim comments: after posting its own, each
-instance re-reads the comments, the earliest active claim wins, and the loser
-deletes its comment.
+  none of ``excluded_labels``, not ``claimed_label``, and unassigned (unless
+  ``skip_assigned`` is off).
+* ``claimed_label`` is the workflow state "taken". Assignees are human
+  responsibility; Ilmar never assigns, and treats any assignee as "claimed by
+  someone else".
+* A claim comment ``<!-- ilmar:claim instance=<id> token=<random> -->`` is an
+  **audit record**, not a lock. Ownership is per instance. Whether the claim is
+  still backed by an execution is decided by the instance's durable execution
+  store during reconciliation (#12, #15).
+* If, before or after posting its claim, an instance sees a claim from
+  *another* instance, it withdraws its own and reports ``CLAIMED_BY_OTHER``. In
+  an overlapping race both back off: safety over progress.
 """
 
 from __future__ import annotations
 
 import contextlib
 import re
+import secrets
 import urllib.parse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ilmar.adapters.github.client import GitHubClient, GitHubNotFoundError
@@ -32,7 +41,7 @@ from ilmar.domain.errors import ProviderError
 from ilmar.domain.tasks import ClaimOutcome, Task, TaskRef
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_CLAIM = re.compile(r"<!-- ilmar:claim instance=([A-Za-z0-9_-]+) -->")
+_CLAIM = re.compile(r"<!-- ilmar:claim instance=([A-Za-z0-9_-]+) token=([0-9a-f]{16,64}) -->")
 
 
 class GitHubTaskProvider:
@@ -47,6 +56,7 @@ class GitHubTaskProvider:
         claimed_label: str = "ilmar:claimed",
         excluded_labels: Sequence[str] = (),
         skip_assigned: bool = True,
+        new_token: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
         if not _REPOSITORY.match(repository):
             raise ValueError(f"repository must look like 'owner/name', got {repository!r}")
@@ -60,6 +70,7 @@ class GitHubTaskProvider:
         self._claimed = claimed_label
         self._excluded = frozenset(excluded_labels)
         self._skip_assigned = skip_assigned
+        self._new_token = new_token
 
     @property
     def name(self) -> str:
@@ -89,38 +100,39 @@ class GitHubTaskProvider:
         if number is None or issue is None or not self._is_open_task(issue):
             return ClaimOutcome.NOT_ELIGIBLE
         claims = self._active_claims(number)
-        if any(instance == self._instance for _, instance in claims):
+        others = [c for c in claims if c[1] != self._instance]
+        if others or self._assigned(issue):
+            return ClaimOutcome.CLAIMED_BY_OTHER
+        if claims:  # only ours: held by this instance (reconciled by the coordinator)
             self._add_label(number)
             return ClaimOutcome.CLAIMED
-        if claims or self._claimed in _labels(issue) or self._assigned(issue):
+        if self._claimed in _labels(issue):
             return ClaimOutcome.CLAIMED_BY_OTHER
         if not self._has_eligible_labels(issue):
             return ClaimOutcome.NOT_ELIGIBLE
 
+        token = self._new_token()
         mine = self._post_comment(
             number,
             f"Ilmar instance `{self._instance}` is working on this task.\n\n"
-            f"<!-- ilmar:claim instance={self._instance} -->",
+            f"<!-- ilmar:claim instance={self._instance} token={token} -->",
         )
         self._add_label(number)
-        winner = min(self._active_claims(number), default=None)
-        if winner is not None and winner[1] == self._instance:
-            return ClaimOutcome.CLAIMED
-        self._delete_comment(mine)
-        return ClaimOutcome.CLAIMED_BY_OTHER
+        if any(instance != self._instance for _, instance, _ in self._active_claims(number)):
+            # Another instance is claiming too: a misconfiguration (ADR-0013). Back off.
+            self._withdraw(number, [mine])
+            return ClaimOutcome.CLAIMED_BY_OTHER
+        return ClaimOutcome.CLAIMED
 
     def release(self, ref: TaskRef) -> None:
         number = self._number(ref)
         if number is None:
             return
-        claims = self._active_claims(number)
-        mine = [comment_id for comment_id, instance in claims if instance == self._instance]
-        if not mine:
-            return  # never ours: leave other claims and labels alone
-        for comment_id in mine:
-            self._delete_comment(comment_id)
-        if len(mine) == len(claims):
-            self._remove_label(number)
+        mine = [
+            cid for cid, instance, _ in self._active_claims(number) if instance == self._instance
+        ]
+        if mine:  # never ours: leave other claims and labels alone
+            self._withdraw(number, mine)
 
     def post_update(self, ref: TaskRef, message: str) -> None:
         number = self._number(ref)
@@ -151,8 +163,15 @@ class GitHubTaskProvider:
             and not self._assigned(issue)
         )
 
-    def _active_claims(self, number: int) -> list[tuple[int, str]]:
-        """``(comment id, instance)`` for every claim comment, oldest first."""
+    def _withdraw(self, number: int, comment_ids: list[int]) -> None:
+        """Delete our claim comments; drop the label once no claim remains."""
+        for comment_id in comment_ids:
+            self._delete_comment(comment_id)
+        if not self._active_claims(number):
+            self._remove_label(number)
+
+    def _active_claims(self, number: int) -> list[tuple[int, str, str]]:
+        """``(comment id, instance, token)`` for every claim comment, oldest first."""
         comments = self._client.paginate(
             self._repo_path(f"/issues/{number}/comments"), query={"per_page": "100"}
         )
@@ -160,7 +179,7 @@ class GitHubTaskProvider:
         for comment in comments:
             match = _CLAIM.search(str(comment.get("body", "")))
             if match:
-                claims.append((int(comment["id"]), match.group(1)))
+                claims.append((int(comment["id"]), match.group(1), match.group(2)))
         return sorted(claims)
 
     def _issue(self, number: int) -> Any:
