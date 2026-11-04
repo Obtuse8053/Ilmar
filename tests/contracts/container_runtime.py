@@ -122,6 +122,25 @@ class ContainerRuntimeContract:
         assert result.succeeded
         assert (workspace / "out.txt").read_text().strip() == "done"
 
+    # -- workspace containment (#4) ----------------------------------------
+
+    def test_writes_cannot_escape_the_workspace(
+        self, runtime: ContainerRuntime, container: ContainerHandle, workspace: Path
+    ) -> None:
+        runtime.run(container, self.write_file("../escaped.txt", "x"), timeout_seconds=30)
+        assert not (workspace.parent / "escaped.txt").exists()
+
+    def test_symlinks_in_the_workspace_do_not_reach_the_host(
+        self, runtime: ContainerRuntime, container: ContainerHandle, workspace: Path
+    ) -> None:
+        outside = workspace.parent / "host-data"
+        outside.mkdir()
+        (workspace / "to-host").symlink_to(outside)
+        (workspace / "to-host-file").symlink_to(outside / "planted.txt")
+        runtime.run(container, self.write_file("to-host/pwned.txt", "x"), timeout_seconds=30)
+        runtime.run(container, self.write_file("to-host-file", "x"), timeout_seconds=30)
+        assert list(outside.iterdir()) == []
+
     # -- stop ------------------------------------------------------------
 
     def test_stop_is_idempotent_and_final(

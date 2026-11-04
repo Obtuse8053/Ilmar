@@ -255,6 +255,29 @@ class SourceControlContract:
         assert tree["dir-link"] == f"-> {tmp_path}"
         assert not any("TOP-SECRET-HOST-DATA" in content for content in tree.values())
 
+    def test_materialising_never_writes_outside_the_destination(
+        self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path
+    ) -> None:
+        """Symlinks in a frozen tree become links; nothing is written through them (#4)."""
+        outside = tmp_path / "host-data"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep\n")
+        (workspace / "escape").symlink_to(outside)
+        (workspace / "escape-file").symlink_to(outside / "precious.txt")
+        (workspace / "src" / "app.py").write_text("print('v2')\n")
+        candidate = self._freeze(provider, repo, workspace)
+        provider.publish_revision(
+            repo, revision=candidate.revision, branch=TASK_BRANCH, expected_head=None
+        )
+        before = sorted(p.name for p in tmp_path.iterdir())
+        provider.checkout_revision(repo, revision=candidate.revision, destination=tmp_path / "v")
+        provider.checkout(repo, base_branch="main", branch=TASK_BRANCH, destination=tmp_path / "r")
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([*before, "v", "r"])
+        assert sorted(p.name for p in outside.iterdir()) == ["precious.txt"]
+        assert (outside / "precious.txt").read_text() == "keep\n"
+        assert (tmp_path / "v" / "escape").is_symlink()
+        assert (tmp_path / "r" / "escape-file").is_symlink()
+
     def test_file_modes_and_bytes_are_preserved(
         self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path
     ) -> None:
