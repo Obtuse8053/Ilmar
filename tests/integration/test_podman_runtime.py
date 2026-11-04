@@ -50,6 +50,7 @@ from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
     DirectoryIdentity,
+    NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
 )
@@ -62,7 +63,7 @@ pytestmark = pytest.mark.integration
 IMAGE = os.environ.get("ILMAR_TEST_PODMAN_IMAGE", "")
 REQUIRED = os.environ.get("ILMAR_TEST_PODMAN_REQUIRED") == "1"
 PODMAN = shutil.which("podman")
-NAMES = (NAME, "ilmar-it-profile")
+NAMES = (NAME, "ilmar-it-profile", "ilmar-it-open")
 SENTINEL = "ilmar-sentinel-must-not-leak"
 
 
@@ -417,3 +418,33 @@ def test_network_none_cannot_reach_a_host_ipv4_service(
     finally:
         server.close()
     assert outcome is Outcome.PASS, f"{outcome.value}: {reason} ({target}:{server.port})"
+
+
+def test_the_same_probe_reaches_the_target_without_isolation(layout: WorkspaceLayout) -> None:
+    """Counter-control: the reachability case is not vacuous.
+
+    With ``UNRESTRICTED`` the identical probe must reach the identical target,
+    so the ``NONE`` result above is due to isolation, not a broken probe.
+    """
+    target = host_ipv4()
+    assert target is not None, "inconclusive: the host has no non-loopback IPv4 address"
+    runtime = PodmanRuntime(layout=layout)
+    workspace = make_workspace(layout, "exec-open")
+    handle = runtime.start(
+        ContainerSpec(
+            image=IMAGE,
+            host_workspace=workspace,
+            name="ilmar-it-open",
+            owner=OWNER,
+            workspace_identity=identity_of(workspace),
+            network=NetworkPolicy.UNRESTRICTED,
+        )
+    )
+    server = EchoServer("0.0.0.0", secrets.token_hex(8))  # noqa: S104
+    try:
+        assert host_round_trip(target, server.port, server.nonce)
+        seen = probe_from_sandbox((runtime, handle), target, server.port)
+        assert server.nonce in seen, "an unisolated sandbox should reach the host target"
+    finally:
+        server.close()
+        runtime.stop(handle, owner=OWNER)

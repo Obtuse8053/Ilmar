@@ -20,8 +20,9 @@ short, every sandbox:
   and proxy variables are never inherited (``--env-host=false``,
   ``--http-proxy=false``), and values travel in a private ``--env-file``, not
   on the command line;
-* has network ``none`` (with no ``/etc/resolv.conf`` and no hosts entries)
-  unless the spec asks for ``UNRESTRICTED``, which is logged as a warning.
+* has network ``none`` (only loopback, no routes, no Podman-managed
+  ``/etc/hosts``) unless the spec asks for ``UNRESTRICTED``, which is logged as
+  a warning.
   ``ALLOWLIST`` arrives with the filtering proxy (ADR-0011 §5).
 
 The ``podman`` process itself runs with a minimal environment
