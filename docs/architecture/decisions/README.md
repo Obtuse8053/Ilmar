@@ -21,7 +21,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0012](0012-recovery-safe-side-effects.md) | Recovery-safe external side effects | Accepted |
 | [0013](0013-github-task-state.md) | GitHub task state under a single-coordinator deployment | Accepted |
 | [0014](0014-podman-runtime-mapping.md) | Podman runtime mapping, workspace identity and command timeouts | Accepted |
-| [0015](0015-egress-proxy-sidecar.md) | Egress allow-list as a per-execution proxy sidecar | Proposed |
+| [0015](0015-egress-proxy-sidecar.md) | Egress allow-list as a per-execution proxy sidecar | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

@@ -56,7 +56,7 @@ maintainer's explicit go-ahead.**
 
 - 2026-11-04: #40 finished (closes #5 together with PR #39):
   `NetworkPolicy.ALLOWLIST` via a per-execution proxy sidecar on an owned
-  `--internal` network (ADR-0015, proposed; amends where ADR-0011's proxy
+  `--internal` network (ADR-0015, accepted; amends where ADR-0011's proxy
   runs). The standard-library proxy allows `CONNECT <listed-host>:443` only.
   The full ADR-0011 §9 suite runs on real Podman in CI with nonce controls
   (63 of 63). ICMP sockets are now explicitly disabled as defence in depth.

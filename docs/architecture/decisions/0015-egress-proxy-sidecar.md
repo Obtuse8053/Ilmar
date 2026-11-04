@@ -1,6 +1,6 @@
 # ADR-0015: Egress allow-list as a per-execution proxy sidecar
 
-- Status: Proposed
+- Status: Accepted (PR #41, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R18], [R21] · Findings: F-020, F-025
 - Amends: ADR-0011 §5 (where the filtering proxy runs). Implements ADR-0011 §5
