@@ -22,6 +22,14 @@ from ilmar.domain.errors import (
 )
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.tasks import TaskRef
+from ilmar.domain.verification import (
+    AgentReport,
+    CheckClass,
+    CheckEvidence,
+    EvidenceRecord,
+    Independence,
+    Verdict,
+)
 from ilmar.ports.execution_store import ExecutionStore
 
 from helpers import at
@@ -30,6 +38,32 @@ S = ExecutionState
 MACHINE = ExecutionStateMachine(max_attempts=3)
 TASK_A = TaskRef("fake", "A")
 TASK_B = TaskRef("fake", "B")
+BASE, CANDIDATE = "a" * 40, "b" * 40
+
+
+def evidence_record(execution_id: str, attempt: int = 1, seconds: float = 10) -> EvidenceRecord:
+    return EvidenceRecord(
+        execution_id=execution_id,
+        attempt=attempt,
+        recorded_at=at(seconds),
+        base_revision=BASE,
+        candidate_revision=CANDIDATE,
+        policy_digest="sha256:" + "0" * 64,
+        checks=(
+            CheckEvidence("ci-config-paths", CheckClass.INDEPENDENT, True),
+            CheckEvidence(
+                "tests", CheckClass.CANDIDATE_EXECUTED, False, command=("pytest",), exit_code=1
+            ),
+        ),
+        protected_paths=(),
+        check_influencing_paths=(),
+        ci_config_paths=(),
+        independence=Independence.UNCHANGED_CHECKS,
+        verdict=Verdict.REJECTED_CHECKS_FAILED,
+        requires_human_review=False,
+        review_reasons=(),
+        agent_report=AgentReport("completed", "says it is done ünïcödé"),
+    )
 
 
 def _create(store: ExecutionStore, execution_id: str, task: TaskRef, seconds: float) -> Execution:
@@ -45,6 +79,10 @@ def _advance(
     seconds: float,
     **kwargs: str,
 ) -> Execution:
+    if target is S.RUNNING_AGENT:
+        kwargs.setdefault("base_revision", BASE)
+    if target is S.VERIFYING:
+        kwargs.setdefault("candidate_revision", CANDIDATE)
     reason = kwargs.pop("reason", f"to {target.value}")
     updated, transition = MACHINE.advance(
         execution, target, now=at(seconds), reason=reason, **kwargs
@@ -202,3 +240,48 @@ class ExecutionStoreContract:
         for thread in threads:
             thread.join()
         assert sorted(results) == ["created"] + ["duplicate"] * 7
+
+    # -- candidate revisions and evidence (#9) -------------------------------------
+
+    def test_revisions_round_trip_and_reset_on_retry(self, store: ExecutionStore) -> None:
+        execution = _create(store, "e1", TASK_A, 0)
+        for seconds, target in enumerate(
+            (S.CLAIMED, S.PROVISIONING, S.RUNNING_AGENT, S.VERIFYING), start=1
+        ):
+            execution = _advance(store, execution, target, seconds)
+        stored = store.get("e1")
+        assert stored is not None
+        assert (stored.base_revision, stored.candidate_revision) == (BASE, CANDIDATE)
+        execution = _advance(store, execution, S.RETRY_WAIT, 10, error="checks failed")
+        execution = _advance(store, execution, S.PROVISIONING, 11)
+        stored = store.get("e1")
+        assert stored is not None
+        assert (stored.base_revision, stored.candidate_revision) == (None, None)
+        assert stored.attempt == 2
+
+    def test_evidence_is_appended_in_order_and_round_trips(self, store: ExecutionStore) -> None:
+        _create(store, "e1", TASK_A, 0)
+        _create(store, "e2", TASK_B, 0)
+        first, second = evidence_record("e1", 1, 10), evidence_record("e1", 2, 20)
+        store.append_evidence(first)
+        store.append_evidence(evidence_record("e2"))
+        store.append_evidence(second)
+        assert store.evidence("e1") == (first, second)
+        assert len(store.evidence("e2")) == 1
+
+    def test_evidence_of_an_execution_without_any_is_empty(self, store: ExecutionStore) -> None:
+        _create(store, "e1", TASK_A, 0)
+        assert tuple(store.evidence("e1")) == ()
+
+    def test_evidence_needs_a_known_execution(self, store: ExecutionStore) -> None:
+        with pytest.raises(ExecutionNotFoundError):
+            store.append_evidence(evidence_record("nope"))
+        with pytest.raises(ExecutionNotFoundError):
+            store.evidence("nope")
+
+    def test_returned_evidence_cannot_change_what_is_stored(self, store: ExecutionStore) -> None:
+        _create(store, "e1", TASK_A, 0)
+        store.append_evidence(evidence_record("e1"))
+        returned = store.evidence("e1")
+        assert isinstance(returned, tuple)
+        assert store.evidence("e1") == returned

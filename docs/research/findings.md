@@ -62,7 +62,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   and add path-containment cases to the `ContainerRuntime` and
   `SourceControlProvider` contracts. Hooks are not needed yet: `checkout` and
   `publish_branch` cover the equivalent steps.
-- Status: proposed (#4, approved) · Affects: ADR-0006 · Milestone: M2
+- Status: accepted (ADR-0012; implemented by #4 and #5) · Affects: ADR-0006
 
 ### F-004: An agent's own judgement of its work is not acceptance evidence
 
@@ -89,7 +89,8 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   touch tests, CI or verification configuration for human review. R7's
   probabilistic "satisfaction" scoring stays **experimental**: do not adopt it
   before deterministic checks exist.
-- Status: proposed (#9, approved) · Affects: ADR-0004, ADR-0006 · Milestone: M2
+- Status: accepted (ADR-0010, ADR-0018; implemented by #9). Holdout checks the
+  agent cannot see remain open · Affects: ADR-0004, ADR-0006, ADR-0018
 
 ### F-006: Retries and continuations need a structured handoff
 
@@ -190,7 +191,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   issue, or GitHub Projects v2 status fields.
 - Recommendation: use as input for the M2 GitHub `TaskProvider` design.
   Prototype before deciding.
-- Status: proposed (#6, approved) · Milestone: M2
+- Status: accepted (ADR-0013; implemented by #6)
 
 ### F-016: The MANIFEST §9 URL for [R3] appears to be wrong
 

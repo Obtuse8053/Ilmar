@@ -13,6 +13,7 @@ from ilmar.domain.errors import (
 )
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.tasks import TaskRef
+from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports.execution_store import check_apply, check_create
 
 
@@ -23,6 +24,7 @@ class InMemoryExecutionStore:
         self._lock = threading.Lock()
         self._executions: dict[str, Execution] = {}
         self._history: dict[str, list[Transition]] = {}
+        self._evidence: dict[str, list[str]] = {}  # serialised, so stored copies cannot change
 
     def create(self, execution: Execution, transition: Transition) -> None:
         check_create(execution, transition)
@@ -69,6 +71,19 @@ class InMemoryExecutionStore:
             if execution_id not in self._history:
                 raise ExecutionNotFoundError(execution_id)
             return tuple(self._history[execution_id])
+
+    def append_evidence(self, record: EvidenceRecord) -> None:
+        with self._lock:
+            if record.execution_id not in self._executions:
+                raise ExecutionNotFoundError(record.execution_id)
+            self._evidence.setdefault(record.execution_id, []).append(record.to_json())
+
+    def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
+        with self._lock:
+            if execution_id not in self._executions:
+                raise ExecutionNotFoundError(execution_id)
+            stored = list(self._evidence.get(execution_id, []))
+        return tuple(EvidenceRecord.from_json(text) for text in stored)
 
     def _active(self, task: TaskRef) -> Execution | None:
         for execution in self._executions.values():

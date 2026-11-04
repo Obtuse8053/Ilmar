@@ -148,6 +148,13 @@ class FakeGitHub:
                         comments.remove(comment)
                         return HttpResponse(204)
             return _json(404, {"message": "Not Found"})
+        if (match := re.fullmatch(r"/issues/(\d+)/labels", path)) and int(
+            match.group(1)
+        ) in self.pulls:
+            labelled = self.pulls[int(match.group(1))]
+            names = {label["name"] for label in labelled.get("labels", [])} | set(body["labels"])
+            labelled["labels"] = [{"name": n} for n in sorted(names)]
+            return _json(200, labelled["labels"])
         if match := re.fullmatch(r"/issues/(\d+)/labels", path):
             issue = self.issues.get(int(match.group(1)))
             if issue is None or method != "POST":

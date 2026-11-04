@@ -25,9 +25,6 @@ statuses in `research/findings.md`.
 
 | Improvement | Finding | Issue |
 | --- | --- | --- |
-| Safe workspace path derivation | F-003 | #4 |
-| Checks the agent cannot edit | F-005 | #9 |
-| GitHub tracker state model | F-015 | #6 |
 | Tracker reconciliation | F-001 | #12 |
 | Backoff and stall detection | F-002 | #13 |
 | Attempt handoff | F-006 | #14 |
@@ -45,4 +42,4 @@ statuses in `research/findings.md`.
    `approved`.
 4. In the same PR, a row is added above and the finding's status is set to
    `proposed (#n, approved)`. The status becomes `accepted` once the merged
-   change or an ADR reflects it.
+   change or an ADR reflects it, and the row is removed in that same PR.

@@ -43,3 +43,28 @@ options = { api_key_env = "ANTHROPIC_API_KEY" }
 [adapters.execution_store]
 kind = "sqlite"
 options = { path = ".ilmar/executions.sqlite3" }
+
+# ADR-0010, ADR-0018: what VERIFYING runs, in a fresh sandbox with no network and
+# no credential. Defined here, never in the repository being changed. The
+# built-in protected, check-influencing and CI-configuration paths always apply;
+# the extra_* lists can only add to them.
+[verification]
+image = "localhost/ilmar-verify:pinned"
+memory_mb = 4096
+extra_protected_paths = ["docs/architecture/decisions/"]
+
+[[verification.commands]]
+name = "lint"
+argv = ["ruff", "check", "."]
+timeout_seconds = 300
+
+[[verification.commands]]
+name = "types"
+argv = ["mypy"]
+timeout_seconds = 600
+
+[[verification.commands]]
+name = "tests"
+argv = ["pytest", "-q"]
+timeout_seconds = 1200
+

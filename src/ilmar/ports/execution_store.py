@@ -8,6 +8,7 @@ from typing import Protocol
 
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.tasks import TaskRef
+from ilmar.domain.verification import EvidenceRecord
 
 
 class ExecutionStore(Protocol):
@@ -21,7 +22,10 @@ class ExecutionStore(Protocol):
     * no lost updates: ``apply`` succeeds only when the stored version is
       ``updated.version - 1`` (otherwise ``ConcurrencyConflictError``);
     * the execution record and its history entry are written together or not
-      at all.
+      at all;
+    * transitions and evidence records are append-only: there is no way to
+      change or remove one, and evidence read back is checked against its
+      digest (``EvidenceIntegrityError``).
 
     Inputs must satisfy :func:`check_create` / :func:`check_apply`.
     """
@@ -45,6 +49,20 @@ class ExecutionStore(Protocol):
 
     def history(self, execution_id: str) -> Sequence[Transition]:
         """All transitions in the order they were stored.
+
+        Raises ``ExecutionNotFoundError`` if the execution does not exist.
+        """
+        ...
+
+    def append_evidence(self, record: EvidenceRecord) -> None:
+        """Append a verification evidence record (ADR-0010, ADR-0018).
+
+        Raises ``ExecutionNotFoundError`` if the execution does not exist.
+        """
+        ...
+
+    def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
+        """All evidence records of an execution, in the order they were appended.
 
         Raises ``ExecutionNotFoundError`` if the execution does not exist.
         """

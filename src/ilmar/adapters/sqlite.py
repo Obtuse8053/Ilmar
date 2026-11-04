@@ -9,7 +9,10 @@ Design notes (ADR-0005):
 * Updates use the execution ``version`` for optimistic concurrency.
 * Timestamps are stored as fixed-width UTC ISO-8601 strings so that text order
   equals time order.
-* The schema version lives in ``PRAGMA user_version``.
+* The schema version lives in ``PRAGMA user_version``. Version 2 (#9) adds
+  the candidate revisions and an ``evidence`` table. Triggers make
+  ``transitions`` and ``evidence`` append-only, and each evidence row carries
+  the digest of its record, checked when read.
 """
 
 from __future__ import annotations
@@ -26,15 +29,17 @@ from typing import Self
 from ilmar.domain.errors import (
     ConcurrencyConflictError,
     DuplicateExecutionError,
+    EvidenceIntegrityError,
     ExecutionNotFoundError,
 )
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.tasks import TaskRef
+from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports.execution_store import check_apply, check_create
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-_SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE executions (
     id                 TEXT PRIMARY KEY,
     task_provider      TEXT NOT NULL,
@@ -67,9 +72,37 @@ CREATE TABLE transitions (
 CREATE INDEX transitions_by_execution ON transitions (execution_id, seq);
 """
 
+# Each entry upgrades the schema from its key to key + 1.
+MIGRATIONS: dict[int, str] = {
+    1: """
+ALTER TABLE executions ADD COLUMN base_revision TEXT;
+ALTER TABLE executions ADD COLUMN candidate_revision TEXT;
+
+CREATE TABLE evidence (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    attempt      INTEGER NOT NULL CHECK (attempt >= 1),
+    recorded_at  TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    record       TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX evidence_by_execution ON evidence (execution_id, seq);
+
+CREATE TRIGGER evidence_is_append_only_update BEFORE UPDATE ON evidence
+BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
+CREATE TRIGGER evidence_is_append_only_delete BEFORE DELETE ON evidence
+BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
+CREATE TRIGGER transitions_are_append_only_update BEFORE UPDATE ON transitions
+BEGIN SELECT RAISE(ABORT, 'history is append-only'); END;
+CREATE TRIGGER transitions_are_append_only_delete BEFORE DELETE ON transitions
+BEGIN SELECT RAISE(ABORT, 'history is append-only'); END;
+""",
+}
+
 _COLUMNS = (
     "id, task_provider, task_key, state, attempt, version, created_at, updated_at, "
-    "branch, change_request_url, last_error"
+    "branch, change_request_url, last_error, base_revision, candidate_revision"
 )
 
 
@@ -120,7 +153,7 @@ class SQLiteExecutionStore:
             try:
                 conn.execute(
                     f"INSERT INTO executions ({_COLUMNS}, is_terminal) "  # noqa: S608
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (*_execution_row(execution), int(execution.state.is_terminal)),
                 )
             except sqlite3.IntegrityError as exc:
@@ -180,8 +213,8 @@ class SQLiteExecutionStore:
             try:
                 conn.execute(
                     "UPDATE executions SET state = ?, is_terminal = ?, attempt = ?, version = ?, "
-                    "updated_at = ?, branch = ?, change_request_url = ?, last_error = ? "
-                    "WHERE id = ?",
+                    "updated_at = ?, branch = ?, change_request_url = ?, last_error = ?, "
+                    "base_revision = ?, candidate_revision = ? WHERE id = ?",
                     (
                         updated.state.value,
                         int(updated.state.is_terminal),
@@ -191,6 +224,8 @@ class SQLiteExecutionStore:
                         updated.branch,
                         updated.change_request_url,
                         updated.last_error,
+                        updated.base_revision,
+                        updated.candidate_revision,
                         updated.id,
                     ),
                 )
@@ -221,6 +256,48 @@ class SQLiteExecutionStore:
             for row in rows
         )
 
+    def append_evidence(self, record: EvidenceRecord) -> None:
+        with self._transaction() as conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM executions WHERE id = ?", (record.execution_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ExecutionNotFoundError(record.execution_id)
+            conn.execute(
+                "INSERT INTO evidence (execution_id, attempt, recorded_at, digest, record) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    record.execution_id,
+                    record.attempt,
+                    _encode_time(record.recorded_at),
+                    record.digest(),
+                    record.to_json(),
+                ),
+            )
+
+    def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
+        with self._lock:
+            if (
+                self._conn.execute(
+                    "SELECT 1 FROM executions WHERE id = ?", (execution_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ExecutionNotFoundError(execution_id)
+            rows = self._conn.execute(
+                "SELECT seq, digest, record FROM evidence WHERE execution_id = ? ORDER BY seq",
+                (execution_id,),
+            ).fetchall()
+        records = []
+        for seq, digest, text in rows:
+            record = EvidenceRecord.from_json(_text(text))
+            if record.digest() != digest or record.execution_id != execution_id:
+                raise EvidenceIntegrityError(f"evidence row {seq} of {execution_id} was altered")
+            records.append(record)
+        return tuple(records)
+
     # -- internals -------------------------------------------------------
 
     @contextmanager
@@ -244,10 +321,20 @@ class SQLiteExecutionStore:
                     f"database schema version {version} is newer than supported "
                     f"version {SCHEMA_VERSION}; upgrade Ilmar"
                 )
-            # version == 0: brand-new database. Later migrations go here.
-            self._conn.executescript(
-                f"BEGIN;\n{_SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
-            )
+            # Brand-new database: create version 1, then apply every migration.
+            # Everything happens in one transaction, so a failure leaves the
+            # file exactly as it was.
+            script = [] if version else [SCHEMA_V1]
+            script += [MIGRATIONS[v] for v in range(max(version, 1), SCHEMA_VERSION)]
+            body = "\n".join(script)
+            try:
+                self._conn.executescript(
+                    f"BEGIN;\n{body}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+                )
+            except sqlite3.Error:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
 
 
 def _encode_time(value: datetime) -> str:
@@ -271,6 +358,8 @@ def _execution_row(execution: Execution) -> tuple[object, ...]:
         execution.branch,
         execution.change_request_url,
         execution.last_error,
+        execution.base_revision,
+        execution.candidate_revision,
     )
 
 
@@ -287,6 +376,8 @@ def _execution_from_row(row: tuple[object, ...]) -> Execution:
         branch,
         change_request_url,
         last_error,
+        base_revision,
+        candidate_revision,
     ) = row
     return Execution(
         id=_text(id_),
@@ -299,6 +390,8 @@ def _execution_from_row(row: tuple[object, ...]) -> Execution:
         branch=_optional_text(branch),
         change_request_url=_optional_text(change_request_url),
         last_error=_optional_text(last_error),
+        base_revision=_optional_text(base_revision),
+        candidate_revision=_optional_text(candidate_revision),
     )
 
 

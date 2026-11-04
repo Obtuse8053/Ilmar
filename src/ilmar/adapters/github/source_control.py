@@ -244,7 +244,15 @@ class GitHubSourceControl:
                 f"/repos/{slug}/pulls",
                 body={"title": spec.title, "head": source, "base": target, "body": body},
             )
-        return self._change_request(spec.repository, pull)
+        labels = [str(label.get("name")) for label in pull.get("labels") or []]
+        if spec.labels:  # added, never removed: a human may have set others
+            added = self._client.request(
+                "POST",
+                f"/repos/{slug}/issues/{int(pull['number'])}/labels",
+                body={"labels": sorted(set(spec.labels))},
+            )
+            labels = [str(label.get("name")) for label in added or []]
+        return self._change_request(spec.repository, pull, labels)
 
     def checks(self, change_request: ChangeRequest) -> ChecksSummary:
         slug = self._slug(change_request.repository)
@@ -365,13 +373,16 @@ class GitHubSourceControl:
                     f"ci-config-modified: {revision[:12]} changes {path}; a human must publish it"
                 )
 
-    def _change_request(self, repository: RepositoryRef, pull: Any) -> ChangeRequest:
+    def _change_request(
+        self, repository: RepositoryRef, pull: Any, labels: list[str]
+    ) -> ChangeRequest:
         return ChangeRequest(
             repository=repository,
             key=str(int(pull["number"])),
             url=str(pull.get("html_url") or ""),
             source_branch=str((pull.get("head") or {}).get("ref") or ""),
             target_branch=str((pull.get("base") or {}).get("ref") or ""),
+            labels=tuple(sorted(set(labels))),
         )
 
 

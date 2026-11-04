@@ -14,6 +14,11 @@ Happy path::
 From PROVISIONING onwards a retryable failure moves to RETRY_WAIT, which
 returns to PROVISIONING with the attempt counter incremented. Every
 non-terminal state can move to FAILED or CANCELLED.
+
+Candidate revisions (ADR-0010): ``base_revision`` is recorded on entering
+RUNNING_AGENT and ``candidate_revision`` on entering VERIFYING; VERIFYING and
+PUBLISHING cannot be entered without them, they cannot be changed within an
+attempt, and a new attempt (RETRY_WAIT -> PROVISIONING) clears both.
 """
 
 from __future__ import annotations
@@ -110,6 +115,8 @@ class ExecutionStateMachine:
         error: str | None = None,
         branch: str | None = None,
         change_request_url: str | None = None,
+        base_revision: str | None = None,
+        candidate_revision: str | None = None,
     ) -> tuple[Execution, Transition]:
         """Move ``execution`` to ``target``.
 
@@ -144,6 +151,8 @@ class ExecutionStateMachine:
                     f"execution {execution.id} has used all {self._max_attempts} attempts"
                 )
 
+        base, candidate = _revisions(execution, target, base_revision, candidate_revision)
+
         updated = dataclasses.replace(
             execution,
             state=target,
@@ -157,6 +166,8 @@ class ExecutionStateMachine:
                 else execution.change_request_url
             ),
             last_error=error if error is not None else execution.last_error,
+            base_revision=base,
+            candidate_revision=candidate,
         )
         transition = Transition(
             execution_id=execution.id,
@@ -166,6 +177,39 @@ class ExecutionStateMachine:
             reason=reason,
         )
         return updated, transition
+
+
+def _revisions(
+    execution: Execution,
+    target: ExecutionState,
+    base_revision: str | None,
+    candidate_revision: str | None,
+) -> tuple[str | None, str | None]:
+    """The revisions after the transition; ``ValueError`` if the rules are broken."""
+    if execution.state is _S.RETRY_WAIT and target is _S.PROVISIONING:
+        if base_revision or candidate_revision:
+            raise ValueError("a new attempt starts without revisions")
+        return None, None  # a new attempt never inherits a candidate
+    base, candidate = execution.base_revision, execution.candidate_revision
+    if base_revision is not None:
+        if target is not _S.RUNNING_AGENT or base is not None:
+            raise ValueError("base_revision is set once, on entering running_agent")
+        base = _revision(base_revision, "base_revision")
+    if candidate_revision is not None:
+        if target is not _S.VERIFYING or candidate is not None:
+            raise ValueError("candidate_revision is set once, on entering verifying")
+        candidate = _revision(candidate_revision, "candidate_revision")
+    if target in (_S.VERIFYING, _S.PUBLISHING) and (base is None or candidate is None):
+        raise ValueError(f"entering {target.value} requires a base and a candidate revision")
+    if target is _S.RUNNING_AGENT and base is None:
+        raise ValueError("entering running_agent requires the base revision")
+    return base, candidate
+
+
+def _revision(value: str, name: str) -> str:
+    if not value or not value.isalnum():
+        raise ValueError(f"{name} must be a non-empty revision id")
+    return value
 
 
 def _require_reason(reason: str) -> None:

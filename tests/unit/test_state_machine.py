@@ -15,6 +15,8 @@ from helpers import at
 
 S = ExecutionState
 TASK = TaskRef("fake", "1")
+BASE, CANDIDATE = "a" * 40, "b" * 40
+
 HAPPY_PATH = [
     S.CLAIMED,
     S.PROVISIONING,
@@ -41,6 +43,8 @@ def walk(
             now=execution.updated_at + timedelta(seconds=1),
             reason="test",
             error=error,
+            base_revision=BASE if target is S.RUNNING_AGENT else None,
+            candidate_revision=CANDIDATE if target is S.VERIFYING else None,
         )
     return execution
 
@@ -198,3 +202,70 @@ def test_advance_does_not_mutate_input(machine: ExecutionStateMachine) -> None:
     machine.advance(execution, S.CLAIMED, now=at(1), reason="test")
     assert execution.state is S.QUEUED
     assert execution.version == 1
+
+
+# -- candidate revisions (ADR-0010, #9) -----------------------------------------------
+
+
+def test_happy_path_records_base_and_candidate(machine: ExecutionStateMachine) -> None:
+    execution = walk(machine, started(machine), *HAPPY_PATH)
+    assert (execution.base_revision, execution.candidate_revision) == (BASE, CANDIDATE)
+
+
+def test_verifying_and_publishing_need_a_candidate(machine: ExecutionStateMachine) -> None:
+    running = walk(machine, started(machine), S.CLAIMED, S.PROVISIONING, S.RUNNING_AGENT)
+    with pytest.raises(ValueError, match="candidate revision"):
+        machine.advance(running, S.VERIFYING, now=at(100), reason="test")
+
+
+def test_running_agent_needs_the_base(machine: ExecutionStateMachine) -> None:
+    provisioning = walk(machine, started(machine), S.CLAIMED, S.PROVISIONING)
+    with pytest.raises(ValueError, match="base revision"):
+        machine.advance(provisioning, S.RUNNING_AGENT, now=at(100), reason="test")
+
+
+def test_revisions_are_set_once_and_only_at_their_step(machine: ExecutionStateMachine) -> None:
+    provisioning = walk(machine, started(machine), S.CLAIMED, S.PROVISIONING)
+    with pytest.raises(ValueError, match="candidate_revision is set once"):
+        machine.advance(
+            provisioning, S.RUNNING_AGENT, now=at(100), reason="t",
+            base_revision=BASE, candidate_revision=CANDIDATE,
+        )  # fmt: skip
+    verifying = walk(machine, provisioning, S.RUNNING_AGENT, S.VERIFYING)
+    with pytest.raises(ValueError, match="candidate_revision is set once"):
+        machine.advance(
+            verifying, S.PUBLISHING, now=at(100), reason="t", candidate_revision="c" * 40
+        )
+    with pytest.raises(ValueError, match="base_revision is set once"):
+        machine.advance(verifying, S.PUBLISHING, now=at(100), reason="t", base_revision="c" * 40)
+
+
+def test_a_new_attempt_clears_the_revisions(machine: ExecutionStateMachine) -> None:
+    verifying = walk(
+        machine, started(machine), S.CLAIMED, S.PROVISIONING, S.RUNNING_AGENT, S.VERIFYING
+    )
+    retried = walk(machine, verifying, S.RETRY_WAIT, S.PROVISIONING)
+    assert retried.attempt == 2
+    assert (retried.base_revision, retried.candidate_revision) == (None, None)
+    with pytest.raises(ValueError, match="new attempt"):
+        machine.advance(
+            walk(machine, verifying, S.RETRY_WAIT), S.PROVISIONING, now=at(500), reason="t",
+            base_revision=BASE,
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize("bad", ["", "not hex!", "../x"])
+def test_revision_ids_are_validated(machine: ExecutionStateMachine, bad: str) -> None:
+    provisioning = walk(machine, started(machine), S.CLAIMED, S.PROVISIONING)
+    with pytest.raises(ValueError, match="revision id"):
+        machine.advance(provisioning, S.RUNNING_AGENT, now=at(100), reason="t", base_revision=bad)
+
+
+def test_a_candidate_needs_a_base() -> None:
+    from ilmar.domain.execution import Execution
+
+    with pytest.raises(ValueError, match="base revision"):
+        Execution(
+            id="e", task=TASK, state=S.VERIFYING, attempt=1, version=1,
+            created_at=at(0), updated_at=at(0), candidate_revision=CANDIDATE,
+        )  # fmt: skip

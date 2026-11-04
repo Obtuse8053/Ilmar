@@ -57,6 +57,8 @@ class ChangeRequestSpec:
     title: str
     description: str
     task: TaskRef
+    labels: tuple[str, ...] = ()
+    """Added to the change request; labels are never removed (a human may have set them)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,8 @@ class ChangeRequest:
     url: str
     source_branch: str
     target_branch: str
+    labels: tuple[str, ...] = ()
+    """All labels now on the change request, sorted."""
 
 
 class CheckState(enum.Enum):

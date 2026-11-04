@@ -31,6 +31,8 @@ def test_example_configuration_is_valid() -> None:
     assert config.adapters["agent_runner"].kind == "claude-code"
     assert config.adapters["execution_store"].kind == "sqlite"
     assert config.state_dir == REPO_ROOT / ".ilmar"
+    assert config.verification is not None
+    assert [c.name for c in config.verification.commands] == ["lint", "types", "tests"]
 
 
 def test_defaults() -> None:
@@ -126,3 +128,80 @@ def test_relative_state_dir_resolves_against_config_file(tmp_path: Path) -> None
     lines += [f'[adapters.{port}]\nkind = "fake"\n' for port in PORT_NAMES]
     path.write_text("".join(lines))
     assert load_config(path).state_dir == tmp_path / "conf" / "state"
+
+
+# -- [verification] (#9, ADR-0018) ---------------------------------------------------
+
+
+def with_verification(**section: Any) -> dict[str, Any]:
+    data = minimal()
+    data["verification"] = {
+        "image": "localhost/verify:1",
+        "commands": [{"name": "tests", "argv": ["pytest", "-q"], "timeout_seconds": 900}],
+    } | section
+    return data
+
+
+def test_verification_is_optional() -> None:
+    assert parse_config(minimal(), base_dir=BASE).verification is None
+
+
+def test_verification_policy_is_parsed() -> None:
+    policy = parse_config(
+        with_verification(memory_mb=2048, cpus=2, max_processes=256), base_dir=BASE
+    ).verification
+    assert policy is not None
+    assert policy.image == "localhost/verify:1"
+    (command,) = policy.commands
+    assert (command.name, command.argv, command.timeout_seconds, command.required) == (
+        "tests",
+        ("pytest", "-q"),
+        900.0,
+        True,
+    )
+    assert (policy.limits.memory_mb, policy.limits.cpus, policy.limits.max_processes) == (
+        2048,
+        2.0,
+        256,
+    )
+
+
+def test_path_classes_can_only_be_extended() -> None:
+    policy = parse_config(
+        with_verification(
+            extra_protected_paths=["docs/policy.md"],
+            extra_check_influencing_paths=["fixtures/"],
+            extra_ci_config_paths=[".woodpecker.yml"],
+        ),
+        base_dir=BASE,
+    ).verification
+    assert policy is not None
+    assert "AGENTS.md" in policy.protected_paths
+    assert "docs/policy.md" in policy.protected_paths
+    assert ".github/" in policy.ci_config_paths
+    assert ".woodpecker.yml" in policy.ci_config_paths
+    assert "tests/" in policy.check_influencing_paths
+    assert "fixtures/" in policy.check_influencing_paths
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ({"image": ""}, "image"),
+        ({"commands": []}, "at least one"),
+        ({"commands": [{"name": "t", "argv": "pytest"}]}, "argv"),
+        ({"commands": [{"name": "t", "argv": []}]}, "argv"),
+        ({"commands": [{"name": "t", "argv": ["x"], "timeout_seconds": "5"}]}, "timeout"),
+        ({"commands": [{"name": "t", "argv": ["x"], "required": "yes"}]}, "required"),
+        ({"commands": [{"name": "t", "argv": ["x"], "shell": True}]}, "unknown"),
+        ({"commands": [{"name": "bad/name", "argv": ["x"]}]}, "check name"),
+        ({"ci_config_paths": []}, "unknown"),
+        ({"extra_ci_config_paths": "x"}, "list"),
+        ({"extra_protected_paths": ["/abs"]}, "pattern"),
+        ({"cpus": 0}, "cpus"),
+        ({"memory_mb": -1}, "memory_mb"),
+    ],
+)
+def test_verification_errors_are_reported(section: dict[str, Any], message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        parse_config(with_verification(**section), base_dir=BASE)
