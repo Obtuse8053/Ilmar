@@ -268,6 +268,11 @@ def test_network_none_has_only_loopback_and_no_routes(
     assert all(line.split()[-1] == "lo" for line in ipv6_routes.splitlines())
 
 
+def test_network_none_allows_no_icmp_sockets(sandbox: Sandbox) -> None:
+    low, high = inside(sandbox, ["cat", "/proc/sys/net/ipv4/ping_group_range"]).split()
+    assert int(low) > int(high)
+
+
 def test_network_none_has_no_resolver(sandbox: Sandbox) -> None:
     resolv = inside(sandbox, sh("cat /etc/resolv.conf 2>/dev/null; true"))
     assert "nameserver" not in resolv

@@ -111,6 +111,7 @@ def test_hardened_profile_options(
     ):
         assert option in args
     assert args[args.index("--user") + 1] == "1000:1000"
+    assert args[args.index("--sysctl") + 1] == "net.ipv4.ping_group_range=1 0"
     assert "--privileged" not in args
     assert not any(a.startswith(("--cap-add", "--security-opt=seccomp")) for a in args)
     tmpfs = [args[i + 1] for i, a in enumerate(args) if a == "--tmpfs"]
@@ -542,6 +543,7 @@ def test_allowlist_sandbox_sits_only_on_the_internal_network(
     assert sysctls == {
         "net.ipv6.conf.all.disable_ipv6=1",
         "net.ipv6.conf.default.disable_ipv6=1",
+        "net.ipv4.ping_group_range=1 0",
     }
     proxy_url = f"http://{proxy.networks['ilmar-exec-1-1-net']}:3128"
     assert sandbox.env["HTTPS_PROXY"] == proxy_url

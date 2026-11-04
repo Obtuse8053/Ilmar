@@ -455,8 +455,11 @@ class PodmanRuntime:
 
     @staticmethod
     def _network_arguments(network: NetworkPolicy, name: str) -> list[str]:
+        # Podman's default containers.conf allows unprivileged ICMP sockets for
+        # group 0 (ping_group_range "0 0"); disable them entirely.
+        no_icmp = ["--sysctl", "net.ipv4.ping_group_range=1 0"]
         if network is NetworkPolicy.NONE:
-            return ["--network=none", "--no-hosts"]
+            return ["--network=none", "--no-hosts", *no_icmp]
         if network is NetworkPolicy.ALLOWLIST:
             return [
                 "--network",
@@ -467,6 +470,7 @@ class PodmanRuntime:
                 "net.ipv6.conf.all.disable_ipv6=1",
                 "--sysctl",
                 "net.ipv6.conf.default.disable_ipv6=1",
+                *no_icmp,
             ]
         return []  # UNRESTRICTED: Podman's default network (opted in)
 
