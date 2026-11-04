@@ -47,12 +47,19 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#40, the sandbox egress allow-list and the full ADR-0011 §9 network suite
-(plan step 5a, building on #5). It completes the sandbox, and #8 needs it.
-#7 does not depend on it and can go first if preferred. **Waiting for the
+#7, the GitHub `SourceControlProvider` with hardened host git and
+exact-revision publishing (plan step 6). With #40 the sandbox is complete,
+and #8 and #9 build on #7's candidate revisions. **Waiting for the
 maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #40 finished (closes #5 together with PR #39):
+  `NetworkPolicy.ALLOWLIST` via a per-execution proxy sidecar on an owned
+  `--internal` network (ADR-0015, proposed; amends where ADR-0011's proxy
+  runs). The standard-library proxy allows `CONNECT <listed-host>:443` only.
+  The full ADR-0011 §9 suite runs on real Podman in CI with nonce controls; it
+  found and fixed Podman's default ICMP permission. Next recommended: #7.
 
 - 2026-11-04: #5 part 1 merged (PR #39); #5 stays open until #40 completes
   the remaining sandbox requirements. Rootless Podman `ContainerRuntime` with

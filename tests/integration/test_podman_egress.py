@@ -206,8 +206,10 @@ def test_allowlist_sandbox_structure(allow: Sandbox) -> None:
     assert int(status["CapEff"].strip(), 16) == 0
     assert int(status["CapBnd"].strip(), 16) == 0
     # No ICMP sockets: no CAP_NET_RAW, and unprivileged ping is disabled.
-    low, high = inside(allow, ["cat", "/proc/sys/net/ipv4/ping_group_range"]).split()
-    assert int(low) > int(high)
+    runtime, handle = allow
+    ping = runtime.run(handle, ["ping", "-c", "1", "-W", "2", "127.0.0.1"], timeout_seconds=30)
+    assert ping.exit_code != 0
+    assert "permission denied" in (ping.stdout + ping.stderr).lower()
     assert not inside(allow, sh("ls /run/podman /var/run/docker.sock 2>/dev/null; true")).strip()
 
 

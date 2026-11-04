@@ -269,8 +269,15 @@ def test_network_none_has_only_loopback_and_no_routes(
 
 
 def test_network_none_allows_no_icmp_sockets(sandbox: Sandbox) -> None:
-    low, high = inside(sandbox, ["cat", "/proc/sys/net/ipv4/ping_group_range"]).split()
-    assert int(low) > int(high)
+    """Behavioural: loopback always exists, so a ping that fails here was refused.
+
+    (Reading ``ping_group_range`` inside the user namespace shows unmapped
+    groups as 65534, so the value itself cannot tell an empty range apart.)
+    """
+    runtime, handle = sandbox
+    result = runtime.run(handle, ["ping", "-c", "1", "-W", "2", "127.0.0.1"], timeout_seconds=30)
+    assert result.exit_code != 0
+    assert "permission denied" in (result.stdout + result.stderr).lower()
 
 
 def test_network_none_has_no_resolver(sandbox: Sandbox) -> None:
