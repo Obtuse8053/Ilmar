@@ -100,7 +100,6 @@ def test_hardened_profile_options(
         "--env-host=false",
         "--http-proxy=false",
         "--network=none",
-        "--dns=none",
         "--no-hosts",
         "--init",
         "--log-driver=none",

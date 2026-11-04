@@ -352,7 +352,7 @@ class PodmanRuntime:
         if env_file:
             args += ["--env-file", env_file]
         if spec.network is NetworkPolicy.NONE:
-            args += ["--network=none", "--dns=none", "--no-hosts"]
+            args += ["--network=none", "--no-hosts"]
         if limits.max_processes is not None:
             args += ["--pids-limit", str(limits.max_processes)]
         if limits.memory_mb is not None:
