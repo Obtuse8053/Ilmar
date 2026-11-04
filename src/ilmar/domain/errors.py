@@ -44,6 +44,10 @@ class LeaseConflictError(ConflictError):
     """A branch head differs from the expected head; the publish was refused (ADR-0010)."""
 
 
+class NonFastForwardError(ConflictError):
+    """Publishing would rewrite branch history; the publish was refused (ADR-0010)."""
+
+
 class CandidateRejectedError(IlmarError):
     """Agent output cannot be frozen safely (nested repository, special file, ...)."""
 

@@ -87,10 +87,16 @@ class SourceControlProvider(Protocol):
     ) -> None:
         """Make ``branch`` on the platform point exactly at ``revision``. Never commits.
 
-        No-op if the branch already points at ``revision``. Otherwise the branch
-        head must equal ``expected_head`` (``None``: the branch must not exist),
-        or ``LeaseConflictError`` is raised and nothing changes. An unknown
-        revision raises ``ProviderError``.
+        No-op if the branch already points at ``revision``. Otherwise:
+
+        * the branch head must equal ``expected_head`` (``None``: the branch must
+          not exist), or ``LeaseConflictError`` is raised;
+        * if the branch exists, ``revision`` must descend from its head
+          (fast-forward only), or ``NonFastForwardError`` is raised. Published
+          history is never rewritten.
+
+        In both error cases nothing changes. An unknown revision raises
+        ``ProviderError``.
         """
         ...
 

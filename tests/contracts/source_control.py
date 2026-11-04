@@ -25,6 +25,7 @@ from ilmar.domain.changes import (
 from ilmar.domain.errors import (
     CandidateRejectedError,
     LeaseConflictError,
+    NonFastForwardError,
     OwnershipConflictError,
     ProviderError,
 )
@@ -404,6 +405,38 @@ class SourceControlContract:
             repo, revision=second.revision, branch=TASK_BRANCH, expected_head=base
         )
         assert provider.branch_head(repo, TASK_BRANCH) == second.revision
+
+    def test_publish_never_rewrites_history(
+        self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path
+    ) -> None:
+        """A correct lease is not enough: the new revision must descend from the head."""
+        (workspace / "progress.txt").write_text("published work\n")
+        published = self._freeze(provider, repo, workspace)
+        provider.publish_revision(
+            repo, revision=published.revision, branch=TASK_BRANCH, expected_head=None
+        )
+        # A candidate frozen on main, not on the published head: a sibling, not a descendant.
+        sibling_ws = tmp_path / "sibling"
+        provider.checkout(repo, base_branch="main", branch="unrelated", destination=sibling_ws)
+        (sibling_ws / "src" / "app.py").write_text("print('rewritten')\n")
+        sibling = self._freeze(provider, repo, sibling_ws)
+        with pytest.raises(NonFastForwardError):
+            provider.publish_revision(
+                repo,
+                revision=sibling.revision,
+                branch=TASK_BRANCH,
+                expected_head=published.revision,
+            )
+        assert provider.branch_head(repo, TASK_BRANCH) == published.revision
+        # The base itself is an ancestor, not a descendant: moving back is also refused.
+        with pytest.raises(NonFastForwardError):
+            provider.publish_revision(
+                repo,
+                revision=published.base_revision,
+                branch=TASK_BRANCH,
+                expected_head=published.revision,
+            )
+        assert provider.branch_head(repo, TASK_BRANCH) == published.revision
 
     def test_publish_rejects_unknown_revision(
         self, provider: SourceControlProvider, repo: RepositoryRef

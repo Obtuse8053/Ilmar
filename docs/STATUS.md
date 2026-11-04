@@ -54,7 +54,8 @@ explicit go-ahead.**
 
 - 2026-11-04: #3 finished: contract suites for all five ports, with
   ADR-0010/0012 port changes (immutable candidate revisions, expected-head
-  leases, owner-checked containers, structured agent outcomes). Next
+  leases with fast-forward-only publishing, owner-checked containers,
+  structured agent outcomes). Next
   recommended: #4.
 
 - 2026-11-04: M2 design review (#33). Proposed ADR-0010 (verify and publish

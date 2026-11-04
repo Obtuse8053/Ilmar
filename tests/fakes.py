@@ -28,6 +28,7 @@ from ilmar.domain.changes import (
 from ilmar.domain.errors import (
     CandidateRejectedError,
     LeaseConflictError,
+    NonFastForwardError,
     OwnershipConflictError,
     ProviderError,
 )
@@ -267,6 +268,7 @@ class FakeSourceControl:
     def __init__(self, *, name: str = "fake") -> None:
         self._name = name
         self._revisions: dict[str, Tree] = {}
+        self._parents: dict[str, str | None] = {}
         self._branches: dict[tuple[RepositoryRef, str], str] = {}
         self._change_requests: dict[tuple[RepositoryRef, str], _ChangeRequestRecord] = {}
         self._keys = itertools.count(1)
@@ -369,6 +371,8 @@ class FakeSourceControl:
             return
         if head != expected_head:
             raise LeaseConflictError(f"{branch} is at {head}, expected {expected_head}")
+        if head is not None and not self._descends_from(revision, head):
+            raise NonFastForwardError(f"{revision} does not descend from {branch} at {head}")
         self._branches[(repository, branch)] = revision
         self.pushes.append((repository, branch, revision))
 
@@ -416,7 +420,16 @@ class FakeSourceControl:
             digest.update(b"x" if entry.executable else b"-")
         revision = digest.hexdigest()[:40]
         self._revisions.setdefault(revision, dict(tree))
+        self._parents.setdefault(revision, parent)
         return revision
+
+    def _descends_from(self, revision: str, ancestor: str) -> bool:
+        current: str | None = revision
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = self._parents.get(current)
+        return False
 
     @staticmethod
     def _materialise(tree: Tree, destination: Path) -> None:
