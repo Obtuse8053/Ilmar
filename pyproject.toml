@@ -68,11 +68,11 @@ select = [
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]  # asserts; fake credentials in config tests
+"tests/**" = ["S101", "S105", "S106", "S108"]  # asserts; fake credentials; container paths
 
 [tool.ruff.lint.isort]
 known-first-party = ["ilmar"]
-known-local-folder = ["contracts", "fake_github", "fakes", "helpers", "license_inventory"]
+known-local-folder = ["contracts", "fake_github", "fake_podman", "fakes", "helpers", "license_inventory"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

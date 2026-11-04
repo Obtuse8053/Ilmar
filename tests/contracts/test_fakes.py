@@ -19,6 +19,7 @@ from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
     ContainerSpec,
+    DirectoryIdentity,
     ResourceOwner,
 )
 from ilmar.ports.agent_runner import AgentRunner
@@ -27,7 +28,7 @@ from ilmar.ports.source_control import SourceControlProvider
 from ilmar.ports.task_provider import TaskProvider
 
 from contracts.agent_runner import AgentRunnerContract, AgentScenario
-from contracts.container_runtime import ContainerRuntimeContract
+from contracts.container_runtime import ContainerRuntimeContract, identity_of
 from contracts.source_control import BASE_FILES, SourceControlContract
 from contracts.task_provider import TaskProviderContract
 from fakes import (
@@ -60,8 +61,16 @@ class TestFakeContainerRuntime(ContainerRuntimeContract):
     def make_runtime(self) -> ContainerRuntime:
         return FakeContainerRuntime()
 
-    def make_spec(self, workspace: Path, name: str, owner: ResourceOwner) -> ContainerSpec:
-        return ContainerSpec(image="fake:latest", host_workspace=workspace, name=name, owner=owner)
+    def make_spec(
+        self, workspace: Path, name: str, owner: ResourceOwner, identity: DirectoryIdentity
+    ) -> ContainerSpec:
+        return ContainerSpec(
+            image="fake:latest",
+            host_workspace=workspace,
+            name=name,
+            owner=owner,
+            workspace_identity=identity,
+        )
 
     def create_foreign(
         self, runtime: ContainerRuntime, spec: ContainerSpec, owner: ResourceOwner | None
@@ -144,7 +153,11 @@ class TestFakeAgentRunner(AgentRunnerContract):
         workspace = self._tmp / scenario.value
         workspace.mkdir(parents=True, exist_ok=True)
         spec = ContainerSpec(
-            image="fake:latest", host_workspace=workspace, name="agent", owner=FAKE_OWNER
+            image="fake:latest",
+            host_workspace=workspace,
+            name="agent",
+            owner=FAKE_OWNER,
+            workspace_identity=identity_of(workspace),
         )
         return runtime, runtime.start(spec)
 

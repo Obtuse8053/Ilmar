@@ -34,9 +34,10 @@ Skip any step whose issue GitHub shows as finished.
 | 2 | #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner` | #33 |
 | 3 | #4 Safe workspace path derivation | #3 |
 | 4 | #6 GitHub `TaskProvider` | #3 |
-| 5 | #5 Podman `ContainerRuntime` and sandbox profile | #4 |
+| 5 | #5 Podman `ContainerRuntime` and sandbox profile (network `NONE`) | #4 |
+| 5a | #40 Sandbox egress allow-list and the ADR-0011 §9 suite | #5 |
 | 6 | #7 GitHub `SourceControlProvider` | #3, #4 |
-| 7 | #8 Claude Code `AgentRunner` | #3, #5 |
+| 7 | #8 Claude Code `AgentRunner` | #3, #40 |
 | 8 | #9 Verification stage | #5, #7 |
 | 9 | #10 Adapter registry | before #11 |
 | 10 | #11 Coordinator loop and end-to-end test (closes M2) | all of the above |
@@ -46,10 +47,24 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#5, the Podman `ContainerRuntime` and the sandbox profile (plan step 5,
-building on #4). **Waiting for the maintainer's explicit go-ahead.**
+#40, the sandbox egress allow-list and the full ADR-0011 §9 network suite
+(plan step 5a, building on #5). It completes the sandbox, and #8 needs it.
+#7 does not depend on it and can go first if preferred. **Waiting for the
+maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #5 part 1 merged (PR #39); #5 stays open until #40 completes
+  the remaining sandbox requirements. Rootless Podman `ContainerRuntime` with
+  the ADR-0011 profile and network `NONE`. ADR-0014 (accepted) records the
+  Podman mapping: a `keep-id` non-root user, the runtime enforcing the
+  recorded workspace identity before and after start, and a timed-out command
+  removing its container (a port contract change). The contract, profile and
+  network `NONE` checks run against real Podman in a new CI job.
+  `UNRESTRICTED` needs a deployment opt-in; an unconfirmed removal raises
+  `ContainmentError` and quarantines the workspace (restart-safe quarantine is
+  part of #12 and #15). The allow-list proxy and the full §9 suite were split
+  into #40. Next recommended: #40.
 
 - 2026-11-04: #6 finished: GitHub `TaskProvider` on a standard-library REST
   client (REST only; token kept to the API origin, including on redirects).

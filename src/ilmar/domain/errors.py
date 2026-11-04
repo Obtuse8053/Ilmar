@@ -54,3 +54,21 @@ class CandidateRejectedError(IlmarError):
 
 class ProviderError(IlmarError):
     """An external provider failed. Adapters wrap provider-specific errors in this."""
+
+
+class PolicyViolationError(IlmarError):
+    """A request exceeds what the deployment permits (for example unrestricted egress)."""
+
+
+class ContainmentError(ProviderError):
+    """A sandbox that had to be removed could not be confirmed gone.
+
+    Its workspace must not be reused, mounted or frozen until removal is
+    confirmed. The coordinator records the container for reconciliation
+    (ADR-0012, ADR-0014).
+    """
+
+    def __init__(self, message: str, *, container_id: str, name: str) -> None:
+        super().__init__(message)
+        self.container_id = container_id
+        self.name = name

@@ -20,6 +20,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0011](0011-sandbox-isolation-profile.md) | Sandbox isolation profile and egress allow-listing | Accepted |
 | [0012](0012-recovery-safe-side-effects.md) | Recovery-safe external side effects | Accepted |
 | [0013](0013-github-task-state.md) | GitHub task state under a single-coordinator deployment | Accepted |
+| [0014](0014-podman-runtime-mapping.md) | Podman runtime mapping, workspace identity and command timeouts | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

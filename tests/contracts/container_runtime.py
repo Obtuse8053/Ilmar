@@ -9,13 +9,20 @@ remove a container, and operations act on the immutable id.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
-from ilmar.domain.errors import OwnershipConflictError, ProviderError
-from ilmar.domain.workspace import ContainerHandle, ContainerSpec, ResourceOwner
+from ilmar.domain.errors import OwnershipConflictError, PolicyViolationError, ProviderError
+from ilmar.domain.workspace import (
+    ContainerHandle,
+    ContainerSpec,
+    DirectoryIdentity,
+    NetworkPolicy,
+    ResourceOwner,
+)
 from ilmar.ports.container_runtime import ContainerRuntime
 
 OWNER = ResourceOwner(instance_id="inst-a", execution_id="exec-1", attempt=1, token="tok-1")
@@ -26,11 +33,28 @@ OTHER_INSTANCE = ResourceOwner(
 NAME = "ilmar-inst-a-exec-1-1"
 
 
+def identity_of(path: Path) -> DirectoryIdentity:
+    info = path.lstat()
+    return DirectoryIdentity(info.st_dev, info.st_ino)
+
+
 class ContainerRuntimeContract:
     def make_runtime(self) -> ContainerRuntime:
         raise NotImplementedError
 
-    def make_spec(self, workspace: Path, name: str, owner: ResourceOwner) -> ContainerSpec:
+    def make_workspace(self, tmp_path: Path) -> Path:
+        """Create the directory the runtime may mount (override to fit a layout)."""
+        path = tmp_path / "workspace"
+        path.mkdir()
+        return path
+
+    def make_spec(
+        self,
+        workspace: Path,
+        name: str,
+        owner: ResourceOwner,
+        identity: DirectoryIdentity,
+    ) -> ContainerSpec:
         raise NotImplementedError
 
     def create_foreign(
@@ -58,13 +82,11 @@ class ContainerRuntimeContract:
 
     @pytest.fixture
     def workspace(self, tmp_path: Path) -> Path:
-        path = tmp_path / "workspace"
-        path.mkdir()
-        return path
+        return self.make_workspace(tmp_path)
 
     @pytest.fixture
     def spec(self, workspace: Path) -> ContainerSpec:
-        return self.make_spec(workspace, NAME, OWNER)
+        return self.make_spec(workspace, NAME, OWNER, identity_of(workspace))
 
     @pytest.fixture
     def container(
@@ -108,12 +130,16 @@ class ContainerRuntimeContract:
         assert not result.succeeded
         assert not result.timed_out
 
-    def test_timeout_is_reported(
+    def test_timeout_is_reported_and_removes_the_container(
         self, runtime: ContainerRuntime, container: ContainerHandle
     ) -> None:
         result = runtime.run(container, self.sleep(30), timeout_seconds=1)
         assert result.timed_out
         assert not result.succeeded
+        assert not runtime.is_running(container)
+        assert runtime.find(NAME) is None
+        with pytest.raises(ProviderError):
+            runtime.run(container, self.echo("after timeout"), timeout_seconds=30)
 
     def test_workspace_is_shared_with_host(
         self, runtime: ContainerRuntime, container: ContainerHandle, workspace: Path
@@ -122,7 +148,37 @@ class ContainerRuntimeContract:
         assert result.succeeded
         assert (workspace / "out.txt").read_text().strip() == "done"
 
+    # -- network policy (PR #39 review) -------------------------------------
+
+    def test_unrestricted_network_needs_a_deployment_opt_in(
+        self, runtime: ContainerRuntime, spec: ContainerSpec
+    ) -> None:
+        with pytest.raises(PolicyViolationError):
+            runtime.start(dataclasses.replace(spec, network=NetworkPolicy.UNRESTRICTED))
+        assert runtime.find(NAME) is None
+
     # -- workspace containment (#4) ----------------------------------------
+
+    def test_a_replaced_workspace_is_not_mounted(
+        self, runtime: ContainerRuntime, workspace: Path
+    ) -> None:
+        recorded = identity_of(workspace)
+        workspace.rename(workspace.with_name("moved-away"))
+        workspace.mkdir()  # same path, different directory
+        with pytest.raises(OwnershipConflictError):
+            runtime.start(self.make_spec(workspace, NAME, OWNER, recorded))
+        assert runtime.find(NAME) is None
+
+    def test_a_symlinked_workspace_is_not_mounted(
+        self, runtime: ContainerRuntime, workspace: Path
+    ) -> None:
+        target = workspace.with_name("elsewhere")
+        target.mkdir()
+        workspace.rmdir()
+        workspace.symlink_to(target)
+        with pytest.raises(OwnershipConflictError):
+            runtime.start(self.make_spec(workspace, NAME, OWNER, identity_of(target)))
+        assert runtime.find(NAME) is None
 
     def test_writes_cannot_escape_the_workspace(
         self, runtime: ContainerRuntime, container: ContainerHandle, workspace: Path

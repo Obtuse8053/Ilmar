@@ -40,6 +40,14 @@ class ResourceLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectoryIdentity:
+    """Immutable identity of a host directory: survives renames, changes if replaced."""
+
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceOwner:
     """Who owns a runtime resource (ADR-0012).
 
@@ -66,6 +74,8 @@ class ContainerSpec:
 
     ``host_workspace`` is a directory on the coordinator's host that is mounted
     read-write at ``container_workdir``. Nothing else from the host is shared.
+    ``workspace_identity`` is the identity the resource ledger recorded for it;
+    a runtime refuses to mount a directory with any other identity (ADR-0012).
     ``name`` is derived deterministically by the core (ADR-0012); ``owner`` is
     attached to the container so that only its owner can replace or remove it.
     """
@@ -74,6 +84,7 @@ class ContainerSpec:
     host_workspace: Path
     name: str
     owner: ResourceOwner
+    workspace_identity: DirectoryIdentity
     container_workdir: PurePosixPath = DEFAULT_CONTAINER_WORKDIR
     env: Mapping[str, str] = field(default_factory=dict)
     network: NetworkPolicy = NetworkPolicy.NONE
