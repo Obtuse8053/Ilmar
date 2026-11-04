@@ -213,8 +213,8 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Recommendation: the host never uses the agent's `.git`. It freezes the
   working tree as plain content into a coordinator-owned repository, using
   hardened git invocations.
-- Status: open (decision proposed in ADR-0010; implementation criteria added
-  to #3, #7) · Affects: ADR-0006, ADR-0010
+- Status: accepted (ADR-0010; implemented by #3, #7) · Affects: ADR-0006,
+  ADR-0010
 
 ### F-018: Claude Code needs only a small, documented egress set when preinstalled
 
@@ -230,7 +230,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Recommendation: allow only the model endpoint, disable non-essential
   traffic, and record the hosts actually contacted in an opt-in integration
   test (#8).
-- Status: open (ADR-0011) · Affects: ADR-0011
+- Status: accepted (ADR-0011; verified by #8) · Affects: ADR-0011
 
 ### F-019: An LLM gateway can keep the real model credential out of the sandbox
 
@@ -252,7 +252,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   runtimes also offer internal networks with no external route.
 - Implication: an internal network plus a host-side filtering proxy gives the
   same allow-list with no network capabilities in the sandbox.
-- Status: open (ADR-0011) · Affects: ADR-0011
+- Status: accepted (ADR-0011; implemented by #5) · Affects: ADR-0011
 
 ### F-021: Agent CLI exit status may not reflect failure
 
@@ -275,5 +275,5 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Implication: M1's `publish_branch` commits at publish time, so verification
   and publication are not bound to the same bytes.
 - Recommendation: bind verification and publication to a commit id (ADR-0010).
-- Status: open (ADR-0010; criteria added to #3, #7, #9) · Affects: ADR-0004,
-  ADR-0010
+- Status: accepted (ADR-0010; implemented by #3, #7, #9) · Affects:
+  ADR-0004, ADR-0010

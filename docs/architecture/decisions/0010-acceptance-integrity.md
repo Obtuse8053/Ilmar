@@ -1,6 +1,6 @@
 # ADR-0010: Verify and publish one immutable candidate revision; humans accept
 
-- Status: Proposed
+- Status: Accepted (PR #34, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R3], [R7], [R9], [R17] · Findings: F-004, F-005, F-017, F-021, F-022
 - Amends: ADR-0004 (adds the candidate revision), ADR-0006 (host-side git)

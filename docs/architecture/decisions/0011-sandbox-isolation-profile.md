@@ -1,6 +1,6 @@
 # ADR-0011: Sandbox isolation profile and egress allow-listing
 
-- Status: Proposed
+- Status: Accepted (PR #34, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R13], [R14], [R15], [R16], [R18] · Findings: F-018, F-019, F-020
 - Amends: ADR-0006 (resolves its "Revisit when: egress allow-listing")

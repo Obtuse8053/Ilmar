@@ -1,6 +1,6 @@
 # ADR-0012: Recovery-safe external side effects
 
-- Status: Proposed
+- Status: Accepted (PR #34, 2026-11-04)
 - Date: 2026-11-04
 - Sources: [R1], [R3] · Findings: F-001, F-006
 
