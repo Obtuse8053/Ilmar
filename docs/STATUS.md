@@ -47,12 +47,19 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#7, the GitHub `SourceControlProvider` with hardened host git and
-exact-revision publishing (plan step 6). With #40 the sandbox is complete,
-and #8 and #9 build on #7's candidate revisions. **Waiting for the
-maintainer's explicit go-ahead.**
+#8, the Claude Code `AgentRunner` (plan step 7). It runs in the
+`ALLOWLIST` sandbox from #40. #9, the verification stage, can follow on #7's
+candidate revisions. **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-04: #7 finished: GitHub `SourceControlProvider` on plumbing-only,
+  hardened host git (ADR-0016, accepted). Workspaces are read as data into
+  `fast-import` and written back from `ls-tree`/`cat-file`. The token is a
+  scoped header passed through the environment only. Publishing uses a lease,
+  is fast-forward only and confirms the remote head; CI-configuration changes
+  are refused. Pull requests carry a marker. The full contract runs against
+  real git. Next recommended: #8.
 
 - 2026-11-04: #40 finished (closes #5 together with PR #39):
   `NetworkPolicy.ALLOWLIST` via a per-execution proxy sidecar on an owned
