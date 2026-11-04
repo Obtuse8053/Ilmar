@@ -15,8 +15,9 @@ work is tracked in GitHub issues (see `docs/roadmap.md`).
   evidence or our own hypotheses. Needs a prototype or primary confirmation
   before it can justify a decision.
 
-**Status:** `open` (not yet proposed), `proposed` (issue opened), `accepted`
-(reflected in an ADR), `rejected` (with reason) or `superseded`.
+**Status:** `open` (not yet proposed), `proposed (#n)` (an issue exists; it
+also says whether the issue is approved), `accepted` (reflected in a merged
+change or ADR), `rejected` (with reason) or `superseded`.
 
 Entries are paraphrased. Never paste source text here (MANIFEST §7).
 
@@ -34,7 +35,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   was closed or unlabelled must move to CANCELLED.
 - Recommendation: add a reconciliation step to the M3 coordinator loop and give
   `TaskProvider` a contract test for "task became ineligible".
-- Status: open · Affects: ADR-0004, ADR-0005 · Milestone: M3
+- Status: proposed (#12, approved) · Affects: ADR-0004, ADR-0005 · Milestone: M3
 
 ### F-002: Retries need backoff timing and stall detection
 
@@ -47,7 +48,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Recommendation: in M3, add a durable `retry_not_before` to `Execution` (a
   schema change that needs an ADR update) and a heartbeat or stall timeout to
   `AgentRunner`/`ContainerRuntime`.
-- Status: open · Affects: ADR-0004 · Milestone: M3
+- Status: proposed (#13, approved) · Affects: ADR-0004 · Milestone: M3
 
 ### F-003: Workspace path safety should be part of the contract
 
@@ -61,7 +62,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   and add path-containment cases to the `ContainerRuntime` and
   `SourceControlProvider` contracts. Hooks are not needed yet: `checkout` and
   `publish_branch` cover the equivalent steps.
-- Status: open · Affects: ADR-0006 · Milestone: M2
+- Status: proposed (#4, approved) · Affects: ADR-0006 · Milestone: M2
 
 ### F-004: An agent's own judgement of its work is not acceptance evidence
 
@@ -88,7 +89,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   touch tests, CI or verification configuration for human review. R7's
   probabilistic "satisfaction" scoring stays **experimental**: do not adopt it
   before deterministic checks exist.
-- Status: open · Affects: ADR-0004, ADR-0006 · Milestone: M2
+- Status: proposed (#9, approved) · Affects: ADR-0004, ADR-0006 · Milestone: M2
 
 ### F-006: Retries and continuations need a structured handoff
 
@@ -99,7 +100,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   `last_error`.
 - Recommendation: in M3, persist a short attempt summary (agent summary,
   verification output) and pass it to the next attempt's `AgentRequest`.
-- Status: open · Affects: ADR-0004 · Milestone: M3
+- Status: proposed (#14, approved) · Affects: ADR-0004 · Milestone: M3
 
 ### F-007: Keep AGENTS.md a short map; put detail in linked docs
 
@@ -109,7 +110,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Implication: AGENTS.md is the entry point for every agent session.
 - Recommendation: keep AGENTS.md around 200 lines, move procedures into
   `docs/`, and consider a size check in `tests/architecture/`.
-- Status: open (applied informally in this change) · Affects: ADR-0008
+- Status: proposed (#30, approved) · Affects: ADR-0008
 
 ### F-008: Mechanical enforcement of layering works well with agents
 
@@ -127,7 +128,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   see the failing check output, not just "failed".
 - Recommendation: combine with F-006 in M3. Full app observability belongs to
   M4 (self-hosting).
-- Status: open · Milestone: M3–M4
+- Status: proposed (#14, approved) · Milestone: M3–M4
 
 ### F-010: A minimal open-source agent is a credible second AgentRunner
 
@@ -139,7 +140,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   A second adapter would test the portability of the port and reduce reliance
   on one proprietary agent.
 - Recommendation: candidate second agent for M5.
-- Status: open · Affects: ADR-0002 · Milestone: M5
+- Status: proposed (#24, approved) · Affects: ADR-0002 · Milestone: M5
 
 ### F-011: Pluggable sandbox providers are common practice
 
@@ -189,7 +190,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   issue, or GitHub Projects v2 status fields.
 - Recommendation: use as input for the M2 GitHub `TaskProvider` design.
   Prototype before deciding.
-- Status: open · Milestone: M2
+- Status: proposed (#6, approved) · Milestone: M2
 
 ### F-016: The MANIFEST §9 URL for [R3] appears to be wrong
 
@@ -198,4 +199,4 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   it lives under `/engineering/` rather than `/research/`.
 - Recommendation: a maintainer should verify the URL and correct MANIFEST §9.
   The manifest is a sensitive file, so the agent did not change it.
-- Status: open
+- Status: proposed (#27, approved)

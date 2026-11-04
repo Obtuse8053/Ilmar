@@ -4,8 +4,8 @@ Ilmar is an open-source, provider-independent software factory. It turns
 development tasks into verified code changes using existing autonomous coding
 agents, and is being built to eventually develop and maintain itself.
 
-> **Status:** pre-alpha, milestone M1 (Foundation). Nothing here runs tasks end
-> to end yet.
+> **Status:** pre-alpha. Nothing here runs tasks end to end yet. For current
+> progress, see [`docs/STATUS.md`](docs/STATUS.md).
 
 ## What exists today
 
@@ -37,6 +37,8 @@ ilmar config validate ilmar.example.toml
   [decision records](docs/architecture/decisions/).
 - [`docs/research/`](docs/research/): source registry, findings and the
   research review process.
+- [`docs/STATUS.md`](docs/STATUS.md): where development stands and what is next.
+- [`docs/workflow.md`](docs/workflow.md): how work is planned, claimed and reviewed.
 - [`docs/roadmap.md`](docs/roadmap.md): milestone status and approved improvements.
 
 ## Contributing

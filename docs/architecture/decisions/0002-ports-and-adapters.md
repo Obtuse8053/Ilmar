@@ -1,6 +1,6 @@
 # ADR-0002: Ports and adapters with an enforced dependency rule
 
-- Status: Proposed
+- Status: Accepted (PR #1, 2026-11-01)
 - Date: 2026-11-01
 - Sources: [R1], [R2], [R4], [R5], [R6] · Findings: F-008, F-010, F-011
 

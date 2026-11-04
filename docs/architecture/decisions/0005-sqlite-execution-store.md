@@ -1,6 +1,6 @@
 # ADR-0005: SQLite execution store with database-enforced single active execution
 
-- Status: Proposed
+- Status: Accepted (PR #1, 2026-11-01)
 - Date: 2026-11-01
 - Sources: [R1] · Findings: F-001
 
