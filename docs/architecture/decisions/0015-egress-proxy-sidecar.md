@@ -70,9 +70,11 @@ Chosen option: 2.
     before a new start.
   - Resources with any other owner are never touched.
 - **Podman defaults overridden:** Podman's default `containers.conf` allows
-  unprivileged ICMP sockets for group 0 (`ping_group_range "0 0"`). The
-  §9 structural check caught this. `NONE` and `ALLOWLIST` sandboxes set
-  `1 0`.
+  unprivileged ICMP sockets for group 0 (`ping_group_range "0 0"`). The §9
+  structural check surfaced this. The sandbox user (gid 1000) was never
+  covered by it, so this is defence in depth, not a fix for an exposure.
+  `NONE` and `ALLOWLIST` sandboxes set `1 0`. A behavioural test (ping to
+  loopback is refused) checks the result.
 - **Verification (ADR-0011 §9):** the real-Podman CI job runs the §9 suite
   with nonce controls against self-hosted targets on the host's IPv4 address
   (TCP 53/80/443, UDP 53/443). Required cases:

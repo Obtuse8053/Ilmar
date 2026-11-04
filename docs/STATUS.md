@@ -58,8 +58,9 @@ maintainer's explicit go-ahead.**
   `NetworkPolicy.ALLOWLIST` via a per-execution proxy sidecar on an owned
   `--internal` network (ADR-0015, proposed; amends where ADR-0011's proxy
   runs). The standard-library proxy allows `CONNECT <listed-host>:443` only.
-  The full ADR-0011 §9 suite runs on real Podman in CI with nonce controls; it
-  found and fixed Podman's default ICMP permission. Next recommended: #7.
+  The full ADR-0011 §9 suite runs on real Podman in CI with nonce controls
+  (63 of 63). ICMP sockets are now explicitly disabled as defence in depth.
+  Next recommended: #7.
 
 - 2026-11-04: #5 part 1 merged (PR #39); #5 stays open until #40 completes
   the remaining sandbox requirements. Rootless Podman `ContainerRuntime` with

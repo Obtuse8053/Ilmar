@@ -312,10 +312,12 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   Reaching the host means the host-loopback forward, which exposes every
   loopback service. Separately, Podman's default `containers.conf` sets
   `net.ipv4.ping_group_range` to `0 0`, allowing unprivileged ICMP sockets
-  for group 0.
+  for group 0. Inside the user namespace that value reads as `65534 65534`,
+  so only a behavioural check can show whether ICMP is really refused.
 - Implication: an allow-list proxy for rootless sandboxes belongs in a
   container on the internal network, not on the host. Isolated sandboxes
-  must override the ICMP default explicitly.
+  should override the ICMP default (defence in depth) and test it by
+  behaviour.
 - Status: accepted (ADR-0015; implemented by #40) · Affects: ADR-0011,
   ADR-0015
 
