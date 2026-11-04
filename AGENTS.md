@@ -135,8 +135,10 @@ The process and formats are in `docs/research/README.md`. The rules:
 ## 5. Testing rules
 
 - Tests are deterministic and offline. No network and no real containers in the
-  default `pytest` run. Integration tests that need real services will be
-  marked and opt-in (introduced in M2).
+  default `pytest` run. Tests that need real services are marked
+  `@pytest.mark.integration`, excluded by default, and run with
+  `pytest -m integration` plus the environment variables each test documents.
+  They must skip, not fail, when those variables are absent.
 - New behaviour comes with tests. Bug fixes come with a regression test.
 - Contract suites test behaviour visible through the port, not implementation
   details.

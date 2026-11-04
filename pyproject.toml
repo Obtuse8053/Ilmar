@@ -49,7 +49,10 @@ ilmar = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests", "scripts"]
-addopts = ["--strict-markers", "--strict-config", "-ra"]
+addopts = ["--strict-markers", "--strict-config", "-ra", "-m", "not integration"]
+markers = [
+    "integration: needs real external services or credentials; opt in with `pytest -m integration`",
+]
 xfail_strict = true
 filterwarnings = ["error"]
 
@@ -69,7 +72,7 @@ ignore = []
 
 [tool.ruff.lint.isort]
 known-first-party = ["ilmar"]
-known-local-folder = ["contracts", "fakes", "helpers", "license_inventory"]
+known-local-folder = ["contracts", "fake_github", "fakes", "helpers", "license_inventory"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

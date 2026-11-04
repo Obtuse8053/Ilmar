@@ -40,6 +40,7 @@ copy; see MANIFEST §7 and `THIRD_PARTY_NOTICES.md`.
 | R17 | Git project: discussions of repository-local config that executes commands (`core.fsmonitor`, `core.hooksPath`, pagers, textconv), the 2024 `core.hooksPath` clone hardening, and a 2022 advisory on `core.fsmonitor` abuse | 2017–2024 | n/a (mailing-list posts and advisories); ideas only | primary (snippet) of git mailing list; secondary advisory (2026-11-04) | Git trusts repository-local config, so running git in an untrusted repository can run arbitrary commands | New Git security releases |
 | R18 | Podman isolation options: `--network none`, `--internal` networks, `--cap-drop`, `--read-only`, `no-new-privileges`, user namespaces, resource limits | Ongoing | n/a; ideas only | secondary (tutorials) (2026-11-04). The primary Podman documentation was **not** consulted; do so in #5 | Container hardening and network isolation building blocks | Podman releases |
 | R19 | Community report: Claude Code non-interactive mode returned exit status 0 on errors, and hooks did not fire (zenn.dev, tested on v2.0.60) | 2025 | All rights reserved (default) | secondary (2026-11-04) | Exit codes may not reflect failure | **Experimental**; re-test in #8 |
+| R20 | GitHub REST API: issues, labels, comments, pagination and versioning ([docs](https://docs.github.com/en/rest/issues)) | Living documentation; API version `2022-11-28` | All rights reserved (docs); ideas only | primary (snippet) of docs.github.com, plus **empirical** read-only calls against `Obtuse8053/Ilmar` (2026-11-04). Auto-creation of labels: secondary | The issues list includes pull requests (`pull_request` key); `labels` filter; `Link`-header cursor pagination; 404 for missing issues; removing an absent label returns 404; adding labels needs Issues write permission and creates missing labels | API version deprecations |
 
 ## Access log
 
@@ -47,5 +48,6 @@ Add a row whenever a source is consulted for a decision or a review.
 
 | Date | IDs | Purpose | Notes |
 | --- | --- | --- | --- |
+| 2026-11-04 | R20 | GitHub `TaskProvider` (#6) | docs.github.com could not be fetched directly. Behaviour was confirmed by read-only REST calls (`gh api`) against this repository and by search snippets of the docs. |
 | 2026-11-04 | R13–R19 | M2 design review (#33): Claude Code connectivity, gateway and headless output; sandbox egress; host-side git safety; Podman isolation | `code.claude.com` was fetched directly. Other pages came from search snippets or secondary reports, as marked. |
 | 2026-11-01 | R1–R7, R9–R12 | Initial verification of the MANIFEST §9 registry (M1) | GitHub, openai.com and anthropic.com could not be fetched directly from the build environment. Information came from search snippets of the primary pages and from secondary reports. Findings in `findings.md` carry evidence levels that reflect this. |
