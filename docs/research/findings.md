@@ -303,3 +303,21 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Status: accepted (ADR-0014; port contract changed in #5) · Affects:
   ADR-0014, the `ContainerRuntime` port
 
+### F-025: Rootless internal networks cannot reach host processes, and Podman's defaults allow ICMP
+
+- Evidence: **Established** (primary Podman documentation, [R21], and
+  observed in CI on Podman 4.9 with netavark) · Sources: [R21]
+- Observation: rootless bridge networks, including `--internal` ones, live in
+  the user's rootless network namespace, so a host process is not on them.
+  Reaching the host means the host-loopback forward, which exposes every
+  loopback service. Separately, Podman's default `containers.conf` sets
+  `net.ipv4.ping_group_range` to `0 0`, allowing unprivileged ICMP sockets
+  for group 0. Inside the user namespace that value reads as `65534 65534`,
+  so only a behavioural check can show whether ICMP is really refused.
+- Implication: an allow-list proxy for rootless sandboxes belongs in a
+  container on the internal network, not on the host. Isolated sandboxes
+  should override the ICMP default (defence in depth) and test it by
+  behaviour.
+- Status: accepted (ADR-0015; implemented by #40) · Affects: ADR-0011,
+  ADR-0015
+

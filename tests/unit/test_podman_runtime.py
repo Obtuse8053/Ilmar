@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from ilmar.adapters.podman import PodmanRuntime, SandboxProfile
+from ilmar.adapters.podman import EgressSettings, PodmanRuntime, SandboxProfile
 from ilmar.adapters.podman.runtime import (
     LABEL_MANAGED,
     PODMAN_ENVIRONMENT,
@@ -35,7 +35,7 @@ from ilmar.domain.workspace import (
     ResourceOwner,
 )
 
-from fake_podman import FakePodman
+from fake_podman import FakeNetwork, FakePodman
 
 OWNER = ResourceOwner(instance_id="inst-a", execution_id="exec-1", attempt=1, token="tok-1")
 Workspace = tuple[Path, DirectoryIdentity]
@@ -111,6 +111,7 @@ def test_hardened_profile_options(
     ):
         assert option in args
     assert args[args.index("--user") + 1] == "1000:1000"
+    assert args[args.index("--sysctl") + 1] == "net.ipv4.ping_group_range=1 0"
     assert "--privileged" not in args
     assert not any(a.startswith(("--cap-add", "--security-opt=seccomp")) for a in args)
     tmpfs = [args[i + 1] for i, a in enumerate(args) if a == "--tmpfs"]
@@ -453,3 +454,306 @@ def test_quarantined_workspace_is_refused_under_any_container_name(
     with pytest.raises(ContainmentError):
         rt.start(spec(workspace, name="ilmar-exec-1-verify"))
     assert podman.commands().count("run") == runs_before
+
+
+# -- ALLOWLIST: internal network plus egress proxy sidecar (#40, ADR-0015) ----------
+
+EGRESS = EgressSettings(proxy_image="localhost/ilmar-proxy:1")
+HOSTS = ("api.example.com",)
+
+
+def allowlist_spec(workspace: Workspace, **kwargs: object) -> ContainerSpec:
+    return spec(workspace, network=NetworkPolicy.ALLOWLIST, allowed_hosts=HOSTS, **kwargs)
+
+
+def call_args(podman: FakePodman, *prefix: str) -> list[list[str]]:
+    return [c.argv for c in podman.calls if c.argv[1 : 1 + len(prefix)] == list(prefix)]
+
+
+def test_allowlist_needs_egress_settings(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    with pytest.raises(ProviderError, match="EgressSettings"):
+        runtime(layout, podman).start(allowlist_spec(workspace))
+    assert "run" not in podman.commands()
+    assert set(podman.networks) == {"podman"}
+
+
+def test_allowlist_creates_an_owned_internal_network_without_dns(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    (create,) = call_args(podman, "network", "create")
+    assert "--internal" in create
+    assert "--disable-dns" in create
+    assert "--ipv6" not in create
+    network = podman.networks["ilmar-exec-1-1-net"]
+    assert network.internal
+    assert not network.dns_enabled
+    assert network.labels["io.ilmar.owner.token"] == "tok-1"
+    assert network.labels["io.ilmar.role"] == "egress-network"
+
+
+def test_egress_proxy_sidecar_is_hardened_and_bridges_two_networks(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    proxy = podman.by_name("ilmar-exec-1-1-egress")
+    assert proxy is not None
+    args = proxy.run_args
+    for option in (
+        "--cap-drop=all",
+        "--security-opt=no-new-privileges",
+        "--read-only",
+        "--read-only-tmpfs=false",
+        "--env-host=false",
+        "--http-proxy=false",
+        "--pull=never",
+    ):
+        assert option in args
+    assert args[args.index("--user") + 1] == "65534:65534"
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--network"] == [
+        "ilmar-exec-1-1-net",
+        "podman",
+    ]
+    (mount,) = [args[i + 1] for i, a in enumerate(args) if a == "--mount"]
+    assert mount.endswith("egress_proxy.py,destination=/ilmar-egress-proxy.py,ro=true")
+    command = args[args.index("localhost/ilmar-proxy:1") :]
+    assert command[:3] == ["localhost/ilmar-proxy:1", "python3", "-I"]
+    assert command[command.index("--allow") + 1] == "api.example.com"
+    subnet = podman.networks["ilmar-exec-1-1-net"].subnet
+    assert command[command.index("--clients") + 1] == subnet
+    assert proxy.labels["io.ilmar.role"] == "egress-proxy"
+
+
+def test_allowlist_sandbox_sits_only_on_the_internal_network(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    sandbox = podman.by_name("ilmar-exec-1-1")
+    proxy = podman.by_name("ilmar-exec-1-1-egress")
+    assert sandbox is not None
+    assert proxy is not None
+    args = sandbox.run_args
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--network"] == ["ilmar-exec-1-1-net"]
+    assert "--network=none" not in args
+    for option in ("--dns=none", "--no-hosts", "--cap-drop=all"):
+        assert option in args
+    sysctls = {args[i + 1] for i, a in enumerate(args) if a == "--sysctl"}
+    assert sysctls == {
+        "net.ipv6.conf.all.disable_ipv6=1",
+        "net.ipv6.conf.default.disable_ipv6=1",
+        "net.ipv4.ping_group_range=1 0",
+    }
+    proxy_url = f"http://{proxy.networks['ilmar-exec-1-1-net']}:3128"
+    assert sandbox.env["HTTPS_PROXY"] == proxy_url
+    assert sandbox.env["https_proxy"] == proxy_url
+    assert sandbox.labels["io.ilmar.role"] == "sandbox"
+
+
+def sidecars(podman: FakePodman) -> tuple[bool, bool]:
+    return podman.by_name("ilmar-exec-1-1-egress") is not None, (
+        "ilmar-exec-1-1-net" in podman.networks
+    )
+
+
+def test_stop_removes_sandbox_proxy_and_network(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    assert sidecars(podman) == (True, True)
+    rt.stop(handle, owner=OWNER)
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+def test_timeout_removes_the_sidecar_too(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    assert rt.run(handle, ["sleep", "60"], timeout_seconds=1).timed_out
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+def test_restart_replaces_sidecars_without_leaking(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    rt.start(allowlist_spec(workspace))
+    rt.start(allowlist_spec(workspace))
+    assert sorted(c.name for c in podman.containers.values()) == [
+        "ilmar-exec-1-1",
+        "ilmar-exec-1-1-egress",
+    ]
+    assert set(podman.networks) == {"podman", "ilmar-exec-1-1-net"}
+
+
+def test_owned_leftovers_of_a_crashed_start_are_cleaned_first(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    rt.start(allowlist_spec(workspace))
+    sandbox = podman.by_name("ilmar-exec-1-1")
+    assert sandbox is not None
+    del podman.containers[sandbox.id]  # the sandbox vanished, sidecars remain
+    rt.start(allowlist_spec(workspace))
+    assert len([c for c in podman.containers.values() if c.name.endswith("-egress")]) == 1
+
+
+def test_foreign_sidecar_resources_are_never_touched(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    other = {"io.ilmar.owner.instance": "inst-b", "io.ilmar.owner.execution": "exec-1"}
+    other |= {"io.ilmar.owner.attempt": "1", "io.ilmar.owner.token": "tok-9"}
+    podman.networks["ilmar-exec-1-1-net"] = FakeNetwork(
+        "ilmar-exec-1-1-net", other, "10.89.9.0/24", internal=True, dns_enabled=False
+    )
+    with pytest.raises(ProviderError, match="network create"):
+        runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    assert podman.networks["ilmar-exec-1-1-net"].labels == other
+    assert "run" not in podman.commands()
+
+
+def test_a_proxy_that_never_becomes_ready_fails_closed(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.proxy_ready = False
+    ticks = iter(range(1000))
+    rt = runtime(
+        layout,
+        podman,
+        egress=EGRESS,
+        clock=lambda: float(next(ticks)),
+        sleep=lambda seconds: None,
+    )
+    with pytest.raises(ProviderError, match="did not become ready"):
+        rt.start(allowlist_spec(workspace))
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+def test_egress_settings_are_validated() -> None:
+    with pytest.raises(ValueError, match="image"):
+        EgressSettings(proxy_image="-x")
+    with pytest.raises(ValueError, match="network"):
+        EgressSettings(proxy_image="img", egress_network="bad name")
+    with pytest.raises(ValueError, match="unprivileged"):
+        EgressSettings(proxy_image="img", proxy_port=80)
+
+
+def test_extra_hosts_pin_addresses_in_the_proxy_only(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    egress = EgressSettings(
+        proxy_image="localhost/ilmar-proxy:1", extra_hosts={"API.Example.com": "10.1.2.3"}
+    )
+    runtime(layout, podman, egress=egress).start(allowlist_spec(workspace))
+    proxy = podman.by_name("ilmar-exec-1-1-egress")
+    sandbox = podman.by_name("ilmar-exec-1-1")
+    assert proxy is not None
+    assert sandbox is not None
+    assert proxy.run_args[proxy.run_args.index("--add-host") + 1] == "api.example.com:10.1.2.3"
+    assert "--add-host" not in sandbox.run_args
+
+
+@pytest.mark.parametrize(
+    ("hosts", "message"),
+    [({"1.2.3.4": "1.2.3.4"}, "hostname"), ({"api.example.com": "not-an-ip"}, "IP")],
+)
+def test_extra_hosts_are_validated(hosts: dict[str, str], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        EgressSettings(proxy_image="img", extra_hosts=hosts)
+
+
+# -- PR #41 review: partial sidecar teardown fails closed ------------------------------
+
+
+def break_teardown(podman: FakePodman, part: str) -> None:
+    if part == "proxy":
+        podman.fail_rm_names.add("ilmar-exec-1-1-egress")
+    else:
+        podman.network_rm_fails = True
+
+
+def repair_teardown(podman: FakePodman) -> None:
+    podman.fail_rm_names.clear()
+    podman.network_rm_fails = False
+
+
+def runs_of(podman: FakePodman, name: str) -> int:
+    return sum(1 for c in call_args(podman, "run") if c[c.index("--name") + 1] == name)
+
+
+@pytest.mark.parametrize("part", ["proxy", "network"])
+@pytest.mark.parametrize("how", ["stop", "timeout"])
+def test_failed_sidecar_teardown_quarantines_the_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, part: str, how: str
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    break_teardown(podman, part)
+
+    def tear_down() -> object:
+        if how == "stop":
+            rt.stop(handle, owner=OWNER)
+            return None
+        return rt.run(handle, ["sleep", "60"], timeout_seconds=1)  # containment, not a result
+
+    with pytest.raises(ContainmentError, match="ilmar-exec-1-1"):
+        tear_down()
+    assert podman.by_name("ilmar-exec-1-1") is None  # the sandbox itself went
+    assert sidecars(podman) != (False, False)  # but not all of its egress resources
+
+    # Retrying under the same or another container name is refused, and no
+    # sandbox is started on the workspace while egress resources remain.
+    for name in ("ilmar-exec-1-1-retry", "ilmar-exec-1-1"):  # another name first
+        with pytest.raises(ContainmentError):
+            rt.start(allowlist_spec(workspace, name=name))
+        with pytest.raises(ContainmentError):
+            rt.start(spec(workspace, name=name))  # NONE too: the workspace is what is owed
+    assert runs_of(podman, "ilmar-exec-1-1") == 1
+    assert runs_of(podman, "ilmar-exec-1-1-retry") == 0
+
+    # Once removal succeeds, the obligation is discharged and the workspace usable.
+    repair_teardown(podman)
+    replacement = rt.start(allowlist_spec(workspace))
+    assert replacement.id != handle.id
+    assert len([c for c in podman.containers.values() if c.name.endswith("-egress")]) == 1
+
+
+def test_sidecar_quarantine_is_per_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    break_teardown(podman, "proxy")
+    with pytest.raises(ContainmentError):
+        rt.stop(handle, owner=OWNER)
+    other = layout.agent_workspace("exec-2", 1)
+    other_spec = spec(
+        (other, ensure_directory(other, root=layout.workspaces_root)), name="ilmar-exec-2-1"
+    )
+    assert rt.start(other_spec).name == "ilmar-exec-2-1"
+
+
+def test_failed_cleanup_after_a_failed_start_quarantines_the_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.proxy_ready = False
+    podman.network_rm_fails = True
+    ticks = iter(range(1000))
+    rt = runtime(
+        layout, podman, egress=EGRESS, clock=lambda: float(next(ticks)), sleep=lambda s: None
+    )
+    with pytest.raises(ContainmentError):
+        rt.start(allowlist_spec(workspace))
+    with pytest.raises(ContainmentError):
+        rt.start(spec(workspace, name="ilmar-exec-1-other"))
+    assert runs_of(podman, "ilmar-exec-1-other") == 0
+    podman.network_rm_fails = False
+    podman.proxy_ready = True
+    rt.start(spec(workspace, name="ilmar-exec-1-other"))
+    assert "ilmar-exec-1-1-net" not in podman.networks

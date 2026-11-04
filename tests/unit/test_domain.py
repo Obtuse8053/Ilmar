@@ -158,3 +158,57 @@ def test_agent_request_requires_positive_timeout() -> None:
     task = Task(TaskRef("fake", "1"), "t", "d")
     with pytest.raises(ValueError, match="timeout"):
         AgentRequest(task=task, instructions="do it", timeout_seconds=0)
+
+
+# -- network allow-list (#40) ---------------------------------------------------
+
+
+def _spec(tmp_path: Path, **kwargs: object) -> ContainerSpec:
+    return ContainerSpec(
+        image="img",
+        host_workspace=tmp_path,
+        name="ilmar-e-1",
+        owner=OWNER,
+        workspace_identity=IDENT,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_allowlist_hosts_are_normalised_and_deduplicated(tmp_path: Path) -> None:
+    spec = _spec(
+        tmp_path,
+        network=NetworkPolicy.ALLOWLIST,
+        allowed_hosts=("API.Anthropic.com.", "api.anthropic.com", "example.org"),
+    )
+    assert spec.allowed_hosts == ("api.anthropic.com", "example.org")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "1.2.3.4",
+        "[::1]",
+        "::1",
+        "localhost",
+        "exa mple.com",
+        "-bad.com",
+        "bad-.com",
+        "under_score.com",
+        "a..b",
+        "",
+        "host.com:443",
+        "x" * 64 + ".com",
+        "10.0.0.1.",
+    ],
+)
+def test_allowlist_rejects_addresses_and_malformed_names(tmp_path: Path, host: str) -> None:
+    with pytest.raises(ValueError, match="hostname"):
+        _spec(tmp_path, network=NetworkPolicy.ALLOWLIST, allowed_hosts=(host,))
+
+
+def test_allowlist_needs_hosts_and_hosts_need_allowlist(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        _spec(tmp_path, network=NetworkPolicy.ALLOWLIST)
+    for policy in (NetworkPolicy.NONE, NetworkPolicy.UNRESTRICTED):
+        with pytest.raises(ValueError, match="only meaningful"):
+            _spec(tmp_path, network=policy, allowed_hosts=("example.org",))

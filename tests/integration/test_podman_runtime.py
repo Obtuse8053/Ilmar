@@ -22,16 +22,8 @@ probe tool itself works inside the sandbox.
 
 from __future__ import annotations
 
-import contextlib
-import enum
-import os
 import secrets
-import shutil
-import socket
-import subprocess
-import threading
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -44,7 +36,6 @@ from ilmar.adapters.podman.runtime import (
     LABEL_TOKEN,
 )
 from ilmar.core.layout import WorkspaceLayout
-from ilmar.core.safe_fs import ensure_directory
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.workspace import (
     ContainerHandle,
@@ -57,44 +48,41 @@ from ilmar.domain.workspace import (
 from ilmar.ports.container_runtime import ContainerRuntime
 
 from contracts.container_runtime import NAME, OWNER, ContainerRuntimeContract
+from integration.podman_support import (
+    IMAGE,
+    PODMAN,
+    EchoServer,
+    Sandbox,
+    classify,
+    expect_isolated,
+    host_ipv4,
+    identity_of,
+    inside,
+    make_workspace,
+    podman,
+    remove_everything,
+    require,
+    sandbox_tcp,
+    sh,
+    tcp_control,
+)
 
 pytestmark = pytest.mark.integration
 
-IMAGE = os.environ.get("ILMAR_TEST_PODMAN_IMAGE", "")
-REQUIRED = os.environ.get("ILMAR_TEST_PODMAN_REQUIRED") == "1"
-PODMAN = shutil.which("podman")
 NAMES = (NAME, "ilmar-it-profile", "ilmar-it-open")
 SENTINEL = "ilmar-sentinel-must-not-leak"
 
 
 @pytest.fixture(autouse=True)
 def _require_podman() -> None:
-    missing = [
-        what
-        for what, present in (("podman", PODMAN), ("ILMAR_TEST_PODMAN_IMAGE", IMAGE))
-        if not present
-    ]
-    if missing:
-        message = f"needs {' and '.join(missing)}"
-        if REQUIRED:
-            pytest.fail(f"ILMAR_TEST_PODMAN_REQUIRED=1 but the suite {message}")
-        pytest.skip(message)
-
-
-def podman(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    assert PODMAN is not None
-    return subprocess.run(  # noqa: S603 - test helper, fixed executable
-        [PODMAN, *args], capture_output=True, text=True, check=check, timeout=120
-    )
+    require(("podman", PODMAN), ("ILMAR_TEST_PODMAN_IMAGE", IMAGE))
 
 
 @pytest.fixture(autouse=True)
 def _clean_containers(_require_podman: None) -> Iterator[None]:
-    for name in NAMES:
-        podman("rm", "--force", "--time", "0", name, check=False)
+    remove_everything(*NAMES)
     yield
-    for name in NAMES:
-        podman("rm", "--force", "--time", "0", name, check=False)
+    remove_everything(*NAMES)
 
 
 @pytest.fixture
@@ -102,21 +90,6 @@ def layout(tmp_path: Path) -> WorkspaceLayout:
     layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
     layout.workspaces_root.mkdir(parents=True)
     return layout
-
-
-def make_workspace(layout: WorkspaceLayout, execution: str = "exec-1") -> Path:
-    path = layout.agent_workspace(execution, 1)
-    ensure_directory(path, root=layout.workspaces_root)
-    return path
-
-
-def identity_of(path: Path) -> DirectoryIdentity:
-    info = path.lstat()
-    return DirectoryIdentity(info.st_dev, info.st_ino)
-
-
-def sh(script: str, *args: str) -> list[str]:
-    return ["sh", "-c", script, "sh", *args]
 
 
 # -- the shared contract -------------------------------------------------------
@@ -181,9 +154,7 @@ class TestContractOnRealPodman(ContainerRuntimeContract):
 
 
 @pytest.fixture
-def sandbox(
-    layout: WorkspaceLayout, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[tuple[PodmanRuntime, ContainerHandle]]:
+def sandbox(layout: WorkspaceLayout, monkeypatch: pytest.MonkeyPatch) -> Iterator[Sandbox]:
     # Secrets and proxies in the coordinator's environment must never leak in.
     monkeypatch.setenv("GITHUB_TOKEN", SENTINEL)
     monkeypatch.setenv("HTTPS_PROXY", f"http://{SENTINEL}:3128")
@@ -204,15 +175,8 @@ def sandbox(
     runtime.stop(handle, owner=OWNER)
 
 
-def inside(sandbox: tuple[PodmanRuntime, ContainerHandle], argv: Sequence[str]) -> str:
-    runtime, handle = sandbox
-    result = runtime.run(handle, argv, timeout_seconds=60)
-    assert result.succeeded, (argv, result.stderr)
-    return result.stdout
-
-
 def test_no_capabilities_and_no_new_privileges(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
+    sandbox: Sandbox,
 ) -> None:
     status = dict(
         line.split(":", 1) for line in inside(sandbox, ["cat", "/proc/self/status"]).splitlines()
@@ -223,13 +187,13 @@ def test_no_capabilities_and_no_new_privileges(
     assert status["Seccomp"].strip() == "2"  # filter mode: the default profile is active
 
 
-def test_runs_as_a_non_root_user(sandbox: tuple[PodmanRuntime, ContainerHandle]) -> None:
+def test_runs_as_a_non_root_user(sandbox: Sandbox) -> None:
     assert inside(sandbox, ["id", "-u"]).strip() == "1000"
     assert inside(sandbox, ["id", "-g"]).strip() == "1000"
 
 
 def test_root_filesystem_is_read_only_with_tmpfs_scratch(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
+    sandbox: Sandbox,
 ) -> None:
     runtime, handle = sandbox
     for path in ("/probe", "/etc/probe", "/usr/probe", "/var/tmp/probe", "/run/probe"):
@@ -244,7 +208,7 @@ def test_root_filesystem_is_read_only_with_tmpfs_scratch(
 
 
 def test_only_the_workspace_directory_comes_from_the_host(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
+    sandbox: Sandbox,
 ) -> None:
     virtual = {"proc", "sysfs", "tmpfs", "devpts", "mqueue", "cgroup", "cgroup2", "devtmpfs"}
     directories = []
@@ -261,7 +225,7 @@ def test_only_the_workspace_directory_comes_from_the_host(
 
 
 def test_environment_is_only_what_was_allowed(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
+    sandbox: Sandbox,
 ) -> None:
     env = inside(sandbox, ["env"])
     assert "ILMAR_ALLOWED=yes" in env
@@ -270,7 +234,7 @@ def test_environment_is_only_what_was_allowed(
     assert "proxy" not in env.lower()
 
 
-def test_resource_limits_are_in_force(sandbox: tuple[PodmanRuntime, ContainerHandle]) -> None:
+def test_resource_limits_are_in_force(sandbox: Sandbox) -> None:
     assert inside(sandbox, ["cat", "/sys/fs/cgroup/pids.max"]).strip() == "128"
     assert inside(sandbox, ["cat", "/sys/fs/cgroup/memory.max"]).strip() == str(256 * 2**20)
     assert inside(sandbox, ["cat", "/sys/fs/cgroup/cpu.max"]).split()[0] != "max"
@@ -293,7 +257,7 @@ def test_missing_images_are_never_pulled(layout: WorkspaceLayout) -> None:
 
 
 def test_network_none_has_only_loopback_and_no_routes(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
+    sandbox: Sandbox,
 ) -> None:
     assert inside(sandbox, ["ls", "/sys/class/net"]).split() == ["lo"]
     ipv4_routes = inside(sandbox, ["cat", "/proc/net/route"]).splitlines()[1:]
@@ -304,7 +268,19 @@ def test_network_none_has_only_loopback_and_no_routes(
     assert all(line.split()[-1] == "lo" for line in ipv6_routes.splitlines())
 
 
-def test_network_none_has_no_resolver(sandbox: tuple[PodmanRuntime, ContainerHandle]) -> None:
+def test_network_none_allows_no_icmp_sockets(sandbox: Sandbox) -> None:
+    """Behavioural: loopback always exists, so a ping that fails here was refused.
+
+    (Reading ``ping_group_range`` inside the user namespace shows unmapped
+    groups as 65534, so the value itself cannot tell an empty range apart.)
+    """
+    runtime, handle = sandbox
+    result = runtime.run(handle, ["ping", "-c", "1", "-W", "2", "127.0.0.1"], timeout_seconds=30)
+    assert result.exit_code != 0
+    assert "permission denied" in (result.stdout + result.stderr).lower()
+
+
+def test_network_none_has_no_resolver(sandbox: Sandbox) -> None:
     resolv = inside(sandbox, sh("cat /etc/resolv.conf 2>/dev/null; true"))
     assert "nameserver" not in resolv
 
@@ -312,87 +288,7 @@ def test_network_none_has_no_resolver(sandbox: tuple[PodmanRuntime, ContainerHan
 # -- network NONE: reachability with controls (ADR-0011 §9) ------------------------------
 
 
-class Outcome(enum.Enum):
-    PASS = "pass"  # the control succeeded and the sandbox attempt failed
-    FAIL = "fail"  # the sandbox reached the target: isolation is broken
-    INCONCLUSIVE = "inconclusive"  # the control failed: proves nothing
-
-
-@dataclass
-class EchoServer:
-    """Answers every TCP connection with the per-run nonce."""
-
-    host: str
-    nonce: str
-    family: socket.AddressFamily = socket.AF_INET
-
-    def __post_init__(self) -> None:
-        self._socket = socket.socket(self.family, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.bind((self.host, 0))
-        self._socket.listen(8)
-        self._socket.settimeout(0.5)
-        self.port = self._socket.getsockname()[1]
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self) -> None:
-        while not self._stop.is_set():
-            try:
-                connection, _ = self._socket.accept()
-            except (TimeoutError, OSError):
-                continue
-            with connection, contextlib.suppress(OSError):
-                connection.sendall(f"{self.nonce}\n".encode())
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
-        self._socket.close()
-
-
-def host_ipv4() -> str | None:
-    """The host's primary non-loopback IPv4 address (no packet is sent)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        try:
-            probe.connect(("192.0.2.1", 9))  # TEST-NET-1: route lookup only
-        except OSError:
-            return None
-        address = str(probe.getsockname()[0])
-    return None if address.startswith("127.") else address
-
-
-def host_round_trip(host: str, port: int, nonce: str) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=3) as connection:
-            return nonce in connection.recv(256).decode(errors="replace")
-    except OSError:
-        return False
-
-
-def probe_from_sandbox(sandbox: tuple[PodmanRuntime, ContainerHandle], host: str, port: int) -> str:
-    runtime, handle = sandbox
-    result = runtime.run(
-        handle, sh('nc -w 3 "$1" "$2" </dev/null', host, str(port)), timeout_seconds=30
-    )
-    return result.stdout
-
-
-def reachability(
-    sandbox: tuple[PodmanRuntime, ContainerHandle], server: EchoServer, target: str
-) -> tuple[Outcome, str]:
-    if not host_round_trip(target, server.port, server.nonce):
-        return Outcome.INCONCLUSIVE, "host-side control did not get the nonce"
-    seen = probe_from_sandbox(sandbox, target, server.port)
-    if server.nonce in seen:
-        return Outcome.FAIL, "the sandbox reached the target"
-    return Outcome.PASS, "control answered; sandbox attempt failed"
-
-
-def test_probe_tool_works_inside_the_sandbox(
-    sandbox: tuple[PodmanRuntime, ContainerHandle],
-) -> None:
+def test_probe_tool_works_inside_the_sandbox(sandbox: Sandbox) -> None:
     """Control for the probe itself: an in-sandbox listener on loopback is reachable."""
     nonce = secrets.token_hex(8)
     out = inside(
@@ -406,18 +302,16 @@ def test_probe_tool_works_inside_the_sandbox(
     assert nonce in out, "nc in the image cannot make a loopback round trip"
 
 
-@pytest.mark.parametrize("bind", ["0.0.0.0"])  # noqa: S104 - the test target must be reachable
-def test_network_none_cannot_reach_a_host_ipv4_service(
-    sandbox: tuple[PodmanRuntime, ContainerHandle], bind: str
-) -> None:
+def test_network_none_cannot_reach_a_host_ipv4_service(sandbox: Sandbox) -> None:
     target = host_ipv4()
     assert target is not None, "inconclusive: the host has no non-loopback IPv4 address"
-    server = EchoServer(bind, secrets.token_hex(8))
+    server = EchoServer("0.0.0.0", 0, secrets.token_hex(8))  # noqa: S104
     try:
-        outcome, reason = reachability(sandbox, server, target)
+        control = tcp_control(target, server.port, server.nonce)
+        outcome, reason = classify(control, sandbox_tcp(sandbox, target, server.port), server.nonce)
     finally:
         server.close()
-    assert outcome is Outcome.PASS, f"{outcome.value}: {reason} ({target}:{server.port})"
+    expect_isolated(outcome, reason, f"NONE tcp {target}:{server.port}", required=True)
 
 
 def test_the_same_probe_reaches_the_target_without_isolation(layout: WorkspaceLayout) -> None:
@@ -440,10 +334,10 @@ def test_the_same_probe_reaches_the_target_without_isolation(layout: WorkspaceLa
             network=NetworkPolicy.UNRESTRICTED,
         )
     )
-    server = EchoServer("0.0.0.0", secrets.token_hex(8))  # noqa: S104
+    server = EchoServer("0.0.0.0", 0, secrets.token_hex(8))  # noqa: S104
     try:
-        assert host_round_trip(target, server.port, server.nonce)
-        seen = probe_from_sandbox((runtime, handle), target, server.port)
+        assert tcp_control(target, server.port, server.nonce)
+        seen = sandbox_tcp((runtime, handle), target, server.port)
         assert server.nonce in seen, "an unisolated sandbox should reach the host target"
     finally:
         server.close()

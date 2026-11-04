@@ -14,14 +14,38 @@ _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class NetworkPolicy(enum.Enum):
-    """Network access granted to a container.
+    """Network access granted to a container (ADR-0011 §5).
 
-    An allow-list mode (egress only to named hosts) is planned once the first
-    real runtime adapter exists; see ADR-0006.
+    * ``NONE``: no network at all (the default).
+    * ``ALLOWLIST``: HTTPS (``CONNECT host:443``) through a filtering proxy to
+      the hostnames in ``ContainerSpec.allowed_hosts`` only.
+    * ``UNRESTRICTED``: needs an explicit deployment opt-in (ADR-0014).
     """
 
     NONE = "none"
+    ALLOWLIST = "allowlist"
     UNRESTRICTED = "unrestricted"
+
+
+_HOST_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+def normalise_hostname(host: str) -> str:
+    """A lowercase DNS hostname without a trailing dot; ``ValueError`` otherwise.
+
+    IP literals are refused: an allow-list names hosts, never addresses.
+    """
+    name = host.strip().lower().removesuffix(".")
+    labels = name.split(".")
+    if (
+        not name
+        or len(name) > 253
+        or len(labels) < 2
+        or not all(_HOST_LABEL.match(label) for label in labels)
+        or labels[-1].isdigit()
+    ):
+        raise ValueError(f"not a valid hostname: {host!r}")
+    return name
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,11 +112,19 @@ class ContainerSpec:
     container_workdir: PurePosixPath = DEFAULT_CONTAINER_WORKDIR
     env: Mapping[str, str] = field(default_factory=dict)
     network: NetworkPolicy = NetworkPolicy.NONE
+    allowed_hosts: tuple[str, ...] = ()
+    """Hostnames reachable on port 443 under ``ALLOWLIST``; empty for other policies."""
     limits: ResourceLimits = field(default_factory=ResourceLimits)
 
     def __post_init__(self) -> None:
         if not _RESOURCE_NAME.match(self.name):
             raise ValueError(f"invalid container name: {self.name!r}")
+        hosts = tuple(sorted({normalise_hostname(host) for host in self.allowed_hosts}))
+        if self.network is NetworkPolicy.ALLOWLIST and not hosts:
+            raise ValueError("ALLOWLIST needs at least one allowed host")
+        if self.network is not NetworkPolicy.ALLOWLIST and hosts:
+            raise ValueError("allowed_hosts is only meaningful with NetworkPolicy.ALLOWLIST")
+        object.__setattr__(self, "allowed_hosts", hosts)
 
 
 @dataclass(frozen=True, slots=True)

@@ -49,6 +49,7 @@ Add a row whenever a source is consulted for a decision or a review.
 
 | Date | IDs | Purpose | Notes |
 | --- | --- | --- | --- |
+| 2026-11-04 | R21 | Egress allow-list (#40) | `podman-network-create` (`--internal`, `--disable-dns`), and the `network`, `ip`, `sysctl`, `add-host` and `dns` option pages, at the same two pinned commits. Behaviour confirmed by the CI §9 suite. |
 | 2026-11-04 | R21 | Podman `ContainerRuntime` (#5) | docs.podman.io is not reachable from the build environment. The same documentation was read from the upstream repository at the two pinned commits. Option texts barely differ between them (newer versions add Quadlet wording, a `containers.conf` default for `http_proxy`, and `tmpcopyup` notes). Behaviour was then confirmed by the CI integration suite on Podman 4.9 (rootless, cgroups v2, systemd, crun, netavark). |
 | 2026-11-04 | R20 | GitHub `TaskProvider` (#6) | docs.github.com could not be fetched directly. Behaviour was confirmed by read-only REST calls (`gh api`) against this repository and by search snippets of the docs. |
 | 2026-11-04 | R13–R19 | M2 design review (#33): Claude Code connectivity, gateway and headless output; sandbox egress; host-side git safety; Podman isolation | `code.claude.com` was fetched directly. Other pages came from search snippets or secondary reports, as marked. |
