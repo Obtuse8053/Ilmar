@@ -131,13 +131,18 @@ class Running:
         self.proxy, self.log, self.calls = proxy, log, calls
 
     def request(self, raw: bytes, payload: bytes = b"") -> bytes:
+        chunks: list[bytes] = []
         with socket.create_connection(self.proxy.address, timeout=5) as client:
-            client.sendall(raw + payload)
-            client.shutdown(socket.SHUT_WR)
-            chunks = []
-            while chunk := client.recv(4096):
-                chunks.append(chunk)
-            return b"".join(chunks)
+            # The proxy may drop a refused client before we finish sending:
+            # a reset or "not connected" here simply means no reply.
+            try:
+                client.sendall(raw + payload)
+                client.shutdown(socket.SHUT_WR)
+                while chunk := client.recv(4096):
+                    chunks.append(chunk)
+            except OSError:
+                pass
+        return b"".join(chunks)
 
 
 def start(
