@@ -5,6 +5,8 @@ Git operations run in the coordinator with :class:`HardenedGit` against one
 coordinator-owned bare repository per GitHub repository. The agent's
 workspace is only ever read as plain files (:mod:`ilmar.adapters.git.trees`).
 Pull requests and checks use the REST API through :class:`GitHubClient`.
+Check runs and commit statuses are read across all pages; a result set that
+cannot be completed is reported as PENDING, never PASSED.
 
 Credentials: the token reaches git only as an ``Authorization`` header scoped
 to the GitHub URL, passed through ``GIT_CONFIG_*`` environment variables. It
@@ -54,6 +56,9 @@ from ilmar.domain.errors import (
 )
 
 MARKER = "<!-- ilmar:change-request -->"
+INCOMPLETE_CHECKS = "ilmar: check results incomplete"
+_CHECKS_PER_PAGE = 100
+_MAX_CHECK_PAGES = 50
 DEFAULT_IDENTITY = Identity("Ilmar", "ilmar@users.noreply.github.com")
 _SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _BRANCH = re.compile(r"^(?!-)(?!.*\.\.)(?!.*//)(?!.*@\{)[A-Za-z0-9._/-]+(?<![./])(?<!\.lock)$")
@@ -247,22 +252,45 @@ class GitHubSourceControl:
         sha = str((pull.get("head") or {}).get("sha") or "")
         if not _SHA.match(sha):
             raise ProviderError(f"pull request {change_request.key} has no head commit")
-        results: list[CheckResult] = []
-        runs = self._client.request(
-            "GET", f"/repos/{slug}/commits/{sha}/check-runs", query={"per_page": "100"}
+        runs, runs_complete = self._all_pages(
+            f"/repos/{slug}/commits/{sha}/check-runs", "check_runs"
         )
-        for run in runs.get("check_runs") or []:
-            results.append(CheckResult(str(run.get("name")), _run_state(run), run.get("html_url")))
-        combined = self._client.request("GET", f"/repos/{slug}/commits/{sha}/status")
-        for status in combined.get("statuses") or []:
-            results.append(
-                CheckResult(
-                    str(status.get("context")),
-                    _status_state(str(status.get("state"))),
-                    status.get("target_url"),
-                )
+        statuses, statuses_complete = self._all_pages(
+            f"/repos/{slug}/commits/{sha}/status", "statuses"
+        )
+        results = [
+            CheckResult(str(run.get("name")), _run_state(run), run.get("html_url")) for run in runs
+        ]
+        results += [
+            CheckResult(
+                str(status.get("context")),
+                _status_state(str(status.get("state"))),
+                status.get("target_url"),
             )
+            for status in statuses
+        ]
+        if not (runs_complete and statuses_complete):
+            # Fail closed: an unseen check may have failed, so never report PASSED.
+            results.append(CheckResult(INCOMPLETE_CHECKS, CheckState.PENDING))
         return ChecksSummary(_overall(results), tuple(sorted(results, key=lambda r: r.name)))
+
+    def _all_pages(self, path: str, key: str) -> tuple[list[Any], bool]:
+        """Every item of a ``{total_count, <key>: [...]}`` endpoint, and whether all were seen."""
+        items: list[Any] = []
+        total: int | None = None
+        for page in range(1, _MAX_CHECK_PAGES + 1):
+            body = self._client.request(
+                "GET", path, query={"per_page": str(_CHECKS_PER_PAGE), "page": str(page)}
+            )
+            batch = body.get(key) or []
+            count = body.get("total_count")
+            if isinstance(count, int):
+                total = count if total is None else max(total, count)
+            items.extend(batch)
+            if len(batch) < _CHECKS_PER_PAGE or (total is not None and len(items) >= total):
+                break
+        complete = total is not None and len(items) >= total
+        return items, complete
 
     # -- helpers -------------------------------------------------------------------
 

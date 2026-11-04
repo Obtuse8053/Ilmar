@@ -121,9 +121,13 @@ Option 3 with credential option C.
   - An open pull request from the same head branch without the marker
     raises `OwnershipConflictError` and is never edited.
   - Ilmar's own pull request is updated in place.
-  - Checks combine check runs and commit statuses. Any failure means
-    FAILED, otherwise anything pending means PENDING, then PASSED, and
-    NONE when nothing is reported. The first 100 check runs are read.
+  - Checks combine check runs and commit statuses, read across **all**
+    pages until GitHub's `total_count` is reached (up to 50 pages of 100
+    each). Any failure means FAILED, otherwise anything pending means
+    PENDING, then PASSED, and NONE when nothing is reported.
+  - If either list cannot be completed, an `ilmar: check results
+    incomplete` entry is added and the summary is never PASSED: it is
+    FAILED if a seen check failed, otherwise PENDING.
 
 ## Verification
 
@@ -144,7 +148,8 @@ Option 3 with credential option C.
   - `.GIT` variants, non-UTF-8 names, quoting round trips and the umask;
   - branch and repository validation;
   - pull request ownership and updates;
-  - check mapping.
+  - check mapping, including a failure beyond the first page of check runs
+    and of statuses, and a truncated result set failing closed.
 - Mutation checks:
 
   | Mutation | Failing tests |
@@ -170,7 +175,8 @@ Option 3 with credential option C.
     repository sizes; revisit for large repositories.
   - The coordinator keeps a bare cache per repository, and a full fetch
     happens when a base revision is unknown.
-  - Only the first 100 check runs per commit are considered.
+  - Commits with more than 5,000 check runs or statuses are reported as
+    incomplete (PENDING), never PASSED.
   - Changing CI configuration always needs a human in M2.
 
 ## Revisit when

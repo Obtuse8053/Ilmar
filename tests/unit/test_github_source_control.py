@@ -13,7 +13,7 @@ import pytest
 
 from ilmar.adapters.git.runner import HardenedGit
 from ilmar.adapters.github import GitHubClient
-from ilmar.adapters.github.source_control import MARKER, GitHubSourceControl
+from ilmar.adapters.github.source_control import INCOMPLETE_CHECKS, MARKER, GitHubSourceControl
 from ilmar.domain.changes import ChangeRequestSpec, CheckState, RepositoryRef
 from ilmar.domain.errors import (
     CandidateRejectedError,
@@ -451,3 +451,62 @@ def test_checks_are_mapped(
     summary = world.provider.checks(world.provider.upsert_change_request(spec()))
     assert summary.state is expected
     assert len(summary.checks) == len(runs) + len(statuses)
+
+
+# -- PR #42 review: every page of checks counts ---------------------------------------------
+
+
+def passing(n: int) -> list[dict[str, Any]]:
+    return [
+        {"name": f"ok-{i:03}", "status": "completed", "conclusion": "success"} for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize("where", ["check_runs", "statuses"])
+def test_a_failure_beyond_the_first_page_is_reported(world: World, where: str) -> None:
+    sha = "c" * 40
+    world.api.head_sha = lambda branch: sha
+    if where == "check_runs":
+        world.api.check_runs[sha] = [
+            *passing(150),
+            {"name": "late-failure", "status": "completed", "conclusion": "failure"},
+        ]
+    else:
+        world.api.statuses[sha] = [
+            *[{"context": f"ok-{i:03}", "state": "success"} for i in range(250)],
+            {"context": "late-failure", "state": "failure"},
+        ]
+    summary = world.provider.checks(world.provider.upsert_change_request(spec()))
+    assert summary.state is CheckState.FAILED
+    assert "late-failure" in {check.name for check in summary.checks}
+    assert len(summary.checks) == (151 if where == "check_runs" else 251)
+
+
+def test_many_passing_checks_on_several_pages_pass(world: World) -> None:
+    sha = "d" * 40
+    world.api.head_sha = lambda branch: sha
+    world.api.check_runs[sha] = passing(230)
+    summary = world.provider.checks(world.provider.upsert_change_request(spec()))
+    assert summary.state is CheckState.PASSED
+    assert len(summary.checks) == 230
+
+
+@pytest.mark.parametrize("where", ["check_runs", "statuses"])
+def test_an_incomplete_result_set_fails_closed(world: World, where: str) -> None:
+    """GitHub reports more results than it returns: never PASSED."""
+    sha = "e" * 40
+    world.api.head_sha = lambda branch: sha
+    world.api.check_runs[sha] = passing(3)
+    world.api.reported_totals[(where, sha)] = 500
+    summary = world.provider.checks(world.provider.upsert_change_request(spec()))
+    assert summary.state is CheckState.PENDING
+    assert INCOMPLETE_CHECKS in {check.name for check in summary.checks}
+
+
+def test_a_failure_still_wins_over_an_incomplete_result_set(world: World) -> None:
+    sha = "f" * 40
+    world.api.head_sha = lambda branch: sha
+    world.api.check_runs[sha] = [{"name": "x", "status": "completed", "conclusion": "failure"}]
+    world.api.reported_totals[("check_runs", sha)] = 500
+    summary = world.provider.checks(world.provider.upsert_change_request(spec()))
+    assert summary.state is CheckState.FAILED

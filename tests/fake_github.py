@@ -63,6 +63,8 @@ class FakeGitHub:
         self.head_sha: Callable[[str], str] = lambda branch: "a" * 40
         self.check_runs: dict[str, list[dict[str, Any]]] = {}
         self.statuses: dict[str, list[dict[str, Any]]] = {}
+        # Override what GitHub reports as total_count, to simulate truncation.
+        self.reported_totals: dict[tuple[str, str], int] = {}
 
     # -- test helpers ----------------------------------------------------
 
@@ -188,9 +190,12 @@ class FakeGitHub:
             return _json(200, self._pull_json(pull))
         if match := re.fullmatch(r"/commits/([0-9a-f]{40})/check-runs", path):
             runs = self.check_runs.get(match.group(1), [])
-            return _json(200, {"total_count": len(runs), "check_runs": runs})
+            total = self.reported_totals.get(("check_runs", match.group(1)), len(runs))
+            return _json(200, {"total_count": total, "check_runs": _slice(runs, query)})
         if match := re.fullmatch(r"/commits/([0-9a-f]{40})/status", path):
-            return _json(200, {"statuses": self.statuses.get(match.group(1), [])})
+            statuses = self.statuses.get(match.group(1), [])
+            total = self.reported_totals.get(("statuses", match.group(1)), len(statuses))
+            return _json(200, {"total_count": total, "statuses": _slice(statuses, query)})
         return _json(404, {"message": f"unsupported in fake: {method} {path}"})
 
     def _pull_json(self, pull: dict[str, Any]) -> dict[str, Any]:
@@ -208,6 +213,12 @@ class FakeGitHub:
             next_url = parts._replace(query=urllib.parse.urlencode(next_query)).geturl()
             headers["Link"] = f'<{next_url}>; rel="next"'
         return _json(200, chunk, headers)
+
+
+def _slice(items: list[Any], query: dict[str, str]) -> list[Any]:
+    size = min(int(query.get("per_page", "30")), 100)
+    page = int(query.get("page", "1"))
+    return items[(page - 1) * size : page * size]
 
 
 def _json(status: int, data: Any, headers: dict[str, str] | None = None) -> HttpResponse:
