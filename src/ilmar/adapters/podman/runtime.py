@@ -177,6 +177,20 @@ def proc_root_identity(pid: int, path: PurePosixPath) -> DirectoryIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class _Cleanup:
+    """One removal still owed before a workspace may be mounted again."""
+
+    kind: str  # "container" (ref is its ID) or "egress" (ref is the sandbox name)
+    ref: str
+    name: str
+    owner: ResourceOwner | None = None
+
+    @classmethod
+    def egress(cls, spec: ContainerSpec) -> _Cleanup:
+        return cls("egress", spec.name, spec.name, spec.owner)
+
+
+@dataclass(frozen=True, slots=True)
 class EgressSettings:
     """How ``ALLOWLIST`` sandboxes reach their listed hosts (ADR-0015).
 
@@ -265,8 +279,9 @@ class PodmanRuntime:
         self._allow_unrestricted = allow_unrestricted_network
         self._egress = egress
         self._sleep = sleep
-        # Workspace identity -> containers that must be confirmed gone first.
-        self._quarantine: dict[DirectoryIdentity, set[str]] = {}
+        # Workspace identity -> resources that must be confirmed gone before the
+        # workspace may be mounted again (ADR-0014, ADR-0015).
+        self._obligations: dict[DirectoryIdentity, set[_Cleanup]] = {}
         self._mounted: dict[str, DirectoryIdentity] = {}
 
     @property
@@ -290,15 +305,15 @@ class PodmanRuntime:
             if existing.owner != spec.owner:
                 raise OwnershipConflictError(f"container {spec.name} is owned by someone else")
             self._remove_sandbox(existing.handle.id, spec.name)
-        else:
-            self._remove_sidecars(spec.name, spec.owner)  # leftovers of a crashed start
+        else:  # leftovers of a crashed start
+            self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
 
         network_args = self._network_arguments(spec.network, spec.name)
         if spec.network is NetworkPolicy.ALLOWLIST:
             try:
                 proxy_url = self._start_egress(spec)
             except BaseException:
-                self._remove_sidecars(spec.name, spec.owner)
+                self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
                 raise
             env |= {"HTTPS_PROXY": proxy_url, "https_proxy": proxy_url}
 
@@ -309,11 +324,11 @@ class PodmanRuntime:
                 started = self._podman_call(self._run_arguments(spec, env_file, network_args))
             self._expect_success(started, "run")
         except BaseException:
-            self._remove_sidecars(spec.name, spec.owner)
+            self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
             raise
         container_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
         if not _CONTAINER_ID.match(container_id):
-            self._remove_sidecars(spec.name, spec.owner)
+            self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
             raise ProviderError("podman run did not report a container ID")
         self._mounted[container_id] = spec.workspace_identity
         try:
@@ -535,7 +550,7 @@ class PodmanRuntime:
         return details is not None and bool(details.get("State", {}).get("Running"))
 
     def _remove(self, container_id: str, name: str) -> None:
-        """Remove ``container_id`` and confirm it is gone, or quarantine its workspace."""
+        """Remove ``container_id`` and confirm it is gone; ``ContainmentError`` otherwise."""
         try:
             done = self._executor(
                 [self._podman, "rm", "--force", "--time", "0", container_id],
@@ -546,11 +561,7 @@ class PodmanRuntime:
         except ProviderError:
             done, gone = None, False
         if gone:
-            self._forget(container_id)
             return
-        workspace = self._mounted.get(container_id)
-        if workspace is not None:
-            self._quarantine.setdefault(workspace, set()).add(container_id)
         reason = "timed out" if done is None or done.timed_out else f"exit {done.returncode}"
         _LOG.error("could not confirm removal of %s (%s): %s", name, container_id, reason)
         raise ContainmentError(
@@ -561,12 +572,46 @@ class PodmanRuntime:
         )
 
     def _remove_sandbox(self, container_id: str, name: str) -> None:
-        """Remove a sandbox (confirmed, else quarantine) and then its egress sidecar."""
+        """Remove a sandbox and its egress sidecar; quarantine the workspace until all are gone."""
         details = self._inspect(container_id)
         owner = _owner(details) if details is not None else None
-        self._remove(container_id, name)
+        cleanups = [_Cleanup("container", container_id, name)]
         if owner is not None:
-            self._remove_sidecars(name, owner)
+            cleanups.append(_Cleanup("egress", name, name, owner))
+        self._discharge(self._mounted.get(container_id), cleanups, name)
+
+    def _discharge(
+        self, workspace: DirectoryIdentity | None, cleanups: Sequence[_Cleanup], name: str
+    ) -> None:
+        """Carry out ``cleanups`` in order; any that fail keep ``workspace`` quarantined.
+
+        Each obligation is recorded *before* it is attempted and dropped only once
+        its resources are confirmed gone. The first failure raises
+        ``ContainmentError``; the remaining obligations stay recorded.
+        """
+        pending = self._obligations.setdefault(workspace, set()) if workspace else set()
+        pending.update(cleanups)
+        try:
+            for cleanup in sorted(cleanups, key=lambda c: c.kind != "container"):
+                try:
+                    if cleanup.kind == "container":
+                        self._remove(cleanup.ref, cleanup.name)
+                        self._mounted.pop(cleanup.ref, None)
+                    elif cleanup.owner is not None:
+                        self._remove_sidecars(cleanup.ref, cleanup.owner)
+                except ContainmentError:
+                    raise
+                except ProviderError as error:
+                    raise ContainmentError(
+                        f"egress resources of {cleanup.ref} could not be confirmed removed "
+                        f"({error}); its workspace must not be reused until they are",
+                        container_id=cleanup.ref,
+                        name=name,
+                    ) from error
+                pending.discard(cleanup)
+        finally:
+            if workspace is not None and not pending:
+                self._obligations.pop(workspace, None)
 
     # -- ALLOWLIST egress sidecar (ADR-0015) ---------------------------------
 
@@ -688,20 +733,14 @@ class PodmanRuntime:
             return
         removed = self._podman_call(["network", "rm", network])
         if self._podman_call(["network", "exists", network]).returncode == 0:
-            self._expect_success(removed, "network rm")
-            raise ProviderError(f"network {network} could not be removed")
-
-    def _forget(self, container_id: str) -> None:
-        workspace = self._mounted.pop(container_id, None)
-        if workspace is not None and workspace in self._quarantine:
-            self._quarantine[workspace].discard(container_id)
-            if not self._quarantine[workspace]:
-                del self._quarantine[workspace]
+            detail = removed.stderr.strip().splitlines()[-1:] or [f"exit {removed.returncode}"]
+            raise ProviderError(f"network {network} could not be removed: {detail[0][:200]}")
 
     def _release_quarantine(self, workspace: DirectoryIdentity, name: str) -> None:
-        """Retry removal of quarantined containers; refuse the workspace if any remain."""
-        for container_id in sorted(self._quarantine.get(workspace, ())):
-            self._remove(container_id, name)
+        """Retry every cleanup still owed for ``workspace``; refuse it if any remain."""
+        owed = list(self._obligations.get(workspace, ()))
+        if owed:
+            self._discharge(workspace, owed, name)
 
     def _verify_mount(self, container_id: str, spec: ContainerSpec) -> None:
         details = self._inspect(container_id)

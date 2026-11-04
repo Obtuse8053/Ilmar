@@ -666,3 +666,94 @@ def test_extra_hosts_pin_addresses_in_the_proxy_only(
 def test_extra_hosts_are_validated(hosts: dict[str, str], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         EgressSettings(proxy_image="img", extra_hosts=hosts)
+
+
+# -- PR #41 review: partial sidecar teardown fails closed ------------------------------
+
+
+def break_teardown(podman: FakePodman, part: str) -> None:
+    if part == "proxy":
+        podman.fail_rm_names.add("ilmar-exec-1-1-egress")
+    else:
+        podman.network_rm_fails = True
+
+
+def repair_teardown(podman: FakePodman) -> None:
+    podman.fail_rm_names.clear()
+    podman.network_rm_fails = False
+
+
+def runs_of(podman: FakePodman, name: str) -> int:
+    return sum(1 for c in call_args(podman, "run") if c[c.index("--name") + 1] == name)
+
+
+@pytest.mark.parametrize("part", ["proxy", "network"])
+@pytest.mark.parametrize("how", ["stop", "timeout"])
+def test_failed_sidecar_teardown_quarantines_the_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, part: str, how: str
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    break_teardown(podman, part)
+
+    def tear_down() -> object:
+        if how == "stop":
+            rt.stop(handle, owner=OWNER)
+            return None
+        return rt.run(handle, ["sleep", "60"], timeout_seconds=1)  # containment, not a result
+
+    with pytest.raises(ContainmentError, match="ilmar-exec-1-1"):
+        tear_down()
+    assert podman.by_name("ilmar-exec-1-1") is None  # the sandbox itself went
+    assert sidecars(podman) != (False, False)  # but not all of its egress resources
+
+    # Retrying under the same or another container name is refused, and no
+    # sandbox is started on the workspace while egress resources remain.
+    for name in ("ilmar-exec-1-1-retry", "ilmar-exec-1-1"):  # another name first
+        with pytest.raises(ContainmentError):
+            rt.start(allowlist_spec(workspace, name=name))
+        with pytest.raises(ContainmentError):
+            rt.start(spec(workspace, name=name))  # NONE too: the workspace is what is owed
+    assert runs_of(podman, "ilmar-exec-1-1") == 1
+    assert runs_of(podman, "ilmar-exec-1-1-retry") == 0
+
+    # Once removal succeeds, the obligation is discharged and the workspace usable.
+    repair_teardown(podman)
+    replacement = rt.start(allowlist_spec(workspace))
+    assert replacement.id != handle.id
+    assert len([c for c in podman.containers.values() if c.name.endswith("-egress")]) == 1
+
+
+def test_sidecar_quarantine_is_per_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    break_teardown(podman, "proxy")
+    with pytest.raises(ContainmentError):
+        rt.stop(handle, owner=OWNER)
+    other = layout.agent_workspace("exec-2", 1)
+    other_spec = spec(
+        (other, ensure_directory(other, root=layout.workspaces_root)), name="ilmar-exec-2-1"
+    )
+    assert rt.start(other_spec).name == "ilmar-exec-2-1"
+
+
+def test_failed_cleanup_after_a_failed_start_quarantines_the_workspace(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.proxy_ready = False
+    podman.network_rm_fails = True
+    ticks = iter(range(1000))
+    rt = runtime(
+        layout, podman, egress=EGRESS, clock=lambda: float(next(ticks)), sleep=lambda s: None
+    )
+    with pytest.raises(ContainmentError):
+        rt.start(allowlist_spec(workspace))
+    with pytest.raises(ContainmentError):
+        rt.start(spec(workspace, name="ilmar-exec-1-other"))
+    assert runs_of(podman, "ilmar-exec-1-other") == 0
+    podman.network_rm_fails = False
+    podman.proxy_ready = True
+    rt.start(spec(workspace, name="ilmar-exec-1-other"))
+    assert "ilmar-exec-1-1-net" not in podman.networks

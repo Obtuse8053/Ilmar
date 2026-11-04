@@ -69,6 +69,19 @@ Chosen option: 2.
   - Leftovers owned by the same owner, from a crashed start, are cleaned
     before a new start.
   - Resources with any other owner are never touched.
+- **Teardown fails closed (cleanup obligations).** This extends ADR-0014's
+  quarantine from the sandbox container to everything created for it.
+  - Before any removal, the runtime records the obligations still owed for
+    the workspace: the sandbox container, and its proxy and network.
+  - An obligation is dropped only when its resources are confirmed gone:
+    `inspect` for containers, `network exists` for the network.
+  - If any obligation fails, `ContainmentError` is raised, rather than a
+    timeout result or a silent success. The workspace stays quarantined:
+    no `start`, under any container name and any network policy, mounts it.
+    Every later `start` retries what is owed first.
+  - This also covers the cleanup after a failed start.
+  - The in-process record does not survive a restart, so the coordinator's
+    ledger must hold the same obligations (#12, #15).
 - **Podman defaults overridden:** Podman's default `containers.conf` allows
   unprivileged ICMP sockets for group 0 (`ping_group_range "0 0"`). The §9
   structural check surfaced this. The sandbox user (gid 1000) was never

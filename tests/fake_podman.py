@@ -69,6 +69,8 @@ class FakePodman:
     rootless: bool = True
     rm_behaviour: str = "ok"  # "ok", "fail" (exit 125, container stays) or "hang"
     proxy_ready: bool = True
+    fail_rm_names: set[str] = field(default_factory=set)  # containers whose rm fails
+    network_rm_fails: bool = False
     networks: dict[str, FakeNetwork] = field(
         default_factory=lambda: {
             "podman": FakeNetwork("podman", {}, "10.88.0.0/16", internal=False, dns_enabled=False)
@@ -104,6 +106,9 @@ class FakePodman:
                 return Completed(125, "", "Error: no such container\n")
             return Completed(0, "", container.logs)
         if command == "rm":
+            target = self.containers.get(rest[-1])
+            if target is not None and target.name in self.fail_rm_names:
+                return Completed(125, "", "Error: cannot remove container: device busy\n")
             if self.rm_behaviour == "fail":
                 return Completed(125, "", "Error: cannot remove container: device busy\n")
             if self.rm_behaviour == "hang":
@@ -237,6 +242,8 @@ class FakePodman:
             ]
             return Completed(0, json.dumps(data), "")
         if action == "rm":
+            if self.network_rm_fails:
+                return Completed(125, "", f"Error: removing network {name}: device busy\n")
             if any(name in c.networks for c in self.containers.values()):
                 return Completed(2, "", f"Error: network {name} is being used\n")
             del self.networks[name]
