@@ -16,7 +16,7 @@ from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.core.verification import Verifier
 from ilmar.domain.agent import AgentOutcome, AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
-from ilmar.domain.errors import ProviderError
+from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.verification import (
     CheckClass,
@@ -66,6 +66,13 @@ class RecordingRuntime(FakeContainerRuntime):
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
     ) -> CommandResult:
+        if argv and argv[0] == "kill-sandbox":  # the candidate ends its own sandbox
+            self._containers[handle.id].running = False
+            return CommandResult(137, "", "Killed\n", 0.1)
+        if argv and argv[0] == "infrastructure-error":
+            raise ProviderError("podman is broken")
+        if argv and argv[0] == "containment-error":
+            raise ContainmentError("removal could not be confirmed", container_id="c", name="n")
         if argv and argv[0] in {"tamper", "clean"}:
             workspace = self._containers[handle.id].spec.host_workspace
             strays = self.processes.setdefault(handle.id, set())
@@ -453,3 +460,67 @@ def test_a_timeout_ends_only_its_own_job(world: World) -> None:
 def test_job_names_are_validated() -> None:
     with pytest.raises(ValueError, match="job"):
         VerificationCommand("x", ("x",), job="../evil")
+
+
+# -- adversarial review of cf68225 ---------------------------------------------------
+
+
+def test_an_existing_run_directory_is_refused_before_anything_runs(world: World) -> None:
+    execution, candidate = world.candidate({"src/app.py": "print(2)\n"})
+    run_directory = world.layout.verification_checkout("e9", 1, 1)
+    run_directory.mkdir(parents=True)  # empty: no job checkout would collide
+    with pytest.raises(ProviderError, match="already exists"):
+        world.verifier().verify(
+            execution=execution,
+            repository=REPO,
+            candidate=candidate,
+            agent_result=COMPLETED,
+            owner=OWNER,
+        )
+    assert world.runtime.started == []
+    assert world.store.evidence("e9") == ()
+
+
+def test_a_candidate_that_kills_its_sandbox_is_rejected_with_evidence(world: World) -> None:
+    commands = (
+        VerificationCommand("kill", ("kill-sandbox",), job="first"),
+        VerificationCommand("after-kill", ("tests",), job="first"),
+        VerificationCommand("later", ("tests",), job="first"),
+        VerificationCommand("other-job", ("tests",), job="second"),
+    )
+    record = verify(world, {"src/app.py": "print(2)\n"}, *commands)
+    by_name = {c.name: c for c in record.checks}
+    assert not by_name["kill"].passed
+    assert by_name["after-kill"].detail == "failed: the sandbox stopped while the command ran"
+    assert by_name["later"].detail.startswith("not run: the job's sandbox stopped")
+    assert by_name["other-job"].passed
+    assert record.verdict is Verdict.REJECTED_CHECKS_FAILED
+    assert world.store.evidence("e9") == (record,)
+    assert len(world.runtime.stopped) == 2  # the stopped sandbox is still removed
+
+
+def test_an_infrastructure_error_produces_no_verdict_and_removes_the_sandbox(
+    world: World,
+) -> None:
+    with pytest.raises(ProviderError, match="podman is broken"):
+        verify(
+            world, {"src/app.py": "print(2)\n"}, VerificationCommand("x", ("infrastructure-error",))
+        )
+    assert world.store.evidence("e9") == ()
+    assert len(world.runtime.stopped) == 1
+
+
+def test_a_containment_error_is_never_turned_into_evidence(world: World) -> None:
+    with pytest.raises(ContainmentError):
+        verify(
+            world, {"src/app.py": "print(2)\n"}, VerificationCommand("x", ("containment-error",))
+        )
+    assert world.store.evidence("e9") == ()
+
+
+def test_candidate_stderr_cannot_inject_control_sequences_into_evidence(world: World) -> None:
+    world.program_results["tests"] = outcome(1, "\x1b[2J\x1b]8;;http://evil\x07click\rfake PASSED")
+    record = verify(world, {"src/app.py": "print(2)\n"})
+    (check,) = [c for c in record.checks if c.name == "tests"]
+    assert all(c.isprintable() for c in check.detail)
+    assert "\x1b" not in check.detail

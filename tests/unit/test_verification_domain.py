@@ -201,3 +201,29 @@ def test_jobs_group_commands_in_order_of_first_appearance() -> None:
     b = VerificationCommand("b", ("b",))
     c = VerificationCommand("c", ("c",), job="static")
     assert policy(commands=(a, b, c)).jobs() == (("static", (a, c)), ("default", (b,)))
+
+
+@pytest.mark.parametrize(
+    ("path", "classes"),
+    [
+        ("src/ilmar/ruff.toml", "check"),  # nested ruff configuration disables lint below it
+        ("src/pkg/pyproject.toml", "check"),
+        (".mypy.ini", "check"),
+        ("src/sitecustomize.py", "check"),
+        ("src/evil.pth", "check"),
+        ("src/ilmar/AGENTS.md", "protected"),
+        ("docs/CLAUDE.md", "protected"),
+        (".claude/settings.json", "protected"),  # hooks execute in later agent sessions
+        (".mcp.json", "protected"),
+        (".vscode/tasks.json", "protected"),
+        (".travis.yml", "ci"),
+        (".woodpecker/build.yml", "ci"),
+    ],
+)
+def test_default_path_classes_cover_indirect_influence(path: str, classes: str) -> None:
+    table = {
+        "check": DEFAULT_CHECK_INFLUENCING_PATHS,
+        "protected": DEFAULT_PROTECTED_PATHS,
+        "ci": DEFAULT_CI_CONFIG_PATHS,
+    }
+    assert matching((path,), table[classes]) == (path,)

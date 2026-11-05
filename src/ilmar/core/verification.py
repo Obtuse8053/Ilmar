@@ -32,7 +32,7 @@ from ilmar.core.naming import verification_container_name
 from ilmar.core.safe_fs import directory_identity, ensure_directory
 from ilmar.domain.agent import AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
-from ilmar.domain.errors import ProviderError
+from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.verification import (
     AgentReport,
@@ -174,10 +174,11 @@ class Verifier:
         run: int,
     ) -> list[CheckEvidence]:
         layout = self._layout
-        ensure_directory(
-            layout.verification_checkout(execution.id, execution.attempt, run),
-            root=layout.workspaces_root,
-        )  # fails if this run already exists: a run's directories are never reused
+        run_directory = layout.verification_checkout(execution.id, execution.attempt, run)
+        if directory_identity(run_directory, root=layout.workspaces_root) is not None:
+            # A run's directories are never reused, whatever is (or is not) inside.
+            raise ProviderError(f"verification run {run} of {execution.id} already exists")
+        ensure_directory(run_directory, root=layout.workspaces_root)
         results: list[CheckEvidence] = []
         for job, commands in self._policy.jobs():
             results += self._run_job(execution, repository, candidate, owner, run, job, commands)
@@ -216,17 +217,32 @@ class Verifier:
             )
         )
         results: list[CheckEvidence] = []
-        sandbox_gone = False
+        sandbox_gone = False  # the runtime removed it after a timeout (ADR-0014)
+        ended: str | None = None
         try:
             for command in commands:
-                if sandbox_gone:
-                    results.append(_not_run(command))
+                if ended is not None:
+                    results.append(_not_run(command, ended))
                     continue
-                result = self._runtime.run(
-                    handle, list(command.argv), timeout_seconds=command.timeout_seconds
-                )
+                try:
+                    result = self._runtime.run(
+                        handle, list(command.argv), timeout_seconds=command.timeout_seconds
+                    )
+                except ContainmentError:
+                    raise
+                except ProviderError:
+                    if self._runtime.is_running(handle):
+                        raise  # an infrastructure failure, not the candidate's doing
+                    # The candidate's code can end its own sandbox (for example by
+                    # killing every process). That fails the check; it is not a
+                    # reason to produce no evidence.
+                    results.append(_sandbox_stopped(command))
+                    ended = "the job's sandbox stopped unexpectedly"
+                    continue
                 results.append(_evidence(command, result))
-                sandbox_gone = result.timed_out  # the runtime removed it (ADR-0014)
+                if result.timed_out:
+                    sandbox_gone = True
+                    ended = "the job's sandbox ended after an earlier timeout"
         finally:
             if not sandbox_gone:
                 self._stop(handle, owner)
@@ -258,7 +274,7 @@ def _evidence(command: VerificationCommand, result: CommandResult) -> CheckEvide
         detail = f"exit {result.exit_code}"
         tail = result.stderr.strip().splitlines()[-1:] if result.exit_code else []
         if tail:
-            detail += f"; last stderr line (reported by the candidate): {tail[0][:_DETAIL_LIMIT]}"
+            detail += f"; last stderr line (reported by the candidate): {_printable(tail[0])}"
     return CheckEvidence(
         name=command.name,
         check_class=CheckClass.CANDIDATE_EXECUTED,
@@ -274,12 +290,29 @@ def _evidence(command: VerificationCommand, result: CommandResult) -> CheckEvide
     )
 
 
-def _not_run(command: VerificationCommand) -> CheckEvidence:
+def _printable(text: str) -> str:
+    """Candidate text made safe to show: no control characters or escape sequences."""
+    return "".join(c if c.isprintable() else "\ufffd" for c in text)[:_DETAIL_LIMIT]
+
+
+def _sandbox_stopped(command: VerificationCommand) -> CheckEvidence:
     return CheckEvidence(
         name=command.name,
         check_class=CheckClass.CANDIDATE_EXECUTED,
         passed=False,
-        detail="not run: the job's sandbox ended after an earlier timeout",
+        detail="failed: the sandbox stopped while the command ran",
+        command=command.argv,
+        required=command.required,
+        job=command.job,
+    )
+
+
+def _not_run(command: VerificationCommand, reason: str) -> CheckEvidence:
+    return CheckEvidence(
+        name=command.name,
+        check_class=CheckClass.CANDIDATE_EXECUTED,
+        passed=False,
+        detail=f"not run: {reason}",
         command=command.argv,
         required=command.required,
         job=command.job,

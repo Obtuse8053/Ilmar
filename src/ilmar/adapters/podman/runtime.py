@@ -54,11 +54,12 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import IO, Any
 
 from ilmar.adapters.podman import egress_proxy
 from ilmar.core.layout import WorkspaceLayout
@@ -142,8 +143,52 @@ MountProbe = Callable[[int, PurePosixPath], DirectoryIdentity]
 """Identity of ``path`` as seen inside the mount namespace of process ``pid``."""
 
 
-def subprocess_executor(argv: Sequence[str], env: Mapping[str, str], timeout: float) -> Completed:
-    """Run a command in its own process group; on timeout, kill the whole group."""
+OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
+"""Bytes kept per stream of one ``podman`` invocation; the rest is drained and dropped.
+
+Sandboxed commands control their output. Without a bound, a command that
+prints without end within its timeout would exhaust the coordinator's memory.
+"""
+
+
+class _Capture:
+    """Reads one pipe to its end, keeping at most ``limit`` bytes."""
+
+    def __init__(self, stream: IO[bytes], limit: int) -> None:
+        self.kept = bytearray()
+        self.dropped = 0
+        self._stream = stream
+        self._limit = limit
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+        self.thread.start()
+
+    def _drain(self) -> None:
+        read = getattr(self._stream, "read1", self._stream.read)
+        while chunk := read(65536):
+            room = max(0, self._limit - len(self.kept))
+            self.kept += chunk[:room]
+            self.dropped += len(chunk) - min(room, len(chunk))
+
+    def text(self) -> str:
+        data = bytes(self.kept)
+        note = (
+            f"\n[ilmar: {self.dropped} further bytes of output discarded]\n" if self.dropped else ""
+        )
+        return _decode(data) + note
+
+
+def subprocess_executor(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    timeout: float,
+    *,
+    output_limit: int = OUTPUT_LIMIT_BYTES,
+) -> Completed:
+    """Run a command in its own process group; on timeout, kill the whole group.
+
+    Each output stream keeps at most ``output_limit`` bytes. Output is still
+    read to the end, so the command never blocks on a full pipe.
+    """
     try:
         process = subprocess.Popen(  # noqa: S603 - argv is built by this adapter
             list(argv),
@@ -155,17 +200,32 @@ def subprocess_executor(argv: Sequence[str], env: Mapping[str, str], timeout: fl
         )
     except OSError as error:
         raise ProviderError(f"cannot run {argv[0]}: {error.strerror}") from None
+    if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE was requested
+        raise ProviderError(f"cannot read the output of {argv[0]}")
+    captures = (_Capture(process.stdout, output_limit), _Capture(process.stderr, output_limit))
+    deadline = time.monotonic() + timeout
+    timed_out = False
     try:
-        out, err = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
+        for capture in captures:  # a leftover process may still hold the pipes
+            capture.thread.join(max(0.0, deadline - time.monotonic()))
+        timed_out = any(capture.thread.is_alive() for capture in captures)
     except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        try:
-            out, err = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            out, err = b"", b""
-        return Completed(TIMED_OUT_EXIT_CODE, _decode(out), _decode(err), timed_out=True)
-    return Completed(process.returncode, _decode(out), _decode(err))
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=10)
+        for capture in captures:
+            capture.thread.join(10)
+    for stream in (process.stdout, process.stderr):
+        with contextlib.suppress(OSError):
+            stream.close()
+    out, err = (capture.text() for capture in captures)
+    if timed_out:
+        return Completed(TIMED_OUT_EXIT_CODE, out, err, timed_out=True)
+    return Completed(process.returncode, out, err)
 
 
 def proc_root_identity(pid: int, path: PurePosixPath) -> DirectoryIdentity:

@@ -358,6 +358,34 @@ def test_subprocess_executor_kills_the_whole_process_group_on_timeout(tmp_path: 
     assert not marker.exists()
 
 
+def test_subprocess_executor_bounds_the_output_it_keeps() -> None:
+    """A sandboxed command cannot exhaust the coordinator's memory (PR #45 review)."""
+    program = (
+        "import sys; sys.stdout.write('x' * 5_000_000); sys.stderr.write('e' * 10); sys.exit(3)"
+    )
+    done = subprocess_executor([sys.executable, "-c", program], {}, 30, output_limit=1000)
+    assert done.returncode == 3
+    assert not done.timed_out
+    assert done.stdout.startswith("x" * 1000)
+    assert done.stdout.endswith("[ilmar: 4999000 further bytes of output discarded]\n")
+    assert len(done.stdout) < 1100
+    assert done.stderr == "e" * 10
+
+
+def test_subprocess_executor_times_out_when_a_leftover_process_holds_the_pipe(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "detach.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    )
+    began = time.monotonic()
+    done = subprocess_executor([sys.executable, str(script)], dict(os.environ), 1)
+    assert done.timed_out
+    assert time.monotonic() - began < 15
+
+
 def test_subprocess_executor_reports_a_missing_program() -> None:
     with pytest.raises(ProviderError, match="cannot run"):
         subprocess_executor(["/nonexistent/podman"], {}, 5)

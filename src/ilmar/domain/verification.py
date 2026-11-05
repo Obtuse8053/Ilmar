@@ -102,8 +102,12 @@ def matching(paths: Iterable[str], patterns: Iterable[str]) -> tuple[str, ...]:
 
 
 DEFAULT_PROTECTED_PATHS: tuple[str, ...] = (
-    "AGENTS.md",
-    "CLAUDE.md",
+    "**/AGENTS.md",  # agents read these at any depth
+    "**/CLAUDE.md",
+    ".claude/",  # agent settings and hooks run commands in later sessions
+    ".mcp.json",
+    ".vscode/",  # editor tasks and devcontainers run on open
+    ".devcontainer/",
     "MANIFEST.md",
     "LICENSE",
     "NOTICE",
@@ -117,15 +121,21 @@ DEFAULT_CHECK_INFLUENCING_PATHS: tuple[str, ...] = (
     "**/test_*.py",
     "**/*_test.py",
     "**/conftest.py",
-    "pyproject.toml",
+    # Tools read nested configuration (ruff per directory, for example), so
+    # configuration files count at any depth.
+    "**/pyproject.toml",
     "setup.py",
-    "setup.cfg",
-    "tox.ini",
+    "**/setup.cfg",
+    "**/tox.ini",
     "noxfile.py",
-    "pytest.ini",
-    "mypy.ini",
-    "ruff.toml",
-    ".ruff.toml",
+    "**/pytest.ini",
+    "**/mypy.ini",
+    "**/.mypy.ini",
+    "**/ruff.toml",
+    "**/.ruff.toml",
+    "**/sitecustomize.py",  # imported by every interpreter that finds them
+    "**/usercustomize.py",
+    "**/*.pth",
     ".coveragerc",
     ".pre-commit-config.yaml",
     "Makefile",
@@ -147,6 +157,12 @@ DEFAULT_CI_CONFIG_PATHS: tuple[str, ...] = (
     "azure-pipelines.yml",
     "Jenkinsfile",
     ".buildkite/",
+    ".travis.yml",
+    "bitbucket-pipelines.yml",
+    ".drone.yml",
+    ".woodpecker.yml",
+    ".woodpecker/",
+    "appveyor.yml",
 )
 
 

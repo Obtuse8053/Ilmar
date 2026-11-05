@@ -75,6 +75,23 @@ Evidence storage:
      the candidate writes is never read. A timeout fails that check, and
      the job's remaining checks are recorded as "not run", because the
      runtime removed the job's sandbox (ADR-0014). Other jobs still run.
+     Candidate text shown in a check's detail (the last stderr line) has
+     control characters replaced, so it cannot carry terminal or link
+     escape sequences into logs or change requests.
+  4a. **Failure handling is fail-closed in both directions.**
+     - If the candidate's code ends its own sandbox (for example by killing
+       every process), the command fails with "the sandbox stopped while
+       the command ran" and the job's remaining commands are "not run".
+       The record is still written, so sabotage is a rejection with
+       evidence, not missing evidence.
+     - Any other runtime error while the sandbox is still running, and
+       every `ContainmentError`, propagates: no verdict and no record. The
+       coordinator treats that as an infrastructure failure.
+     - A run directory that already exists is refused before anything is
+       checked out or started, even if it is empty.
+     - Each output stream of a sandboxed command is bounded (8 MiB kept,
+       the rest drained and counted) by the Podman adapter, so a command
+       printing without end cannot exhaust the coordinator's memory.
   5. The verdict follows ADR-0010 §5:
 
      | Diff | Required checks | Verdict | `independence` |
@@ -113,6 +130,11 @@ Evidence storage:
     followed by its tests). Dependencies are expected in the image, so no
     job installs anything (ADR-0011 §7).
   - Evidence records each check's `job`.
+- **Default path classes** count tool configuration at any depth (ruff, for
+  example, reads a `ruff.toml` in any directory), plus `sitecustomize.py`,
+  `usercustomize.py` and `.pth` files. Agent instruction files at any depth,
+  `.claude/`, `.mcp.json`, `.vscode/` and `.devcontainer/` are protected,
+  because they make later agent or editor sessions run commands.
 - **Evidence records** hold:
   - execution, attempt and time;
   - base and candidate revisions;
@@ -155,6 +177,12 @@ Evidence storage:
   - job isolation: one sandbox per job, one start for all of a job's
     commands, a tampered checkout or stray process in one job invisible
     to another, shared state within a job, a timeout ending only its job;
+  - adversarial cases: an existing run directory refused before anything
+    runs; a candidate killing its sandbox rejected with evidence; an
+    infrastructure error or `ContainmentError` producing no record; control
+    sequences removed from candidate text; bounded output, and a leftover
+    process holding the output pipe treated as a timeout;
+  - default path classes for nested configuration and agent hook files;
   - timeouts, then "not run";
   - optional checks;
   - evidence appended before return;
@@ -181,7 +209,9 @@ Evidence storage:
   publishes. An unfixed one is rejected whatever the agent claims. A
   two-job run shows that a file written to the checkout, a file in `/tmp`
   and a background process left by the first job are visible to the
-  first job's later commands and to nothing in the second job.
+  first job's later commands and to nothing in the second job. A
+  candidate that kills every process in its sandbox is rejected with
+  evidence, and the next job still runs.
 
 ## Consequences
 
@@ -198,6 +228,14 @@ Evidence storage:
     [R7]).
   - The verification image must carry every tool the checks need, and no
     network is available at verification time (ADR-0011 §7).
+  - Inline suppressions (`# noqa`, `# type: ignore`, skip markers in source
+    files outside the test paths) are ordinary source changes and are not
+    flagged. Holdout checks are the strengthening here too.
+  - The path checks trust `CandidateRevision.changed_paths` as produced by
+    `freeze_candidate`. The coordinator (#11) and restart recovery
+    (#12/#15) must pass that object through, or recompute the diff from
+    the two revisions. They must never rebuild it from stored revisions
+    with an empty path list.
   - Commands within one job can influence each other. The policy author
     decides the grouping; the default puts everything in one job, which is
     the cheapest and the weakest setting.

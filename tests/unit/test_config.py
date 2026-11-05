@@ -172,15 +172,15 @@ def test_path_classes_can_only_be_extended() -> None:
         with_verification(
             extra_protected_paths=["docs/policy.md"],
             extra_check_influencing_paths=["fixtures/"],
-            extra_ci_config_paths=[".woodpecker.yml"],
+            extra_ci_config_paths=[".ci/pipeline.yml"],
         ),
         base_dir=BASE,
     ).verification
     assert policy is not None
-    assert "AGENTS.md" in policy.protected_paths
+    assert "**/AGENTS.md" in policy.protected_paths
     assert "docs/policy.md" in policy.protected_paths
     assert ".github/" in policy.ci_config_paths
-    assert ".woodpecker.yml" in policy.ci_config_paths
+    assert ".ci/pipeline.yml" in policy.ci_config_paths
     assert "tests/" in policy.check_influencing_paths
     assert "fixtures/" in policy.check_influencing_paths
 

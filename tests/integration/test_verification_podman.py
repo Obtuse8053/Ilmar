@@ -202,3 +202,22 @@ def test_jobs_are_isolated_from_each_other_but_not_internally(tmp_path: Path) ->
     failed = [(c.name, c.detail) for c in record.checks if not c.passed]
     assert failed == []
     assert {c.job for c in record.checks if c.job} == {"first", "second"}
+
+
+def test_a_candidate_that_kills_its_sandbox_is_rejected_with_evidence(tmp_path: Path) -> None:
+    """Adversarial review of cf68225: sabotage is a failed check, not missing evidence."""
+    commands = (
+        VerificationCommand(
+            "kill-everything", ("sh", "-c", "kill -9 -1; sleep 5"), timeout_seconds=60, job="first"
+        ),
+        VerificationCommand("after-kill", ("true",), timeout_seconds=60, job="first"),
+        VerificationCommand("other-job", ("true",), timeout_seconds=60, job="second"),
+    )
+    verifier, execution, candidate = scenario(
+        tmp_path, {"src/app.py": "print('fixed')\n"}, commands
+    )
+    record = run(verifier, execution, candidate)
+    by_name = {c.name: c for c in record.checks}
+    assert not by_name["after-kill"].passed
+    assert by_name["other-job"].passed
+    assert record.verdict is Verdict.REJECTED_CHECKS_FAILED
