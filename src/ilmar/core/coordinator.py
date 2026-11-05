@@ -4,8 +4,10 @@
 The coordinator owns the instance (the lock and the fence, ADR-0020); work is
 per execution. A pass:
 
-1. refuses to start anything while the journal has unfinished operations,
-   because recovery (#11c) must settle them first (exit 2);
+1. refuses to start anything while the journal has unfinished operations
+   that are not safe to repeat, because recovery (#11c) must settle them
+   first (exit 2). Unfinished *repeatable* operations (a claim release, a
+   stop) are simply performed again by the step they belong to;
 2. follows up published executions: a change request that was **merged**
    completes the task, one **closed** without merging abandons it. Either
    way Ilmar's claim is released. While it is open the task stays claimed;
@@ -37,7 +39,7 @@ from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.core.verification import Verifier
 from ilmar.core.worker import MAX_ATTEMPTS, ExecutionWorker, Outcome, WorkerResult
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
-from ilmar.domain.errors import ProviderError
+from ilmar.domain.errors import ConflictError, ProviderError
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
 from ilmar.domain.tasks import Task
@@ -136,7 +138,7 @@ class Coordinator:
         return self._c.execution_store
 
     def run_once(self) -> PassReport:
-        unfinished = self._store.unfinished_operations()
+        unfinished = [o for o in self._store.unfinished_operations() if not o.kind.repeatable]
         if unfinished:
             keys = ", ".join(o.key for o in unfinished[:10])
             return PassReport(
@@ -174,9 +176,11 @@ class Coordinator:
     def follow_up_change_requests(self) -> tuple[str, ...]:
         """Release the claim of tasks whose change request was merged or closed."""
         completed: list[str] = []
-        open_requests = [
+        open_requests = [  # RELEASING: an earlier pass was interrupted while releasing
             r
-            for r in self._store.resources(statuses={ResourceStatus.ACTIVE})
+            for r in self._store.resources(
+                statuses={ResourceStatus.ACTIVE, ResourceStatus.RELEASING}
+            )
             if r.kind is ResourceKind.CHANGE_REQUEST
         ]
         for resource in open_requests:
@@ -200,7 +204,11 @@ class Coordinator:
             if state is ChangeRequestState.OPEN:
                 continue
             merged = state is ChangeRequestState.MERGED
-            with self.leases.acquire(execution.id) as lease:
+            try:
+                lease = self.leases.acquire(execution.id)
+            except ConflictError:
+                continue  # a worker holds it; asked again next pass
+            with lease:
                 self._effects.stop_tracking_change_request(
                     execution,
                     lease,
@@ -228,13 +236,16 @@ class Coordinator:
     def _pick(self) -> Task | None:
         """The first eligible task (by key) Ilmar is not already working on or done with.
 
-        A task with an active execution, or with a published (SUCCEEDED)
-        execution, is never started again automatically: its change request
-        exists, open or merged.
+        Never started again automatically: a task with an active execution;
+        one with a published (SUCCEEDED) execution, whose change request
+        exists, open or merged; and one whose execution FAILED. Releasing a
+        failed task's claim makes it eligible on the tracker, but running it
+        again would be an automatic retry of a failure that was classified
+        as not retryable (ADR-0021). A human decides.
         """
-        published = {e.task for e in self._store.list_in_states({S.SUCCEEDED})}
+        finished = {e.task for e in self._store.list_in_states({S.SUCCEEDED, S.FAILED})}
         for task in sorted(self._c.task_provider.list_eligible(), key=lambda t: t.ref.key):
-            if task.ref in published or self._store.active_for_task(task.ref) is not None:
+            if task.ref in finished or self._store.active_for_task(task.ref) is not None:
                 continue
             return task
         return None

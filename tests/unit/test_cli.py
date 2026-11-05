@@ -103,13 +103,9 @@ def test_run_with_an_invalid_configuration_exits_3(
     assert "error" in capsys.readouterr().err
 
 
-def test_run_on_a_locked_instance_exits_3_and_changes_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def runnable_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The example configuration with stand-in executables and local paths."""
     import stat
-
-    from ilmar.core.layout import WorkspaceLayout
-    from ilmar.core.ownership import InstanceLock
 
     tools = tmp_path / "bin"
     tools.mkdir()
@@ -118,7 +114,6 @@ def test_run_on_a_locked_instance_exits_3_and_changes_nothing(
         (tools / name).chmod(stat.S_IRWXU)
     text = (REPO_ROOT / "ilmar.example.toml").read_text()
     text = text.replace('state_dir = ".ilmar"', f'state_dir = "{tmp_path / "state"}"')
-    text = text.replace('kind = "podman"\n', 'kind = "podman"\n', 1)
     text = text.replace(
         "options = { proxy_image", f'options = {{ podman = "{tools / "podman"}", proxy_image', 1
     )
@@ -134,9 +129,34 @@ def test_run_on_a_locked_instance_exits_3_and_changes_nothing(
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-y")
     (tmp_path / "state").mkdir()
+    return config
+
+
+def test_run_on_a_locked_instance_exits_3_and_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ilmar.core.layout import WorkspaceLayout
+    from ilmar.core.ownership import InstanceLock
+
+    config = runnable_config(tmp_path, monkeypatch)
     held = InstanceLock.acquire(WorkspaceLayout.under((tmp_path / "state").resolve()))
     try:
         assert main(["run", "--once", "--config", str(config)]) == 3
         assert "another coordinator" in capsys.readouterr().err
     finally:
         held.release()
+
+
+def test_run_reports_an_unexpected_error_as_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ilmar.core.coordinator import Coordinator
+
+    config = runnable_config(tmp_path, monkeypatch)
+
+    def broken(self: Coordinator) -> None:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(Coordinator, "run_once", broken)
+    assert main(["run", "--once", "--config", str(config)]) == 2
+    assert "unexpected RuntimeError" in capsys.readouterr().err

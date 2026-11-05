@@ -341,16 +341,30 @@ def test_an_unremovable_sandbox_blocks_and_is_never_frozen(setup: Setup) -> None
     assert setup.tasks.list_eligible() == ()  # still claimed: a human must look
 
 
-def test_unfinished_operations_block_new_work(setup: Setup) -> None:
-    setup.runtime.stop_hook = lambda handle: (_ for _ in ()).throw(ProviderError("lost"))
-    first = setup.coordinator().run_once()
-    assert first.code == 2
-    setup.runtime.stop_hook = None
+def test_an_unsettled_non_repeatable_effect_blocks_new_work(setup: Setup) -> None:
+    def pushed_elsewhere(*args: Any, **kwargs: Any) -> None:
+        execution = setup.store.get("e1")
+        assert execution is not None
+        assert execution.branch
+        setup.scm._branches[(REPO, execution.branch)] = setup.scm.seed(REPO, "x", {"y": "z"})
+        raise ProviderError("connection reset")
+
+    setup.scm.publish_revision = pushed_elsewhere  # type: ignore[method-assign]
+    assert setup.coordinator().run_once().code == 2
     setup.tasks.add(task("2"))
     second = setup.coordinator().run_once()
     assert second.code == 2
     assert "unfinished operation" in second.summary
     assert setup.store.get("e2") is None
+
+
+def test_an_unsettled_repeatable_effect_does_not_stop_other_work(setup: Setup) -> None:
+    setup.runtime.stop_hook = lambda handle: (_ for _ in ()).throw(ProviderError("lost"))
+    assert setup.coordinator().run_once().code == 2  # e1 blocked: its stop is unclear
+    setup.runtime.stop_hook = None
+    setup.tasks.add(task("2"))
+    second = setup.coordinator().run_once()
+    assert (second.code, second.results[0].outcome) == (0, Outcome.PUBLISHED)
 
 
 # -- fencing and concurrency -------------------------------------------------------------
@@ -493,3 +507,209 @@ def test_attempts_beyond_three_are_refused_by_construction(setup: Setup) -> None
             clock=setup.clock,
             agent_timeout_seconds=1,
         )
+
+
+# -- adversarial review of 46c1662 -------------------------------------------------------
+
+
+def test_a_containment_failure_while_starting_is_never_retried(setup: Setup) -> None:
+    """Podman's start raises ContainmentError (a ProviderError) if cleanup is unconfirmed."""
+
+    def unconfirmed(spec: Any) -> Any:
+        raise ContainmentError("egress sidecar not removed", container_id="c", name=spec.name)
+
+    setup.runtime.start = unconfirmed  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state, execution.attempt) == (2, S.FAILED, 1)
+    assert S.RETRY_WAIT not in states(setup)
+    assert setup.agent.runs == 0
+    (container,) = resources(setup, ResourceKind.CONTAINER)
+    assert container.status is R.QUARANTINED
+
+
+def test_a_policy_violation_while_publishing_is_never_retried(setup: Setup) -> None:
+    from ilmar.adapters.github.client import CrossOriginRedirectError
+    from ilmar.core.effects import NEVER_TRANSIENT
+    from ilmar.domain.errors import PolicyViolationError
+
+    assert issubclass(CrossOriginRedirectError, PolicyViolationError)
+    assert issubclass(CrossOriginRedirectError, NEVER_TRANSIENT)
+    calls = []
+
+    def redirected(*args: Any, **kwargs: Any) -> None:
+        calls.append(1)
+        raise CrossOriginRedirectError("redirect to another origin refused")
+
+    setup.scm.publish_revision = redirected  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state) == (1, S.FAILED)
+    assert calls == [1]  # not tried again, not under retry-1
+    assert setup.agent.runs == 1
+
+
+def test_a_failed_checkout_is_not_retried(setup: Setup) -> None:
+    def unsafe(*args: Any, **kwargs: Any) -> str:
+        raise ProviderError("unsafe path in tree")
+
+    setup.scm.checkout = unsafe  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state, execution.attempt) == (1, S.FAILED, 1)
+    assert setup.agent.runs == 0
+
+
+def test_a_failed_task_is_never_started_again_automatically(setup: Setup) -> None:
+    setup.agent.plan = [(AgentOutcome.FAILED, {})]
+    coordinator = setup.coordinator()
+    assert coordinator.run_once().code == 1
+    assert setup.tasks.list_eligible() == (task("1"),)  # the claim was released
+    again = coordinator.run_once()
+    assert (again.code, again.summary) == (0, "no eligible task")
+    assert setup.store.get("e2") is None
+    assert setup.agent.runs == 1
+
+
+def test_verification_infrastructure_failures_re_verify_the_same_candidate(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, calls, seen = Verifier.verify, [], []
+
+    def flaky(self: Verifier, **kwargs: Any) -> Any:
+        calls.append(kwargs["run"])
+        seen.append(kwargs["candidate"])
+        if len(calls) == 1:
+            raise ProviderError("podman went away")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(Verifier, "verify", flaky)
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.attempt) == (0, 1)  # no new attempt, no second agent run
+    assert setup.agent.runs == 1
+    assert calls == [1, 2]
+    assert seen[0] == seen[1]  # exactly the same frozen candidate both times
+    first = setup.store.operation(operation_key(K.VERIFY, "e1", 1, "run-1"))
+    assert first is not None
+    assert first.status is OperationStatus.FAILED
+    assert setup.scm.pushes[0][2] == execution.candidate_revision
+
+
+def test_repeated_verification_failures_block_without_rerunning_the_agent(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: Verifier, **kwargs: Any) -> Any:
+        raise ProviderError("podman went away")
+
+    monkeypatch.setattr(Verifier, "verify", broken)
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state, execution.attempt) == (2, S.VERIFYING, 1)
+    assert "frozen candidate is kept" in report.results[0].detail
+    assert setup.agent.runs == 1
+    assert setup.scm.pushes == []
+
+
+def test_repeated_push_failures_block_without_rerunning_the_agent(setup: Setup) -> None:
+    def never_sent(*args: Any, **kwargs: Any) -> None:
+        raise ProviderError("timeout before sending")
+
+    setup.scm.publish_revision = never_sent  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state, execution.attempt) == (2, S.PUBLISHING, 1)
+    assert setup.agent.runs == 1
+    steps = [o.key for o in setup.store.operations("e1") if o.kind is K.PUBLISH_REVISION]
+    assert steps == [
+        "publish-revision:e1:1",
+        "publish-revision:e1:1:retry-1",
+        "publish-revision:e1:1:retry-2",
+    ]
+    assert setup.store.unfinished_operations() == ()
+
+
+def test_no_change_request_is_opened_when_the_branch_moved_after_the_push(setup: Setup) -> None:
+    original = setup.scm.publish_revision
+
+    def then_someone_pushes(*args: Any, **kwargs: Any) -> None:
+        original(*args, **kwargs)
+        setup.scm._branches[(REPO, kwargs["branch"])] = setup.scm.seed(REPO, "x", {"a": "b"})
+
+    setup.scm.publish_revision = then_someone_pushes  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    assert report.code == 2
+    detail = report.results[0].detail
+    assert "not the verified candidate" in detail or "moved after the push" in detail
+    assert resources(setup, ResourceKind.CHANGE_REQUEST) == []
+
+
+def test_the_head_is_checked_again_right_before_the_change_request(setup: Setup) -> None:
+    original, reads = setup.scm.branch_head, []
+
+    def moving(repository: Any, branch: str) -> Any:
+        reads.append(branch)
+        head = original(repository, branch)
+        if branch.startswith("ilmar/") and len(reads) == 3:  # the read after the push
+            return "f" * 40
+        return head
+
+    setup.scm.branch_head = moving  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    assert report.code == 2
+    assert resources(setup, ResourceKind.CHANGE_REQUEST) == []
+
+
+def test_a_branch_that_moves_while_the_change_request_opens_is_not_complete(
+    setup: Setup,
+) -> None:
+    original = setup.scm.upsert_change_request
+
+    def racing(spec: Any) -> Any:
+        request = original(spec)
+        setup.scm._branches[(REPO, spec.source_branch)] = setup.scm.seed(REPO, "x", {"a": "b"})
+        return request
+
+    setup.scm.upsert_change_request = racing  # type: ignore[method-assign]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state) == (2, S.PUBLISHING)  # not called complete
+    (request,) = resources(setup, ResourceKind.CHANGE_REQUEST)
+    assert request.status is R.ACTIVE  # but the change request is tracked
+
+
+def test_an_interrupted_claim_release_after_a_merge_is_resumed(setup: Setup) -> None:
+    from ilmar.domain.changes import ChangeRequest
+
+    coordinator = setup.coordinator()
+    coordinator.run_once()
+    (resource,) = resources(setup, ResourceKind.CHANGE_REQUEST)
+    upsert = setup.store.operation(operation_key(K.UPSERT_CHANGE_REQUEST, "e1", 1))
+    assert upsert is not None
+    request = ChangeRequest(REPO, resource.identity, upsert.result["url"], resource.name, "main")
+    setup.scm.finish_change_request(request, merged=True)
+    original, calls = setup.tasks.release, []
+
+    def flaky(ref: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise ProviderError("tracker unavailable")
+        original(ref)
+
+    setup.tasks.release = flaky  # type: ignore[method-assign]
+    with pytest.raises(ProviderError):
+        coordinator.run_once()
+    (half,) = resources(setup, ResourceKind.CHANGE_REQUEST)
+    assert half.status is R.RELEASING
+    report = coordinator.run_once()  # a repeatable release does not block the pass
+    (done,) = resources(setup, ResourceKind.CHANGE_REQUEST)
+    assert (done.status, done.note) == (R.RELEASED, "merged: task complete")
+    assert report.completed_tasks == ("e1",)
+    assert setup.tasks.list_eligible() == (task("1"),)

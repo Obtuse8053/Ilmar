@@ -53,8 +53,10 @@ The maintainer decided, on issue #11:
 - **`ilmar.core.coordinator.Coordinator`.**
   - One per process; holds the `Ownership` (ADR-0020).
   - `run_once()` refuses new work while the journal has unfinished
-    operations, follows up published change requests, then picks at most
-    one eligible task.
+    operations that are **not repeatable**. Unfinished repeatable ones (a
+    claim release, a stop) are simply performed again by their step.
+  - It then follows up published change requests, resuming any release an
+    earlier pass left half done, and picks at most one eligible task.
   - `dispatch()` runs a worker. It is safe to call concurrently for
     different executions; there is no global execution mutex.
 - **`ilmar.core.worker.ExecutionWorker`.**
@@ -100,12 +102,22 @@ Keys follow ADR-0020: `<kind>:<execution>:<attempt>[:<step>]`.
 | SUCCEEDED | `post_update`, delete the attempt directory | everything inside `RELEASING` | `RELEASED` ("deleted after success"). The claim is **kept** |
 | FAILED | `post_update`, `release` | — | the workspace stays `ACTIVE`: kept for inspection |
 
-**Before publishing**, the worker checks:
+**Before publishing**, and again around the change request, the worker
+checks:
 - the in-memory candidate equals the journal's freeze: revision, base and
   changed-paths digest (`check_candidate`), and equals the execution's
   recorded revisions;
 - the latest evidence is the one this run produced, is publishable, and
   names the same candidate and base.
+
+After the push:
+- the push effect reads the branch head back, and it must be the candidate;
+- right before opening the change request, the head is read again;
+- the upsert effect records the head right after.
+
+If the branch moved at any of these points, no change request is opened,
+or the execution is **not** marked complete (it stays PUBLISHING, blocked,
+with the change request tracked in the ledger).
 
 Any mismatch blocks the execution. The published revision is therefore
 exactly the verified frozen candidate on an unchanged base.
@@ -114,11 +126,30 @@ exactly the verified frozen candidate on an unchanged base.
 
 | Class | Examples | Result |
 | --- | --- | --- |
-| Transient | agent TIMED_OUT; a checkout that failed (attempt-scoped paths); a sandbox start that left no container; an agent run interrupted by a runtime error; verification that did not finish and left no sandbox; a push that the branch head shows did not happen (first retried twice under `retry-1`, `retry-2`) | a new attempt while attempts remain, otherwise FAILED ("attempts exhausted"). **At most 3 attempts**, capped in code regardless of configuration |
-| Deterministic | agent FAILED; the agent changed nothing; `REJECTED_CHECKS_FAILED` | FAILED, never retried |
+| Transient (before freezing) | agent TIMED_OUT; a sandbox start that left no container; an agent run interrupted by a runtime error | a new attempt while attempts remain, otherwise FAILED ("attempts exhausted"). **At most 3 attempts**, capped in code regardless of configuration |
+| Transient (after freezing) | verification that did not finish and left no sandbox; a push that the branch head shows did not happen | **the same frozen candidate** is verified again (run *n+1*: a new key, directory and sandboxes) or pushed again (`retry-1`, `retry-2`) in the same attempt, at most 3 tries. **The agent is never re-run for these.** If all tries fail, the execution stays in VERIFYING or PUBLISHING, blocked (exit 2), with the candidate kept for #11c |
+| Deterministic | agent FAILED; the agent changed nothing; `REJECTED_CHECKS_FAILED`; a failed checkout (an unknown base branch, or a tree the adapter refuses as unsafe, would fail the same way) | FAILED, never retried |
 | Security / policy | `REJECTED_CI_CONFIG`; `CandidateRejectedError`; `PolicyViolationError`; `OwnershipConflictError` (foreign change request, replaced directory); `LeaseConflictError` / `NonFastForwardError` (the branch moved) | FAILED, never retried |
 | Blocked | an ambiguous effect that cannot be decided by observation; a `ContainmentError` (quarantine); `LedgerIntegrityError`; a stale view | the worker stops; exit 2. Quarantined resources and the claim stay for a human |
-| Ownership lost | `FencingError` | propagated at once; exit 3; nothing more happens |
+| Ownership lost | `FencingError`, also when it hits the commit of an effect's outcome (never masked as a refused follow-up) | propagated at once; exit 3; nothing more happens |
+
+`Effects.NEVER_TRANSIENT` lists the failures that are never turned into a
+transient failure, whichever port raised them:
+- `ContainmentError`;
+- `PolicyViolationError`;
+- `OwnershipConflictError`;
+- `CandidateRejectedError`;
+- `LedgerIntegrityError`;
+- `FencingError`.
+
+Every `except ProviderError` lets them through first, because
+`ContainmentError` is itself a `ProviderError`: Podman's `start` raises it
+when sandbox or sidecar teardown cannot be confirmed, and the container is
+then quarantined. GitHub's `CrossOriginRedirectError` is also a
+`PolicyViolationError`.
+
+Unexpected errors at the process boundary exit 2 ("a human must look"),
+never 0 or 1.
 
 An agent FAILED outcome cannot be told apart from a deterministic failure
 by the `AgentResult` alone, so it is not retried. A runner-provided reason
@@ -143,9 +174,14 @@ ADR-0020's table; ADR-0020 itself is unchanged.
     `merged: task complete`.
   - **CLOSED:** the same, with the note `closed without merging`.
 - **On terminal failure**, the claim is released and a note posted.
-- **A task with a published execution is never started again
-  automatically**, even if it shows up as eligible, because its change
-  request exists, open or merged.
+- **A task with a published or failed execution is never started again
+  automatically**, even if it shows up as eligible.
+  - Published: its change request exists, open or merged.
+  - Failed: releasing the claim makes the task eligible on the tracker,
+    but a new execution would be an automatic retry of a failure that was
+    classified as not retryable.
+
+  A human decides. A command to reset a task comes later (#12).
 
 ### Workspaces
 
@@ -218,6 +254,22 @@ bounded pool can replace the call without changing the design.
   - unfinished operations block the next pass.
 - Integrity: a candidate swapped in memory, or evidence for another
   candidate, blocks before verification or publication.
+- Adversarial review of `46c1662`, each fix mutation-checked:
+  - a `ContainmentError` from start → quarantine, FAILED, never retried;
+  - a cross-origin redirect while pushing → FAILED, tried once;
+  - a failed checkout → FAILED, never retried;
+  - a failed task is never started again;
+  - a verification infrastructure failure → the same frozen candidate is
+    re-verified (run 2), with the agent run once;
+  - repeated verification failures, and repeated push failures, block
+    without re-running the agent;
+  - a branch moved after the push, before the change request, or while it
+    opens → no completion;
+  - an interrupted claim release after a merge is resumed;
+  - a repeatable unfinished effect does not stop other work, and a
+    non-repeatable one does;
+  - a lost fence on an outcome commit raises `FencingError`;
+  - an unexpected error exits 2.
 - Fencing and concurrency:
   - a takeover during the agent run stops the worker before freezing;
   - two executions run their agents at the same moment and publish
@@ -247,14 +299,21 @@ bounded pool can replace the call without changing the design.
   - Agent FAILED outcomes are never retried, even when the cause was
     transient (an API hiccup). This is deliberate until runners report a
     reason.
-  - A transient failure late in the run (verification infrastructure, a
-    push) repeats the agent run in a new attempt.
+  - A late-stage failure that persists for three tries leaves the
+    execution blocked in VERIFYING or PUBLISHING until #11c resumes it from
+    the frozen candidate (`load_candidate`). This is deliberate: the agent
+    is never re-run once a candidate exists.
+  - A transient failure of a checkout is not retried, because it cannot be
+    told apart from a deterministic one.
+  - Containers of a coordinator that lost ownership mid-run are left for
+    the new owner. A stale owner must not act; #11c cleans up through the
+    ledger.
   - Until #11c, any crash or ambiguous outcome blocks new work for the
     instance. That is fail closed, but the instance stops until a human
     reconciles.
   - Failed workspaces accumulate until #12/#15 adds cleanup.
-  - A published task is never re-run automatically, even if its change
-    request was closed. Re-running is a human decision.
+  - A published or failed task is never re-run automatically, even if its
+    change request was closed. Re-running is a human decision.
 
 ## Revisit when
 

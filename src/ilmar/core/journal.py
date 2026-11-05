@@ -45,6 +45,7 @@ from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.errors import (
     AmbiguousOperationError,
     ConcurrencyConflictError,
+    FencingError,
     LedgerIntegrityError,
 )
 from ilmar.domain.execution import Execution
@@ -168,6 +169,8 @@ class Journal:
             follow_up = after(result) if after is not None else Commit()
             _check_scope(follow_up, execution.id)
             self._store.commit(fence, _with(follow_up, succeeded))
+        except FencingError:
+            raise  # ownership was lost: nothing more may be written or done
         except Exception as error:
             # The effect happened. Keep that knowledge (and its result) even
             # though the follow-up was refused: recovery reconciles it.

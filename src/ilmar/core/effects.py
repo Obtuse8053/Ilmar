@@ -42,6 +42,7 @@ from ilmar.domain.errors import (
     AmbiguousOperationError,
     CandidateRejectedError,
     ContainmentError,
+    FencingError,
     IlmarError,
     LeaseConflictError,
     LedgerIntegrityError,
@@ -79,7 +80,25 @@ _SUMMARY_LIMIT = 2000
 
 
 class TransientError(IlmarError):
-    """The attempt failed for a reason that a new attempt may not meet (ADR-0021)."""
+    """The step failed for a reason a repetition may not meet (ADR-0021)."""
+
+
+class DeterministicError(IlmarError):
+    """The step failed in a way that repeating it would only reproduce (ADR-0021)."""
+
+
+# Never converted into a transient failure, whatever port raised them: a
+# security, policy, ownership or integrity failure ends retries at once
+# (review of 46c1662). ``ContainmentError`` is a ``ProviderError``, so every
+# ``except ProviderError`` below lets these through first.
+NEVER_TRANSIENT: tuple[type[BaseException], ...] = (
+    ContainmentError,
+    PolicyViolationError,
+    OwnershipConflictError,
+    CandidateRejectedError,
+    LedgerIntegrityError,
+    FencingError,
+)
 
 
 def identity_text(identity: DirectoryIdentity) -> str:
@@ -226,11 +245,15 @@ class Effects:
                 after=lambda r: _merge(
                     Commit(resources=(self._activate(planned, r["identity"]),)), then(r)
                 ),
-                definitive=(ProviderError,),  # attempt-scoped: a new attempt uses a new path
+                definitive=(ProviderError,),  # attempt-scoped: nothing else was changed
             )
+        except NEVER_TRANSIENT:
+            raise
         except ProviderError as error:
+            # Not retried: a checkout fails the same way again (unknown base
+            # branch, an unsafe tree refused by the adapter).
             self._settle_partial(execution, lease, planned, path)
-            raise TransientError(f"checkout failed: {type(error).__name__}") from error
+            raise DeterministicError(f"checkout failed: {type(error).__name__}") from error
         return Checkout(
             result["base_revision"],
             result["branch_head"] or None,
@@ -342,6 +365,11 @@ class Effects:
                 Commit(resources=(planned.moved(R.RELEASED, now=self._clock(), note="refused"),)),
             )
             raise
+        except ContainmentError:
+            self._quarantine(execution, lease, planned, "start could not be cleaned up")
+            raise
+        except NEVER_TRANSIENT:
+            raise
         except ProviderError as error:
             # Observe: if no container exists under the name, nothing happened.
             if runtime.find(name) is None:
@@ -378,7 +406,7 @@ class Effects:
         key = operation_key(K.RUN_AGENT, execution.id, execution.attempt)
         try:
             result = self._journal.perform(K.RUN_AGENT, execution, effect, lease=lease)
-        except ContainmentError:
+        except NEVER_TRANSIENT:
             raise
         except ProviderError as error:
             # ADR-0021: an agent run with an unknown outcome abandons the attempt.
@@ -536,6 +564,8 @@ class Effects:
                 if planned.name == error.name:
                     self._quarantine(execution, lease, planned, "removal could not be confirmed")
             raise
+        except NEVER_TRANSIENT:
+            raise
         except ProviderError as error:
             key = operation_key(K.VERIFY, execution.id, execution.attempt, f"run-{run}")
             left = [c for c in containers if self._c.container_runtime.find(c.name) is not None]
@@ -545,9 +575,14 @@ class Effects:
                     OperationStatus.FAILED,
                     reason="verification did not finish and left no sandbox",
                     changes=Commit(
-                        resources=tuple(
-                            c.moved(R.RELEASED, now=self._clock(), note="removed or never created")
-                            for c in containers
+                        resources=(
+                            *(
+                                c.moved(
+                                    R.RELEASED, now=self._clock(), note="removed or never created"
+                                )
+                                for c in containers
+                            ),
+                            self._observed_checkout(checkout, run_dir),
                         )
                     ),
                 )
@@ -591,7 +626,9 @@ class Effects:
                 intent={"revision": revision, "branch": branch, "expected": expected_head or ""},
                 definitive=(LeaseConflictError, NonFastForwardError),
             )
-        except (LeaseConflictError, NonFastForwardError, LedgerIntegrityError):
+        except (LeaseConflictError, NonFastForwardError):
+            raise
+        except NEVER_TRANSIENT:
             raise
         except ProviderError as error:
             head = scm.branch_head(repository, branch)  # observe
@@ -617,17 +654,32 @@ class Effects:
         *,
         spec: ChangeRequestSpec,
         owner_token: str,
+        verified: str,
         then: Then,
     ) -> ChangeRequest:
+        """Open or update the change request for ``verified``.
+
+        The result records the branch head right after: ``then`` decides,
+        and must refuse to call the execution complete if it is no longer
+        ``verified`` (someone pushed in between).
+        """
         planned = self._planned(
             ResourceKind.CHANGE_REQUEST, execution, spec.source_branch, owner_token
         )
         made: list[ChangeRequest] = []
+        scm = self._c.source_control
 
         def effect() -> Mapping[str, str]:
-            request = self._c.source_control.upsert_change_request(spec)
+            request = scm.upsert_change_request(spec)
             made.append(request)
-            return {"key": request.key, "url": request.url, "labels": ",".join(request.labels)}
+            head = scm.branch_head(spec.repository, spec.source_branch)
+            return {
+                "key": request.key,
+                "url": request.url,
+                "labels": ",".join(request.labels),
+                "head_after": head or "",
+                "verified": verified,
+            }
 
         result = self._journal.perform(
             K.UPSERT_CHANGE_REQUEST,
@@ -659,8 +711,15 @@ class Effects:
         note: str,
         step: str,
     ) -> None:
-        """The task is complete (merged) or abandoned (closed): release Ilmar's claim."""
-        releasing = resource.moved(R.RELEASING, now=self._clock())
+        """The task is complete (merged) or abandoned (closed): release Ilmar's claim.
+
+        Resumes a resource left ``RELEASING`` by an earlier, interrupted pass.
+        """
+        if resource.status is R.RELEASING:
+            releasing, before = resource, Commit()
+        else:
+            releasing = resource.moved(R.RELEASING, now=self._clock())
+            before = Commit(resources=(releasing,))
 
         def effect() -> Mapping[str, str]:
             self._c.task_provider.release(execution.task)
@@ -672,7 +731,7 @@ class Effects:
             effect,
             lease=lease,
             step=step,
-            before=Commit(resources=(releasing,)),
+            before=before,
             after=lambda _: Commit(
                 resources=(releasing.moved(R.RELEASED, now=self._clock(), note=note),)
             ),
@@ -705,6 +764,15 @@ class Effects:
             lease,
             execution,
             Commit(resources=(current.moved(R.QUARANTINED, now=self._clock(), note=note),)),
+        )
+
+    def _observed_checkout(self, checkout: Resource, run_dir: Path) -> Resource:
+        """What a verification run left on disk, as the ledger should record it."""
+        found = directory_identity(run_dir, root=self._c.layout.workspaces_root)
+        if found is None:
+            return checkout.moved(R.RELEASED, now=self._clock(), note="never created")
+        return checkout.moved(
+            R.ACTIVE, now=self._clock(), identity=identity_text(found), note="interrupted run"
         )
 
     def _settle_partial(

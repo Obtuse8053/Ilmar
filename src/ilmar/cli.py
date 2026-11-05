@@ -130,6 +130,13 @@ def _run_once(path: Path) -> int:
             except OwnershipConflictError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return int(ExitCode.CONFIGURATION)
+            except Exception as exc:  # the process boundary: never report a false outcome
+                print(
+                    f"error: unexpected {type(exc).__name__}; the journal shows where work "
+                    "stopped and a human must look",
+                    file=sys.stderr,
+                )
+                return int(ExitCode.BLOCKED)
     print(report.summary)
     for execution_id in report.completed_tasks:
         print(f"task completed (change request merged): {execution_id}")

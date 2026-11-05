@@ -9,9 +9,14 @@ executions.
 
 Failure classification (ADR-0021):
 
-* **transient** (``TransientError``): the agent timed out; a checkout,
-  sandbox start, agent run, verification run or push certainly did not
-  complete. A new attempt follows while attempts remain (at most 3).
+* **transient** (``TransientError``): the agent timed out; a sandbox start
+  or agent run certainly did not complete. A new attempt follows while
+  attempts remain (at most 3).
+* **late-stage transient**: verification infrastructure or a push failed
+  after the candidate was frozen. The *same frozen candidate* is verified
+  or pushed again in the same attempt (at most 3 tries); the agent is never
+  re-run for these. If every try fails, the execution is left where it is,
+  blocked, with its verified candidate kept for #11c.
 * **deterministic, security or policy**: never retried automatically. They
   end in FAILED and release the claim: the agent failed or changed nothing,
   checks failed, CI configuration changed, unsafe agent output, the branch
@@ -31,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ilmar.core.components import Components
-from ilmar.core.effects import Effects, TransientError, parse_identity
+from ilmar.core.effects import DeterministicError, Effects, TransientError, parse_identity
 from ilmar.core.journal import check_candidate
 from ilmar.core.naming import branch_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
@@ -59,6 +64,8 @@ from ilmar.ports.execution_store import ExecutionStore
 
 S = ExecutionState
 MAX_ATTEMPTS = 3
+LATE_TRIES = 3
+"""Verification runs, or pushes, of one frozen candidate within an attempt."""
 REVIEW_LABEL = "ilmar:needs-human-review"
 _DETERMINISTIC = (
     CandidateRejectedError,
@@ -86,6 +93,12 @@ class WorkerResult:
 
 
 class _Deterministic(Exception):  # noqa: N818 - internal control flow, never escapes
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Blocked(Exception):  # noqa: N818 - internal control flow, never escapes
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
@@ -173,6 +186,10 @@ class _Run:
                 self.retry_or_fail(str(error))
             except _Deterministic as failure:
                 self.fail(failure.reason)
+            except DeterministicError as error:
+                self.fail(str(error))
+            except _Blocked as blocked:
+                return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
             except _DETERMINISTIC as error:
                 self.fail(f"{type(error).__name__}: {error}")
             except ContainmentError as error:
@@ -283,7 +300,6 @@ class _Run:
         if candidate is None or agent_result is None:
             raise LedgerIntegrityError(f"{self.id}: verifying needs the candidate in memory (#11c)")
         self.check_frozen(execution, candidate)
-        run = 1 + sum(1 for e in self.store.evidence(self.id) if e.attempt == execution.attempt)
 
         def then(r: Mapping[str, str]) -> Commit:
             verdict = Verdict(r["verdict"])
@@ -296,14 +312,28 @@ class _Run:
             )
             return self.transition_to(S.FAILED, reason, error=reason)
 
-        self.evidence = self.w.effects.verify(
-            execution,
-            self.lease,
-            candidate=candidate,
-            agent_result=agent_result,
-            owner=owner,
-            run=run,
-            then=then,
+        for _ in range(LATE_TRIES):
+            run = 1 + sum(  # every journaled run of this attempt, finished or not
+                1
+                for o in self.store.operations(self.id)
+                if o.kind is OperationKind.VERIFY and o.attempt == execution.attempt
+            )
+            try:
+                self.evidence = self.w.effects.verify(
+                    self.current(),
+                    self.lease,
+                    candidate=candidate,
+                    agent_result=agent_result,
+                    owner=owner,
+                    run=run,
+                    then=then,
+                )
+                return
+            except TransientError:
+                continue  # the same frozen candidate, a fresh run directory and sandboxes
+        raise _Blocked(
+            f"verification infrastructure failed {LATE_TRIES} times; the frozen candidate "
+            "is kept for recovery (#11c)"
         )
 
     def publish(self, execution: Execution) -> None:
@@ -325,21 +355,31 @@ class _Run:
         if checkout is None:
             raise LedgerIntegrityError(f"{self.id} has no recorded checkout")
         expected_head = checkout.result["branch_head"] or None
-        step = ""
-        for tries in range(3):
+        for tries in range(LATE_TRIES):
             try:
                 self.w.effects.publish(
                     self.current(),
                     self.lease,
                     branch=self.branch,
                     expected_head=expected_head,
-                    step=step,
+                    step=f"retry-{tries}" if tries else "",
                 )
                 break
             except TransientError:
-                if tries == 2:
-                    raise
-                step = f"retry-{tries + 1}"
+                continue
+        else:
+            raise _Blocked(
+                f"the push failed {LATE_TRIES} times; the verified candidate is kept "
+                "for recovery (#11c)"
+            )
+        revision = execution.candidate_revision
+        head = self.w.components.source_control.branch_head(
+            self.w.components.target.repository, self.branch
+        )
+        if head != revision:
+            raise LedgerIntegrityError(
+                f"{self.branch} moved after the push; no change request is opened for it"
+            )
         labels = (REVIEW_LABEL,) if evidence.verdict is Verdict.PUBLISH_FOR_REVIEW else ()
         spec = ChangeRequestSpec(
             repository=self.w.components.target.repository,
@@ -351,15 +391,29 @@ class _Run:
             labels=labels,
         )
         owner = self.require_owner(execution)
+        if revision is None:
+            raise LedgerIntegrityError(f"{self.id} has no candidate to open a change request for")
+
+        def then(r: Mapping[str, str]) -> Commit:
+            if r["head_after"] != r["verified"]:
+                return Commit()  # the change request exists but no longer shows it
+            return self.transition_to(
+                S.SUCCEEDED, "change request published", change_request_url=r["url"]
+            )
+
         self.w.effects.upsert_change_request(
             self.current(),
             self.lease,
             spec=spec,
             owner_token=owner.token,
-            then=lambda r: self.transition_to(
-                S.SUCCEEDED, "change request published", change_request_url=r["url"]
-            ),
+            verified=revision,
+            then=then,
         )
+        if self.current().state is not S.SUCCEEDED:
+            raise _Blocked(
+                f"{self.branch} moved while the change request was opened; it does not show "
+                "the verified candidate, so the execution is not complete"
+            )
 
     # -- endings ----------------------------------------------------------------------
 
