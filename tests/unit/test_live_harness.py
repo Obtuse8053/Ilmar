@@ -53,6 +53,7 @@ class FakeGitHub:
             "private": True,
             "topics": ["ilmar-disposable"],
             "default_branch": "main",
+            "full_name": "owner/ilmar-disposable",
         }
     )
     headers: dict[str, str] = field(
@@ -73,8 +74,14 @@ class FakeGitHub:
             return HttpResponse(200, self.headers, json.dumps(self.repo).encode())
         if key == ("GET", "/repos/owner/Ilmar"):
             return HttpResponse(404, {}, b'{"message":"Not Found"}')
-        if key[1].endswith(("/actions/permissions", "/actions/runs")):
+        if key[1].endswith(("/actions/permissions", "/actions/runs", "/actions/secrets", "/hooks")):
             return HttpResponse(403, {}, b'{"message":"Resource not accessible"}')
+        if key == ("PUT", f"/repos/owner/ilmar-disposable/contents/{h.PROBE_FILE}"):
+            return HttpResponse(201, {}, b'{"content":{}}')
+        if key == ("POST", "/repos/owner/ilmar-disposable/pulls"):
+            return HttpResponse(201, {}, b'{"number":9}')
+        if key[0] == "GET" and key[1].endswith(("/issues", "/pulls")):
+            return HttpResponse(200, {}, b"[]")
         if key[1].endswith("/git/ref/heads/main"):
             return HttpResponse(200, {}, json.dumps({"object": {"sha": "a" * 40}}).encode())
         if key == ("PUT", f"/repos/owner/ilmar-disposable/contents/{h.PROBE_WORKFLOW}"):
@@ -125,6 +132,13 @@ def test_every_encoding_of_a_secret_is_found_and_redacted() -> None:
         "token=<ILMAR_LIVE_GITHUB_TOKEN> header=Basic <ILMAR_LIVE_GITHUB_TOKEN>"
     )
     assert h.find_secrets(b"nothing here", [secret]) == []
+
+
+def test_fragments_of_a_secret_are_found() -> None:
+    """Tools record keys by fragments: Claude Code by the last 20 characters."""
+    key = h.Secret("ANTHROPIC_API_KEY", KEY)
+    assert h.find_secrets(f'"approved":["{KEY[-20:]}"]'.encode(), [key]) == ["ANTHROPIC_API_KEY"]
+    assert h.find_secrets(b"sk-ant-api03-", [key]) == []  # the shared prefix is no leak
 
 
 def test_scan_tree_names_files_and_secrets_never_values(tmp_path: Path) -> None:
@@ -187,7 +201,7 @@ def test_preflight_accepts_the_required_repository_and_token() -> None:
     result = run_preflight(fake)
     assert result.default_branch == "main"
     assert result.token_expires == expiry(NOW + timedelta(days=6))[:16] + " UTC"
-    assert len(result.checks) == 6
+    assert len(result.checks) == 11
     probe = [p for p in fake.calls("DELETE") if "probe" in p]
     assert probe == [
         f"/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/probe-{NOW:%Y%m%d%H%M%S}"
@@ -254,9 +268,66 @@ def test_preflight_refuses_a_token_with_more_reach(endpoint: tuple[str, str], me
 def test_preflight_refuses_a_token_that_can_write_workflows_and_removes_the_probe() -> None:
     put = ("PUT", f"/repos/owner/ilmar-disposable/contents/{h.PROBE_WORKFLOW}")
     fake = FakeGitHub(statuses={put: 201})
-    with pytest.raises(h.LiveGuardError, match="workflow"):
+    with pytest.raises(h.LiveGuardError, match="Workflows permission"):
         run_preflight(fake)
     assert any("probe" in p for p in fake.calls("DELETE"))
+
+
+def test_preflight_refuses_a_repository_reached_through_a_redirect() -> None:
+    fake = FakeGitHub()
+    fake.repo["full_name"] = "someone-else/ilmar-disposable"
+    with pytest.raises(h.LiveGuardError, match="redirects"):
+        run_preflight(fake)
+
+
+@pytest.mark.parametrize("permission", ["actions/secrets", "hooks"])
+def test_preflight_refuses_secrets_or_webhooks_permission(permission: str) -> None:
+    fake = FakeGitHub(statuses={("GET", f"/repos/owner/ilmar-disposable/{permission}"): 200})
+    with pytest.raises(h.LiveGuardError, match="must not"):
+        run_preflight(fake)
+
+
+@pytest.mark.parametrize("status", [401, 422, 500, 502])
+def test_an_unclear_answer_is_never_taken_as_no_permission(status: int) -> None:
+    """Review of PR #50: only 403/404 mean "not granted"."""
+    for endpoint in (
+        ("GET", "/repos/owner/ilmar-disposable/actions/permissions"),
+        ("PUT", f"/repos/owner/ilmar-disposable/contents/{h.PROBE_WORKFLOW}"),
+    ):
+        fake = FakeGitHub(statuses={endpoint: status})
+        with pytest.raises(h.LiveGuardError, match="could not be checked"):
+            run_preflight(fake)
+
+
+def test_a_refused_workflow_write_counts_only_after_a_successful_control_write() -> None:
+    """Too little Contents permission must not pass for "no Workflows permission"."""
+    put = ("PUT", f"/repos/owner/ilmar-disposable/contents/{h.PROBE_FILE}")
+    fake = FakeGitHub(statuses={put: 403})
+    with pytest.raises(h.LiveGuardError, match="cannot write contents"):
+        run_preflight(fake)
+    assert any("probe" in p for p in fake.calls("DELETE"))  # the branch still goes
+    assert not [r for r in fake.requests if h.PROBE_WORKFLOW in r.url]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        (("GET", "/repos/owner/ilmar-disposable/issues"), "lacks Issues"),
+        (("GET", "/repos/owner/ilmar-disposable/pulls"), "lacks Pull requests"),
+        (("POST", "/repos/owner/ilmar-disposable/pulls"), "cannot open pull requests"),
+    ],
+)
+def test_preflight_refuses_a_token_with_too_little(endpoint: tuple[str, str], message: str) -> None:
+    fake = FakeGitHub(statuses={endpoint: 403})
+    with pytest.raises(h.LiveGuardError, match=message):
+        run_preflight(fake)
+
+
+def test_the_probe_pull_request_is_closed_and_its_branch_deleted() -> None:
+    fake = FakeGitHub()
+    run_preflight(fake)
+    assert fake.calls("PATCH") == ["/repos/owner/ilmar-disposable/pulls/9"]
+    assert [p for p in fake.calls("DELETE") if "probe" in p]
 
 
 @pytest.mark.parametrize(
@@ -399,6 +470,9 @@ class FakeView:
     def inspect(self, container_id: str) -> dict[str, Any] | None:
         return self.present.get(container_id)
 
+    def network_internal(self, network: str) -> bool | None:
+        return True
+
     def follow_logs(self, container_id: str) -> FakeFollower:
         follower = FakeFollower("ilmar-egress ALLOW host=api.anthropic.com address=1\n")
         self.followers[container_id] = follower
@@ -525,3 +599,41 @@ def test_live_tests_are_opt_in_and_never_in_ci() -> None:
         source = (INTEGRATION / name).read_text()
         assert "pytestmark = pytest.mark.integration" in source
         assert name not in ci
+
+
+def test_only_the_coordinator_and_git_may_hold_the_token_in_their_environment(
+    tmp_path: Path,
+) -> None:
+    secrets = [h.Secret("ILMAR_LIVE_GITHUB_TOKEN", TOKEN)]
+    for pid, program in (("1", "python3"), ("2", "git-remote-http"), ("3", "conmon")):
+        (tmp_path / pid).mkdir()
+        (tmp_path / pid / "comm").write_text(program + "\n")
+        (tmp_path / pid / "environ").write_bytes(f"ILMAR_LIVE_GITHUB_TOKEN={TOKEN}\0".encode())
+    found = h.environments_with_secrets(secrets, tmp_path, trusted=h.TRUSTED_WITH_TOKEN)
+    assert found == ["conmon: ILMAR_LIVE_GITHUB_TOKEN"]
+
+
+def test_orphaned_processes_are_found_by_container_id(tmp_path: Path) -> None:
+    (tmp_path / "5").mkdir()
+    (tmp_path / "5" / "cmdline").write_bytes(b"/usr/bin/podman\0exec\0" + b"f" * 64 + b"\0")
+    assert h.processes_mentioning(["f" * 64], tmp_path) == ["podman"]
+    assert h.processes_mentioning(["e" * 64], tmp_path) == []
+
+
+def test_leaked_files_are_wiped_and_named(tmp_path: Path) -> None:
+    (tmp_path / "keep.txt").write_text("fine")
+    (tmp_path / "leak.json").write_text(f'{{"k": "{KEY}"}}')
+    assert h.wipe_leaks(tmp_path, settings().secrets) == ["leak.json"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["keep.txt"]
+
+
+def test_the_watcher_checks_each_sandbox_network() -> None:
+    view = FakeView()
+    view.present["s1"] = {
+        **inspected("ilmar-live-e1-1", "sandbox"),
+        "NetworkSettings": {"Networks": {"ilmar-live-e1-1-net": {}}},
+    }
+    watcher = h.Watcher(view, "live", settings().secrets, proc=None)
+    watcher.poll()
+    assert watcher.sandboxes()[0].networks == ("ilmar-live-e1-1-net",)
+    assert watcher.internal_networks == {"ilmar-live-e1-1-net": True}

@@ -137,9 +137,15 @@ def session(
     try:
         yield current
     finally:
-        if not KEEP:
-            problems = h.cleanup_run(github, live.repository, run)
-            assert problems == [], problems
+        # Always, also after a failure: no sandbox may keep running with a
+        # credential in memory, and no file may keep one on disk.
+        removed = h.SubprocessPodman().remove_instance(current.instance)
+        wiped = [f"state/{p}" for p in h.wipe_leaks(current.state, live.secrets)]
+        wiped += [f"config/{p}" for p in h.wipe_leaks(current.config.parent, live.secrets)]
+        problems = [] if KEEP else h.cleanup_run(github, live.repository, run)
+        assert wiped == [], f"credential files found and deleted: {wiped}"
+        assert problems == [], problems
+        del removed  # removing leftovers after a failure is expected; after a pass, none exist
 
 
 # -- checks shared by both runs ------------------------------------------------------------
@@ -212,7 +218,10 @@ def sandboxes_were_contained(session: Session, watcher: h.Watcher) -> dict[str, 
     for seen in verifiers:
         assert seen.network_mode == "none", (seen.name, seen.network_mode)
     for seen in agents:
-        assert seen.network_mode.endswith("-net"), (seen.name, seen.network_mode)
+        # Exactly one network: the run's internal one, whose only way out is the proxy.
+        assert seen.networks == (f"{seen.name}-net",), (seen.name, seen.networks)
+        assert watcher.internal_networks.get(seen.networks[0]) is True, seen.networks
+    assert watcher.environment_leaks == set(), sorted(watcher.environment_leaks)
     proxies = watcher.proxies()
     assert len(proxies) == len(agents)
     hosts: set[str] = set()
@@ -263,9 +272,11 @@ def nothing_leaked(session: Session, execution: Execution, request: dict[str, An
     assert leaks == {}
 
 
-def nothing_left_running(session: Session) -> None:
+def nothing_left_running(session: Session, watcher: h.Watcher) -> None:
     podman = h.SubprocessPodman()
     assert podman.containers(session.instance) == []
+    orphans = h.processes_mentioning(watcher.seen)  # e.g. a podman exec outliving its parent
+    assert orphans == []
     networks = subprocess.run(  # noqa: S603 - fixed argv
         [h.tool("podman"), "network", "ls", "-q", "--filter",
          f"label=io.ilmar.owner.instance={session.instance}"],
@@ -291,7 +302,7 @@ def image_digest(image: str) -> str:
 
 
 def test_preflight(checked: h.Preflight, live: h.LiveSettings) -> None:
-    assert len(checked.checks) == 6
+    assert len(checked.checks) == 11
     h.write_report(live.report_dir, "preflight", {
         "repository": checked.repository, "token_expires": checked.token_expires,
         "checks": checked.checks, "at": datetime.now(UTC).isoformat(),
@@ -309,7 +320,7 @@ def test_a_task_is_published_verified_merged_and_completed(session: Session) -> 
     request = verified_pull_request(session, execution)
     contained = sandboxes_were_contained(session, watcher)
     nothing_leaked(session, execution, request)
-    nothing_left_running(session)
+    nothing_left_running(session, watcher)
     assert not session.state.joinpath("workspaces", execution.id).exists()  # deleted on success
     assert "ilmar:claimed" in labels(session)  # held while the pull request is open
 
@@ -347,22 +358,32 @@ def test_a_task_is_published_verified_merged_and_completed(session: Session) -> 
 
 def test_a_coordinator_killed_mid_agent_recovers_with_one_pull_request(session: Session) -> None:
     """The crash drill: SIGKILL while Claude Code works; the next pass recovers safely."""
-    delay = float(os.environ.get("ILMAR_LIVE_CRASH_DELAY", "8"))
+    delay = float(os.environ.get("ILMAR_LIVE_CRASH_DELAY", "2"))
+    agent_intended = (OperationKind.RUN_AGENT.value, 1, OperationStatus.INTENDED.value)
+
+    def agent_in_progress() -> bool:
+        return any(
+            (k, a, st) == agent_intended for k, a, st, _ in h.read_operations(session.database)
+        )
+
     with h.Watcher(h.SubprocessPodman(), session.instance, session.live.secrets) as watcher:
         process = subprocess.Popen(  # noqa: S603 - our own CLI, fixed argv
             session.command(), env=session.environment(), stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, start_new_session=True,
         )  # fmt: skip
         try:
-            agent_running = h.wait_for(
-                lambda: any(
-                    (k, a, s) == (OperationKind.RUN_AGENT.value, 1, OperationStatus.INTENDED.value)
-                    for k, a, s, _ in h.read_operations(session.database)
+            # Mid-agent for real: the agent's run is recorded as in progress and
+            # Claude Code has reached the model through the proxy.
+            talking = h.wait_for(
+                lambda: (
+                    agent_in_progress()
+                    and f"ALLOW host={h.ANTHROPIC_HOST}" in watcher.proxy_log_so_far()
                 ),
                 timeout=600,
             )
-            assert agent_running, "the agent never started"
-            time.sleep(delay)  # Claude Code is working now
+            assert talking, "Claude Code never reached the model"
+            time.sleep(delay)
+            assert agent_in_progress(), "the agent finished before the kill; lower the delay"
             assert process.poll() is None, "the coordinator finished before the crash"
         finally:
             os.killpg(process.pid, signal.SIGKILL)  # the coordinator dies; no cleanup runs
@@ -393,7 +414,7 @@ def test_a_coordinator_killed_mid_agent_recovers_with_one_pull_request(session: 
     assert len(contained["agent_sandboxes"]) == 2
     assert interrupted[0] in contained["agent_sandboxes"]
     nothing_leaked(session, execution, request)
-    nothing_left_running(session)  # the dead run's sandbox, sidecar and network are gone
+    nothing_left_running(session, watcher)  # the dead run's sandbox, sidecar and network
 
     h.write_report(session.live.report_dir, f"crash-drill-{session.run.run_id}", {
         "run": session.run.run_id, "pull_request": request["html_url"],

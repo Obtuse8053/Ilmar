@@ -41,6 +41,7 @@ API = "https://api.github.com"
 GITHUB_TOKEN_ENV = "ILMAR_LIVE_GITHUB_TOKEN"
 ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
 PROBE_WORKFLOW = ".github/workflows/ilmar-permission-probe.yml"
+PROBE_FILE = "ilmar-permission-probe.txt"
 
 
 class LiveGuardError(AssertionError):
@@ -65,7 +66,13 @@ class Secret:
         return self._value
 
     def forms(self) -> tuple[bytes, ...]:
-        """Every encoding in which this value could leak (raw, base64, git Basic auth)."""
+        """Every encoding in which this value could leak.
+
+        Raw, base64, git Basic auth and URL-encoded, plus 20-character fragments
+        of the secret part (after a well-known prefix such as ``github_pat_`` or
+        ``sk-ant-api03-``): tools record keys by such fragments (Claude Code
+        remembers approved keys by their last 20 characters).
+        """
         raw = self._value.encode()
         forms = {
             raw,
@@ -73,12 +80,22 @@ class Secret:
             base64.b64encode(b"x-access-token:" + raw),
             urllib.parse.quote(self._value, safe="").encode(),
         }
+        body = raw[len(_known_prefix(self._value)) :]
+        if len(body) >= 40:
+            forms |= {body[:20], body[len(body) // 2 - 10 : len(body) // 2 + 10], body[-20:]}
         return tuple(sorted(forms))
 
     def __repr__(self) -> str:
         return f"Secret({self.env}=<redacted>)"
 
     __str__ = __repr__
+
+
+_KNOWN_PREFIXES = ("github_pat_", "sk-ant-api03-", "sk-ant-admin01-", "sk-ant-", "ghp_")
+
+
+def _known_prefix(value: str) -> str:
+    return next((p for p in _KNOWN_PREFIXES if value.startswith(p)), "")
 
 
 def redact(text: str, secrets: Iterable[Secret]) -> str:
@@ -285,6 +302,9 @@ def preflight(github: LiveGitHub, settings: LiveSettings, *, now: datetime) -> P
     repo = reply.data
     if repo.get("name") != REPOSITORY_NAME:
         raise LiveGuardError(f"the repository is not named {REPOSITORY_NAME}")
+    if str(repo.get("full_name", "")).lower() != settings.repository.lower():
+        # GitHub follows renames and transfers: refuse a repository reached by redirect.
+        raise LiveGuardError(f"{settings.repository} redirects to another repository")
     if repo.get("private") is not True:
         raise LiveGuardError("the disposable repository must be private")
     if REPOSITORY_TOPIC not in (repo.get("topics") or []):
@@ -316,37 +336,72 @@ def preflight(github: LiveGitHub, settings: LiveSettings, *, now: datetime) -> P
     for permission, path in (
         ("Administration", f"/repos/{settings.repository}/actions/permissions"),
         ("Actions", f"/repos/{settings.repository}/actions/runs?per_page=1"),
+        ("Secrets", f"/repos/{settings.repository}/actions/secrets?per_page=1"),
+        ("Webhooks", f"/repos/{settings.repository}/hooks?per_page=1"),
     ):
-        status = github.call("GET", path).status
-        if status not in (403, 404):
-            raise LiveGuardError(f"the token has {permission} permission (HTTP {status})")
+        refuse_if_granted(github.call("GET", path), permission)
         result.checks.append(f"token: no {permission} permission")
 
-    probe_workflow_permission(github, settings.repository, result.default_branch, now=now)
+    for permission, path in (  # what the run needs, read side: too little must also stop it
+        ("Issues", f"/repos/{settings.repository}/issues?per_page=1"),
+        ("Pull requests", f"/repos/{settings.repository}/pulls?per_page=1"),
+    ):
+        status = github.call("GET", path).status
+        if status != 200:
+            raise LiveGuardError(f"the token lacks {permission} permission (HTTP {status})")
+        result.checks.append(f"token: has {permission} permission")
+
+    probe_write_permissions(github, settings.repository, result.default_branch, now=now)
+    result.checks.append("token: can write contents and pull requests")
     result.checks.append("token: cannot write workflows")
     return result
 
 
-def probe_workflow_permission(
+def refuse_if_granted(reply: Reply, permission: str) -> None:
+    """403/404 means "not granted"; success means granted; anything else is not an answer."""
+    if 200 <= reply.status < 300:
+        raise LiveGuardError(f"the token has {permission} permission; it must not")
+    if reply.status not in (403, 404):
+        raise LiveGuardError(f"{permission} permission could not be checked (HTTP {reply.status})")
+
+
+def probe_write_permissions(
     github: LiveGitHub, repository: str, base: str, *, now: datetime
 ) -> None:
+    """Prove the writes the run needs work, then that a workflow write is refused.
+
+    On a throwaway branch, deleted afterwards whatever happens:
+    1. create the branch, then a harmless file: Contents write works, so a
+       refused workflow write below cannot be a missing Contents permission;
+    2. open a pull request from it and close it again: Pull requests write;
+    3. try to create a workflow file: it must be refused with 403 or 404.
+       Any other failure (422, 5xx) is not an answer and stops the run.
+    """
     head = github.ok("GET", f"/repos/{repository}/git/ref/heads/{base}")["object"]["sha"]
     branch = f"ilmar-live/probe-{now:%Y%m%d%H%M%S}"
     github.ok("POST", f"/repos/{repository}/git/refs", {"ref": f"refs/heads/{branch}", "sha": head})
     try:
-        reply = github.call(
-            "PUT",
-            f"/repos/{repository}/contents/{PROBE_WORKFLOW}",
-            {
-                "message": "ilmar permission probe (must be refused)",
-                "branch": branch,
-                "content": base64.b64encode(b"name: probe\non: []\njobs: {}\n").decode(),
-            },
-        )
+        control = github.call("PUT", f"/repos/{repository}/contents/{PROBE_FILE}", {
+            "message": "ilmar permission probe (control)", "branch": branch,
+            "content": base64.b64encode(b"probe\n").decode(),
+        })  # fmt: skip
+        if control.status != 201:
+            raise LiveGuardError(f"the token cannot write contents (HTTP {control.status})")
+        request = github.call("POST", f"/repos/{repository}/pulls", {
+            "title": "ilmar permission probe (closed at once)", "head": branch, "base": base,
+            "body": "Created and closed by Ilmar's live-test guard.",
+        })  # fmt: skip
+        if request.status != 201 or not isinstance(request.data, dict):
+            raise LiveGuardError(f"the token cannot open pull requests (HTTP {request.status})")
+        github.call("PATCH", f"/repos/{repository}/pulls/{request.data['number']}",
+                    {"state": "closed"})  # fmt: skip
+        workflow = github.call("PUT", f"/repos/{repository}/contents/{PROBE_WORKFLOW}", {
+            "message": "ilmar permission probe (must be refused)", "branch": branch,
+            "content": base64.b64encode(b"name: probe\non: []\njobs: {}\n").decode(),
+        })  # fmt: skip
     finally:
         github.call("DELETE", f"/repos/{repository}/git/refs/heads/{branch}")
-    if 200 <= reply.status < 300:
-        raise LiveGuardError("the token can write workflow files; it must not")
+    refuse_if_granted(workflow, "Workflows")
 
 
 # -- the disposable project --------------------------------------------------------------------
@@ -527,6 +582,7 @@ class LogFollower(Protocol):
 class PodmanView(Protocol):
     def containers(self, instance: str) -> list[str]: ...
     def inspect(self, container_id: str) -> dict[str, Any] | None: ...
+    def network_internal(self, network: str) -> bool | None: ...
     def follow_logs(self, container_id: str) -> LogFollower: ...
 
 
@@ -538,6 +594,7 @@ class SeenContainer:
     role: str
     allowed_hosts: tuple[str, ...] = ()
     network_mode: str = ""
+    networks: tuple[str, ...] = ()
     secrets_in_definition: list[str] = field(default_factory=list)
     log: str = ""
 
@@ -552,11 +609,13 @@ def describe(inspected: Mapping[str, Any], secrets: Sequence[Secret]) -> SeenCon
         if index + 1 < len(command):
             allowed = tuple(h for h in command[index + 1].split(",") if h)
     host = inspected.get("HostConfig") or {}
+    attached = (inspected.get("NetworkSettings") or {}).get("Networks") or {}
     return SeenContainer(
         name=str(inspected.get("Name", "")).lstrip("/"),
         role=str(labels.get("io.ilmar.role", "")),
         allowed_hosts=allowed,
         network_mode=str(host.get("NetworkMode", "")),
+        networks=tuple(sorted(attached)),
         secrets_in_definition=find_secrets(json.dumps(inspected).encode(), secrets),
     )
 
@@ -566,6 +625,57 @@ def parse_egress(log: str) -> tuple[list[str], list[str]]:
     allowed = sorted(set(re.findall(r"ilmar-egress ALLOW host=(\S+)", log)))
     denied = [line for line in log.splitlines() if "ilmar-egress DENY" in line]
     return allowed, denied
+
+
+TRUSTED_WITH_TOKEN = ("python", "git")
+"""Host programs that may hold the GitHub token in their environment: the
+coordinator and the git it runs. Never podman, conmon, a runtime or a sandbox."""
+
+
+def environments_with_secrets(
+    secrets: Sequence[Secret], proc: Path = Path("/proc"), *, trusted: Sequence[str] = ()
+) -> list[str]:
+    """``<program>: <secret names>`` for readable processes whose environment holds a
+    secret, except programs whose name starts with one of ``trusted``.
+
+    Processes of other users (and most sandboxed ones, in their own user
+    namespace) are unreadable and skipped: this is a best-effort net.
+    """
+    found = []
+    for entry in proc.glob("[0-9]*"):
+        try:
+            environ = (entry / "environ").read_bytes()
+            program = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        if program.startswith(tuple(trusted)):
+            continue
+        if hits := find_secrets(environ, secrets):
+            found.append(f"{program}: {', '.join(hits)}")
+    return sorted(found)
+
+
+def processes_mentioning(needles: Iterable[str], proc: Path = Path("/proc")) -> list[str]:
+    """Programs whose argv mentions one of ``needles`` (e.g. an orphaned ``podman exec``)."""
+    wanted = [n.encode() for n in needles if n]
+    found = []
+    for entry in proc.glob("[0-9]*"):
+        try:
+            argv = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if any(n in argv for n in wanted):
+            found.append(Path(argv.split(b"\0", 1)[0].decode(errors="replace")).name)
+    return sorted(found)
+
+
+def wipe_leaks(root: Path, secrets: Sequence[Secret]) -> list[str]:
+    """Delete every file under ``root`` that holds a secret; return their relative paths."""
+    leaked = scan_tree(root, secrets)
+    for relative in leaked:
+        with contextlib.suppress(OSError):
+            (root / relative).unlink()
+    return sorted(leaked)
 
 
 def processes_with_secrets(secrets: Sequence[Secret], proc: Path = Path("/proc")) -> list[str]:
@@ -602,6 +712,8 @@ class Watcher:
         self._interval, self._proc = interval, proc
         self.seen: dict[str, SeenContainer] = {}
         self.argv_leaks: set[str] = set()
+        self.environment_leaks: set[str] = set()
+        self.internal_networks: dict[str, bool | None] = {}
         self._followers: dict[str, LogFollower] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -618,8 +730,15 @@ class Watcher:
             self.seen[container_id] = seen
             if seen.role == "egress-proxy":
                 self._followers[container_id] = self._view.follow_logs(container_id)
+            if seen.role == "sandbox":
+                for network in seen.networks:
+                    self.internal_networks.setdefault(network, self._view.network_internal(network))
         if self._proc is not None:
             self.argv_leaks.update(processes_with_secrets(self._secrets, self._proc))
+            token = [s for s in self._secrets if s.env == GITHUB_TOKEN_ENV]
+            self.environment_leaks.update(
+                environments_with_secrets(token, self._proc, trusted=TRUSTED_WITH_TOKEN)
+            )
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -644,6 +763,10 @@ class Watcher:
         for container_id, follower in self._followers.items():
             follower.stop()
             self.seen[container_id].log = follower.text()
+
+    def proxy_log_so_far(self) -> str:
+        """Everything the egress proxies logged up to now (while the run goes on)."""
+        return "".join(follower.text() for follower in list(self._followers.values()))
 
     def sandboxes(self) -> list[SeenContainer]:
         return [s for s in self.seen.values() if s.role == "sandbox"]
@@ -675,8 +798,35 @@ class SubprocessPodman:
         data = json.loads(done.stdout)
         return data[0] if data else None
 
+    def network_internal(self, network: str) -> bool | None:
+        done = self._run("network", "inspect", network)
+        if done.returncode != 0:
+            return None
+        data = json.loads(done.stdout)
+        return bool(data[0].get("internal")) if data else None
+
     def follow_logs(self, container_id: str) -> LogFollower:
         return _Follower([self._podman, "logs", "--follow", container_id])
+
+    def networks(self, instance: str) -> list[str]:
+        done = self._run("network", "ls", "-q", "--filter",
+                         f"label=io.ilmar.owner.instance={instance}")  # fmt: skip
+        return done.stdout.split()
+
+    def remove_instance(self, instance: str) -> list[str]:
+        """Remove every container and network labelled with this run's instance.
+
+        The instance id is unique per live run, so nothing else is touched. Used
+        after a failure, so no sandbox keeps a credential in memory.
+        """
+        removed = []
+        for container_id in self.containers(instance):
+            self._run("rm", "--force", "--time", "0", container_id)
+            removed.append(container_id[:12])
+        for network in self.networks(instance):
+            self._run("network", "rm", "--force", network)
+            removed.append(network)
+        return removed
 
 
 class _Follower:

@@ -21,6 +21,7 @@ import json
 import os
 import secrets as random
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,10 @@ def holders(marker: bytes) -> list[str]:
             for name in files:
                 path = Path(directory, name)
                 try:
-                    if path.is_symlink() or path.stat().st_size > 256 * 1024 * 1024:
+                    info = path.lstat()
+                    # Regular files only: Podman keeps FIFOs and sockets here, and
+                    # reading a FIFO would block forever.
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024 * 1024:
                         continue
                     if marker in path.read_bytes():
                         found.append(str(path))
