@@ -40,20 +40,47 @@ Skip any step whose issue GitHub shows as finished.
 | 7 | #8 Claude Code `AgentRunner` | #3, #40 |
 | 8 | #9 Verification stage | #5, #7 |
 | 9 | #10 Adapter registry | before #11 |
-| 10 | #11 Coordinator loop and end-to-end test (closes M2) | all of the above |
+| 10 | #11 Coordinator loop and end-to-end test (closes M2), in four PRs: | all of the above |
+| 10a | #11a Instance lock, fencing, operation journal, resource ledger (ADR-0020) | #10 |
+| 10b | #11b One execution end to end with write-ahead ordering; `ilmar run --once --config PATH` | 10a |
+| 10c | #11c Crash recovery for every state; `load_candidate`; crash-injection harness | 10b |
+| 10d | #11d Opt-in live test on a disposable repository; M2 close-out | 10c, #44 |
 
 Steps 3 and 4 can run in parallel. Maintenance issues without a milestone can
 fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#11, the coordinator loop and end-to-end acceptance test (plan step 10), which
-closes M2. It consumes `Components` from `ilmar.adapters.registry.build`
-(ADR-0019) and must pass `changed_paths` from `freeze_candidate` straight to
-the Verifier (ADR-0018). #44 (the live Claude Code smoke test) still blocks
-unattended operation. **Waiting for the maintainer's explicit go-ahead.**
+#11b (plan step 10b): the coordinator for one execution, written as a
+sequence of `Journal.perform` calls over the `Components` from ADR-0019,
+after #11a (ADR-0020) is merged. **Waiting for the maintainer's explicit
+go-ahead.**
 
 ## Change log
+
+- 2026-11-05: #11a finished: fencing, the write-ahead operation journal and
+  the resource ledger (ADR-0020, accepted after an adversarial review on PR
+  #47). #11 is split into #11a–#11d.
+  - An exclusive instance lock plus a store fencing epoch: a superseded
+    coordinator can write nothing.
+  - Every side effect gets a durable intent, an ownership re-check right
+    before it, and a recorded outcome. A deterministic idempotency key per
+    step; per-kind reconciliation rules.
+  - A resource ledger from intent to release or quarantine.
+  - A candidate can be recorded only with its freeze and changed-paths
+    digest.
+  - Store schema v3, with triggers.
+  - `ExecutionStore` port: new methods and an optional `fence` keyword.
+  - The review added:
+    - per-execution leases, so executions can run in parallel under one
+      coordinator;
+    - stale-view checks right before every effect;
+    - candidate integrity on every path (no direct, swapped, re-based or
+      reconciled candidates);
+    - results kept when a follow-up is refused;
+    - `synchronous = FULL`.
+
+  #11 stays open for #11b–#11d. Next recommended: #11b.
 
 - 2026-11-05: #10 finished: adapter registry (ADR-0019, accepted after an
   adversarial review on PR #46).

@@ -7,8 +7,9 @@ implement :meth:`make_store`.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -19,8 +20,21 @@ from ilmar.domain.errors import (
     ConcurrencyConflictError,
     DuplicateExecutionError,
     ExecutionNotFoundError,
+    FencingError,
+    LedgerIntegrityError,
 )
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.ledger import (
+    Commit,
+    Fence,
+    Operation,
+    OperationKind,
+    OperationStatus,
+    Resource,
+    ResourceKind,
+    ResourceStatus,
+    changed_paths_digest,
+)
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import (
     AgentReport,
@@ -91,7 +105,311 @@ def _advance(
     return updated
 
 
-class ExecutionStoreContract:
+# -- fencing, journal and ledger (ADR-0020) ----------------------------------------------
+
+K = OperationKind
+ST = OperationStatus
+R = ResourceStatus
+
+
+def claimed(store: ExecutionStore) -> Fence:
+    return store.claim_instance("inst", now=at(0))
+
+
+def fenced_execution(store: ExecutionStore, fence: Fence, execution_id: str = "e1") -> Execution:
+    execution, transition = MACHINE.start(TASK_A, execution_id=execution_id, now=at(1))
+    store.create(execution, transition, fence=fence)
+    return execution
+
+
+def intent(
+    kind: OperationKind, fence: Fence, execution_id: str = "e1", step: str = ""
+) -> Operation:
+    return Operation.intended(
+        kind, execution_id, 1, fence=fence, now=at(2), step=step, intent={"what": "x"}
+    )
+
+
+def freeze_op(fence: Fence, *, revision: str = CANDIDATE) -> tuple[Operation, Operation]:
+    first = intent(K.FREEZE_CANDIDATE, fence)
+    done = first.moved(
+        ST.SUCCEEDED,
+        fence=fence,
+        now=at(3),
+        result={
+            "revision": revision,
+            "base_revision": BASE,
+            "changed_paths_digest": changed_paths_digest(["src/a.py"]),
+            "changed_path_count": "1",
+        },
+    )
+    return first, done
+
+
+def to_running_agent(store: ExecutionStore, fence: Fence, execution: Execution) -> Execution:
+    for target, seconds in ((S.CLAIMED, 4), (S.PROVISIONING, 5), (S.RUNNING_AGENT, 6)):
+        updated, transition = MACHINE.advance(
+            execution,
+            target,
+            now=at(seconds),
+            reason="t",
+            base_revision=BASE if target is S.RUNNING_AGENT else None,
+        )
+        store.apply(updated, transition, fence=fence)
+        execution = updated
+    return execution
+
+
+class FencingContract:
+    """Mixed into :class:`ExecutionStoreContract`; see ADR-0020."""
+
+    def test_claiming_gives_increasing_epochs(self, store: ExecutionStore) -> None:
+        assert store.fence() is None
+        first = claimed(store)
+        second = claimed(store)
+        assert (first.epoch, second.epoch) == (1, 2)
+        assert store.fence() == second
+
+    def test_another_instance_cannot_claim_the_store(self, store: ExecutionStore) -> None:
+        claimed(store)
+        with pytest.raises(FencingError, match="belongs to instance"):
+            store.claim_instance("other", now=at(1))
+
+    def test_once_claimed_unfenced_writes_are_refused(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        with pytest.raises(FencingError):
+            store.create(execution, transition)
+        store.create(execution, transition, fence=fence)
+        updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="t")
+        with pytest.raises(FencingError):
+            store.apply(updated, step)
+        with pytest.raises(FencingError):
+            store.append_evidence(evidence_record("e1"))
+        store.apply(updated, step, fence=fence)
+
+    def test_a_superseded_fence_writes_nothing(self, store: ExecutionStore) -> None:
+        old = claimed(store)
+        execution = fenced_execution(store, old)
+        claimed(store)  # another coordinator took over
+        updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="t")
+        writes: tuple[Callable[[], None], ...] = (
+            lambda: store.apply(updated, step, fence=old),
+            lambda: store.commit(old, Commit(operations=(intent(K.CLAIM_TASK, old),))),
+            lambda: store.append_evidence(evidence_record("e1"), fence=old),
+        )
+        for write in writes:
+            with pytest.raises(FencingError):
+                write()
+        assert store.get("e1") == execution
+        assert store.operations("e1") == ()
+        assert store.evidence("e1") == ()
+
+    def test_a_fence_on_an_unclaimed_store_is_refused(self, store: ExecutionStore) -> None:
+        with pytest.raises(FencingError):
+            store.commit(Fence("inst", 1), Commit())
+
+    def test_a_commit_is_all_or_nothing(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        bad = Resource.intended(
+            ResourceKind.WORKSPACE, "e1", 2, "/w", owner_token="tok", now=at(1)
+        )  # attempt 2 does not exist yet
+        with pytest.raises(LedgerIntegrityError):
+            store.commit(
+                fence,
+                Commit(
+                    created=((execution, transition),),
+                    operations=(intent(K.CLAIM_TASK, fence),),
+                    resources=(bad,),
+                ),
+            )
+        assert store.get("e1") is None
+        assert store.operation(intent(K.CLAIM_TASK, fence).key) is None
+        assert store.resources() == ()
+
+    def test_operations_round_trip_and_follow_their_status_rules(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        first = intent(K.START_CONTAINER, fence, step="ilmar-inst-e1-1")
+        store.commit(fence, Commit(operations=(first,)))
+        assert store.operation(first.key) == first
+        assert store.unfinished_operations() == (first,)
+        done = first.moved(ST.SUCCEEDED, fence=fence, now=at(3), result={"id": "c1"})
+        store.commit(fence, Commit(operations=(done,)))
+        assert store.operation(first.key) == done
+        assert store.operations("e1") == (done,)
+        assert store.unfinished_operations() == ()
+        again = dataclasses.replace(done, status=ST.AMBIGUOUS, version=3)
+        with pytest.raises(LedgerIntegrityError, match="cannot move"):
+            store.commit(fence, Commit(operations=(again,)))
+
+    def test_operation_writes_are_versioned(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        first = intent(K.CLAIM_TASK, fence)
+        store.commit(fence, Commit(operations=(first,)))
+        with pytest.raises(ConcurrencyConflictError):
+            store.commit(fence, Commit(operations=(first,)))  # inserting twice
+        done = first.moved(ST.SUCCEEDED, fence=fence, now=at(3))
+        store.commit(fence, Commit(operations=(done,)))
+        stale = first.moved(ST.FAILED, fence=fence, now=at(4))  # version 2 again
+        with pytest.raises(ConcurrencyConflictError):
+            store.commit(fence, Commit(operations=(stale,)))
+
+    def test_operations_must_start_intended_with_the_current_epoch(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        with pytest.raises(LedgerIntegrityError, match="epoch"):
+            store.commit(fence, Commit(operations=(intent(K.CLAIM_TASK, Fence("inst", 9)),)))
+        skipped = dataclasses.replace(intent(K.CLAIM_TASK, fence), status=ST.SUCCEEDED)
+        with pytest.raises(LedgerIntegrityError, match="must start as intended"):
+            store.commit(fence, Commit(operations=(skipped,)))
+
+    def test_intent_and_identity_are_immutable(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        first = intent(K.PUBLISH_REVISION, fence)
+        store.commit(fence, Commit(operations=(first,)))
+        changed = dataclasses.replace(first, intent={"what": "else"}, version=2, status=ST.FAILED)
+        with pytest.raises(LedgerIntegrityError, match="immutable"):
+            store.commit(fence, Commit(operations=(changed,)))
+
+    def test_operations_belong_to_the_current_attempt(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        later = Operation.intended(K.CLAIM_TASK, "e1", 2, fence=fence, now=at(2))
+        with pytest.raises(LedgerIntegrityError, match="attempt"):
+            store.commit(fence, Commit(operations=(later,)))
+
+    def test_resources_follow_their_lifecycle(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        planned = Resource.intended(
+            ResourceKind.CONTAINER, "e1", 1, "ilmar-inst-e1-1", owner_token="tok", now=at(2)
+        )
+        store.commit(fence, Commit(resources=(planned,)))
+        active = planned.moved(R.ACTIVE, now=at(3), identity="c0ffee")
+        store.commit(fence, Commit(resources=(active,)))
+        assert store.resources(statuses={R.ACTIVE}) == (active,)
+        assert store.resources(execution_id="other") == ()
+        swapped = dataclasses.replace(active, identity="other", version=3, status=R.RELEASING)
+        with pytest.raises(LedgerIntegrityError, match="identity"):
+            store.commit(fence, Commit(resources=(swapped,)))
+        quarantined = active.moved(R.QUARANTINED, now=at(4), note="removal unconfirmed")
+        store.commit(fence, Commit(resources=(quarantined,)))
+        assert store.resource(planned.key) == quarantined
+        reused = dataclasses.replace(quarantined, status=R.RELEASED, version=4)
+        with pytest.raises(LedgerIntegrityError, match="cannot move"):
+            store.commit(fence, Commit(resources=(reused,)))
+
+    def test_a_candidate_is_recorded_only_with_its_freeze(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution = to_running_agent(store, fence, fenced_execution(store, fence))
+        verifying, step = MACHINE.advance(
+            execution, S.VERIFYING, now=at(7), reason="t", candidate_revision=CANDIDATE
+        )
+        with pytest.raises(LedgerIntegrityError, match="no matching"):
+            store.apply(verifying, step, fence=fence)
+        first, other = freeze_op(fence, revision="c" * 40)
+        store.commit(fence, Commit(operations=(first,)))
+        store.commit(fence, Commit(operations=(other,)))
+        with pytest.raises(LedgerIntegrityError, match="no matching"):
+            store.apply(verifying, step, fence=fence)
+        assert store.get("e1") == execution
+
+    def test_a_candidate_and_its_freeze_can_be_committed_together(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = to_running_agent(store, fence, fenced_execution(store, fence))
+        first, done = freeze_op(fence)
+        store.commit(fence, Commit(operations=(first,)))
+        verifying, step = MACHINE.advance(
+            execution, S.VERIFYING, now=at(7), reason="t", candidate_revision=CANDIDATE
+        )
+        store.commit(fence, Commit(applied=((verifying, step),), operations=(done,)))
+        assert store.get("e1") == verifying
+
+    def test_a_new_execution_cannot_carry_a_candidate(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        smuggled = dataclasses.replace(execution, base_revision=BASE, candidate_revision=CANDIDATE)
+        with pytest.raises(LedgerIntegrityError, match="cannot already carry a candidate"):
+            store.create(smuggled, transition, fence=fence)
+        assert store.get("e1") is None
+
+    def test_a_recorded_candidate_cannot_be_swapped_or_rebased_later(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = to_running_agent(store, fence, fenced_execution(store, fence))
+        first, done = freeze_op(fence)
+        store.commit(fence, Commit(operations=(first,)))
+        verifying, step = MACHINE.advance(
+            execution, S.VERIFYING, now=at(7), reason="t", candidate_revision=CANDIDATE
+        )
+        store.commit(fence, Commit(applied=((verifying, step),), operations=(done,)))
+        publishing, to_publish = MACHINE.advance(verifying, S.PUBLISHING, now=at(8), reason="t")
+        for tampered in (
+            dataclasses.replace(publishing, candidate_revision="e" * 40),
+            dataclasses.replace(publishing, base_revision="d" * 40),
+        ):
+            with pytest.raises(LedgerIntegrityError, match="no matching"):
+                store.apply(tampered, to_publish, fence=fence)
+        store.apply(publishing, to_publish, fence=fence)  # unchanged: fine
+        assert store.get("e1") == publishing
+
+    def test_an_intent_needs_the_version_its_writer_saw(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        claimed_execution, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="t")
+        store.apply(claimed_execution, step, fence=fence)
+        stale = Commit(operations=(intent(K.CLAIM_TASK, fence),), expected=(("e1", 1),))
+        with pytest.raises(ConcurrencyConflictError, match="stale"):
+            store.commit(fence, stale)
+        assert store.operations("e1") == ()
+        store.commit(
+            fence, Commit(operations=(intent(K.CLAIM_TASK, fence),), expected=(("e1", 2),))
+        )
+
+    def test_one_commit_cannot_create_two_active_executions_for_a_task(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        first = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        second = MACHINE.start(TASK_A, execution_id="e2", now=at(1))
+        with pytest.raises(DuplicateExecutionError):
+            store.commit(fence, Commit(created=(first, second)))
+        assert store.get("e1") is None
+
+    def test_concurrent_intents_for_one_key_admit_exactly_one(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        results: list[str] = []
+        barrier = threading.Barrier(8)
+
+        def attempt() -> None:
+            barrier.wait()
+            try:
+                store.commit(fence, Commit(operations=(intent(K.PUBLISH_REVISION, fence),)))
+                results.append("ok")
+            except ConcurrencyConflictError:
+                results.append("conflict")
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sorted(results) == ["conflict"] * 7 + ["ok"]
+
+
+class ExecutionStoreContract(FencingContract):
     def make_store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
         raise NotImplementedError
 
