@@ -337,3 +337,41 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Status: accepted (ADR-0016; implemented by #7) · Affects: ADR-0010,
   ADR-0016
 
+### F-027: No maintained GitHub emulator pairs a stateful API with real git and fault injection
+
+- Evidence: **Emerging** (one primary read of emulate's repository page
+  [R23]; WireMock from secondary sources only [R24]; Ilmar's needs from its
+  own code) · Sources: [R23], [R24], [R25], [R26]
+- Observation, **verified**:
+  - emulate's documentation (read 2026-11-05) lists stateful issues,
+    comments, labels, pull requests with merge, refs, commits and check runs.
+    It describes **no** git smart HTTP and no fault injection, and it serves
+    plain HTTP by default.
+  - Ilmar publishes with real `git push` and reads branch heads with
+    `git ls-remote` (`GitHubSourceControl.branch_head`). It reads pull
+    requests, labels, comments and checks through the REST API.
+- Observation, **not verified (assumptions to check before relying on
+  them)**:
+  - that emulate offers no way to back its repositories with a real git
+    repository. This is inferred from the documentation's silence, and its
+    source was not read;
+  - that WireMock cannot apply a write and then lose the response. Secondary
+    sources describe its faults as replacing a response; proxying with a
+    fault after the upstream call was not checked in its primary docs;
+  - the git-http-backend behaviour the recommendation relies on (serving a
+    bare repository over smart HTTP behind an authenticating TLS front end).
+    [R26] is **not yet read**.
+- Implication: if these hold, no existing tool lets one test both the API
+  state and the git state Ilmar acts on, with lost-response faults, so fault
+  tolerance against GitHub (ADR-0020, ADR-0022) is today tested only with
+  in-process fakes or against real GitHub without faults.
+- Recommendation: a minimal, purpose-built emulator for exactly the
+  endpoints Ilmar uses, whose repository state is a real bare repository
+  served over HTTPS. It is reached through a per-origin `ca_bundle` option,
+  never a TLS bypass. Its responses are validated against a pinned,
+  attributed extract of GitHub's OpenAPI description [R25]. Drift is
+  detected by running the same contract suite against real GitHub. Before
+  #51 is implemented: read [R26] and the licence of [R25] in primary form,
+  and re-check the two unverified tool limitations.
+- Status: proposed (#51, approved) · Affects: ADR-0016, ADR-0020, ADR-0022,
+  ADR-0023

@@ -32,6 +32,7 @@ statuses in `research/findings.md`.
 | Second, open-source agent | F-010 | #24 |
 | AGENTS.md size budget | F-007 | #30 |
 | Fix the R3 URL in MANIFEST §9 | F-016 | #27 |
+| Stateful GitHub emulator over real git, with fault injection | F-027 | #51 |
 
 ## How items get here
 
