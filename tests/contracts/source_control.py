@@ -9,6 +9,7 @@ prove that nothing in an agent workspace is executed or followed.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import stat
 from collections.abc import Mapping
@@ -506,3 +507,15 @@ class SourceControlContract:
     ) -> None:
         change_request = provider.upsert_change_request(self._spec(repo))
         assert isinstance(provider.checks(change_request), ChecksSummary)
+
+    def test_labels_are_added_and_never_removed(
+        self, provider: SourceControlProvider, repo: RepositoryRef
+    ) -> None:
+        review = "ilmar:needs-human-review"
+        first = provider.upsert_change_request(
+            dataclasses.replace(self._spec(repo), labels=(review,))
+        )
+        assert review in first.labels
+        again = provider.upsert_change_request(self._spec(repo, title="no labels this time"))
+        assert again.key == first.key
+        assert review in again.labels

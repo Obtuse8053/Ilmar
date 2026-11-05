@@ -79,6 +79,10 @@ class Execution:
     branch: str | None = None
     change_request_url: str | None = None
     last_error: str | None = None
+    base_revision: str | None = None
+    """The revision the current attempt's agent started from (ADR-0010)."""
+    candidate_revision: str | None = None
+    """The current attempt's frozen output; what is verified and published."""
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -91,6 +95,8 @@ class Execution:
         _require_aware(self.updated_at, "updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
+        if self.candidate_revision is not None and self.base_revision is None:
+            raise ValueError("a candidate revision needs a base revision")
 
 
 @dataclass(frozen=True, slots=True)

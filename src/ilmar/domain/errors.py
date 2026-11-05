@@ -52,6 +52,10 @@ class CandidateRejectedError(IlmarError):
     """Agent output cannot be frozen safely (nested repository, special file, ...)."""
 
 
+class EvidenceIntegrityError(IlmarError):
+    """A stored evidence record does not match its digest: it was altered outside Ilmar."""
+
+
 class ProviderError(IlmarError):
     """An external provider failed. Adapters wrap provider-specific errors in this."""
 

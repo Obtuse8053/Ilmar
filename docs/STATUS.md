@@ -47,12 +47,27 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#9, the verification stage (plan step 8): candidate revisions from #7 are
-checked in a fresh `NONE` sandbox from #5. Then #10 (adapter registry) and
-#11 (coordinator loop, which closes M2). **Waiting for the maintainer's
-explicit go-ahead.**
+#10, the adapter registry (plan step 9): it builds the configured adapters
+(GitHub, Podman, Claude Code, SQLite) and the verification policy from
+`ilmar.toml`, and is the last piece before #11 (coordinator loop and
+end-to-end test, which closes M2). **Waiting for the maintainer's explicit
+go-ahead.**
 
 ## Change log
+
+- 2026-11-05: #9 finished: verification stage (ADR-0018, accepted after an
+  adversarial review on PR #45). The policy lives in `[verification]` of
+  `ilmar.toml`; its path classes can only be extended. Independent path
+  checks run on the diff, then candidate-executed checks run per **job**:
+  each job gets its own checkout and `NONE` sandbox, and a job's commands
+  share them, as CI steps do. Checks are judged only by the
+  harness-measured exit status. A candidate that kills its sandbox is
+  rejected with evidence; sandboxed output is bounded. #11 and #12/#15 must
+  pass `changed_paths` from `freeze_candidate` (or recompute them), never
+  rebuild a candidate with an empty path list. The outcome table follows ADR-0010 §5.
+  Evidence records are append-only and digest-checked in store schema v2 (the
+  first migration), and executions carry their base and candidate revisions.
+  Change requests can be labelled for review. Next recommended: #10.
 
 - 2026-11-04: #8 finished: Claude Code `AgentRunner` (ADR-0017, accepted).
   It uses documented print mode with a JSON result. The model credential is

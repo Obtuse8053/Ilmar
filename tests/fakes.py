@@ -7,6 +7,7 @@ use them exercise the same behaviour a real adapter must provide.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -276,6 +277,7 @@ class _ChangeRequestRecord:
     description: str
     ilmar_marker: bool
     checks: ChecksSummary = field(default_factory=lambda: ChecksSummary(CheckState.NONE))
+    labels: set[str] = field(default_factory=set)
 
 
 class FakeSourceControl:
@@ -409,6 +411,10 @@ class FakeSourceControl:
                     f"change request on {spec.source_branch} was not opened by Ilmar"
                 )
             record.title, record.description = spec.title, description
+            record.labels |= set(spec.labels)
+            record.request = dataclasses.replace(
+                record.request, labels=tuple(sorted(record.labels))
+            )
             return record.request
         request = ChangeRequest(
             repository=spec.repository,
@@ -416,9 +422,10 @@ class FakeSourceControl:
             url=f"https://example.invalid/cr/{spec.source_branch}",
             source_branch=spec.source_branch,
             target_branch=spec.target_branch,
+            labels=tuple(sorted(set(spec.labels))),
         )
         self._change_requests[key] = _ChangeRequestRecord(
-            request, spec.title, description, ilmar_marker=True
+            request, spec.title, description, ilmar_marker=True, labels=set(spec.labels)
         )
         return request
 

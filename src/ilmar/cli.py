@@ -43,6 +43,12 @@ def _config_validate(path: Path) -> int:
     print(f"{path}: OK")
     for port, adapter in config.adapters.items():
         print(f"  {port}: {adapter.kind}")
+    policy = config.verification
+    if policy is None:
+        print("  verification: not configured (nothing can be verified or published)")
+    else:
+        names = ", ".join(c.name for c in policy.commands)
+        print(f"  verification: {names} ({policy.digest()})")
     return 0
 
 

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Loading and validating ``ilmar.toml``.
 
-The file has three sections::
+The file has these sections::
 
     [ilmar]                      # general settings
     [limits]                     # execution limits
     [adapters.<port>]            # one table per port: kind + options
+    [verification]               # the verification policy (ADR-0010, ADR-0018)
+    [[verification.commands]]    # one per check: name, argv, timeout, required, job
+
+The verification policy lives here, never in the repository being changed.
+Its path classes can only be *extended* (``extra_*``); the built-in protected,
+check-influencing and CI-configuration paths always apply.
 
 Validation is structural: it does not check that an adapter ``kind`` is
 installed. Option keys that look like secrets are rejected unless they end in
@@ -23,6 +29,15 @@ from types import MappingProxyType
 from typing import Any
 
 from ilmar.domain.errors import ConfigError
+from ilmar.domain.verification import (
+    DEFAULT_CHECK_INFLUENCING_PATHS,
+    DEFAULT_CI_CONFIG_PATHS,
+    DEFAULT_JOB,
+    DEFAULT_PROTECTED_PATHS,
+    VerificationCommand,
+    VerificationPolicy,
+)
+from ilmar.domain.workspace import ResourceLimits
 
 PORT_NAMES: tuple[str, ...] = (
     "task_provider",
@@ -56,6 +71,8 @@ class IlmarConfig:
     state_dir: Path
     limits: Limits
     adapters: Mapping[str, AdapterConfig]
+    verification: VerificationPolicy | None = None
+    """``None`` when the file has no ``[verification]``; nothing can be verified then."""
 
 
 def load_config(path: Path) -> IlmarConfig:
@@ -72,7 +89,7 @@ def load_config(path: Path) -> IlmarConfig:
 
 def parse_config(data: Mapping[str, Any], *, base_dir: Path) -> IlmarConfig:
     """Validate already-parsed configuration data."""
-    _reject_unknown(data, {"ilmar", "limits", "adapters"}, "top level")
+    _reject_unknown(data, {"ilmar", "limits", "adapters", "verification"}, "top level")
 
     general = _table(data, "ilmar", "[ilmar]")
     _reject_unknown(general, {"state_dir"}, "[ilmar]")
@@ -87,7 +104,91 @@ def parse_config(data: Mapping[str, Any], *, base_dir: Path) -> IlmarConfig:
         state_dir=state_dir,
         limits=_parse_limits(_table(data, "limits", "[limits]")),
         adapters=_parse_adapters(_table(data, "adapters", "[adapters]")),
+        verification=(
+            _parse_verification(_table(data, "verification", "[verification]"))
+            if "verification" in data
+            else None
+        ),
     )
+
+
+def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
+    where = "[verification]"
+    _reject_unknown(
+        raw,
+        {
+            "image",
+            "commands",
+            "extra_protected_paths",
+            "extra_check_influencing_paths",
+            "extra_ci_config_paths",
+            "memory_mb",
+            "cpus",
+            "max_processes",
+        },
+        where,
+    )
+    image = raw.get("image")
+    if not isinstance(image, str) or not image:
+        raise ConfigError(f"{where} image must be a non-empty string")
+    commands_raw = raw.get("commands", [])
+    if not isinstance(commands_raw, list) or not commands_raw:
+        raise ConfigError(f"{where} needs at least one [[verification.commands]] table")
+    commands = []
+    for index, entry in enumerate(commands_raw):
+        at = f"[[verification.commands]] #{index + 1}"
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"{at} must be a table")
+        _reject_unknown(entry, {"name", "argv", "timeout_seconds", "required", "job"}, at)
+        argv = entry.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+            raise ConfigError(f"{at} argv must be a list of strings")
+        timeout = entry.get("timeout_seconds", 600)
+        required = entry.get("required", True)
+        if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+            raise ConfigError(f"{at} timeout_seconds must be a number")
+        if not isinstance(required, bool):
+            raise ConfigError(f"{at} required must be true or false")
+        try:
+            commands.append(
+                VerificationCommand(
+                    str(entry.get("name", "")),
+                    tuple(argv),
+                    float(timeout),
+                    required,
+                    str(entry.get("job", DEFAULT_JOB)),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{at}: {exc}") from None
+    limits: dict[str, Any] = {}
+    for key in ("memory_mb", "max_processes"):
+        if key in raw:
+            limits[key] = _positive_int(raw, key, 1)
+    if "cpus" in raw:
+        cpus = raw["cpus"]
+        if isinstance(cpus, bool) or not isinstance(cpus, int | float) or cpus <= 0:
+            raise ConfigError(f"{where} cpus must be a positive number")
+        limits["cpus"] = float(cpus)
+    try:
+        return VerificationPolicy(
+            image=image,
+            commands=tuple(commands),
+            protected_paths=DEFAULT_PROTECTED_PATHS + _patterns(raw, "extra_protected_paths"),
+            check_influencing_paths=DEFAULT_CHECK_INFLUENCING_PATHS
+            + _patterns(raw, "extra_check_influencing_paths"),
+            ci_config_paths=DEFAULT_CI_CONFIG_PATHS + _patterns(raw, "extra_ci_config_paths"),
+            limits=ResourceLimits(**limits),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"{where}: {exc}") from None
+
+
+def _patterns(raw: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = raw.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ConfigError(f"[verification] {key} must be a list of non-empty strings")
+    return tuple(value)
 
 
 def _parse_limits(raw: Mapping[str, Any]) -> Limits:
@@ -158,5 +259,5 @@ def _reject_unknown(data: Mapping[str, Any], allowed: set[str], where: str) -> N
 def _positive_int(data: Mapping[str, Any], key: str, default: int) -> int:
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ConfigError(f"[limits] {key} must be a positive integer")
+        raise ConfigError(f"{key} must be a positive integer")
     return value
