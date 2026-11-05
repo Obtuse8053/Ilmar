@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from ilmar.adapters.podman import EgressSettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.agent import AgentOutcome, AgentRequest
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
+from live_harness import Secret, write_report
 
 from helpers import task
 from integration.podman_support import (
@@ -44,6 +46,20 @@ KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 VERSION = os.environ.get("ILMAR_TEST_CLAUDE_VERSION") or None
 NAME = "ilmar-it-claude-live"
 ALLOWED = ("api.anthropic.com",)
+
+
+def record_smoke_test(contacted: list[str]) -> None:
+    """The #44 record: version, image digest, date and hosts; never the key."""
+    directory = os.environ.get("ILMAR_LIVE_REPORT_DIR")
+    if not directory:
+        return
+    digest = podman("image", "inspect", "--format", "{{.Digest}}", IMAGE).stdout.strip()
+    path = write_report(Path(directory), "issue-44-smoke-test", {
+        "claude_code_version": VERSION or "(not pinned: set ILMAR_TEST_CLAUDE_VERSION)",
+        "image": IMAGE, "image_digest": digest, "hosts_contacted": contacted,
+        "denied": [], "at": datetime.now(UTC).isoformat(),
+    }, [Secret("ANTHROPIC_API_KEY", KEY)])  # fmt: skip
+    print(f"#44 record written to {path}")
 
 
 @pytest.mark.skipif(
@@ -90,5 +106,7 @@ def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Pa
         assert set(contacted) <= set(ALLOWED), contacted
         assert result.outcome is AgentOutcome.COMPLETED, result.summary
         assert (workspace / "hello.txt").read_text().strip() == "hi"
+        assert contacted, "Claude Code never reached the model API"
+        record_smoke_test(contacted)
     finally:
         runtime.stop(handle, owner=owner)

@@ -70,7 +70,16 @@ class ContainerRuntime(Protocol):
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
-    ) -> CommandResult: ...
+    ) -> CommandResult:
+        """Run ``argv`` in the container with ``env`` added for this command only.
+
+        ``env`` is where a credential goes (the model key: ADR-0006). An adapter
+        must keep it out of anything the runtime persists or shows: not the
+        command line, not a file, not the runtime's own records of the command
+        (ADR-0023). ``ContainerSpec.env``, by contrast, becomes part of the
+        container's definition and never carries a secret.
+        """
+        ...
 
     def is_running(self, handle: ContainerHandle) -> bool: ...
 

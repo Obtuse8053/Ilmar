@@ -189,21 +189,78 @@ def test_podman_itself_sees_only_a_minimal_environment(
         assert "HTTPS_PROXY" not in call.env
 
 
-def test_values_travel_in_a_private_env_file_not_argv(
+def test_values_travel_in_memory_never_in_argv_or_on_disk(
+    layout: WorkspaceLayout,
+    podman: FakePodman,
+    workspace: Workspace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review for #11d: an env *file* outlived a killed coordinator in $TMPDIR."""
+    spool = tmp_path / "tmp"
+    spool.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spool))
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace, env={"PROFILE": "sandbox"}))
+    rt.run(handle, ["echo", "x"], timeout_seconds=5, env={"ANTHROPIC_API_KEY": "sk-model"})
+    started = next(c for c in podman.calls if c.argv[1] == "run")
+    executed = next(c for c in podman.calls if c.argv[1] == "exec")
+    # The container's own environment: a memfd env file (it becomes part of the
+    # container's definition, so ContainerSpec.env never carries a secret).
+    assert started.env_file == {"HOME": "/home/ilmar", "PROFILE": "sandbox"}
+    env_file = started.argv[started.argv.index("--env-file") + 1]
+    assert env_file.startswith("/dev/fd/")
+    assert len(started.pass_fds) == 1
+    # A command's environment: stdin to an in-container loader, never --env or
+    # --env-file, which Podman records in its state database (review of PR #50).
+    assert executed.command_env == {"ANTHROPIC_API_KEY": "sk-model"}
+    assert executed.argv[2:3] == ["--interactive"]
+    assert "--env-file" not in executed.argv
+    assert executed.pass_fds == ()
+    for call in podman.calls:
+        assert not any("sk-model" in arg for arg in call.argv)
+    open_memory = [link for link in _open_descriptors() if "ilmar-env" in link]
+    assert open_memory == []  # every descriptor was closed right after use
+    assert list(spool.iterdir()) == []  # nothing was ever written to disk
+
+
+def test_the_env_loader_exports_values_verbatim_without_evaluating_them(tmp_path: Path) -> None:
+    """The real loader in a real POSIX sh: hostile values stay data."""
+    import subprocess
+
+    from ilmar.adapters.podman.runtime import ENV_LOADER, env_stream
+
+    hostile = {"A": "$(touch pwned) `touch pwned2` ; rm -rf / # ' \" \\ *", "B": "=x=y", "C": ""}
+    done = subprocess.run(  # noqa: S603 - a fixed program
+        ["/bin/sh", "-c", ENV_LOADER, "ilmar-env", "/usr/bin/env"],
+        input=env_stream(hostile), capture_output=True, cwd=tmp_path, check=False,
+        env={"PATH": "/usr/bin:/bin"},
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    exported = dict(line.split("=", 1) for line in done.stdout.decode().splitlines())
+    assert {k: exported[k] for k in hostile} == hostile
+    assert list(tmp_path.iterdir()) == []  # nothing was executed
+
+
+def test_a_command_without_values_runs_as_before(
     layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
 ) -> None:
     rt = runtime(layout, podman)
-    handle = rt.start(spec(workspace, env={"ANTHROPIC_API_KEY": "sk-model"}))
-    rt.run(handle, ["echo", "x"], timeout_seconds=5, env={"STEP": "two"})
-    started = next(c for c in podman.calls if c.argv[1] == "run")
+    handle = rt.start(spec(workspace))
+    rt.run(handle, ["echo", "x"], timeout_seconds=5)
     executed = next(c for c in podman.calls if c.argv[1] == "exec")
-    assert started.env_file == {"HOME": "/home/ilmar", "ANTHROPIC_API_KEY": "sk-model"}
-    assert executed.env_file == {"STEP": "two"}
-    for call in podman.calls:
-        assert not any("sk-model" in arg or arg == "two" for arg in call.argv)
-    for path in (started.argv, executed.argv):
-        env_file = path[path.index("--env-file") + 1]
-        assert not Path(env_file).exists()  # deleted right after use
+    assert "--interactive" not in executed.argv
+    assert executed.stdin is None
+
+
+def _open_descriptors() -> list[str]:
+    links = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            links.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except FileNotFoundError:  # the listing's own descriptor, already closed
+            continue
+    return links
 
 
 @pytest.mark.parametrize(
@@ -840,3 +897,30 @@ def test_remove_owned_touches_nothing_if_any_part_is_foreign(
     with pytest.raises(OwnershipConflictError):
         runtime(layout, podman, egress=EGRESS).remove_owned(name, owner=OWNER)
     assert (set(podman.networks), set(podman.containers)) == before
+
+
+def test_a_coordinator_killed_mid_command_leaves_no_credential_on_disk(tmp_path: Path) -> None:
+    """The crash drill's concern, offline: SIGKILL while the env descriptor is in use."""
+    import subprocess
+    import sys
+
+    spool = tmp_path / "tmp"
+    spool.mkdir()
+    child = (
+        "import os, signal\n"
+        "from pathlib import Path\n"
+        "from ilmar.adapters.podman.runtime import PodmanRuntime\n"
+        "from ilmar.core.layout import WorkspaceLayout\n"
+        f"rt = PodmanRuntime(layout=WorkspaceLayout.under(Path({str(tmp_path)!r})))\n"
+        "with rt._env_file({'ANTHROPIC_API_KEY': 'sk-ant-must-not-persist'}):\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    )
+    src = Path(__file__).resolve().parents[2] / "src"
+    done = subprocess.run(  # noqa: S603 - a fixed child program
+        [sys.executable, "-c", child], env={"TMPDIR": str(spool), "PYTHONPATH": str(src)},
+        check=False,
+    )  # fmt: skip
+    assert done.returncode == -9  # it really died there
+    leftovers = [p for p in spool.rglob("*") if b"must-not-persist" in p.read_bytes()]
+    assert leftovers == []
+    assert list(spool.iterdir()) == []

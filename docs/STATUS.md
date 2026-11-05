@@ -62,6 +62,22 @@ disposable GitHub repository with real Claude Code, then the M2 close-out.
 
 ## Change log
 
+- 2026-11-05: #11d harness on PR #50 (adversarial review done; awaiting approval and the
+  maintainer's live run): live end-to-end tests and the #44 record (ADR-0023,
+  Proposed).
+  - Run locally with two commands: `scripts/live_setup.py` once, then
+    `scripts/live_run.py` (`docs/operations/live-testing.md`).
+  - Found and fixed:
+    - Podman records a `podman exec`'s environment in its state database on
+      disk, so every agent run had written the model key there. Per-command
+      values now go through stdin to an in-container loader.
+    - A killed coordinator left the key in a temporary env file. Container
+      environments now go through a memfd.
+    - Both are verified on real Podman in CI.
+  - Unattended operation is explicitly refused.
+
+  #11 stays open until the live tests have passed.
+
 - 2026-11-05: #11c finished: crash recovery (ADR-0022, accepted after an
   adversarial review on PR #49).
   - Every worker step is decided from the journal, the ledger and trusted

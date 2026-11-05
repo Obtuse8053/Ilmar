@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -52,6 +53,10 @@ class Call:
     env: dict[str, str]
     timeout: float
     env_file: dict[str, str] | None = None
+    pass_fds: tuple[int, ...] = ()
+    stdin: bytes | None = None
+    command_env: dict[str, str] | None = None
+    """What the in-container loader exported from stdin (``podman exec`` only)."""
 
 
 @dataclass
@@ -88,10 +93,18 @@ class FakePodman:
 
     # -- executor --------------------------------------------------------
 
-    def __call__(self, argv: Sequence[str], env: Mapping[str, str], timeout: float) -> Completed:
+    def __call__(
+        self,
+        argv: Sequence[str],
+        env: Mapping[str, str],
+        timeout: float,
+        *,
+        pass_fds: Sequence[int] = (),
+        stdin: bytes | None = None,
+    ) -> Completed:
         args = list(argv)
         assert args[0] == PODMAN, args
-        call = Call(args, dict(env), timeout)
+        call = Call(args, dict(env), timeout, pass_fds=tuple(pass_fds), stdin=stdin)
         self.calls.append(call)
         command, rest = args[1], args[2:]
         if command == "info":
@@ -262,9 +275,18 @@ class FakePodman:
         return Completed(125, "", f"Error: unsupported network action {action}\n")
 
     def _exec(self, rest: list[str], call: Call, timeout: float) -> Completed:
-        _read_env_file(rest, call)
-        if rest[0] == "--env-file":
-            rest = rest[2:]
+        recorded = "podman records exec environments on disk: values must go through stdin"
+        assert "--env-file" not in rest, recorded
+        assert "--env" not in rest, recorded
+        if rest[0] == "--interactive":
+            rest = rest[1:]
+            container_id, loader = rest[0], rest[1:5]
+            assert loader[:2] == ["/bin/sh", "-c"], loader
+            assert loader[3] == "ilmar-env", loader
+            assert call.stdin is not None
+            lines = call.stdin.decode().split("\n")
+            call.command_env = dict(line.split("=", 1) for line in lines[: lines.index("")])
+            rest = [container_id, *rest[5:]]
         container = self.containers.get(rest[0])
         if container is None or not container.running:
             return Completed(125, "", "Error: no such container\n")
@@ -291,7 +313,11 @@ class FakePodman:
 def _read_env_file(rest: list[str], call: Call) -> dict[str, str]:
     if "--env-file" not in rest:
         return {}
-    path = Path(rest[rest.index("--env-file") + 1])
-    lines = path.read_text(encoding="utf-8").splitlines()
+    path = rest[rest.index("--env-file") + 1]
+    # Like podman: the path is the inherited descriptor (/dev/fd/N), read in place.
+    fd = int(path.removeprefix("/dev/fd/"))
+    assert path == f"/dev/fd/{fd}", path
+    assert fd in call.pass_fds, (path, call.pass_fds)
+    lines = os.pread(fd, 1 << 16, 0).decode("utf-8").splitlines()
     call.env_file = dict(line.split("=", 1) for line in lines)
     return call.env_file

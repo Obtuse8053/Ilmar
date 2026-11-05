@@ -111,6 +111,9 @@ class ContainerSpec:
     workspace_identity: DirectoryIdentity
     container_workdir: PurePosixPath = DEFAULT_CONTAINER_WORKDIR
     env: Mapping[str, str] = field(default_factory=dict)
+    """The container's own environment. Runtimes store it with the container's
+    definition (Podman: in its database, shown by ``inspect``), so it never holds a
+    secret; per-command values go to ``ContainerRuntime.run(env=...)`` (ADR-0023)."""
     network: NetworkPolicy = NetworkPolicy.NONE
     allowed_hosts: tuple[str, ...] = ()
     """Hostnames reachable on port 443 under ``ALLOWLIST``; empty for other policies."""

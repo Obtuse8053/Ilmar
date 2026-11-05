@@ -18,6 +18,12 @@ from ilmar.core.ownership import Ownership
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
 from ilmar.domain.errors import ConfigError, FencingError, OwnershipConflictError
 
+UNATTENDED_DISABLED = (
+    "unattended operation is disabled: only `ilmar run --once` is available, run by a "
+    "person who watches it. It stays disabled until the real Claude Code smoke test "
+    "(issue 44) has passed and unattended operation (issue 20) is designed and approved."
+)
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
@@ -25,6 +31,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
+        if not args.once:
+            print(f"error: {UNATTENDED_DISABLED}", file=sys.stderr)
+            return int(ExitCode.CONFIGURATION)
         return _run_once(Path(args.config))
     parser.print_help()
     return 2
@@ -41,7 +50,11 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path", nargs="?", default="ilmar.toml")
 
     run = commands.add_parser("run", help="process work (needs the instance lock)")
-    run.add_argument("--once", action="store_true", required=True, help="one pass, then exit")
+    run.add_argument(
+        "--once",
+        action="store_true",
+        help="one pass, then exit (required: unattended operation is disabled)",
+    )
     run.add_argument(
         "--config",
         required=True,
