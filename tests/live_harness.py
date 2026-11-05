@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ilmar.adapters.github.client import HttpRequest, HttpResponse, Transport
+from ilmar.adapters.podman.runtime import PODMAN_ENVIRONMENT
 
 REPOSITORY_NAME = "ilmar-disposable"
 REPOSITORY_TOPIC = "ilmar-disposable"
@@ -783,8 +784,9 @@ class SubprocessPodman:
 
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(  # noqa: S603 - fixed argv
-            [self._podman, *args], capture_output=True, text=True, check=False, timeout=30
-        )
+            [self._podman, *args], capture_output=True, text=True, check=False, timeout=30,
+            env=host_environment(),
+        )  # fmt: skip
 
     def containers(self, instance: str) -> list[str]:
         done = self._run("ps", "-a", "-q", "--no-trunc", "--filter",
@@ -833,8 +835,9 @@ class _Follower:
     def __init__(self, argv: list[str]) -> None:
         self._chunks: list[str] = []
         self._process = subprocess.Popen(  # noqa: S603 - fixed argv
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env=host_environment(),
+        )  # fmt: skip
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
 
@@ -902,6 +905,16 @@ def write_report(directory: Path, name: str, report: Mapping[str, Any],
     return path
 
 
+def host_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """What the harness's own podman and git calls get: never a credential.
+
+    The test process holds both credentials in its environment; a child that
+    inherited them (podman, conmon, a container) would hold them too.
+    """
+    source = os.environ if base is None else base
+    return {k: source[k] for k in PODMAN_ENVIRONMENT if k in source}
+
+
 def tool(name: str) -> str:
     """The absolute path of a host program (no lookup through relative PATH entries)."""
     found = shutil.which(name)
@@ -915,7 +928,7 @@ def git_blobs(repository: Path, revision: str) -> Iterator[tuple[str, bytes]]:
     git = tool("git")
     listing = subprocess.run(  # noqa: S603 - fixed argv
         [git, "--git-dir", str(repository), "ls-tree", "-r", "-z", revision],
-        capture_output=True, check=True,
+        capture_output=True, check=True, env=host_environment(),
     )  # fmt: skip
     for entry in listing.stdout.split(b"\0"):
         if not entry:
@@ -924,6 +937,6 @@ def git_blobs(repository: Path, revision: str) -> Iterator[tuple[str, bytes]]:
         object_id = meta.split()[2].decode()
         blob = subprocess.run(  # noqa: S603 - fixed argv
             [git, "--git-dir", str(repository), "cat-file", "blob", object_id],
-            capture_output=True, check=True,
+            capture_output=True, check=True, env=host_environment(),
         )  # fmt: skip
         yield path.decode(errors="replace"), blob.stdout

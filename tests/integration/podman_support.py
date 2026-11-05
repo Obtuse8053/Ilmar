@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from ilmar.adapters.podman import PodmanRuntime
+from ilmar.adapters.podman.runtime import PODMAN_ENVIRONMENT
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.safe_fs import ensure_directory
 from ilmar.domain.workspace import ContainerHandle, DirectoryIdentity
@@ -52,8 +53,9 @@ def require(*needs: tuple[str, object]) -> None:
 def podman(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     assert PODMAN is not None
     return subprocess.run(  # noqa: S603 - test helper, fixed executable
-        [PODMAN, *args], capture_output=True, text=True, check=check, timeout=120
-    )
+        [PODMAN, *args], capture_output=True, text=True, check=check, timeout=120,
+        env={k: os.environ[k] for k in PODMAN_ENVIRONMENT if k in os.environ},
+    )  # fmt: skip
 
 
 def remove_everything(*names: str) -> None:

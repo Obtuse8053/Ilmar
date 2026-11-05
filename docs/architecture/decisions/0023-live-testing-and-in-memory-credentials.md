@@ -58,20 +58,66 @@ reproduced it.
 
 ## Decision
 
-### Credentials reach `podman` through memory only (amends ADR-0014)
+### Credentials never reach Podman's records or the disk (amends ADR-0014)
 
-`PodmanRuntime` writes `ContainerSpec.env` and per-command `env` into a
-`memfd_create` descriptor (`MFD_CLOEXEC`). It passes
-`--env-file /dev/fd/N`, and the executor gives only that `podman` call the
-descriptor (`pass_fds`). The descriptor is closed right after the call. No
-value is ever on disk or on a command line. The `Executor` protocol gains
-an optional `pass_fds`. The rest of ADR-0014's environment rules stand.
+The adversarial review of PR #50 ran a real-Podman probe
+(`tests/integration/test_podman_credentials.py`, in CI). It searched
+everything Podman keeps on disk for a marker value given to one command.
+With `podman exec --env-file` (memfd or not), the marker was in Podman's
+state database (`storage/db.sql`) **while the command ran and after a killed
+coordinator**. Podman records an exec session's environment. So every agent
+run had written the model key to disk, whatever channel carried it into
+`podman`.
+
+Decided:
+- **Per-command values (`ContainerRuntime.run(env=...)`, where the model key
+  goes) travel through the command's stdin.**
+  - Ilmar runs `podman exec --interactive <id> /bin/sh -c ENV_LOADER
+    ilmar-env <argv…>`. The loader reads `NAME=value` lines up to an empty
+    line, `export`s each one, and `exec`s the command.
+  - Values are only expanded, never re-parsed or `eval`ed. A test runs the
+    real loader on hostile values.
+  - Podman streams stdin and never records it.
+  - A command that is given values therefore needs `/bin/sh` in its image.
+    The agent image has one. A command without values runs unchanged.
+- **The container's own environment (`ContainerSpec.env`)** becomes part of
+  the container's definition, which Podman stores and `inspect` shows. It
+  **never carries a secret**; the domain type and the port say so. It
+  reaches `podman run` as `--env-file /dev/fd/N` backed by a memfd
+  (`MFD_CLOEXEC`, inherited only by that call through `pass_fds`), so
+  nothing is left in `$TMPDIR` either. Before, a `SIGKILL` left
+  `ilmar-env-*` files there.
+- **The `Executor` protocol** gains the optional `pass_fds` and `stdin`.
+- **Checked on real Podman:**
+  - the marker appears nowhere on disk, during the command, after it, or
+    after a killed coordinator and the sandbox's removal;
+  - the descriptor is not visible inside the container.
 
 ### Unattended operation stays disabled
 
 `ilmar run` without `--once` exits 3 and explains why. Changing that needs
 #44 recorded and #20 designed and approved. There is no configuration
 switch for it.
+
+### Running it: two commands
+
+- `scripts/live_setup.py --claude-version x.y.z` never sees a credential.
+  It:
+  - checks the host;
+  - creates the disposable repository and a private canary if missing,
+    refusing (never changing) an existing public one;
+  - builds the images;
+  - writes the non-secret settings (0600);
+  - prints GitHub's pre-filled token link. The repository selection cannot
+    be pre-filled.
+- `scripts/live_run.py [--post]`:
+  - asks for both credentials with hidden input and passes them only through
+    the test process's environment;
+  - drops `PYTEST_ADDOPTS` and the configured pytest options, so nothing can
+    add `--showlocals`;
+  - runs #44, and the live tests only if #44 passed;
+  - optionally posts the credential-free records on #44 and #11 with the
+    maintainer's `gh` login.
 
 ### The live harness (`tests/live_harness.py`)
 
@@ -82,8 +128,16 @@ switch for it.
   - the token is fine-grained (`github_pat_`, no `X-OAuth-Scopes`) and
     expires within 7 days (`GitHub-Authentication-Token-Expiration`);
   - the token gets 404 for a private outside repository;
-  - the token gets 403 or 404 for the Administration and Actions probes;
-  - the token cannot create a workflow file.
+  - the token gets 403 or 404 for the Administration, Actions, Secrets and
+    Webhooks probes. Success means "granted", and any other status is not an
+    answer and stops the run;
+  - the token can read issues and pull requests;
+  - on a throwaway branch it can write a harmless file and open (and close)
+    a pull request, and its workflow-file write is then refused. The refusal
+    counts only after the control write succeeded, so too little Contents
+    permission cannot pass for "no Workflows permission";
+  - the repository's `full_name` is the configured one, so a renamed or
+    transferred repository reached by redirect is refused.
 - **Isolation per run:** a new base branch `ilmar-live/<run>`, whose commit
   has the default branch as its parent, plus its own label and issue.
   Nothing existing is moved or force-pushed. Everything the run made is
@@ -99,7 +153,8 @@ switch for it.
     test checks the live test files for this.
 - **Leak detection:**
   - each credential is searched for in its raw, base64, URL-encoded and git
-    Basic-auth (`x-access-token:`) forms;
+    Basic-auth (`x-access-token:`) forms, and as 20-character fragments of
+    its secret part (Claude Code records approved keys by their last 20);
   - in the state directory (database, coordinator repository, workspaces),
     the configuration, the CLI output and the evidence;
   - in every file of the frozen candidate;
@@ -107,14 +162,18 @@ switch for it.
   - in files in the temporary directories;
   - in every readable process's argv, polled during the run;
   - in every container's definition. The model key may appear only in the
-    agent's sandbox.
+    agent's sandbox;
+  - in the environment of every readable process: only the coordinator and
+    git may hold the GitHub token.
 - **Containment:**
   - a watcher records every container of the run's instance as it appears,
     and follows each egress proxy's log until the proxy is removed;
   - the proxy's `--allow` must be exactly the configured endpoint
     (`api.anthropic.com`);
   - its log must show only that host, at least once, and no `DENY`;
-  - verification sandboxes must have network `none`.
+  - verification sandboxes must have network `none`;
+  - the agent's sandbox must be attached to exactly its own network, and
+    that network must be internal.
 - **Verified equals published:**
   - the pull request's head is the branch head, the execution's candidate
     and the evidence's candidate, with the evidence digest equal to the one
@@ -126,19 +185,29 @@ switch for it.
   task complete, releases the claim and comments on the issue. The
   change-request row is released.
 - **Crash drill:**
-  - `SIGKILL` the CLI's process group while the agent operation is
-    `INTENDED`;
+  - `SIGKILL` the CLI's process group once the agent operation is
+    `INTENDED` and Claude Code has reached the model through the proxy.
+    Before the kill, the test checks that the run is still in progress;
   - the sandbox must still exist and no pull request may be open;
   - the next pass publishes from attempt 2: attempt 1's run is `FAILED` and
     attempt 2's `SUCCEEDED`;
   - one pull request; nothing of the instance is left in Podman.
+- **After every run, passed or failed:**
+  - every container and network of the run's unique instance is removed;
+  - any file holding a credential is deleted, and the test fails;
+  - the GitHub side is cleaned up.
+
+  After a pass, no process may still refer to the run's containers.
 - **Records:** JSON files without credentials (checked before writing) for
   #44 and for each run, to post on the issues.
 
 ## Consequences
 
-- A crash can no longer leave a credential on disk through Ilmar. A
-  regression test kills a process while it holds the descriptor.
+- No credential reaches disk through Ilmar or through Podman's own records,
+  also across a crash. Real-Podman tests check this in CI.
+- A command given per-command values needs `/bin/sh` in its image.
+- Anyone who ran Ilmar's agent with a real key **before** this change has
+  had that key written to Podman's `db.sql`. Rotate such keys.
 - `memfd_create` is Linux-only. So is rootless Podman as Ilmar uses it.
 - The live run costs four short Claude Code sessions: #44, the end-to-end
   run, and two in the crash drill.

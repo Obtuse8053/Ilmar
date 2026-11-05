@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -637,3 +638,48 @@ def test_the_watcher_checks_each_sandbox_network() -> None:
     watcher.poll()
     assert watcher.sandboxes()[0].networks == ("ilmar-live-e1-1-net",)
     assert watcher.internal_networks == {"ilmar-live-e1-1-net": True}
+
+
+def test_the_harness_never_hands_a_credential_to_podman_or_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of PR #50: the test process holds both credentials; its children must not."""
+    monkeypatch.setenv("ILMAR_LIVE_GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", KEY)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    env = h.host_environment()
+    assert "ILMAR_LIVE_GITHUB_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    seen: list[dict[str, str]] = []
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        seen.append(kwargs.get("env") or dict(os.environ))
+        return __import__("subprocess").CompletedProcess(argv, 0, "[]", "")
+
+    monkeypatch.setattr("subprocess.run", capture)
+    view = h.SubprocessPodman("/usr/bin/podman")
+    view.containers("live")
+    view.network_internal("n")
+    view.remove_instance("live")
+    assert seen
+    for env in seen:
+        assert TOKEN not in str(env)
+        assert KEY not in str(env)
+
+
+def test_every_subprocess_in_the_live_files_sets_its_environment() -> None:
+    """A subprocess without env= would inherit both credentials from pytest."""
+    import ast
+
+    for path in (Path(h.__file__), INTEGRATION / "test_live_end_to_end.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"run", "Popen"}
+                and getattr(node.func.value, "id", "") == "subprocess"
+            ):
+                keywords = {k.arg for k in node.keywords}
+                assert "env" in keywords, f"{path.name}:{node.lineno}"

@@ -197,7 +197,7 @@ def verified_pull_request(session: Session, execution: Execution) -> dict[str, A
     frozen = subprocess.run(  # noqa: S603 - fixed argv
         [h.tool("git"), "--git-dir", str(session.coordinator_repository),
          "diff", "--name-only", "--no-renames", execution.base_revision or "", candidate],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=h.host_environment(),
     ).stdout.split()  # fmt: skip
     assert changed == set(frozen)  # the PR shows exactly the verified change
     return request
@@ -280,7 +280,7 @@ def nothing_left_running(session: Session, watcher: h.Watcher) -> None:
     networks = subprocess.run(  # noqa: S603 - fixed argv
         [h.tool("podman"), "network", "ls", "-q", "--filter",
          f"label=io.ilmar.owner.instance={session.instance}"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=h.host_environment(),
     ).stdout.split()  # fmt: skip
     assert networks == []
 
@@ -293,7 +293,7 @@ def labels(session: Session) -> set[str]:
 def image_digest(image: str) -> str:
     done = subprocess.run(  # noqa: S603 - fixed argv
         [h.tool("podman"), "image", "inspect", "--format", "{{.Digest}}",
-         image], capture_output=True, text=True, check=False,
+         image], capture_output=True, text=True, check=False, env=h.host_environment(),
     )  # fmt: skip
     return str(done.stdout).strip()
 
@@ -393,7 +393,7 @@ def test_a_coordinator_killed_mid_agent_recovers_with_one_pull_request(session: 
         assert len(interrupted) == 1
         left = subprocess.run(  # noqa: S603 - fixed argv
             [h.tool("podman"), "container", "exists", interrupted[0]],
-            check=False,
+            check=False, env=h.host_environment(),
         )  # fmt: skip
         assert left.returncode == 0, "the crash should leave the sandbox behind"
         assert h.change_requests_for(session.github, session.live.repository,
