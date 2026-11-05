@@ -209,6 +209,26 @@ class ContainerRuntimeContract:
         with pytest.raises(ProviderError):
             runtime.run(container, self.echo("too late"), timeout_seconds=30)
 
+    def test_remove_owned_removes_the_recorded_sandbox_once(
+        self, runtime: ContainerRuntime, spec: ContainerSpec
+    ) -> None:
+        runtime.start(spec)
+        assert runtime.remove_owned(NAME, owner=OWNER) is True
+        assert runtime.find(NAME) is None
+        assert runtime.remove_owned(NAME, owner=OWNER) is False  # idempotent
+
+    def test_remove_owned_of_nothing_is_false(self, runtime: ContainerRuntime) -> None:
+        assert runtime.remove_owned(NAME, owner=OWNER) is False
+
+    def test_remove_owned_never_touches_another_owners_sandbox(
+        self, runtime: ContainerRuntime, spec: ContainerSpec
+    ) -> None:
+        handle = runtime.start(spec)
+        with pytest.raises(OwnershipConflictError):
+            runtime.remove_owned(NAME, owner=OTHER_ATTEMPT)
+        assert runtime.is_running(handle)
+        runtime.stop(handle, owner=OWNER)
+
     @pytest.mark.parametrize("wrong", [OTHER_ATTEMPT, OTHER_INSTANCE])
     def test_stop_with_wrong_owner_is_refused_and_leaves_container(
         self, runtime: ContainerRuntime, container: ContainerHandle, wrong: ResourceOwner

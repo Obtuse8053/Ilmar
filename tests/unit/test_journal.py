@@ -215,6 +215,7 @@ def test_an_unclear_failure_is_ambiguous_and_blocks_until_reconciled(
         ST.SUCCEEDED,
         reason="branch head equals the candidate",
         result={"head": CANDIDATE},
+        lease=coordinator.lease(),
     )
     assert coordinator.perform(K.PUBLISH_REVISION, world.push) == {"head": CANDIDATE}
     assert world.pushes == []
@@ -240,11 +241,17 @@ def test_a_repeatable_step_is_repeated_after_an_unclear_failure(
 def test_reconciliation_only_settles_unfinished_operations(coordinator: Coordinator) -> None:
     coordinator.perform(K.CLAIM_TASK, World().claim)
     with pytest.raises(LedgerIntegrityError, match="already succeeded"):
-        coordinator.journal.reconcile("claim-task:e1:1", ST.FAILED, reason="x")
+        coordinator.journal.reconcile(
+            "claim-task:e1:1", ST.FAILED, reason="x", lease=coordinator.lease()
+        )
     with pytest.raises(LedgerIntegrityError, match="no operation"):
-        coordinator.journal.reconcile("claim-task:e1:9", ST.FAILED, reason="x")
+        coordinator.journal.reconcile(
+            "claim-task:e1:9", ST.FAILED, reason="x", lease=coordinator.lease()
+        )
     with pytest.raises(ValueError, match="succeeded or failed"):
-        coordinator.journal.reconcile("claim-task:e1:1", ST.AMBIGUOUS, reason="x")
+        coordinator.journal.reconcile(
+            "claim-task:e1:1", ST.AMBIGUOUS, reason="x", lease=coordinator.lease()
+        )
 
 
 # -- stale coordinators ------------------------------------------------------------------
@@ -392,9 +399,10 @@ def recover(c: Coordinator, world: World) -> None:
                 ST.SUCCEEDED,
                 reason="head equals candidate",
                 result={"head": CANDIDATE},
+                lease=c.lease(),
             )
         else:
-            c.journal.reconcile(operation.key, ST.FAILED, reason="head unchanged")
+            c.journal.reconcile(operation.key, ST.FAILED, reason="head unchanged", lease=c.lease())
     with contextlib.suppress(LedgerIntegrityError):  # a step failed for this attempt
         drive(c, world)
 
@@ -590,6 +598,7 @@ def test_a_freeze_can_never_be_reconciled_into_a_candidate(coordinator: Coordina
             ST.SUCCEEDED,
             reason="trust me",
             result=freeze_result(candidate()),
+            lease=coordinator.lease(),
         )
 
 
@@ -631,3 +640,26 @@ def test_a_lost_fence_on_the_outcome_is_reported_as_lost_ownership(
     operation = coordinator.store.inner.operation("publish-revision:e1:1")
     assert operation is not None
     assert operation.status is ST.INTENDED  # nothing more was written
+
+
+def test_only_the_lease_holder_reconciles_and_only_while_owning(
+    coordinator: Coordinator,
+) -> None:
+    """Recovery settles operations under the same checks as performing them (review of 28a4a89)."""
+
+    def timed_out() -> Mapping[str, str]:
+        raise TimeoutError
+
+    with pytest.raises(TimeoutError):
+        coordinator.perform(K.PUBLISH_REVISION, timed_out)
+    key = "publish-revision:e1:1"
+    other = coordinator.leases.acquire("e2")
+    with pytest.raises(FencingError, match="cannot act for e1"):
+        coordinator.journal.reconcile(key, ST.FAILED, reason="x", lease=other)
+    lease = coordinator.lease()
+    lease.release()
+    with pytest.raises(FencingError, match="no longer held"):
+        coordinator.journal.reconcile(key, ST.FAILED, reason="x", lease=lease)
+    operation = coordinator.store.inner.operation(key)
+    assert operation is not None
+    assert operation.status is ST.AMBIGUOUS

@@ -20,7 +20,7 @@ import hashlib
 import itertools
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -62,6 +62,11 @@ class FakeNetwork:
     internal: bool
     dns_enabled: bool
     hosts: int = 1
+    id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = hashlib.sha256(f"net-{self.name}-{id(self)}".encode()).hexdigest()
 
 
 @dataclass
@@ -71,6 +76,7 @@ class FakePodman:
     proxy_ready: bool = True
     fail_rm_names: set[str] = field(default_factory=set)  # containers whose rm fails
     network_rm_fails: bool = False
+    after_network_inspect: Callable[[str], None] | None = None  # to race a removal
     networks: dict[str, FakeNetwork] = field(
         default_factory=lambda: {
             "podman": FakeNetwork("podman", {}, "10.88.0.0/16", internal=False, dns_enabled=False)
@@ -225,7 +231,9 @@ class FakePodman:
                 name, labels, subnet, "--internal" in rest, "--disable-dns" not in rest
             )
             return Completed(0, name + "\n", "")
-        network = self.networks.get(name)
+        network = self.networks.get(name) or next(
+            (n for n in self.networks.values() if n.id == name), None
+        )  # by name or by full ID, as podman accepts
         if action == "exists":
             return Completed(0 if network else 1, "", "")
         if network is None:
@@ -234,19 +242,22 @@ class FakePodman:
             data = [
                 {
                     "name": network.name,
+                    "id": network.id,
                     "labels": network.labels,
                     "subnets": [{"subnet": network.subnet}],
                     "internal": network.internal,
                     "dns_enabled": network.dns_enabled,
                 }
             ]
+            if self.after_network_inspect is not None:
+                self.after_network_inspect(network.name)
             return Completed(0, json.dumps(data), "")
         if action == "rm":
             if self.network_rm_fails:
                 return Completed(125, "", f"Error: removing network {name}: device busy\n")
-            if any(name in c.networks for c in self.containers.values()):
+            if any(network.name in c.networks for c in self.containers.values()):
                 return Completed(2, "", f"Error: network {name} is being used\n")
-            del self.networks[name]
+            del self.networks[network.name]
             return Completed(0, name + "\n", "")
         return Completed(125, "", f"Error: unsupported network action {action}\n")
 

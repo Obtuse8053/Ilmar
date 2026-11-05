@@ -235,6 +235,15 @@ class FakeContainerRuntime:
         container = self._containers.get(handle.id)
         return container is not None and container.running
 
+    def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
+        found = self._by_name(name)
+        if found is None:
+            return False
+        if found.owner != owner:
+            raise OwnershipConflictError(f"{name} is not owned by the recorded execution")
+        del self._containers[found.handle.id]
+        return True
+
     def stop(self, handle: ContainerHandle, *, owner: ResourceOwner) -> None:
         container = self._containers.get(handle.id)
         if container is None:
@@ -296,6 +305,7 @@ class FakeSourceControl:
         self._name = name
         self._revisions: dict[str, Tree] = {}
         self._parents: dict[str, str | None] = {}
+        self._frozen: set[str] = set()  # like refs/ilmar/candidates/* in the real adapter
         self._branches: dict[tuple[RepositoryRef, str], str] = {}
         self._change_requests: dict[tuple[RepositoryRef, str], _ChangeRequestRecord] = {}
         self._keys = itertools.count(1)
@@ -371,6 +381,21 @@ class FakeSourceControl:
         tree = _read_tree(workspace)
         changed = sorted(path for path in set(base) | set(tree) if base.get(path) != tree.get(path))
         revision = self._store(base_revision, tree, message)
+        self._frozen.add(revision)
+        return CandidateRevision(revision, base_revision, tuple(changed))
+
+    def load_candidate(
+        self, repository: RepositoryRef, *, base_revision: str, revision: str
+    ) -> CandidateRevision:
+        tree, base = self._revisions.get(revision), self._revisions.get(base_revision)
+        if (
+            revision not in self._frozen
+            or tree is None
+            or base is None
+            or self._parents.get(revision) != base_revision
+        ):
+            raise CandidateRejectedError(f"{revision} is not a candidate frozen on {base_revision}")
+        changed = sorted(path for path in set(base) | set(tree) if base.get(path) != tree.get(path))
         return CandidateRevision(revision, base_revision, tuple(changed))
 
     def checkout_revision(

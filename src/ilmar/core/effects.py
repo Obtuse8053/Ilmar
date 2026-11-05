@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ilmar.core.components import Components
-from ilmar.core.journal import Journal, freeze_result
+from ilmar.core.journal import Journal, check_candidate, freeze_result
 from ilmar.core.mounts import authorize_mount
 from ilmar.core.naming import container_name, verification_container_name
 from ilmar.core.ownership import ExecutionLease
@@ -81,6 +81,12 @@ _SUMMARY_LIMIT = 2000
 
 class TransientError(IlmarError):
     """The step failed for a reason a repetition may not meet (ADR-0021)."""
+
+
+ABANDONED = "interrupted; the attempt is abandoned"
+"""The note of a step that recovery settled as failed because a crash interrupted it.
+
+Such a failure is transient: it says nothing about the step itself (ADR-0022)."""
 
 
 class DeterministicError(IlmarError):
@@ -172,7 +178,10 @@ class Effects:
             return False
         except ProviderError:
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="the note may or may not exist; not repeated"
+                key,
+                OperationStatus.FAILED,
+                reason="the note may or may not exist; not repeated",
+                lease=lease,
             )
             return False
         return True
@@ -260,25 +269,25 @@ class Effects:
             parse_identity(result["identity"]),
         )
 
-    def delete_attempt(self, execution: Execution, lease: ExecutionLease) -> bool:
+    def delete_attempt(
+        self, execution: Execution, lease: ExecutionLease, *, step: str = ""
+    ) -> bool:
         """Delete a finished attempt's directory and record every resource inside as released."""
         layout = self._c.layout
         path = layout.attempt_dir(execution.id, execution.attempt)
         top = self._store.resource(
             resource_key(ResourceKind.WORKSPACE, execution.id, execution.attempt, str(path))
         )
-        if top is None or top.status is not R.ACTIVE or top.identity is None:
+        if top is None or top.status is R.RELEASED:
             return False
-        inside = [
-            r
-            for r in self._store.resources(execution_id=execution.id, statuses={R.ACTIVE})
-            if r.attempt == execution.attempt
-            and r.kind in (ResourceKind.WORKSPACE, ResourceKind.VERIFICATION_CHECKOUT)
-            and r.key != top.key
-            and Path(r.name).is_relative_to(path)
-        ]
+        if top.status is R.QUARANTINED or top.identity is None:
+            raise LedgerIntegrityError(f"{path} is not a recorded, deletable directory")
+        group = self._attempt_tree(execution, path, statuses={R.ACTIVE, R.RELEASING})
         now = self._clock()
-        releasing = [r.moved(R.RELEASING, now=now) for r in (top, *inside)]
+        releasing = [r if r.status is R.RELEASING else r.moved(R.RELEASING, now=now) for r in group]
+        before = Commit(
+            resources=tuple(r for r, g in zip(releasing, group, strict=True) if g is not r)
+        )
         expected = parse_identity(top.identity)
 
         def effect() -> Mapping[str, str]:
@@ -291,8 +300,9 @@ class Effects:
                 execution,
                 effect,
                 lease=lease,
+                step=step,
                 intent={"path": str(path)},
-                before=Commit(resources=tuple(releasing)),
+                before=before,
                 after=lambda _: Commit(
                     resources=tuple(
                         r.moved(R.RELEASED, now=self._clock(), note="deleted after success")
@@ -302,18 +312,31 @@ class Effects:
                 definitive=(OwnershipConflictError,),
             )
         except OwnershipConflictError:
+            latest = [self._store.resource(r.key) or r for r in releasing]
             self._commit(
                 lease,
                 execution,
                 Commit(
                     resources=tuple(
                         r.moved(R.QUARANTINED, now=self._clock(), note="replaced on disk")
-                        for r in releasing
+                        for r in latest
+                        if r.status not in (R.RELEASED, R.QUARANTINED)
                     )
                 ),
             )
             raise
         return True
+
+    def _attempt_tree(
+        self, execution: Execution, path: Path, *, statuses: set[ResourceStatus]
+    ) -> list[Resource]:
+        return [
+            r
+            for r in self._store.resources(execution_id=execution.id, statuses=statuses)
+            if r.attempt == execution.attempt
+            and r.kind in (ResourceKind.WORKSPACE, ResourceKind.VERIFICATION_CHECKOUT)
+            and (r.name == str(path) or Path(r.name).is_relative_to(path))
+        ]
 
     # -- the agent sandbox ------------------------------------------------------------
 
@@ -382,6 +405,7 @@ class Effects:
                             planned.moved(R.RELEASED, now=self._clock(), note="never created"),
                         )
                     ),
+                    lease=lease,
                 )
                 raise TransientError(f"the agent sandbox did not start: {error}") from error
             raise  # it exists: left ambiguous for reconciliation (#11c)
@@ -404,6 +428,13 @@ class Effects:
             }
 
         key = operation_key(K.RUN_AGENT, execution.id, execution.attempt)
+        if (
+            self._store.operation(
+                operation_key(K.FREEZE_CANDIDATE, execution.id, execution.attempt)
+            )
+            is not None
+        ):
+            raise LedgerIntegrityError(f"{execution.id}: the agent never runs after a freeze")
         try:
             result = self._journal.perform(K.RUN_AGENT, execution, effect, lease=lease)
         except NEVER_TRANSIENT:
@@ -411,7 +442,10 @@ class Effects:
         except ProviderError as error:
             # ADR-0021: an agent run with an unknown outcome abandons the attempt.
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="outcome unknown; the attempt is abandoned"
+                key,
+                OperationStatus.FAILED,
+                reason="outcome unknown; the attempt is abandoned",
+                lease=lease,
             )
             raise TransientError(f"the agent run was interrupted: {error}") from error
         exit_code = result["exit_code"]
@@ -421,23 +455,36 @@ class Effects:
             int(exit_code) if exit_code else None,
         )
 
-    def stop_agent_sandbox(
-        self,
-        execution: Execution,
-        lease: ExecutionLease,
-        *,
-        handle: ContainerHandle,
-        owner: ResourceOwner,
+    def remove_sandbox(
+        self, execution: Execution, lease: ExecutionLease, *, resource: Resource
     ) -> None:
-        key = resource_key(ResourceKind.CONTAINER, execution.id, execution.attempt, handle.name)
-        active = self._store.resource(key)
-        if active is None or active.status is not R.ACTIVE:
-            raise LedgerIntegrityError(f"{key} is not an active resource")
-        releasing = active.moved(R.RELEASING, now=self._clock())
+        """Remove a recorded sandbox (container, egress sidecar, network) from durable data.
+
+        Journaled as ``stop-container:<execution>:<current attempt>:<name>``.
+        The owner comes from the ledger row, so this works after a restart and
+        for earlier attempts. A foreign or ambiguous owner, or an unconfirmed
+        removal, quarantines the row and raises.
+        """
+        if resource.kind is not ResourceKind.CONTAINER:
+            raise LedgerIntegrityError(f"{resource.key} is not a sandbox")
+        current = self._store.resource(resource.key) or resource
+        if current.status is R.RELEASED:
+            return
+        if current.status is R.QUARANTINED:
+            raise LedgerIntegrityError(f"{current.key} is quarantined; a human must resolve it")
+        owner = ResourceOwner(
+            self._c.instance_id, current.execution_id, current.attempt, current.owner_token
+        )
+        key = operation_key(K.STOP_CONTAINER, execution.id, execution.attempt, current.name)
+        if current.status is R.ACTIVE:
+            target = current.moved(R.RELEASING, now=self._clock())
+            before = Commit(resources=(target,))
+        else:  # INTENDED (maybe never created) or RELEASING (removal under way)
+            target, before = current, Commit()
 
         def effect() -> Mapping[str, str]:
-            self._c.container_runtime.stop(handle, owner=owner)
-            return {}
+            removed = self._c.container_runtime.remove_owned(current.name, owner=owner)
+            return {"removed": str(removed).lower()}
 
         try:
             self._journal.perform(
@@ -445,13 +492,238 @@ class Effects:
                 execution,
                 effect,
                 lease=lease,
-                step=handle.name,
-                before=Commit(resources=(releasing,)),
-                after=lambda _: Commit(resources=(releasing.moved(R.RELEASED, now=self._clock()),)),
+                step=current.name,
+                before=before,
+                after=lambda r: Commit(
+                    resources=(
+                        target.moved(
+                            R.RELEASED,
+                            now=self._clock(),
+                            note="removed" if r["removed"] == "true" else "already gone",
+                        ),
+                    )
+                ),
             )
-        except ContainmentError:
-            self._quarantine(execution, lease, releasing, "removal could not be confirmed")
+        except (OwnershipConflictError, ContainmentError) as error:
+            latest = self._store.resource(current.key) or current
+            self._quarantine(execution, lease, latest, f"not removed: {type(error).__name__}")
+            if (op := self._store.operation(key)) is not None and not op.status.is_final:
+                self._journal.reconcile(
+                    key,
+                    OperationStatus.FAILED,
+                    reason=f"quarantined: {type(error).__name__}",
+                    lease=lease,
+                )
             raise
+
+    # -- settling what a crash left unclear (ADR-0022) ----------------------------------
+
+    def settle_directory_step(
+        self, execution: Execution, lease: ExecutionLease, *, kind: OperationKind, path: Path
+    ) -> None:
+        """An interrupted attempt-directory creation or checkout: observe the directory."""
+        key = operation_key(kind, execution.id, execution.attempt)
+        planned = self._store.resource(
+            resource_key(ResourceKind.WORKSPACE, execution.id, execution.attempt, str(path))
+        )
+        if planned is not None and planned.status is R.INTENDED:
+            self._settle_partial(execution, lease, planned, path)
+        self._journal.reconcile(key, OperationStatus.FAILED, reason=ABANDONED, lease=lease)
+
+    def abandon_agent_run(self, execution: Execution, lease: ExecutionLease) -> None:
+        self._journal.reconcile(
+            operation_key(K.RUN_AGENT, execution.id, execution.attempt),
+            OperationStatus.FAILED,
+            reason="outcome unknown after a restart; the attempt is abandoned",
+            lease=lease,
+        )
+
+    def settle_start(self, execution: Execution, lease: ExecutionLease, *, name: str) -> None:
+        self._journal.reconcile(
+            operation_key(K.START_CONTAINER, execution.id, execution.attempt, name),
+            OperationStatus.FAILED,
+            reason="interrupted before the agent ran; the sandbox was removed",
+            lease=lease,
+        )
+
+    def settle_post(self, execution: Execution, lease: ExecutionLease, *, step: str) -> None:
+        self._journal.reconcile(
+            operation_key(K.POST_UPDATE, execution.id, execution.attempt, step),
+            OperationStatus.FAILED,
+            reason="the note may or may not exist; not repeated",
+            lease=lease,
+        )
+
+    def settle_verify(
+        self,
+        execution: Execution,
+        lease: ExecutionLease,
+        *,
+        run: int,
+        candidate: CandidateRevision,
+        then: Then,
+    ) -> bool:
+        """An interrupted verification run, decided by its own evidence (matched by run).
+
+        Its sandboxes are removed first, from the ledger. Returns ``True`` if
+        the run had finished and its outcome is now recorded.
+        """
+        attempt = execution.attempt
+        names = {
+            verification_container_name(self._c.instance_id, execution.id, attempt, run, job)
+            for job, _ in self._c.verification.jobs()
+        }
+        for row in self._store.resources(execution_id=execution.id):
+            if row.kind is ResourceKind.CONTAINER and row.attempt == attempt and row.name in names:
+                self.remove_sandbox(self._current(execution), lease, resource=row)
+        execution = self._current(execution)
+        run_dir = self._c.layout.verification_checkout(execution.id, attempt, run)
+        checkout = self._store.resource(
+            resource_key(ResourceKind.VERIFICATION_CHECKOUT, execution.id, attempt, str(run_dir))
+        )
+        settled_checkout = (
+            (self._observed_checkout(checkout, run_dir),)
+            if checkout is not None and checkout.status is R.INTENDED
+            else ()
+        )
+        key = operation_key(K.VERIFY, execution.id, attempt, f"run-{run}")
+        evidence = [
+            e for e in self._store.evidence(execution.id) if e.attempt == attempt and e.run == run
+        ]
+        if len(evidence) == 1 and (evidence[0].candidate_revision, evidence[0].base_revision) == (
+            candidate.revision,
+            candidate.base_revision,
+        ):
+            record = evidence[0]
+            found = directory_identity(run_dir, root=self._c.layout.workspaces_root)
+            result = {
+                "verdict": record.verdict.value,
+                "evidence_digest": record.digest(),
+                "candidate_revision": record.candidate_revision,
+                "checkout_identity": "" if found is None else identity_text(found),
+            }
+            self._journal.reconcile(
+                key,
+                OperationStatus.SUCCEEDED,
+                reason=f"evidence of run {run} exists",
+                result=result,
+                changes=_merge(Commit(resources=settled_checkout), then(result)),
+                lease=lease,
+            )
+            return True
+        if evidence:
+            raise LedgerIntegrityError(f"{key}: its evidence is for another candidate")
+        self._journal.reconcile(
+            key,
+            OperationStatus.FAILED,
+            reason=f"run {run} left no evidence",
+            changes=Commit(resources=settled_checkout),
+            lease=lease,
+        )
+        return False
+
+    def settle_publish(
+        self,
+        execution: Execution,
+        lease: ExecutionLease,
+        *,
+        step: str,
+        branch: str,
+        expected_head: str | None,
+    ) -> bool:
+        """An interrupted push, decided by the branch head. Never overwrites anything.
+
+        Returns ``True`` if the branch is at the verified candidate. A head that
+        is neither the candidate nor the expected head blocks for a human.
+        """
+        revision = execution.candidate_revision
+        key = operation_key(K.PUBLISH_REVISION, execution.id, execution.attempt, step)
+        head = self._c.source_control.branch_head(self._c.target.repository, branch)
+        if head is not None and head == revision:
+            self._journal.reconcile(
+                key,
+                OperationStatus.SUCCEEDED,
+                reason="the branch is at the candidate",
+                result={"head": head},
+                lease=lease,
+            )
+            return True
+        if head == expected_head:
+            self._journal.reconcile(
+                key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
+            )
+            return False
+        raise LedgerIntegrityError(
+            f"{branch} moved to an unverified head; a human must decide (it is never "
+            "force-pushed, reset or overwritten)"
+        )
+
+    def settle_delete(self, execution: Execution, lease: ExecutionLease, *, step: str) -> bool:
+        """An interrupted workspace deletion, decided by the directory. ``True`` if gone."""
+        path = self._c.layout.attempt_dir(execution.id, execution.attempt)
+        key = operation_key(K.DELETE_WORKSPACE, execution.id, execution.attempt, step)
+        group = self._attempt_tree(execution, path, statuses={R.RELEASING})
+        top = self._store.resource(
+            resource_key(ResourceKind.WORKSPACE, execution.id, execution.attempt, str(path))
+        )
+        if top is None or top.identity is None:
+            raise LedgerIntegrityError(f"{key}: no recorded attempt directory")
+        found = directory_identity(path, root=self._c.layout.workspaces_root)
+        now = self._clock()
+        if found is None:
+            self._journal.reconcile(
+                key,
+                OperationStatus.SUCCEEDED,
+                reason="the directory is gone",
+                result={"removed": "true"},
+                changes=Commit(
+                    resources=tuple(r.moved(R.RELEASED, now=now, note="deleted") for r in group)
+                ),
+                lease=lease,
+            )
+            return True
+        if identity_text(found) == top.identity:
+            self._journal.reconcile(
+                key, OperationStatus.FAILED, reason="the directory is still there", lease=lease
+            )
+            return False
+        self._journal.reconcile(
+            key,
+            OperationStatus.FAILED,
+            reason="the directory was replaced",
+            changes=Commit(
+                resources=tuple(r.moved(R.QUARANTINED, now=now, note="replaced") for r in group)
+            ),
+            lease=lease,
+        )
+        raise LedgerIntegrityError(f"{path} was replaced; it is quarantined, never deleted")
+
+    def load_candidate(self, execution: Execution) -> CandidateRevision:
+        """The frozen candidate, rebuilt and proven equal to what the freeze recorded."""
+        freeze = self._store.operation(
+            operation_key(K.FREEZE_CANDIDATE, execution.id, execution.attempt)
+        )
+        if (
+            freeze is None
+            or execution.candidate_revision is None
+            or execution.base_revision is None
+        ):
+            raise LedgerIntegrityError(f"{execution.id} has no frozen candidate to load")
+        try:
+            candidate = self._c.source_control.load_candidate(
+                self._c.target.repository,
+                base_revision=execution.base_revision,
+                revision=execution.candidate_revision,
+            )
+        except CandidateRejectedError as error:
+            # Freezing succeeded, so this is the coordinator's own repository
+            # losing or changing a recorded candidate: an integrity problem
+            # for a human, not a failure of the agent's work.
+            raise LedgerIntegrityError(
+                f"{execution.id}: the frozen candidate cannot be reloaded: {error}"
+            ) from error
+        check_candidate(candidate, freeze)
+        return candidate
 
     # -- candidate, verification and publication ---------------------------------------
 
@@ -585,6 +857,7 @@ class Effects:
                             self._observed_checkout(checkout, run_dir),
                         )
                     ),
+                    lease=lease,
                 )
                 raise TransientError(f"verification did not finish: {error}") from error
             raise
@@ -638,11 +911,12 @@ class Effects:
                     OperationStatus.SUCCEEDED,
                     reason="the branch is at the candidate",
                     result={"head": revision},
+                    lease=lease,
                 )
                 return
             if head == expected_head:
                 self._journal.reconcile(
-                    key, OperationStatus.FAILED, reason="the branch did not move"
+                    key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
                 )
                 raise TransientError(f"the push did not happen: {error}") from error
             raise  # the branch moved elsewhere: left ambiguous for a human
@@ -663,9 +937,12 @@ class Effects:
         and must refuse to call the execution complete if it is no longer
         ``verified`` (someone pushed in between).
         """
-        planned = self._planned(
-            ResourceKind.CHANGE_REQUEST, execution, spec.source_branch, owner_token
-        )
+        planned = self._store.resource(
+            resource_key(
+                ResourceKind.CHANGE_REQUEST, execution.id, execution.attempt, spec.source_branch
+            )
+        ) or self._planned(ResourceKind.CHANGE_REQUEST, execution, spec.source_branch, owner_token)
+        first = self._store.resource(planned.key) is None
         made: list[ChangeRequest] = []
         scm = self._c.source_control
 
@@ -687,8 +964,13 @@ class Effects:
             effect,
             lease=lease,
             intent={"source_branch": spec.source_branch, "target_branch": spec.target_branch},
-            before=Commit(resources=(planned,)),
-            after=lambda r: _merge(Commit(resources=(self._activate(planned, r["key"]),)), then(r)),
+            before=Commit(resources=(planned,)) if first else Commit(),
+            after=lambda r: _merge(
+                Commit(resources=(self._activate(planned, r["key"]),))
+                if planned.status is R.INTENDED
+                else Commit(),
+                then(r),
+            ),
             definitive=(OwnershipConflictError,),
         )
         if made:
@@ -790,6 +1072,12 @@ class Effects:
                 R.ACTIVE, now=self._clock(), identity=identity_text(found), note="partial checkout"
             )
         self._commit(lease, execution, Commit(resources=(moved,)))
+
+    def _current(self, execution: Execution) -> Execution:
+        found = self._store.get(execution.id)
+        if found is None:
+            raise LedgerIntegrityError(f"execution {execution.id} vanished")
+        return found
 
     def _commit(self, lease: ExecutionLease, execution: Execution, changes: Commit) -> None:
         lease.check(execution.id)

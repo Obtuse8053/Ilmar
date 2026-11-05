@@ -74,6 +74,24 @@ class ContainerRuntime(Protocol):
 
     def is_running(self, handle: ContainerHandle) -> bool: ...
 
+    def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
+        """Remove the sandbox named ``name`` and everything that belongs to it (ADR-0022).
+
+        Works from durable data only (the name and the owner recorded in the
+        ledger), so a restarted coordinator can clean up what a crashed one
+        left. It removes the container *and* any companion resources the
+        runtime created for it (for Podman: the egress proxy and the network).
+
+        * Returns ``False`` if nothing with that name exists, ``True`` after
+          removing something.
+        * Fails closed before touching anything: if any of those resources
+          carries another owner, or no complete owner, or a name matches more
+          than one resource, ``OwnershipConflictError`` is raised and all are
+          left as they are.
+        * Raises ``ContainmentError`` if a removal cannot be confirmed.
+        """
+        ...
+
     def stop(self, handle: ContainerHandle, *, owner: ResourceOwner) -> None:
         """Stop and remove the container ``handle.id`` if it is owned by ``owner``.
 

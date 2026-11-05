@@ -71,10 +71,19 @@ class Journal:
         store: ExecutionStore,
         ownership: Ownership,
         clock: Callable[[], datetime],
+        always_definitive: tuple[type[BaseException], ...] = (),
     ) -> None:
+        """``always_definitive`` errors are recorded as ``FAILED`` for every kind.
+
+        The coordinator passes its never-transient classes (security, policy,
+        ownership, integrity): their outcome is known, and recording it as
+        final (with the class as the note) is what lets recovery refuse to
+        retry them after a crash (ADR-0021, ADR-0022).
+        """
         self._store = store
         self._ownership = ownership
         self._clock = clock
+        self._always_definitive = always_definitive
 
     @property
     def fence(self) -> Fence:
@@ -101,6 +110,7 @@ class Journal:
         """
         lease.check(execution.id)
         _check_scope(before, execution.id)
+        definitive = (*definitive, *self._always_definitive)
         fence = self._ownership.fence
         expected = next(
             (e.version for e, _ in before.applied if e.id == execution.id), execution.version
@@ -186,6 +196,7 @@ class Journal:
         key: str,
         status: OperationStatus,
         *,
+        lease: ExecutionLease,
         reason: str,
         result: Mapping[str, str] | None = None,
         changes: Commit = Commit(),  # noqa: B008 - an immutable, empty value
@@ -200,6 +211,10 @@ class Journal:
         operation = self._store.operation(key)
         if operation is None:
             raise LedgerIntegrityError(f"no operation {key} to reconcile")
+        # Like perform: only the lease holder settles an execution's operations,
+        # and only while this coordinator still owns the instance (ADR-0020).
+        lease.check(operation.execution_id)
+        self._ownership.check()
         if operation.status.is_final:
             raise LedgerIntegrityError(f"{key} is already {operation.status.value}")
         if operation.kind is OperationKind.FREEZE_CANDIDATE:

@@ -17,6 +17,7 @@ import pytest
 from ilmar.adapters.github import GitHubClient
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.domain.changes import ChangeRequest, RepositoryRef
+from ilmar.domain.errors import CandidateRejectedError
 from ilmar.ports.source_control import SourceControlProvider
 
 from contracts.source_control import BASE_FILES, SourceControlContract
@@ -62,6 +63,21 @@ class TestGitHubSourceControlOnRealGit(SourceControlContract):
         self._human("commit", "--quiet", "-m", "base", cwd=seed)
         self._human("push", "--quiet", str(bare), "HEAD:refs/heads/main", cwd=seed)
         return RepositoryRef("github", "owner/repo")
+
+    def test_load_candidate_reads_parents_from_the_commit_itself(
+        self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
+    ) -> None:
+        """A graft file cannot make a candidate look frozen on another base (review of 28a4a89)."""
+        base, candidate = self._frozen(provider, repo, tmp_path)
+        other = self.push_external(provider, repo, "main", {"x.txt": "x\n"})
+        provider.checkout(repo, base_branch="main", branch="ilmar/g", destination=tmp_path / "g")
+        (bare,) = (self._tmp / "coordinator").rglob("*.git")
+        (bare / "info").mkdir(exist_ok=True)
+        (bare / "info" / "grafts").write_text(f"{candidate.revision} {other}\n")
+        with pytest.raises(CandidateRejectedError):
+            provider.load_candidate(repo, base_revision=other, revision=candidate.revision)
+        loaded = provider.load_candidate(repo, base_revision=base, revision=candidate.revision)
+        assert loaded == candidate
 
     def push_external(
         self,

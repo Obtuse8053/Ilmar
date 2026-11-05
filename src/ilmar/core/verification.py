@@ -162,6 +162,7 @@ class Verifier:
             agent_report=AgentReport(
                 agent_result.outcome.value, agent_result.summary[:_SUMMARY_LIMIT]
             ),
+            run=run,
         )
         self._store.append_evidence(record, fence=self._fence)
         return record

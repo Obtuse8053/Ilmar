@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -12,6 +13,7 @@ from ilmar.domain.verification import (
     DEFAULT_CHECK_INFLUENCING_PATHS,
     DEFAULT_CI_CONFIG_PATHS,
     DEFAULT_PROTECTED_PATHS,
+    EVIDENCE_FORMAT,
     AgentReport,
     CheckClass,
     CheckEvidence,
@@ -167,6 +169,45 @@ def record(**kwargs: object) -> EvidenceRecord:
         "agent_report": AgentReport("completed", "Fixed it."),
     } | kwargs
     return EvidenceRecord(**settings)  # type: ignore[arg-type]
+
+
+def test_records_without_a_run_keep_their_original_bytes_and_digest() -> None:
+    """Format 1 is still written for run-less records, so stored digests still verify.
+
+    The digest was computed by the code before #11c on the same record.
+    """
+    old = record()
+    assert json.loads(old.to_json())["format"] == 1
+    assert "run" not in json.loads(old.to_json())
+    assert old.digest() == "sha256:f256a641ba67d5fd4511193d9bb520c407dd5192eb4be370a59f1099cfa20ace"
+
+
+def test_evidence_names_the_verification_run_it_came_from() -> None:
+    new = record(run=2)
+    data = json.loads(new.to_json())
+    assert data["format"] == EVIDENCE_FORMAT == 2
+    assert data["run"] == 2
+    assert EvidenceRecord.from_json(new.to_json()) == new
+    assert new.digest() != record(run=3).digest() != record().digest()
+
+
+@pytest.mark.parametrize("run", [0, -1])
+def test_a_run_number_starts_at_one(run: int) -> None:
+    with pytest.raises(ValueError, match="run"):
+        record(run=run)
+
+
+@pytest.mark.parametrize("bad", ["true", '"1"', "1.0", "0", "null"])
+def test_format_two_accepts_only_a_whole_positive_run(bad: str) -> None:
+    text = record(run=1).to_json().replace('"run":1,', f'"run":{bad},')
+    with pytest.raises(ValueError, match="run"):
+        EvidenceRecord.from_json(text)
+
+
+def test_format_two_requires_a_run() -> None:
+    text = record(run=1).to_json().replace('"run":1,', "")
+    with pytest.raises(ValueError, match="run"):
+        EvidenceRecord.from_json(text)
 
 
 def test_evidence_round_trips_through_json() -> None:

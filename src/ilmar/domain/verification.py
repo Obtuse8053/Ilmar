@@ -22,7 +22,11 @@ from typing import Any
 
 from ilmar.domain.workspace import ResourceLimits
 
-EVIDENCE_FORMAT = 1
+EVIDENCE_FORMAT = 2
+"""Format 2 (#11c, ADR-0022) adds ``run``: the verification run the record belongs to.
+Format 1 records (no run) are still read, and re-encode byte for byte, so their
+stored digests still verify."""
+_LEGACY_FORMAT = 1
 
 
 class CheckClass(enum.Enum):
@@ -296,12 +300,16 @@ class EvidenceRecord:
     requires_human_review: bool
     review_reasons: tuple[str, ...]
     agent_report: AgentReport
+    run: int | None = None
+    """The verification run of the attempt; ``None`` only for format 1 records."""
 
     def __post_init__(self) -> None:
         if self.recorded_at.tzinfo is None:
             raise ValueError("recorded_at must be timezone-aware")
         if self.attempt < 1:
             raise ValueError("attempt starts at 1")
+        if self.run is not None and self.run < 1:
+            raise ValueError("run starts at 1")
         if self.verdict is Verdict.PUBLISH and self.requires_human_review:
             raise ValueError("a record that requires review cannot have verdict PUBLISH")
 
@@ -311,8 +319,14 @@ class EvidenceRecord:
     @classmethod
     def from_json(cls, text: str) -> EvidenceRecord:
         data = json.loads(text)
-        if data.get("format") != EVIDENCE_FORMAT:
-            raise ValueError(f"unsupported evidence format: {data.get('format')!r}")
+        version = data.get("format")
+        if version not in (EVIDENCE_FORMAT, _LEGACY_FORMAT):
+            raise ValueError(f"unsupported evidence format: {version!r}")
+        run = data.get("run")
+        if version == EVIDENCE_FORMAT and (type(run) is not int or run < 1):
+            raise ValueError("format 2 evidence needs its run")
+        if version == _LEGACY_FORMAT and "run" in data:
+            raise ValueError("format 1 evidence has no run")
         return cls(
             execution_id=data["execution_id"],
             attempt=data["attempt"],
@@ -329,6 +343,7 @@ class EvidenceRecord:
             requires_human_review=data["requires_human_review"],
             review_reasons=tuple(data["review_reasons"]),
             agent_report=AgentReport(**data["agent_report"]),
+            run=run,
         )
 
     def digest(self) -> str:
@@ -336,8 +351,14 @@ class EvidenceRecord:
 
 
 def _encode(record: EvidenceRecord) -> dict[str, Any]:
+    encoded = _encode_body(record)
+    if record.run is None:  # format 1, exactly as it was stored
+        return {"format": _LEGACY_FORMAT, **encoded}
+    return {"format": EVIDENCE_FORMAT, "run": record.run, **encoded}
+
+
+def _encode_body(record: EvidenceRecord) -> dict[str, Any]:
     return {
-        "format": EVIDENCE_FORMAT,
         "execution_id": record.execution_id,
         "attempt": record.attempt,
         "recorded_at": record.recorded_at.isoformat(),
