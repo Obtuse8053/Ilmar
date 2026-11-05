@@ -53,13 +53,12 @@ import re
 import signal
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import IO, Any
+from typing import IO, Any, Protocol
 
 from ilmar.adapters.podman import egress_proxy
 from ilmar.core.layout import WorkspaceLayout
@@ -136,8 +135,22 @@ class Completed:
     timed_out: bool = False
 
 
-Executor = Callable[[Sequence[str], Mapping[str, str], float], Completed]
-"""Runs ``argv`` with exactly ``env`` and a timeout in seconds."""
+class Executor(Protocol):
+    """Runs ``argv`` with exactly ``env`` and a timeout in seconds.
+
+    ``pass_fds`` are inherited by the child under the same numbers: how values
+    reach ``--env-file /dev/fd/N`` without a file on disk.
+    """
+
+    def __call__(
+        self,
+        argv: Sequence[str],
+        env: Mapping[str, str],
+        timeout: float,
+        *,
+        pass_fds: Sequence[int] = (),
+    ) -> Completed: ...
+
 
 MountProbe = Callable[[int, PurePosixPath], DirectoryIdentity]
 """Identity of ``path`` as seen inside the mount namespace of process ``pid``."""
@@ -182,6 +195,7 @@ def subprocess_executor(
     env: Mapping[str, str],
     timeout: float,
     *,
+    pass_fds: Sequence[int] = (),
     output_limit: int = OUTPUT_LIMIT_BYTES,
 ) -> Completed:
     """Run a command in its own process group; on timeout, kill the whole group.
@@ -197,6 +211,7 @@ def subprocess_executor(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=tuple(pass_fds),
         )
     except OSError as error:
         raise ProviderError(f"cannot run {argv[0]}: {error.strerror}") from None
@@ -380,8 +395,10 @@ class PodmanRuntime:
         try:
             # Immediately before the mount: the actual directory, not just the path.
             authorize_mount(self._layout, spec.host_workspace, spec.workspace_identity)
-            with self._env_file(env) as env_file:
-                started = self._podman_call(self._run_arguments(spec, env_file, network_args))
+            with self._env_file(env) as (env_file, fds):
+                started = self._podman_call(
+                    self._run_arguments(spec, env_file, network_args), pass_fds=fds
+                )
             self._expect_success(started, "run")
         except BaseException:
             self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
@@ -447,12 +464,13 @@ class PodmanRuntime:
             raise ProviderError(f"container is not running: {handle.name}")
 
         began = self._clock()
-        with self._env_file(command_env) as env_file:
+        with self._env_file(command_env) as (env_file, fds):
             options = ["--env-file", env_file] if env_file else []
             done = self._executor(
                 [self._podman, "exec", *options, container_id, *argv],
                 self._environ,
                 timeout_seconds,
+                pass_fds=fds,
             )
         duration = max(0.0, self._clock() - began)
         if done.timed_out:
@@ -626,8 +644,10 @@ class PodmanRuntime:
 
     # -- podman calls ------------------------------------------------------
 
-    def _podman_call(self, args: Sequence[str]) -> Completed:
-        done = self._executor([self._podman, *args], self._environ, _CONTROL_TIMEOUT)
+    def _podman_call(self, args: Sequence[str], *, pass_fds: Sequence[int] = ()) -> Completed:
+        done = self._executor(
+            [self._podman, *args], self._environ, _CONTROL_TIMEOUT, pass_fds=pass_fds
+        )
         if done.timed_out:
             raise ProviderError(f"podman {args[0]} timed out")
         return done
@@ -876,19 +896,25 @@ class PodmanRuntime:
             raise ProviderError(f"podman {what} failed: {detail[0][:300]}")
 
     @contextlib.contextmanager
-    def _env_file(self, env: Mapping[str, str]) -> Iterator[str | None]:
-        """Pass values in a private file, not on a command line others can read."""
+    def _env_file(self, env: Mapping[str, str]) -> Iterator[tuple[str | None, tuple[int, ...]]]:
+        """Pass values as ``--env-file /dev/fd/N`` backed by memory, never by a file.
+
+        Not on a command line others can read, and never on disk: a memfd has
+        no path, and the kernel frees it when the last descriptor closes, also
+        when the coordinator is killed mid-command (review for #11d; before,
+        a crash left the model key in ``$TMPDIR``). Yields the path and the
+        descriptor podman must inherit.
+        """
         if not env:
-            yield None
+            yield None, ()
             return
-        fd, path = tempfile.mkstemp(prefix="ilmar-env-")
+        fd = os.memfd_create("ilmar-env", os.MFD_CLOEXEC)  # CLOEXEC: only podman gets it
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.writelines(f"{key}={value}\n" for key, value in env.items())
-            yield path
+            os.write(fd, "".join(f"{key}={value}\n" for key, value in env.items()).encode())
+            os.lseek(fd, 0, os.SEEK_SET)
+            yield f"/dev/fd/{fd}", (fd,)
         finally:
-            with contextlib.suppress(FileNotFoundError):
-                Path(path).unlink()
+            os.close(fd)
 
 
 def _merge_limits(requested: ResourceLimits, defaults: ResourceLimits) -> ResourceLimits:

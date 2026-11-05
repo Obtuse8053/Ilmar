@@ -85,12 +85,23 @@ def test_validate_requires_a_verification_policy(
     assert "[verification] is required" in capsys.readouterr().err
 
 
-def test_run_needs_an_explicit_configuration_and_once(capsys: pytest.CaptureFixture[str]) -> None:
-    for argv in (["run", "--once"], ["run", "--config", "ilmar.toml"]):
-        with pytest.raises(SystemExit) as info:
-            main(argv)
-        assert info.value.code == 2  # argparse usage error, before anything happens
+def test_run_needs_an_explicit_configuration(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(["run", "--once"])
+    assert info.value.code == 2  # argparse usage error, before anything happens
     capsys.readouterr()
+
+
+def test_unattended_operation_is_disabled(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#11d: without --once nothing is read or started, whatever the configuration."""
+    missing = tmp_path / "never-read.toml"
+    assert main(["run", "--config", str(missing)]) == 3
+    error = capsys.readouterr().err
+    assert "unattended operation is disabled" in error
+    assert "issue 44" in error
+    assert not missing.exists()
 
 
 def test_run_with_an_invalid_configuration_exits_3(

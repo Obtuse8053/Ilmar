@@ -189,9 +189,17 @@ def test_podman_itself_sees_only_a_minimal_environment(
         assert "HTTPS_PROXY" not in call.env
 
 
-def test_values_travel_in_a_private_env_file_not_argv(
-    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+def test_values_travel_in_memory_never_in_argv_or_on_disk(
+    layout: WorkspaceLayout,
+    podman: FakePodman,
+    workspace: Workspace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Review for #11d: an env *file* outlived a killed coordinator in $TMPDIR."""
+    spool = tmp_path / "tmp"
+    spool.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spool))
     rt = runtime(layout, podman)
     handle = rt.start(spec(workspace, env={"ANTHROPIC_API_KEY": "sk-model"}))
     rt.run(handle, ["echo", "x"], timeout_seconds=5, env={"STEP": "two"})
@@ -201,9 +209,23 @@ def test_values_travel_in_a_private_env_file_not_argv(
     assert executed.env_file == {"STEP": "two"}
     for call in podman.calls:
         assert not any("sk-model" in arg or arg == "two" for arg in call.argv)
-    for path in (started.argv, executed.argv):
-        env_file = path[path.index("--env-file") + 1]
-        assert not Path(env_file).exists()  # deleted right after use
+    for call in (started, executed):
+        env_file = call.argv[call.argv.index("--env-file") + 1]
+        assert env_file.startswith("/dev/fd/")  # an inherited descriptor, not a path
+        assert len(call.pass_fds) == 1
+    open_memory = [link for link in _open_descriptors() if "ilmar-env" in link]
+    assert open_memory == []  # every descriptor was closed right after use
+    assert list(spool.iterdir()) == []  # nothing was ever written to disk
+
+
+def _open_descriptors() -> list[str]:
+    links = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            links.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except FileNotFoundError:  # the listing's own descriptor, already closed
+            continue
+    return links
 
 
 @pytest.mark.parametrize(
@@ -840,3 +862,30 @@ def test_remove_owned_touches_nothing_if_any_part_is_foreign(
     with pytest.raises(OwnershipConflictError):
         runtime(layout, podman, egress=EGRESS).remove_owned(name, owner=OWNER)
     assert (set(podman.networks), set(podman.containers)) == before
+
+
+def test_a_coordinator_killed_mid_command_leaves_no_credential_on_disk(tmp_path: Path) -> None:
+    """The crash drill's concern, offline: SIGKILL while the env descriptor is in use."""
+    import subprocess
+    import sys
+
+    spool = tmp_path / "tmp"
+    spool.mkdir()
+    child = (
+        "import os, signal\n"
+        "from pathlib import Path\n"
+        "from ilmar.adapters.podman.runtime import PodmanRuntime\n"
+        "from ilmar.core.layout import WorkspaceLayout\n"
+        f"rt = PodmanRuntime(layout=WorkspaceLayout.under(Path({str(tmp_path)!r})))\n"
+        "with rt._env_file({'ANTHROPIC_API_KEY': 'sk-ant-must-not-persist'}):\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    )
+    src = Path(__file__).resolve().parents[2] / "src"
+    done = subprocess.run(  # noqa: S603 - a fixed child program
+        [sys.executable, "-c", child], env={"TMPDIR": str(spool), "PYTHONPATH": str(src)},
+        check=False,
+    )  # fmt: skip
+    assert done.returncode == -9  # it really died there
+    leftovers = [p for p in spool.rglob("*") if b"must-not-persist" in p.read_bytes()]
+    assert leftovers == []
+    assert list(spool.iterdir()) == []

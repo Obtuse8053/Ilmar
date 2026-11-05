@@ -62,6 +62,17 @@ disposable GitHub repository with real Claude Code, then the M2 close-out.
 
 ## Change log
 
+- 2026-11-05: #11d harness on PR (pending review): live end-to-end tests and the #44
+  record (ADR-0023, Proposed).
+  - The live run itself waits for the maintainer. It is opt-in and local
+    (`docs/operations/live-testing.md`).
+  - Found while preparing the crash drill: a killed coordinator left the
+    model key in a temporary env file. Environment values now reach Podman
+    only through a memfd.
+  - Unattended operation is explicitly refused.
+
+  #11 stays open until the live tests have passed.
+
 - 2026-11-05: #11c finished: crash recovery (ADR-0022, accepted after an
   adversarial review on PR #49).
   - Every worker step is decided from the journal, the ledger and trusted

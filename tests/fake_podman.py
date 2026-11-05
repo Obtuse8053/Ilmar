@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ class Call:
     env: dict[str, str]
     timeout: float
     env_file: dict[str, str] | None = None
+    pass_fds: tuple[int, ...] = ()
 
 
 @dataclass
@@ -88,10 +90,17 @@ class FakePodman:
 
     # -- executor --------------------------------------------------------
 
-    def __call__(self, argv: Sequence[str], env: Mapping[str, str], timeout: float) -> Completed:
+    def __call__(
+        self,
+        argv: Sequence[str],
+        env: Mapping[str, str],
+        timeout: float,
+        *,
+        pass_fds: Sequence[int] = (),
+    ) -> Completed:
         args = list(argv)
         assert args[0] == PODMAN, args
-        call = Call(args, dict(env), timeout)
+        call = Call(args, dict(env), timeout, pass_fds=tuple(pass_fds))
         self.calls.append(call)
         command, rest = args[1], args[2:]
         if command == "info":
@@ -291,7 +300,11 @@ class FakePodman:
 def _read_env_file(rest: list[str], call: Call) -> dict[str, str]:
     if "--env-file" not in rest:
         return {}
-    path = Path(rest[rest.index("--env-file") + 1])
-    lines = path.read_text(encoding="utf-8").splitlines()
+    path = rest[rest.index("--env-file") + 1]
+    # Like podman: the path is the inherited descriptor (/dev/fd/N), read in place.
+    fd = int(path.removeprefix("/dev/fd/"))
+    assert path == f"/dev/fd/{fd}", path
+    assert fd in call.pass_fds, (path, call.pass_fds)
+    lines = os.pread(fd, 1 << 16, 0).decode("utf-8").splitlines()
     call.env_file = dict(line.split("=", 1) for line in lines)
     return call.env_file
