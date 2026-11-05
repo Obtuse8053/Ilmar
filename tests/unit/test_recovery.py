@@ -18,8 +18,10 @@ every invariant of ADR-0022 is checked.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +41,17 @@ from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import Coordinator, PassReport
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import Ownership
+from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.changes import CandidateRevision
-from ilmar.domain.errors import CandidateRejectedError, FencingError
+from ilmar.domain.errors import (
+    CandidateRejectedError,
+    ContainmentError,
+    FencingError,
+    PolicyViolationError,
+)
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus
+from ilmar.domain.verification import VerificationCommand, VerificationPolicy
 from ilmar.domain.workspace import NetworkPolicy, ResourceOwner
 from recovery_support import Crash, Killable, KillableStore, Switch
 
@@ -68,6 +77,7 @@ class World:
     root: Path
     tasks: FakeTaskProvider = field(default_factory=lambda: FakeTaskProvider((task("1"),)))
     tasks_override: tuple[str, ...] = ()
+    verification: VerificationPolicy = field(default_factory=policy)
     scm: FakeSourceControl = field(default_factory=FakeSourceControl)
     runtime: WorkspaceRuntime = field(default_factory=WorkspaceRuntime)
     agent: ScriptedAgent = field(default_factory=ScriptedAgent)
@@ -98,7 +108,7 @@ class World:
             execution_store=store,
             agent_sandbox=AgentSandbox("localhost/agent:1", NetworkPolicy.ALLOWLIST, ("api.x",)),
             target=Target(REPO, "main"),
-            verification=policy(),
+            verification=self.verification,
         )
         ownership = Ownership.take(
             layout=self.layout, store=inner, instance_id="inst", now=self.clock()
@@ -502,3 +512,351 @@ def test_several_interrupted_executions_are_recovered_together(tmp_path: Path) -
     assert len(world.scm.pushes) == 2
     assert world.agent.runs == 2  # task 2's interrupted run never happened; its retry did
     assert world.runtime._containers == {}
+
+
+# -- review of 28a4a89 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PolicyViolationError("forbidden"), ContainmentError("escaped", container_id="c", name="c")],
+)
+def test_a_recorded_security_failure_is_never_retried_after_a_crash(
+    world: World, error: Exception
+) -> None:
+    """The agent run fails with a never-transient error, recorded on its operation;
+    the process dies before the failure moves the execution. Recovery must fail
+    it, not abandon the run and retry (ADR-0021)."""
+    switch = Switch()
+
+    def violate() -> None:
+        switch.write_at = switch.writes + 2  # die right after the outcome is recorded
+        raise error
+
+    world.agent.during = violate
+    crashed = world.process(switch)
+    assert crashed.run() is None
+    crashed.exit()
+    with SQLiteExecutionStore(world.db) as store:
+        (run,) = [o for o in store.operations("e1") if o.kind is K.RUN_AGENT]
+        assert run.note == type(error).__name__  # the class is on record
+    world.agent.during = None
+    recover(world)
+    execution = one_execution(world)
+    assert execution.state is S.FAILED, execution
+    assert execution.attempt == 1
+    assert world.agent.runs == 1
+    assert world.runtime._containers == {}
+    assert world.scm.pushes == []
+    with SQLiteExecutionStore(world.db) as store:
+        assert store.unfinished_operations() == ()
+
+
+def test_a_security_failure_leaves_nothing_for_later_passes(world: World) -> None:
+    """Without a crash too: the failure is final, so the next pass has nothing to redo."""
+
+    def violate() -> None:
+        raise PolicyViolationError("forbidden")
+
+    world.agent.during = violate
+    process = world.process()
+    first = process.run()
+    second = process.run()
+    process.exit()
+    assert first is not None
+    assert first.code == 1, first.summary
+    assert second is not None
+    assert (second.code, second.summary) == (0, "no eligible task")
+    with SQLiteExecutionStore(world.db) as store:
+        (run,) = [o for o in store.operations("e1") if o.kind is K.RUN_AGENT]
+        assert (run.status.value, run.note) == ("failed", "PolicyViolationError")
+        assert store.unfinished_operations() == ()
+
+
+@pytest.mark.parametrize("boundary", ["agent.run", "scm.publish_revision", "scm.freeze_candidate"])
+def test_a_wall_clock_stepped_back_across_a_restart_does_not_stop_recovery(
+    world: World, boundary: str
+) -> None:
+    """An NTP step back of a day between crash and restart (ADR-0022, clock rules)."""
+    crash_before(world, boundary)
+    world.clock.now -= timedelta(days=1)
+    reports = recover(world)
+    assert [r.code for r in reports] == [0], [r.summary for r in reports]
+    assert check_invariants(world) == []
+    with SQLiteExecutionStore(world.db) as store:
+        history = store.history("e1")
+    stamps = [t.at for t in history]
+    assert stamps == sorted(stamps)  # persisted time never runs backwards
+
+
+def test_a_wall_clock_stepped_back_while_running_does_not_stop_the_pass(world: World) -> None:
+    def step_back() -> None:
+        world.clock.now -= timedelta(days=1)
+
+    world.agent.during = step_back
+    reports = recover(world)
+    assert [r.code for r in reports] == [0], [r.summary for r in reports]
+    assert check_invariants(world) == []
+
+
+def test_an_unexpected_error_in_one_execution_does_not_stop_unrelated_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 4 holds for bugs too: one execution's unexpected error blocks only it."""
+    world = World(tmp_path.resolve(), tasks_override=("1", "2"))
+    crash_before(world, "scm.publish_revision")
+    real_get = world.tasks.get
+
+    def buggy(ref: Any) -> Any:
+        if ref.key == "1":
+            raise RuntimeError("tracker adapter bug")
+        return real_get(ref)
+
+    monkeypatch.setattr(world.tasks, "get", buggy)
+    results = []
+    for _ in range(2):
+        process = world.process()
+        results.append(process.run())
+        process.exit()
+    first, second = results
+    assert first is not None
+    assert first.code == 2, first.summary
+    assert "RuntimeError" in first.summary
+    assert second is not None
+    assert second.code == 2  # still blocked, still reported, never silently skipped
+    with SQLiteExecutionStore(world.db) as store:
+        states = {e.task.key: e.state for e in store.list_in_states(set(ExecutionState))}
+    assert states == {"1": S.PUBLISHING, "2": S.SUCCEEDED}
+
+
+def test_evidence_from_another_verification_policy_never_publishes(world: World) -> None:
+    """The policy changed while Ilmar was down: the old run's evidence is not enough."""
+    crash_before(world, "scm.publish_revision")
+    world.verification = policy(
+        VerificationCommand("fixed", ("check", "src/app.py", "fixed"), job="tests"),
+        VerificationCommand("stricter", ("check", "src/app.py", "never"), job="tests"),
+    )
+    process = world.process()
+    report = process.run()
+    process.exit()
+    assert report is not None
+    assert report.code == 2, report.summary
+    assert "policy" in report.summary
+    assert world.scm.pushes == []
+    assert world.agent.runs == 1
+
+
+# -- crash injection beyond the happy path (review of 28a4a89) ---------------------------
+#
+# The same exhaustive crash points for the other paths an execution can take:
+# a transient agent failure and a new attempt; a verification failure (the
+# claim is released, the workspace kept); and the follow-up after a merge.
+
+FIXED = {"src/app.py": "print('fixed')\n"}
+
+
+def retry_world(root: Path) -> World:
+    world = World(root)
+    world.agent.plan = [(AgentOutcome.TIMED_OUT, {}), (AgentOutcome.COMPLETED, FIXED)]
+    return world
+
+
+def failing_world(root: Path) -> World:
+    world = World(root)
+    world.agent.plan = [(AgentOutcome.COMPLETED, {"src/app.py": "print('still broken')\n"})]
+    return world
+
+
+def notes_posted_once(world: World) -> list[str]:
+    updates = world.tasks.updates(task("1").ref)
+    return [f"note posted {n} times: {u!r}" for u in set(updates) if (n := updates.count(u)) > 1]
+
+
+def check_retry(world: World) -> list[str]:
+    execution = one_execution(world)
+    if execution.state is S.FAILED:
+        # Bounded by design: each interrupted attempt costs one of the three.
+        problems = [p for p in check_failed(world, verified=False) if "verified" not in p]
+        if execution.attempt != 3 or "attempts exhausted" not in (execution.last_error or ""):
+            problems.append(f"failed early: attempt {execution.attempt}, {execution.last_error}")
+        return problems
+    problems = check_invariants(world)
+    execution = one_execution(world)
+    if execution.attempt < 2:
+        problems.append("the timed-out attempt was not followed by a new one")
+    return problems + notes_posted_once(world)
+
+
+def exhausted_world(root: Path) -> World:
+    world = World(root)
+    world.agent.plan = [(AgentOutcome.TIMED_OUT, {})]
+    return world
+
+
+def security_world(root: Path) -> World:
+    world = World(root)
+
+    def violate() -> None:
+        raise PolicyViolationError("forbidden")
+
+    world.agent.during = violate
+    return world
+
+
+def check_failed(world: World, *, verified: bool = True) -> list[str]:
+    problems = notes_posted_once(world)
+    with SQLiteExecutionStore(world.db) as store:
+        executions = store.list_in_states(set(ExecutionState))
+        if [e.state for e in executions] != [S.FAILED]:
+            return [f"expected one failed execution: {[e.state.value for e in executions]}"]
+        (execution,) = executions
+        if store.unfinished_operations():
+            problems.append(f"unfinished: {[o.key for o in store.unfinished_operations()]}")
+        rows = store.resources(execution_id=execution.id)
+        if any(r.status is R.QUARANTINED for r in rows):
+            problems.append("a resource was quarantined")
+        if any(r.kind is ResourceKind.CONTAINER and r.status is not R.RELEASED for r in rows):
+            problems.append("a sandbox row is not released")
+        kept = [r for r in rows if r.kind is ResourceKind.WORKSPACE and r.status is R.ACTIVE]
+        if not kept:
+            problems.append("the failed workspace was not kept")
+        if store.operation(f"release-task:{execution.id}:{execution.attempt}:failed") is None:
+            problems.append("the claim was not released")
+    if world.scm.pushes or world.scm._change_requests:
+        problems.append("a failed execution published something")
+        if world.agent.runs > execution.attempt:
+            problems.append(f"{world.agent.runs} agent runs in {execution.attempt} attempts")
+        evidence = store.evidence(execution.id)
+        if not verified and evidence:
+            problems.append("an unverifiable execution was verified")
+        if verified and (len(evidence) != 1 or evidence[0].attempt != execution.attempt):
+            problems.append(f"a deterministic failure was retried: {len(evidence)} verifications")
+    if world.runtime._containers:
+        problems.append("live sandboxes remain")
+    if world.tasks.list_eligible() != (task("1"),):
+        problems.append("the failed task's claim is still held")
+    return problems
+
+
+def merge(world: World) -> None:
+    ((_, request),) = world.scm._change_requests.items()
+    world.scm.finish_change_request(request.request, merged=True)
+
+
+def check_merged(world: World) -> list[str]:
+    problems = check_invariants(world)
+    problems = [p for p in problems if "not claimed" not in p]  # released after a merge
+    if world.tasks.list_eligible() != (task("1"),):
+        problems.append("the claim was not released after the merge")
+    with SQLiteExecutionStore(world.db) as store:
+        rows = store.resources(execution_id="e1")
+    requests = [r for r in rows if r.kind is ResourceKind.CHANGE_REQUEST]
+    if [(r.status, r.note) for r in requests] != [(R.RELEASED, "merged: task complete")]:
+        problems.append(f"change request row: {[(r.status.value, r.note) for r in requests]}")
+    return problems + notes_posted_once(world)
+
+
+Scenario = tuple[
+    Callable[[Path], World], Callable[[World], None] | None, Callable[[World], list[str]]
+]
+SCENARIOS: dict[str, Scenario] = {
+    "retry": (retry_world, None, check_retry),
+    "failing": (failing_world, None, check_failed),
+    "exhausted": (exhausted_world, None, partial(check_failed, verified=False)),
+    "security": (security_world, None, partial(check_failed, verified=False)),
+    "merged": (World, merge, check_merged),
+}
+
+
+def scenario_points(tmp_path: Path, name: str) -> tuple[int, int]:
+    make, between, _ = SCENARIOS[name]
+    root = tmp_path / f"{name}-reference"
+    root.mkdir()
+    world = make(root.resolve())
+    process = world.process()
+    report = process.run()
+    process.exit()
+    assert report is not None
+    if between is None:
+        return process.switch.writes, process.switch.effects
+    between(world)
+    second = world.process()
+    assert second.run() is not None
+    second.exit()
+    return second.switch.writes, second.switch.effects
+
+
+def crash_scenario(tmp_path: Path, name: str, switch: Switch, label: str) -> list[str]:
+    make, between, check = SCENARIOS[name]
+    root = tmp_path / label
+    root.mkdir()
+    world = make(root.resolve())
+    if between is not None:  # the crash happens in the pass after the merge
+        first = world.process()
+        assert first.run() is not None
+        first.exit()
+        between(world)
+    crashed = world.process(switch)
+    if crashed.run() is not None:
+        return [f"{label}: no crash"]
+    crashed.exit()
+    recover(world)
+    return check(world)
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_every_crash_point_is_recovered_on_every_path(tmp_path: Path, name: str) -> None:
+    writes, effects = scenario_points(tmp_path, name)
+    assert writes > 3
+    failures: dict[str, list[str]] = {}
+    for n in range(1, writes + 1):
+        if problems := crash_scenario(tmp_path, name, Switch(write_at=n), f"w{n}"):
+            failures[f"write {n}"] = problems
+    for k in range(1, effects + 1):
+        if problems := crash_scenario(tmp_path, name, Switch(effect_at=k), f"e{k}"):
+            failures[f"effect {k}"] = problems
+    assert failures == {}
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_recovery_interrupted_again_is_recovered_on_every_path(tmp_path: Path, name: str) -> None:
+    """Every first crash point, then a second crash early, midway and late in recovery."""
+    writes, _ = scenario_points(tmp_path, name)
+    make, between, check = SCENARIOS[name]
+    failures: dict[str, list[str]] = {}
+    for first in range(1, writes + 1):
+        for second in (1, 4, 9):
+            root = tmp_path / f"d{first}-{second}"
+            root.mkdir()
+            world = make(root.resolve())
+            if between is not None:
+                setup = world.process()
+                assert setup.run() is not None
+                setup.exit()
+                between(world)
+            crashed = world.process(Switch(write_at=first))
+            assert crashed.run() is None
+            crashed.exit()
+            again = world.process(Switch(write_at=second))
+            again.run()  # may finish before reaching the second crash point
+            again.exit()
+            recover(world)
+            if problems := check(world):
+                failures[f"{first}/{second}"] = problems
+    assert failures == {}
+
+
+def test_interrupted_provisioning_stays_transient_through_a_second_crash(tmp_path: Path) -> None:
+    """Review of 28a4a89: the abandon was recorded, then a crash before the retry; the
+    next recovery read the abandoned step as a deterministic failure."""
+    world = retry_world(tmp_path.resolve())
+    crashed = world.process(Switch(write_at=6))  # in attempt 1's provisioning
+    assert crashed.run() is None
+    crashed.exit()
+    again = world.process(Switch(write_at=4))  # after the abandon, before the retry
+    assert again.run() is None
+    again.exit()
+    recover(world)
+    execution = one_execution(world)
+    assert execution.state is S.SUCCEEDED, execution.last_error
+    assert check_retry(world) == []

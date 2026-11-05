@@ -83,6 +83,12 @@ class TransientError(IlmarError):
     """The step failed for a reason a repetition may not meet (ADR-0021)."""
 
 
+ABANDONED = "interrupted; the attempt is abandoned"
+"""The note of a step that recovery settled as failed because a crash interrupted it.
+
+Such a failure is transient: it says nothing about the step itself (ADR-0022)."""
+
+
 class DeterministicError(IlmarError):
     """The step failed in a way that repeating it would only reproduce (ADR-0021)."""
 
@@ -172,7 +178,10 @@ class Effects:
             return False
         except ProviderError:
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="the note may or may not exist; not repeated"
+                key,
+                OperationStatus.FAILED,
+                reason="the note may or may not exist; not repeated",
+                lease=lease,
             )
             return False
         return True
@@ -396,6 +405,7 @@ class Effects:
                             planned.moved(R.RELEASED, now=self._clock(), note="never created"),
                         )
                     ),
+                    lease=lease,
                 )
                 raise TransientError(f"the agent sandbox did not start: {error}") from error
             raise  # it exists: left ambiguous for reconciliation (#11c)
@@ -432,7 +442,10 @@ class Effects:
         except ProviderError as error:
             # ADR-0021: an agent run with an unknown outcome abandons the attempt.
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="outcome unknown; the attempt is abandoned"
+                key,
+                OperationStatus.FAILED,
+                reason="outcome unknown; the attempt is abandoned",
+                lease=lease,
             )
             raise TransientError(f"the agent run was interrupted: {error}") from error
         exit_code = result["exit_code"]
@@ -496,7 +509,10 @@ class Effects:
             self._quarantine(execution, lease, latest, f"not removed: {type(error).__name__}")
             if (op := self._store.operation(key)) is not None and not op.status.is_final:
                 self._journal.reconcile(
-                    key, OperationStatus.FAILED, reason=f"quarantined: {type(error).__name__}"
+                    key,
+                    OperationStatus.FAILED,
+                    reason=f"quarantined: {type(error).__name__}",
+                    lease=lease,
                 )
             raise
 
@@ -512,15 +528,14 @@ class Effects:
         )
         if planned is not None and planned.status is R.INTENDED:
             self._settle_partial(execution, lease, planned, path)
-        self._journal.reconcile(
-            key, OperationStatus.FAILED, reason="interrupted; the attempt is abandoned"
-        )
+        self._journal.reconcile(key, OperationStatus.FAILED, reason=ABANDONED, lease=lease)
 
     def abandon_agent_run(self, execution: Execution, lease: ExecutionLease) -> None:
         self._journal.reconcile(
             operation_key(K.RUN_AGENT, execution.id, execution.attempt),
             OperationStatus.FAILED,
             reason="outcome unknown after a restart; the attempt is abandoned",
+            lease=lease,
         )
 
     def settle_start(self, execution: Execution, lease: ExecutionLease, *, name: str) -> None:
@@ -528,6 +543,7 @@ class Effects:
             operation_key(K.START_CONTAINER, execution.id, execution.attempt, name),
             OperationStatus.FAILED,
             reason="interrupted before the agent ran; the sandbox was removed",
+            lease=lease,
         )
 
     def settle_post(self, execution: Execution, lease: ExecutionLease, *, step: str) -> None:
@@ -535,6 +551,7 @@ class Effects:
             operation_key(K.POST_UPDATE, execution.id, execution.attempt, step),
             OperationStatus.FAILED,
             reason="the note may or may not exist; not repeated",
+            lease=lease,
         )
 
     def settle_verify(
@@ -591,6 +608,7 @@ class Effects:
                 reason=f"evidence of run {run} exists",
                 result=result,
                 changes=_merge(Commit(resources=settled_checkout), then(result)),
+                lease=lease,
             )
             return True
         if evidence:
@@ -600,6 +618,7 @@ class Effects:
             OperationStatus.FAILED,
             reason=f"run {run} left no evidence",
             changes=Commit(resources=settled_checkout),
+            lease=lease,
         )
         return False
 
@@ -626,10 +645,13 @@ class Effects:
                 OperationStatus.SUCCEEDED,
                 reason="the branch is at the candidate",
                 result={"head": head},
+                lease=lease,
             )
             return True
         if head == expected_head:
-            self._journal.reconcile(key, OperationStatus.FAILED, reason="the branch did not move")
+            self._journal.reconcile(
+                key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
+            )
             return False
         raise LedgerIntegrityError(
             f"{branch} moved to an unverified head; a human must decide (it is never "
@@ -657,11 +679,12 @@ class Effects:
                 changes=Commit(
                     resources=tuple(r.moved(R.RELEASED, now=now, note="deleted") for r in group)
                 ),
+                lease=lease,
             )
             return True
         if identity_text(found) == top.identity:
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="the directory is still there"
+                key, OperationStatus.FAILED, reason="the directory is still there", lease=lease
             )
             return False
         self._journal.reconcile(
@@ -671,6 +694,7 @@ class Effects:
             changes=Commit(
                 resources=tuple(r.moved(R.QUARANTINED, now=now, note="replaced") for r in group)
             ),
+            lease=lease,
         )
         raise LedgerIntegrityError(f"{path} was replaced; it is quarantined, never deleted")
 
@@ -833,6 +857,7 @@ class Effects:
                             self._observed_checkout(checkout, run_dir),
                         )
                     ),
+                    lease=lease,
                 )
                 raise TransientError(f"verification did not finish: {error}") from error
             raise
@@ -886,11 +911,12 @@ class Effects:
                     OperationStatus.SUCCEEDED,
                     reason="the branch is at the candidate",
                     result={"head": revision},
+                    lease=lease,
                 )
                 return
             if head == expected_head:
                 self._journal.reconcile(
-                    key, OperationStatus.FAILED, reason="the branch did not move"
+                    key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
                 )
                 raise TransientError(f"the push did not happen: {error}") from error
             raise  # the branch moved elsewhere: left ambiguous for a human

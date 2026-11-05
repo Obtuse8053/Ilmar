@@ -17,6 +17,7 @@ import pytest
 from ilmar.adapters.github import GitHubClient
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.domain.changes import ChangeRequest, RepositoryRef
+from ilmar.domain.errors import CandidateRejectedError
 from ilmar.ports.source_control import SourceControlProvider
 
 from contracts.source_control import BASE_FILES, SourceControlContract
@@ -91,3 +92,22 @@ class TestGitHubSourceControlOnRealGit(SourceControlContract):
         pull["state"] = "closed"
         pull["merged"] = merged
         pull["merged_at"] = "2026-11-05T12:00:00Z" if merged else None
+
+
+def test_load_candidate_reads_parents_from_the_commit_itself(tmp_path: Path) -> None:
+    """A graft file cannot make a candidate look frozen on another base (review of 28a4a89)."""
+    suite = TestGitHubSourceControlOnRealGit()
+    suite._setup.__wrapped__(suite, tmp_path)
+    provider = suite.make_provider()
+    repo = suite.make_repository(provider)
+    base, candidate = suite._frozen(provider, repo, tmp_path)
+    other = suite.push_external(provider, repo, "main", {"x.txt": "x\n"})
+    provider.checkout(repo, base_branch="main", branch="ilmar/g", destination=tmp_path / "g")
+    (bare,) = (tmp_path.resolve() / "coordinator").rglob("*.git")
+    (bare / "info").mkdir(exist_ok=True)
+    (bare / "info" / "grafts").write_text(f"{candidate.revision} {other}\n")
+    with pytest.raises(CandidateRejectedError):
+        provider.load_candidate(repo, base_revision=other, revision=candidate.revision)
+    assert provider.load_candidate(repo, base_revision=base, revision=candidate.revision) == (
+        candidate
+    )

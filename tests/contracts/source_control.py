@@ -228,6 +228,18 @@ class SourceControlContract:
                 repo, base_revision=candidate.revision, revision=candidate.revision
             )
 
+    def test_loading_refuses_a_commit_on_the_base_that_was_never_frozen(
+        self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
+    ) -> None:
+        """A commit whose parent is the base but which someone else made (review of 28a4a89)."""
+        base, _ = self._frozen(provider, repo, tmp_path)
+        other = self.push_external(provider, repo, "main", {"src/app.py": "print('theirs')\n"})
+        provider.checkout(  # the coordinator's repository now has that commit too
+            repo, base_branch="main", branch="ilmar/load-2", destination=tmp_path / "again"
+        )
+        with pytest.raises(CandidateRejectedError):
+            provider.load_candidate(repo, base_revision=base, revision=other)
+
     def _frozen(
         self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
     ) -> tuple[str, CandidateRevision]:

@@ -707,8 +707,9 @@ def test_an_interrupted_claim_release_after_a_merge_is_resumed(setup: Setup) -> 
         original(ref)
 
     setup.tasks.release = flaky  # type: ignore[method-assign]
-    with pytest.raises(ProviderError):
-        coordinator.run_once()
+    interrupted = coordinator.run_once()  # reported, and it does not abort the pass
+    assert interrupted.code == 2
+    assert "ProviderError" in interrupted.summary
     (half,) = resources(setup, ResourceKind.CHANGE_REQUEST)
     assert half.status is R.RELEASING
     report = coordinator.run_once()  # a repeatable release does not block the pass

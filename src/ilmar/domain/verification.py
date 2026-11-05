@@ -323,7 +323,7 @@ class EvidenceRecord:
         if version not in (EVIDENCE_FORMAT, _LEGACY_FORMAT):
             raise ValueError(f"unsupported evidence format: {version!r}")
         run = data.get("run")
-        if version == EVIDENCE_FORMAT and (not isinstance(run, int) or run < 1):
+        if version == EVIDENCE_FORMAT and (type(run) is not int or run < 1):
             raise ValueError("format 2 evidence needs its run")
         if version == _LEGACY_FORMAT and "run" in data:
             raise ValueError("format 1 evidence has no run")

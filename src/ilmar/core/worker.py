@@ -35,8 +35,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from ilmar.core.clock import not_before
 from ilmar.core.components import Components
-from ilmar.core.effects import DeterministicError, Effects, TransientError, parse_identity
+from ilmar.core.effects import (
+    ABANDONED,
+    NEVER_TRANSIENT,
+    DeterministicError,
+    Effects,
+    TransientError,
+    parse_identity,
+)
 from ilmar.core.naming import branch_name, container_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
 from ilmar.core.safe_fs import directory_identity
@@ -80,6 +88,7 @@ MAX_ATTEMPTS = 3
 LATE_TRIES = 3
 """Verification runs, pushes or deletions of one frozen candidate within an attempt."""
 REVIEW_LABEL = "ilmar:needs-human-review"
+_NEVER_TRANSIENT_NAMES = frozenset(c.__name__ for c in NEVER_TRANSIENT)
 _DETERMINISTIC = (
     CandidateRejectedError,
     LeaseConflictError,
@@ -168,6 +177,19 @@ def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
     return False
 
 
+def recorded_never_transient(operation: Operation | None) -> str | None:
+    """The never-transient error class an operation recorded, if any.
+
+    The journal records such failures as ``FAILED`` with the class as the
+    note (older records: ``AMBIGUOUS``). Recovery must end the execution
+    for these, exactly as the uninterrupted path does, and never abandon
+    and retry them (ADR-0021, ADR-0022).
+    """
+    if operation is None or operation.status not in (ST.FAILED, ST.AMBIGUOUS):
+        return None
+    return operation.note if operation.note in _NEVER_TRANSIENT_NAMES else None
+
+
 class _Run:
     """One worker run. Holds no state a step depends on: everything is re-read."""
 
@@ -223,17 +245,21 @@ class _Run:
         return self.task
 
     def move(self, target: ExecutionState, reason: str, **values: str) -> Execution:
+        current = self.current()
         updated, transition = self.w.machine.advance(
-            self.current(), target, now=self.w.clock(), reason=reason, **values
-        )
+            current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
+            **values,
+        )  # fmt: skip
         self.lease.check(self.id)
         self.store.apply(updated, transition, fence=self.w.effects.fence)
         return updated
 
     def transition_to(self, target: ExecutionState, reason: str, **values: str) -> Commit:
+        current = self.current()
         updated, transition = self.w.machine.advance(
-            self.current(), target, now=self.w.clock(), reason=reason, **values
-        )
+            current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
+            **values,
+        )  # fmt: skip
         return Commit(applied=((updated, transition),))
 
     # -- the loop -------------------------------------------------------------------
@@ -308,10 +334,17 @@ class _Run:
             (create, K.CREATE_WORKSPACE, layout.attempt_dir(self.id, execution.attempt)),
             (checkout, K.CHECKOUT_BASE, layout.agent_workspace(self.id, execution.attempt)),
         ):
+            never = recorded_never_transient(operation)
             if operation is not None and operation.status in _UNFINISHED:
                 effects.settle_directory_step(execution, self.lease, kind=kind, path=path)
+                if never:
+                    raise _Deterministic(f"{kind.value} failed: {never}")
                 raise TransientError("provisioning was interrupted")
             if operation is not None and operation.status is ST.FAILED:
+                if never:
+                    raise _Deterministic(f"{kind.value} failed: {never}")
+                if operation.note == ABANDONED:  # a crash, then another before retrying
+                    raise TransientError("provisioning was interrupted")
                 raise _Deterministic(f"{kind.value} failed")
         if create is None:
             effects.create_attempt_directory(execution, self.lease, owner_token=self.w.new_token())
@@ -337,6 +370,11 @@ class _Run:
             self.fresh_agent_run(execution, name)
             return
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)
+        never = recorded_never_transient(start) or recorded_never_transient(run)
+        if never:  # recorded before the crash: fail, as the uninterrupted path does
+            if sandbox is not None:
+                effects.remove_sandbox(execution, self.lease, resource=sandbox)
+            raise _Deterministic(f"the agent step failed: {never}")
         if run is None:
             # A crash after the sandbox was created and before the agent ran: the
             # sandbox is never reused (ADR-0022). Remove it and start over.
@@ -449,13 +487,21 @@ class _Run:
             return self.transition_to(S.FAILED, reason, error=reason)
 
         runs = sorted(self.ops(execution, K.VERIFY), key=lambda o: int(o.key.rsplit("run-", 1)[1]))
+        never = next((n for o in runs if (n := recorded_never_transient(o))), None)
         for operation in runs:
             if operation.status in _UNFINISHED:
                 number = int(operation.key.rsplit("run-", 1)[1])
-                if effects.settle_verify(
+                if never is None and effects.settle_verify(
                     self.current(), self.lease, run=number, candidate=candidate, then=then
                 ):
                     return
+                if never is not None:  # its sandboxes go; its outcome does not count
+                    effects.settle_verify(
+                        self.current(), self.lease, run=number, candidate=candidate,
+                        then=lambda _r: Commit(),
+                    )  # fmt: skip
+        if never is not None:
+            raise _Deterministic(f"verification failed: {never}")
         tried = len(runs)
         if tried >= LATE_TRIES:
             raise _Blocked(
@@ -486,6 +532,13 @@ class _Run:
             candidate.base_revision,
         ) or not evidence.verdict.publishable:
             raise LedgerIntegrityError(f"{self.id}: the latest evidence does not allow publishing")
+        if evidence.policy_digest != c.verification.digest():
+            # The policy changed since this run (for example while Ilmar was down).
+            # Evidence only proves what it checked: a human decides (ADR-0022).
+            raise _Blocked(
+                "the verification policy changed since the candidate was verified; "
+                "it is not published on the old evidence"
+            )
         branch = execution.branch or branch_name(execution.task)
         checkout = self.op(execution, K.CHECKOUT_BASE)
         if checkout is None or checkout.status is not ST.SUCCEEDED:

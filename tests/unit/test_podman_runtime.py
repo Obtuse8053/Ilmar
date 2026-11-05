@@ -785,3 +785,58 @@ def test_failed_cleanup_after_a_failed_start_quarantines_the_workspace(
     podman.proxy_ready = True
     rt.start(spec(workspace, name="ilmar-exec-1-other"))
     assert "ilmar-exec-1-1-net" not in podman.networks
+
+
+# -- remove_owned: from labels alone, fail closed (#11c, ADR-0022) -------------------------
+
+
+def test_remove_owned_never_removes_a_network_replaced_after_its_labels_were_read(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    """Review of 28a4a89: the network is removed by the ID read with its owner labels."""
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    name = "ilmar-exec-1-1"
+    foreign = FakeNetwork(name + "-net", {"io.ilmar.owner.token": "other"}, "10.99.0.0/24",
+                          internal=True, dns_enabled=False)  # fmt: skip
+
+    def replace(network: str) -> None:  # someone swaps the network in between
+        if network == name + "-net":
+            podman.after_network_inspect = None
+            del podman.networks[network]
+            podman.networks[network] = foreign
+
+    podman.after_network_inspect = replace
+    fresh = runtime(layout, podman, egress=EGRESS)
+    assert fresh.remove_owned(name, owner=OWNER) is True  # ours is gone
+    assert podman.networks[name + "-net"] is foreign  # the stranger's is untouched
+    assert podman.by_name(name) is None
+    assert podman.by_name(name + "-egress") is None
+
+
+def test_remove_owned_works_without_any_memory_of_the_sandbox(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    fresh = runtime(layout, podman, egress=EGRESS)
+    assert fresh.remove_owned("ilmar-exec-1-1", owner=OWNER) is True
+    assert set(podman.networks) == {"podman"}
+    assert podman.containers == {}
+    assert fresh.remove_owned("ilmar-exec-1-1", owner=OWNER) is False
+
+
+@pytest.mark.parametrize("part", ["-egress", "-net"])
+def test_remove_owned_touches_nothing_if_any_part_is_foreign(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, part: str
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    name = "ilmar-exec-1-1"
+    if part == "-net":
+        podman.networks[name + part].labels["io.ilmar.owner.token"] = "spoofed"
+    else:
+        proxy = podman.by_name(name + part)
+        assert proxy is not None
+        proxy.labels["io.ilmar.owner.token"] = "spoofed"
+    before = (set(podman.networks), set(podman.containers))
+    with pytest.raises(OwnershipConflictError):
+        runtime(layout, podman, egress=EGRESS).remove_owned(name, owner=OWNER)
+    assert (set(podman.networks), set(podman.containers)) == before

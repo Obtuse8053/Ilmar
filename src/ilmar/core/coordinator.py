@@ -26,13 +26,16 @@ pool, since each worker holds only its own execution's lease.
 from __future__ import annotations
 
 import enum
+import logging
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 
+from ilmar.core.clock import NonDecreasingClock
 from ilmar.core.components import Components
-from ilmar.core.effects import Effects
+from ilmar.core.effects import NEVER_TRANSIENT, Effects
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -46,11 +49,18 @@ from ilmar.core.worker import (
 )
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
 from ilmar.domain.errors import ConflictError, FencingError, ProviderError
-from ilmar.domain.execution import ExecutionState
-from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
+from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.ledger import (
+    OperationKind,
+    Resource,
+    ResourceKind,
+    ResourceStatus,
+    operation_key,
+)
 from ilmar.domain.tasks import Task
 from ilmar.ports.execution_store import ExecutionStore
 
+_LOG = logging.getLogger(__name__)
 S = ExecutionState
 
 
@@ -120,8 +130,17 @@ class Coordinator:
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
     ) -> Coordinator:
-        """Wire the journal, the fenced Verifier and the effects for ``components``."""
-        journal = Journal(store=components.execution_store, ownership=ownership, clock=clock)
+        """Wire the journal, the fenced Verifier and the effects for ``components``.
+
+        Every persisted timestamp comes from one non-decreasing clock (ADR-0022).
+        """
+        clock = NonDecreasingClock(clock)
+        journal = Journal(
+            store=components.execution_store,
+            ownership=ownership,
+            clock=clock,
+            always_definitive=NEVER_TRANSIENT,
+        )
         verifier = Verifier(
             source_control=components.source_control,
             runtime=components.container_runtime,
@@ -153,14 +172,16 @@ class Coordinator:
 
     def run_once(self) -> PassReport:
         results = list(self.recover())
-        completed = self.follow_up_change_requests()
+        completed = self.follow_up_change_requests(results)
         task = self._pick()
         if task is not None:
             execution, transition = self._machine.start(
                 task.ref, execution_id=self._new_id(), now=self._clock()
             )
             self._store.create(execution, transition, fence=self._effects.fence)
-            results.append(self.dispatch(execution.id, task))
+            result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
+            if result is not None:
+                results.append(result)
         if not results:
             return PassReport(ExitCode.SUCCESS, "no eligible task", completed_tasks=completed)
         code = max(_CODES[r.outcome] for r in results)
@@ -179,20 +200,39 @@ class Coordinator:
         ]
         results = []
         for execution in sorted([*active, *finished], key=lambda e: (e.created_at, e.id)):
-            try:
-                task = self._c.task_provider.get(execution.task)  # read only
-            except ProviderError:
-                results.append(
-                    WorkerResult(execution.id, Outcome.BLOCKED, "the tracker could not be read")
-                )
-                continue
-            try:
-                results.append(self.dispatch(execution.id, task))
-            except FencingError:
-                raise  # this process no longer owns the instance: stop, never skip
-            except ConflictError:
-                continue  # another worker holds this execution's lease
+            result = self._isolated(execution.id, partial(self._recover_one, execution))
+            if result is not None:
+                results.append(result)
         return tuple(results)
+
+    def _recover_one(self, execution: Execution) -> WorkerResult | None:
+        try:
+            task = self._c.task_provider.get(execution.task)  # read only
+        except ProviderError:
+            return WorkerResult(execution.id, Outcome.BLOCKED, "the tracker could not be read")
+        return self.dispatch(execution.id, task)
+
+    def _isolated(
+        self, execution_id: str, work: Callable[[], WorkerResult | None]
+    ) -> WorkerResult | None:
+        """One execution's boundary: its failure blocks it alone (ADR-0022, decision 4).
+
+        Everything a worker expects is handled inside it. What reaches here is
+        unexpected (an adapter or Ilmar bug). It is logged and reported as
+        blocked, never silenced: the pass still exits 2, and the next pass tries
+        again from durable state, which the journal keeps consistent. Losing
+        ownership stops the whole pass.
+        """
+        try:
+            return work()
+        except FencingError:
+            raise  # this process no longer owns the instance: stop, never skip
+        except ConflictError:
+            return None  # another worker holds this execution's lease
+        except Exception as error:  # the per-execution boundary
+            _LOG.exception("execution %s stopped by an unexpected error", execution_id)
+            detail = f"unexpected {type(error).__name__}: {error}"
+            return WorkerResult(execution_id, Outcome.BLOCKED, detail[:300])
 
     def dispatch(self, execution_id: str, task: Task | None) -> WorkerResult:
         """Run one execution's worker. Safe to call concurrently for different executions."""
@@ -200,8 +240,14 @@ class Coordinator:
 
     # -- task completion --------------------------------------------------------------
 
-    def follow_up_change_requests(self) -> tuple[str, ...]:
-        """Release the claim of tasks whose change request was merged or closed."""
+    def follow_up_change_requests(
+        self, problems: list[WorkerResult] | None = None
+    ) -> tuple[str, ...]:
+        """Release the claim of tasks whose change request was merged or closed.
+
+        A change request whose follow-up fails unexpectedly is reported in
+        ``problems`` and does not stop the others (ADR-0022, decision 4).
+        """
         completed: list[str] = []
         open_requests = [  # RELEASING: an earlier pass was interrupted while releasing
             r
@@ -211,54 +257,54 @@ class Coordinator:
             if r.kind is ResourceKind.CHANGE_REQUEST
         ]
         for resource in open_requests:
-            execution = self._store.get(resource.execution_id)
-            if execution is None or execution.state is not S.SUCCEEDED or not resource.identity:
-                continue
-            upsert = self._store.operation(
-                operation_key(OperationKind.UPSERT_CHANGE_REQUEST, execution.id, execution.attempt)
+            blocked = self._isolated(
+                resource.execution_id, partial(self._follow_up_one, resource, completed)
             )
-            request = ChangeRequest(
-                repository=self._c.target.repository,
-                key=resource.identity,
-                url=upsert.result.get("url", "") if upsert else "",
-                source_branch=resource.name,
-                target_branch=self._c.target.base_branch,
-            )
-            try:
-                state = self._c.source_control.change_request_state(request)  # read only
-            except ProviderError:
-                continue  # unknown for now; asked again next pass
-            if state is ChangeRequestState.OPEN:
-                continue
-            merged = state is ChangeRequestState.MERGED
-            try:
-                lease = self.leases.acquire(execution.id)
-            except FencingError:
-                raise
-            except ConflictError:
-                continue  # a worker holds it; asked again next pass
-            with lease:
-                self._effects.stop_tracking_change_request(
-                    execution,
-                    lease,
-                    resource=resource,
-                    note="merged: task complete" if merged else "closed without merging",
-                    step=state.value,
-                )
-                self._effects.post_update(
-                    execution,
-                    lease,
-                    step=state.value,
-                    message=(
-                        "The change request was merged: this task is complete."
-                        if merged
-                        else "The change request was closed without merging; "
-                        "Ilmar released this task."
-                    ),
-                )
-            if merged:
-                completed.append(execution.id)
+            if blocked is not None and problems is not None:
+                problems.append(blocked)
         return tuple(completed)
+
+    def _follow_up_one(self, resource: Resource, completed: list[str]) -> None:
+        execution = self._store.get(resource.execution_id)
+        if execution is None or execution.state is not S.SUCCEEDED or not resource.identity:
+            return
+        upsert = self._store.operation(
+            operation_key(OperationKind.UPSERT_CHANGE_REQUEST, execution.id, execution.attempt)
+        )
+        request = ChangeRequest(
+            repository=self._c.target.repository,
+            key=resource.identity,
+            url=upsert.result.get("url", "") if upsert else "",
+            source_branch=resource.name,
+            target_branch=self._c.target.base_branch,
+        )
+        try:
+            state = self._c.source_control.change_request_state(request)  # read only
+        except ProviderError:
+            return  # unknown for now; asked again next pass
+        if state is ChangeRequestState.OPEN:
+            return
+        merged = state is ChangeRequestState.MERGED
+        with self.leases.acquire(execution.id) as lease:  # ConflictError: asked again next pass
+            self._effects.stop_tracking_change_request(
+                execution,
+                lease,
+                resource=resource,
+                note="merged: task complete" if merged else "closed without merging",
+                step=state.value,
+            )
+            self._effects.post_update(
+                execution,
+                lease,
+                step=state.value,
+                message=(
+                    "The change request was merged: this task is complete."
+                    if merged
+                    else "The change request was closed without merging; Ilmar released this task."
+                ),
+            )
+        if merged:
+            completed.append(execution.id)
 
     # -- choosing work ----------------------------------------------------------------
 

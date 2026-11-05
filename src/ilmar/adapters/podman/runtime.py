@@ -490,10 +490,16 @@ class PodmanRuntime:
             raise
         network = name + EGRESS_NETWORK_SUFFIX
         network_exists = self._podman_call(["network", "exists", network]).returncode == 0
-        network_owner = None
+        network_owner, network_id = None, ""
         if network_exists:
-            labels = self._network(network).get("labels") or {}
+            details = self._network(network)
+            labels = details.get("labels") or {}
             network_owner = _owner({"Config": {"Labels": labels}})
+            # Removed by the ID read together with its labels, never by name: a
+            # network replaced in between is someone else's and is left alone.
+            network_id = str(details.get("id") or "")
+            if not _CONTAINER_ID.match(network_id):
+                raise OwnershipConflictError(f"{network} has no verifiable ID")
         # Ownership is checked for everything before anything is removed.
         for found, what in ((container, name), (proxy, name + EGRESS_PROXY_SUFFIX)):
             if found is not None and found.owner != owner:
@@ -506,8 +512,8 @@ class PodmanRuntime:
         if proxy is not None:
             self._remove(proxy.handle.id, proxy.handle.name)
         if network_exists:
-            removed = self._podman_call(["network", "rm", network])
-            if self._podman_call(["network", "exists", network]).returncode == 0:
+            removed = self._podman_call(["network", "rm", network_id])
+            if self._podman_call(["network", "exists", network_id]).returncode == 0:
                 detail = removed.stderr.strip().splitlines()[-1:] or [f"exit {removed.returncode}"]
                 raise ContainmentError(
                     f"network {network} could not be confirmed removed: {detail[0][:200]}",

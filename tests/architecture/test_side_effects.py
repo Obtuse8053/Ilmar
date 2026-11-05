@@ -19,19 +19,51 @@ import pytest
 
 CORE = Path(__file__).resolve().parents[2] / "src" / "ilmar" / "core"
 ALLOWED = {"effects.py", "verification.py"}
+PORTS_DIR = CORE.parent / "ports"
+STORE_PORT = "execution_store.py"
+"""Its writes are fenced by the store itself (ADR-0020), not by the journal."""
+READS = {
+    # Port methods that change nothing outside Ilmar.
+    "name", "find", "is_running", "list_eligible", "get", "branch_head",
+    "load_candidate", "checks", "change_request_state",
+}  # fmt: skip
+
+
+def _port_methods() -> dict[str, set[str]]:
+    """Every method each port declares, read from ``ilmar.ports``."""
+    methods: dict[str, set[str]] = {}
+    for path in sorted(PORTS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        methods[path.name] = {
+            f.name
+            for c in tree.body
+            if isinstance(c, ast.ClassDef)
+            for f in c.body
+            if isinstance(f, ast.FunctionDef) and not f.name.startswith("_")
+        }
+    return methods
+
+
 MUTATING = {
-    "claim",
-    "release",
-    "post_update",
-    "checkout",
-    "freeze_candidate",
-    "checkout_revision",
-    "publish_revision",
-    "upsert_change_request",
-    "start",
-    "stop",
-    "run",
+    m
+    for port, names in _port_methods().items()
+    if port != STORE_PORT
+    for m in names
+    if m not in READS
 }
+"""Every port method that changes the outside world, derived from the ports so a new
+one (like ``remove_owned``) cannot be forgotten."""
+
+
+def test_the_mutating_set_is_derived_from_the_ports() -> None:
+    expected = {
+        "claim", "release", "post_update", "checkout", "freeze_candidate",
+        "checkout_revision", "publish_revision", "upsert_change_request",
+        "start", "stop", "run", "remove_owned",
+    }  # fmt: skip
+    assert expected == MUTATING
+
+
 PORTS = {
     "task_provider",
     "source_control",
@@ -126,3 +158,51 @@ def test_every_effect_goes_through_the_journal() -> None:
             assert not mutating, f"Effects.{method.name} is not read-only"
         else:
             assert journal_calls, f"Effects.{method.name} does not go through the journal"
+
+
+def _effect_closures(method: ast.FunctionDef) -> set[ast.AST]:
+    """Nodes inside nested functions or lambdas: the effects handed to ``perform``."""
+    inner: set[ast.AST] = set()
+    for node in ast.walk(method):
+        if node is not method and isinstance(node, ast.FunctionDef | ast.Lambda):
+            inner.update(ast.walk(node))
+    return inner
+
+
+def _unjournaled_mutations(source: str) -> list[str]:
+    tree = ast.parse(source)
+    found = []
+    for cls in tree.body:
+        if not (isinstance(cls, ast.ClassDef) and cls.name == "Effects"):
+            continue
+        for method in cls.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            inner = _effect_closures(method)
+            for node in ast.walk(method):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in MUTATING
+                    and _receiver_names(node.func.value) & PORTS
+                    and node not in inner
+                ):
+                    found.append(f"Effects.{method.name}:{node.lineno} .{node.func.attr}()")
+    return found
+
+
+def test_every_mutating_port_call_in_effects_is_inside_a_journaled_effect() -> None:
+    """A mutating call outside an effect closure would bypass the write-ahead intent,
+    the ownership re-check and the lease check (ADR-0020), even in recovery cleanup."""
+    assert _unjournaled_mutations((CORE / "effects.py").read_text()) == []
+
+
+def test_the_closure_rule_detects_a_direct_call() -> None:
+    sample = (
+        "class Effects:\n"
+        "    def settle(self):\n"
+        "        self._c.container_runtime.remove_owned('x', owner=o)\n"
+        "        def effect():\n"
+        "            return self._c.container_runtime.remove_owned('y', owner=o)\n"
+    )
+    assert _unjournaled_mutations(sample) == ["Effects.settle:3 .remove_owned()"]

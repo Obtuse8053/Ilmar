@@ -176,8 +176,13 @@ class GitHubSourceControl:
             raise CandidateRejectedError(
                 f"{revision[:12]} is not a candidate this coordinator froze"
             )
-        parents = git.run("rev-list", "--parents", "-n", "1", revision).text().split()
-        if parents[1:] != [base_revision]:
+        # The parents are read from the commit object itself: revision walking
+        # (rev-list, log) honours info/grafts and shallow files, which could
+        # make the candidate appear to sit on another base.
+        raw = git.run("cat-file", "commit", revision).text()
+        header = raw.split("\n\n", 1)[0].splitlines()
+        parents = [line[len("parent ") :] for line in header if line.startswith("parent ")]
+        if parents != [base_revision]:
             raise CandidateRejectedError(f"{revision[:12]} is not frozen on {base_revision[:12]}")
         changed = git.run(
             "diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-ext-diff",

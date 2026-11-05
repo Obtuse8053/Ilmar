@@ -96,7 +96,16 @@ Checked after every crash point by the crash-injection suite
   execution. Recovery never deletes, overwrites or reuses anything whose
   ownership or content it cannot prove.
 - **I7 — Fencing:** a coordinator that lost ownership raises `FencingError`
-  and performs no further writes or effects.
+  and performs no further writes or effects. Settling an operation
+  (`Journal.reconcile`) needs the execution's lease and current ownership,
+  exactly like performing one.
+- **I8 — Failure classes survive a crash:** a failure recorded as
+  never-transient (security, policy, ownership, containment, integrity) ends
+  the execution after a restart, exactly as without one. An interruption
+  that recovery abandoned stays transient through further crashes.
+- **I9 — Evidence is for this policy:** a candidate is published only on
+  evidence whose policy digest equals the policy now in force.
+- **I10 — Time never runs backwards in persisted state** (see "Time").
 
 ### Where state comes from
 
@@ -156,6 +165,58 @@ through `Journal.reconcile` and never calls a mutating port method itself.
 The architecture test now allows a public `Effects` method to use either
 `perform` or `reconcile`. `load_candidate` is the only read-only exception.
 
+### Failure classes across a crash
+
+- The journal records every never-transient error (`NEVER_TRANSIENT`) as
+  `FAILED`, with the error class as the operation's note, for every kind.
+  Before this, they were left `AMBIGUOUS`. A crash between that record and
+  the execution's failure then made recovery treat the step as interrupted
+  and retry it: a policy violation was re-run and could publish from a new
+  attempt. It also made every later pass re-dispatch the failed execution.
+- Recovery reads that note. A never-transient failure, recorded `FAILED`
+  (or `AMBIGUOUS` in older records), fails the execution after its
+  sandboxes are removed. This covers provisioning, the agent sandbox, the
+  agent run and verification.
+- An interrupted step that recovery settles as `FAILED` carries the note
+  `ABANDONED`. A second crash before the retry must not turn it into a
+  deterministic failure.
+
+### One execution's boundary
+
+`run_once` runs each execution, recovered or new, and each change-request
+follow-up inside its own boundary:
+- `FencingError` stops the pass.
+- A lease held elsewhere skips the execution.
+- Any other unexpected exception (an adapter or Ilmar bug) is logged and
+  reported as that execution's `BLOCKED` result: exit 2, never silenced.
+  The next pass tries again from durable state.
+
+This is the per-execution process boundary that decision 4 needs. Without
+it, one execution's bug aborted every pass, oldest first, and no unrelated
+task ever ran.
+
+### Time
+
+- **Deadlines of running work** (agent and command timeouts, proxy
+  start-up) are measured with `time.monotonic` inside the adapters and are
+  never persisted.
+- **Persisted timestamps** come from the wall clock through one
+  `NonDecreasingClock` per process. Every transition is also clamped to the
+  execution's last persisted update (`not_before`). A backward step (NTP, a
+  restored snapshot) therefore never makes a write invalid: timestamps
+  stand still until the wall clock catches up. Before this, a step back
+  during a pass recorded a succeeded change request as ambiguous and
+  blocked it for good.
+- Nothing in Ilmar compares a persisted timestamp with the current time to
+  make a decision (no wall-clock expiry), so standing still is safe.
+
+### Evidence and policy
+
+`publish` blocks when the evidence's `policy_digest` differs from the
+policy in force, for example when the configuration changed while Ilmar
+was down. Re-verifying instead would need a PUBLISHING → VERIFYING
+transition, which ADR-0004 does not allow. A human decides.
+
 ### Port contract changes
 
 - **`ContainerRuntime.remove_owned(name, *, owner) -> bool`** (new).
@@ -167,12 +228,17 @@ The architecture test now allows a public `Effects` method to use either
     `OwnershipConflictError` and touches nothing. The ledger row is then
     quarantined.
   - An unconfirmed removal raises `ContainmentError`.
+  - Containers are removed by the immutable ID read with their labels. The
+    network is too: by the ID that `network inspect` returned with its
+    labels, never by name. A network replaced between the check and the
+    removal is someone else's and stays.
   - Partial leftovers from an interrupted removal are finished.
   - Contract-tested on the fake and on real Podman.
 - **`SourceControlProvider.load_candidate(repository, *, base_revision,
   revision) -> CandidateRevision`** (new, read only).
   - Succeeds only for a revision frozen by this provider whose single parent
-    is the base.
+    is the base. The parent is read from the raw commit object, so
+    `info/grafts`, shallow files and replace refs cannot fake it.
   - Recomputes the changed paths, without renames, external diff tools or
     textconv.
   - Raises `CandidateRejectedError` otherwise.
@@ -198,15 +264,33 @@ through `remove_owned`.
   - Every invariant is checked after recovery.
   - `Crash` is a `BaseException`, so nothing in Ilmar can catch it. After
     it fires, every write and effect fails too.
-- **Crashes during recovery.**
+- **Every path, not only the happy one.** The same exhaustive injection
+  runs for:
+  - a transient agent failure followed by a new attempt;
+  - a verification failure, where the claim is released and the workspace
+    kept;
+  - exhausted attempts;
+  - a security failure;
+  - the follow-up after a merge.
+- **Crashes during recovery**, on every path: every first crash point, then
+  a second crash early, midway and late in recovery.
 - **One test per blocking rule:**
   - a moved branch;
   - a foreign sandbox;
   - a tampered or unloadable candidate;
   - a replaced or symlinked workspace;
   - a fenced-out process;
+  - a recorded security failure, with and without a crash;
+  - a wall clock stepped back across a restart and during a pass;
+  - an unexpected error in one execution;
+  - evidence from another policy;
+  - a Podman network replaced between inspection and removal;
   - a blocked execution next to unrelated work that publishes;
   - several interrupted executions recovered together.
+- **The architecture test** derives the mutating port methods from
+  `ilmar.ports`, so a new one (`remove_owned` was missing) cannot be
+  forgotten. Every mutating call in `Effects` must sit inside an effect
+  closure handed to the journal.
 - **Mutation checks** confirmed that the suite fails when sandbox removal or
   the push reconciliation is broken.
 - **Real Podman** (`tests/integration/test_recovery_podman.py`, in CI):
@@ -223,8 +307,10 @@ through `remove_owned`.
   recovery. All other parts of ADR-0021 stand.
 - Normal running and recovery share one code path. A new step must be
   written as "decide from durable state", or the crash suite fails.
-- An interrupted agent run costs a whole new attempt (bounded by the three
-  attempts). This is accepted: a contaminated sandbox is never reused.
+- An interrupted agent run or provisioning costs a whole new attempt. This
+  is accepted: a contaminated sandbox is never reused. Three interrupted
+  attempts end the execution as "attempts exhausted". The task is then
+  released but, like any failed task, not picked again automatically.
 - Blocked executions need a human. Until then, their task stays claimed
   and their resources stay as they are.
 - A directory identity is `(device, inode)`. A directory deleted and
@@ -237,6 +323,8 @@ through `remove_owned`.
 
 ## Revisit when
 
+- A per-execution boundary that catches unexpected exceptions turns out to
+  hide recurring bugs. Every catch is logged and reported as blocked.
 - Executions run in parallel in one process (leases already allow it), or
   coordinators run on several hosts: the evidence of "no live sandbox" must
   then cover remote runtimes.

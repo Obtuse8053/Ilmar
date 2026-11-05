@@ -197,6 +197,13 @@ def test_a_run_number_starts_at_one(run: int) -> None:
         record(run=run)
 
 
+@pytest.mark.parametrize("bad", ["true", '"1"', "1.0", "0", "null"])
+def test_format_two_accepts_only_a_whole_positive_run(bad: str) -> None:
+    text = record(run=1).to_json().replace('"run":1,', f'"run":{bad},')
+    with pytest.raises(ValueError, match="run"):
+        EvidenceRecord.from_json(text)
+
+
 def test_format_two_requires_a_run() -> None:
     text = record(run=1).to_json().replace('"run":1,', "")
     with pytest.raises(ValueError, match="run"):
