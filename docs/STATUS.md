@@ -55,7 +55,8 @@ unattended operation. **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
 
-- 2026-11-05: #10 finished: adapter registry (ADR-0019, proposed).
+- 2026-11-05: #10 finished: adapter registry (ADR-0019, accepted after an
+  adversarial review on PR #46).
   `(port, kind)` maps to lazily imported parsers. `plan()` validates every
   adapter's options and the rules between ports without secrets or side
   effects (`ilmar config validate`, plus `--check-environment`). `build()`
@@ -64,7 +65,12 @@ unattended operation. **Waiting for the maintainer's explicit go-ahead.**
   sandbox is configurable, the agent sandbox's hosts come from the agent
   adapter, and `[verification]` is required. Configuration: `[ilmar]
   instance_id`; the agent image moved to `[adapters.agent_runner]`.
-  Next recommended: #11.
+  The review added four rules. Every creation error is redacted. The model
+  credential may not share a variable or a value with tracker or SCM
+  credentials. Host executables come only from absolute `PATH` entries and
+  never from `workspaces/`. The configuration file must not be writable by
+  others. Ports are now checked by signature, not just member names. #11
+  must take an explicit configuration path. Next recommended: #11.
 
 - 2026-11-05: #9 finished: verification stage (ADR-0018, accepted after an
   adversarial review on PR #45). The policy lives in `[verification]` of

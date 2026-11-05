@@ -1,6 +1,6 @@
 # ADR-0019: Adapter registry, two-phase construction and the `Components` bundle
 
-- Status: Proposed
+- Status: Accepted (maintainer approval on PR #46, 2026-11-05)
 - Date: 2026-11-05
 - Sources: [R1], [R11] · Findings: F-014
 - Implements: #10; completes ADR-0007's "adapter-specific validation arrives
