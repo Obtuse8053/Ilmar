@@ -31,7 +31,8 @@ recorded in [`decisions/`](decisions/), the evidence behind those decisions is i
 - **Core** (`ilmar.core`): orchestration logic: the execution state machine
   (ADR-0004), the verification stage (ADR-0018), and `Components`, the
   provider-neutral bundle of configured ports the coordinator runs with
-  (ADR-0019).
+  (ADR-0019), and ownership and the write-ahead journal (`ownership`,
+  `journal`, ADR-0020).
 - **Adapters** (`ilmar.adapters`): SQLite and in-memory execution stores
   (ADR-0005), GitHub tasks and source control (ADR-0013, ADR-0016), Podman
   (ADR-0014, ADR-0015) and Claude Code (ADR-0017). `ilmar.adapters.registry`
@@ -69,6 +70,7 @@ reaches a path.
 │       ├── agent/                  agent workspace (agent sandbox)
 │       └── verify-<run>/           fresh checkout per verification run
 └── coordinator/                    never mounted
+    ├── instance.lock               exclusive flock held for the coordinator's life (ADR-0020)
     └── repos/<provider>/<hash>/    coordinator-owned git repository
 ```
 

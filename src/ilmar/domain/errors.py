@@ -76,3 +76,32 @@ class ContainmentError(ProviderError):
         super().__init__(message)
         self.container_id = container_id
         self.name = name
+
+
+class FencingError(ConflictError):
+    """This coordinator no longer owns the store or the instance (ADR-0020).
+
+    Raised when a write carries a superseded fence, when no fence is given to
+    a store a coordinator has claimed, or when the instance lock is no longer
+    held. The holder must perform no further external side effect.
+    """
+
+
+class InstanceLockedError(FencingError):
+    """Another coordinator holds this instance's lock; this one must not start."""
+
+
+class AmbiguousOperationError(IlmarError):
+    """An earlier attempt of a side effect may or may not have happened (ADR-0020).
+
+    The operation must be reconciled against the external system before the
+    execution can continue. It is never repeated blindly.
+    """
+
+    def __init__(self, message: str, *, key: str) -> None:
+        super().__init__(message)
+        self.key = key
+
+
+class LedgerIntegrityError(IlmarError):
+    """The journal, the ledger or a frozen candidate is inconsistent; work stops (ADR-0020)."""
