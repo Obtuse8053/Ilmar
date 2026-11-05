@@ -19,7 +19,9 @@ import pytest
 
 from ilmar.domain.changes import (
     CandidateRevision,
+    ChangeRequest,
     ChangeRequestSpec,
+    ChangeRequestState,
     ChecksSummary,
     RepositoryRef,
 )
@@ -91,6 +93,12 @@ class SourceControlContract:
         self, provider: SourceControlProvider, repository: RepositoryRef, source_branch: str
     ) -> None:
         """Open a change request on ``source_branch`` the way a human would."""
+        raise NotImplementedError
+
+    def finish_change_request(
+        self, provider: SourceControlProvider, change_request: ChangeRequest, *, merged: bool
+    ) -> None:
+        """Merge (``merged``) or close a change request the way a human would."""
         raise NotImplementedError
 
     # -- fixtures --------------------------------------------------------
@@ -519,3 +527,19 @@ class SourceControlContract:
         again = provider.upsert_change_request(self._spec(repo, title="no labels this time"))
         assert again.key == first.key
         assert review in again.labels
+
+    @pytest.mark.parametrize(
+        ("merged", "expected"),
+        [(True, ChangeRequestState.MERGED), (False, ChangeRequestState.CLOSED)],
+    )
+    def test_change_request_state_follows_the_platform(
+        self,
+        provider: SourceControlProvider,
+        repo: RepositoryRef,
+        merged: bool,
+        expected: ChangeRequestState,
+    ) -> None:
+        change_request = provider.upsert_change_request(self._spec(repo))
+        assert provider.change_request_state(change_request) is ChangeRequestState.OPEN
+        self.finish_change_request(provider, change_request, merged=merged)
+        assert provider.change_request_state(change_request) is expected

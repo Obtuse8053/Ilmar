@@ -42,6 +42,7 @@ from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
     ChangeRequestSpec,
+    ChangeRequestState,
     CheckResult,
     ChecksSummary,
     CheckState,
@@ -253,6 +254,17 @@ class GitHubSourceControl:
             )
             labels = [str(label.get("name")) for label in added or []]
         return self._change_request(spec.repository, pull, labels)
+
+    def change_request_state(self, change_request: ChangeRequest) -> ChangeRequestState:
+        slug = self._slug(change_request.repository)
+        pull = self._client.request("GET", f"/repos/{slug}/pulls/{int(change_request.key)}")
+        if pull.get("merged") is True or pull.get("merged_at"):
+            return ChangeRequestState.MERGED
+        if pull.get("state") == "closed":
+            return ChangeRequestState.CLOSED
+        if pull.get("state") == "open":
+            return ChangeRequestState.OPEN
+        raise ProviderError(f"pull request {change_request.key} has an unknown state")
 
     def checks(self, change_request: ChangeRequest) -> ChecksSummary:
         slug = self._slug(change_request.repository)

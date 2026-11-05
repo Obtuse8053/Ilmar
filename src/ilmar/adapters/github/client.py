@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from ilmar.domain.errors import ProviderError
+from ilmar.domain.errors import PolicyViolationError, ProviderError
 
 API_VERSION = "2022-11-28"
 DEFAULT_API_URL = "https://api.github.com"
@@ -43,8 +43,12 @@ class HttpResponse:
 Transport = Callable[[HttpRequest], HttpResponse]
 
 
-class CrossOriginRedirectError(ProviderError):
-    """A redirect pointed to a different origin; it was refused, credentials and all."""
+class CrossOriginRedirectError(ProviderError, PolicyViolationError):
+    """A redirect pointed to a different origin; it was refused, credentials and all.
+
+    Also a ``PolicyViolationError``, so the coordinator never treats it as a
+    transient failure to retry (review of 46c1662).
+    """
 
 
 def _origin(url: str) -> tuple[str, str, int | None]:

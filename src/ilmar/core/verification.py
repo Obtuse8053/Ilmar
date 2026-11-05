@@ -34,6 +34,7 @@ from ilmar.domain.agent import AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
 from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.ledger import Fence
 from ilmar.domain.verification import (
     AgentReport,
     CheckClass,
@@ -72,6 +73,7 @@ class Verifier:
         policy: VerificationPolicy,
         instance_id: str,
         clock: Callable[[], datetime],
+        fence: Fence | None = None,
     ) -> None:
         self._source_control = source_control
         self._runtime = runtime
@@ -80,6 +82,7 @@ class Verifier:
         self._policy = policy
         self._instance = instance_id
         self._clock = clock
+        self._fence = fence  # evidence is a fenced write once a coordinator owns the store
 
     def verify(
         self,
@@ -160,7 +163,7 @@ class Verifier:
                 agent_result.outcome.value, agent_result.summary[:_SUMMARY_LIMIT]
             ),
         )
-        self._store.append_evidence(record)
+        self._store.append_evidence(record, fence=self._fence)
         return record
 
     # -- candidate-executed checks ---------------------------------------------------

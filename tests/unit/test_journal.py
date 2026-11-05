@@ -614,3 +614,20 @@ def test_a_worker_cannot_touch_another_executions_records(coordinator: Coordinat
     publish = coordinator.store.inner.operation("publish-revision:e1:1")
     assert publish is not None
     assert publish.status is ST.AMBIGUOUS
+
+
+def test_a_lost_fence_on_the_outcome_is_reported_as_lost_ownership(
+    coordinator: Coordinator, path: Path
+) -> None:
+    """Review of 46c1662: it must not be masked as a refused follow-up."""
+
+    def act_then_lose() -> Mapping[str, str]:
+        with SQLiteExecutionStore(path) as intruder:
+            intruder.claim_instance("inst", now=at(5))
+        return {"head": CANDIDATE}
+
+    with pytest.raises(FencingError):
+        coordinator.perform(K.PUBLISH_REVISION, act_then_lose)
+    operation = coordinator.store.inner.operation("publish-revision:e1:1")
+    assert operation is not None
+    assert operation.status is ST.INTENDED  # nothing more was written

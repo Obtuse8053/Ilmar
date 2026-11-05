@@ -61,6 +61,9 @@ class OperationKind(enum.Enum):
     CREATE_WORKSPACE = "create-workspace"
     CHECKOUT_BASE = "checkout-base"
     START_CONTAINER = "start-container"
+    RUN_AGENT = "run-agent"
+    """Not repeatable: it is costly and changes the workspace. An unknown
+    outcome abandons the attempt (ADR-0021)."""
     STOP_CONTAINER = "stop-container"
     FREEZE_CANDIDATE = "freeze-candidate"
     VERIFY = "verify"

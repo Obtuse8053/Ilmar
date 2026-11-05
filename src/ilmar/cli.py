@@ -7,12 +7,16 @@ import argparse
 import os
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ilmar import __version__
-from ilmar.adapters.registry import plan
+from ilmar.adapters.registry import build, plan
 from ilmar.config import load_config
-from ilmar.domain.errors import ConfigError
+from ilmar.core.coordinator import Coordinator, ExitCode
+from ilmar.core.ownership import Ownership
+from ilmar.core.safe_fs import ensure_directory, require_canonical_root
+from ilmar.domain.errors import ConfigError, FencingError, OwnershipConflictError
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -20,6 +24,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
+    if args.command == "run":
+        return _run_once(Path(args.config))
     parser.print_help()
     return 2
 
@@ -33,6 +39,14 @@ def _build_parser() -> argparse.ArgumentParser:
     config_commands = config.add_subparsers(dest="config_command", required=True)
     validate = config_commands.add_parser("validate", help="check a configuration file")
     validate.add_argument("path", nargs="?", default="ilmar.toml")
+
+    run = commands.add_parser("run", help="process work (needs the instance lock)")
+    run.add_argument("--once", action="store_true", required=True, help="one pass, then exit")
+    run.add_argument(
+        "--config",
+        required=True,
+        help="the configuration file; required, never taken from the working directory",
+    )
     validate.add_argument(
         "--check-environment",
         action="store_true",
@@ -73,6 +87,64 @@ def _config_validate(path: Path, *, check_environment: bool = False) -> int:
     else:
         print(f"  secrets read from: {', '.join(blueprint.environment) or 'none'}")
     return 0
+
+
+def _run_once(path: Path) -> int:
+    """One coordinator pass. Exit codes: 0 success, 1 failure, 2 blocked, 3 configuration."""
+    try:
+        config = load_config(path)
+        config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        components = build(config)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIGURATION)
+    with components:
+        try:
+            ownership = Ownership.take(
+                layout=components.layout,
+                store=components.execution_store,
+                instance_id=components.instance_id,
+                now=_now(),
+            )
+        except (FencingError, OwnershipConflictError, OSError) as exc:
+            print(f"error: cannot own this instance: {exc}", file=sys.stderr)
+            return int(ExitCode.CONFIGURATION)
+        with ownership:
+            try:
+                ensure_directory(
+                    components.layout.workspaces_root,
+                    root=components.layout.coordinator_root.parent,
+                )
+                require_canonical_root(components.layout.workspaces_root)
+                coordinator = Coordinator.create(
+                    components,
+                    ownership,
+                    max_attempts=config.limits.max_attempts,
+                    agent_timeout_seconds=config.limits.agent_timeout_seconds,
+                    clock=_now,
+                )
+                report = coordinator.run_once()
+            except FencingError as exc:
+                print(f"error: ownership lost: {exc}", file=sys.stderr)
+                return int(ExitCode.CONFIGURATION)
+            except OwnershipConflictError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return int(ExitCode.CONFIGURATION)
+            except Exception as exc:  # the process boundary: never report a false outcome
+                print(
+                    f"error: unexpected {type(exc).__name__}; the journal shows where work "
+                    "stopped and a human must look",
+                    file=sys.stderr,
+                )
+                return int(ExitCode.BLOCKED)
+    print(report.summary)
+    for execution_id in report.completed_tasks:
+        print(f"task completed (change request merged): {execution_id}")
+    return int(report.code)
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 if __name__ == "__main__":  # pragma: no cover
