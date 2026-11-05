@@ -337,3 +337,27 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
 - Status: accepted (ADR-0016; implemented by #7) · Affects: ADR-0010,
   ADR-0016
 
+### F-027: No maintained GitHub emulator pairs a stateful API with real git and fault injection
+
+- Evidence: **Emerging** (one primary read of emulate's documentation [R23];
+  WireMock from secondary sources [R24]; the git requirement follows from
+  ADR-0010 and ADR-0016) · Sources: [R23], [R24], [R25], [R26]
+- Observation: emulate models GitHub statefully but keeps repository content
+  in its own model, so real `git push` cannot reach it, and it documents no
+  fault injection. WireMock injects transport faults but models state as
+  scripted scenarios, and cannot apply a write and then lose its response.
+  Ilmar publishes through real git and reads branch heads through the API.
+  An emulator whose branch heads are not git's would test a different
+  system.
+- Implication: crash and fault tolerance against GitHub (ADR-0020,
+  ADR-0022) can only be tested end to end against real GitHub, which is
+  slow, needs credentials and cannot inject faults.
+- Recommendation: a minimal, purpose-built emulator for exactly the
+  endpoints Ilmar uses. Its state lives in a real bare repository served by
+  `git http-backend` over HTTPS. It is reached through a per-origin
+  `ca_bundle` option, never a TLS bypass. Its responses are validated
+  against a pinned, attributed extract of GitHub's OpenAPI description
+  [R25]. Drift is detected by running the same contract suite against real
+  GitHub.
+- Status: proposed (#51, approved) · Affects: ADR-0016, ADR-0020, ADR-0022,
+  ADR-0023
