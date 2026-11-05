@@ -241,12 +241,25 @@ def check_commit(
         else:
             _check_resource_update(stored_resource, new_resource)
 
-    for e, t in changes.applied:
+    for execution_id, version in changes.expected:
+        if current_execution(execution_id).version != version:
+            raise ConcurrencyConflictError(
+                f"execution {execution_id} is no longer at version {version}; "
+                "this worker's view is stale"
+            )
+
+    # A candidate exists only together with the freeze that produced it, on
+    # every path into the store: never on a new execution, and never changed
+    # (or re-based) by any transition without a matching successful freeze.
+    for e, _ in changes.created:
+        if e.candidate_revision is not None:
+            raise LedgerIntegrityError(f"new execution {e.id} cannot already carry a candidate")
+    for e, _ in changes.applied:
         before = execution(e.id)
-        if (
-            e.candidate_revision is not None
-            and t.to_state is ExecutionState.VERIFYING
-            and (before is None or before.candidate_revision != e.candidate_revision)
+        if e.candidate_revision is not None and (
+            before is None
+            or (before.candidate_revision, before.base_revision)
+            != (e.candidate_revision, e.base_revision)
         ):
             _check_frozen(e, final_ops, operation)
 

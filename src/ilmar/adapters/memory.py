@@ -123,6 +123,9 @@ class InMemoryExecutionStore:
                 operation=self._operations.get,
                 resource=self._resources.get,
             )
+            new_tasks = [e.task for e, _ in changes.created if not e.state.is_terminal]
+            if len(new_tasks) != len(set(new_tasks)):
+                raise DuplicateExecutionError("two active executions for one task in one commit")
             for execution, _ in changes.created:
                 self._check_new(execution)
             for execution, transition in changes.applied:

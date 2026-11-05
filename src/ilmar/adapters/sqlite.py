@@ -243,6 +243,11 @@ class SQLiteExecutionStore:
             self._conn.execute("PRAGMA foreign_keys = ON")
             if str(path) != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
+            # Every commit is on disk before it returns: an intent must be
+            # durable before its side effect starts (ADR-0020). Some builds
+            # default WAL databases to NORMAL, which can lose the last commits
+            # on power loss.
+            self._conn.execute("PRAGMA synchronous = FULL")
             self._migrate()
         except BaseException:
             self._conn.close()

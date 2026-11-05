@@ -18,6 +18,11 @@ Two independent mechanisms, so that losing either stops all side effects:
 
 :meth:`Ownership.check` verifies both, and the journal calls it immediately
 before every external side effect.
+
+Inside one coordinator, :class:`ExecutionLeases` gives each execution at most
+one worker at a time (ADR-0012 fencing level 2). Leadership is per instance,
+work is per execution: different executions can run in parallel, and nothing
+here serialises them.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import contextlib
 import fcntl
 import os
 import stat
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -33,7 +39,12 @@ from typing import Self
 
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
-from ilmar.domain.errors import FencingError, InstanceLockedError, OwnershipConflictError
+from ilmar.domain.errors import (
+    ConflictError,
+    FencingError,
+    InstanceLockedError,
+    OwnershipConflictError,
+)
 from ilmar.domain.ledger import Fence
 from ilmar.ports.execution_store import ExecutionStore
 
@@ -163,3 +174,61 @@ class Ownership:
         traceback: TracebackType | None,
     ) -> None:
         self.release()
+
+
+class ExecutionLease:
+    """The right of one worker to act for one execution, until released."""
+
+    def __init__(self, leases: ExecutionLeases, execution_id: str) -> None:
+        self.execution_id = execution_id
+        self._leases = leases
+        self._held = True
+
+    def check(self, execution_id: str) -> None:
+        """Raise ``FencingError`` unless this lease is held and is for ``execution_id``."""
+        if not self._held or not self._leases.holds(self):
+            raise FencingError(f"the lease on {self.execution_id} is no longer held")
+        if execution_id != self.execution_id:
+            raise FencingError(f"a lease on {self.execution_id} cannot act for {execution_id}")
+
+    def release(self) -> None:
+        if self._held:
+            self._held = False
+            self._leases.release(self)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
+class ExecutionLeases:
+    """In-process registry: at most one lease per execution id. Thread-safe."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._held: dict[str, ExecutionLease] = {}
+
+    def acquire(self, execution_id: str) -> ExecutionLease:
+        """Lease ``execution_id``, or raise ``ConflictError`` if another worker holds it."""
+        with self._lock:
+            if execution_id in self._held:
+                raise ConflictError(f"another worker holds the lease on {execution_id}")
+            lease = ExecutionLease(self, execution_id)
+            self._held[execution_id] = lease
+            return lease
+
+    def holds(self, lease: ExecutionLease) -> bool:
+        with self._lock:
+            return self._held.get(lease.execution_id) is lease
+
+    def release(self, lease: ExecutionLease) -> None:
+        with self._lock:
+            if self._held.get(lease.execution_id) is lease:
+                del self._held[lease.execution_id]

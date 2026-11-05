@@ -11,6 +11,7 @@ ownership again.
 from __future__ import annotations
 
 import contextlib
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,11 +22,13 @@ import pytest
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.core.journal import Journal, check_candidate, freeze_result
 from ilmar.core.layout import WorkspaceLayout
-from ilmar.core.ownership import LOCK_NAME, Ownership
+from ilmar.core.ownership import LOCK_NAME, ExecutionLease, ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.errors import (
     AmbiguousOperationError,
+    ConcurrencyConflictError,
+    ConflictError,
     FencingError,
     LedgerIntegrityError,
     ProviderError,
@@ -95,6 +98,24 @@ class Coordinator:
     store: CrashingStore
     ownership: Ownership
     journal: Journal
+    leases: ExecutionLeases = field(default_factory=ExecutionLeases)
+
+    def lease(self, execution_id: str = "e1") -> ExecutionLease:
+        if not hasattr(self, "_lease"):
+            self._lease = self.leases.acquire(execution_id)
+        return self._lease
+
+    def perform(
+        self,
+        kind: OperationKind,
+        effect: Callable[[], Mapping[str, str]],
+        *,
+        execution: Execution | None = None,
+        **options: Any,
+    ) -> Mapping[str, str]:
+        return self.journal.perform(
+            kind, execution or self.execution(), effect, lease=self.lease(), **options
+        )
 
     def execution(self) -> Execution:
         found = self.store.inner.get("e1")
@@ -146,15 +167,15 @@ def test_the_intent_is_durable_before_the_effect_runs(coordinator: Coordinator) 
         seen.append(coordinator.store.inner.operation("claim-task:e1:1"))
         return {"ok": "1"}
 
-    coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), effect)
+    coordinator.perform(K.CLAIM_TASK, effect)
     assert seen[0] is not None
     assert seen[0].status is ST.INTENDED
 
 
 def test_a_succeeded_step_is_never_performed_twice(coordinator: Coordinator) -> None:
     world = World()
-    first = coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push)
-    second = coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push)
+    first = coordinator.perform(K.PUBLISH_REVISION, world.push)
+    second = coordinator.perform(K.PUBLISH_REVISION, world.push)
     assert first == second == {"head": CANDIDATE}
     assert world.pushes == [CANDIDATE]
 
@@ -166,15 +187,13 @@ def test_a_definitive_failure_is_recorded_and_not_retried_in_the_attempt(
         raise ProviderError("the remote said no")
 
     with pytest.raises(ProviderError):
-        coordinator.journal.perform(
-            K.PUBLISH_REVISION, coordinator.execution(), refused, definitive=(ProviderError,)
-        )
+        coordinator.perform(K.PUBLISH_REVISION, refused, definitive=(ProviderError,))
     operation = coordinator.store.inner.operation("publish-revision:e1:1")
     assert operation is not None
     assert operation.status is ST.FAILED
     assert operation.note == "ProviderError"  # the type only, never the message
     with pytest.raises(LedgerIntegrityError, match="already failed"):
-        coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), World().push)
+        coordinator.perform(K.PUBLISH_REVISION, World().push)
 
 
 def test_an_unclear_failure_is_ambiguous_and_blocks_until_reconciled(
@@ -184,11 +203,11 @@ def test_an_unclear_failure_is_ambiguous_and_blocks_until_reconciled(
         raise TimeoutError("no answer")
 
     with pytest.raises(TimeoutError):
-        coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), timed_out)
+        coordinator.perform(K.PUBLISH_REVISION, timed_out)
     assert coordinator.store.inner.operation("publish-revision:e1:1").status is ST.AMBIGUOUS  # type: ignore[union-attr]
     world = World()
     with pytest.raises(AmbiguousOperationError) as info:
-        coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push)
+        coordinator.perform(K.PUBLISH_REVISION, world.push)
     assert info.value.key == "publish-revision:e1:1"
     assert world.pushes == []
     coordinator.journal.reconcile(
@@ -197,9 +216,7 @@ def test_an_unclear_failure_is_ambiguous_and_blocks_until_reconciled(
         reason="branch head equals the candidate",
         result={"head": CANDIDATE},
     )
-    assert coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push) == {
-        "head": CANDIDATE
-    }
+    assert coordinator.perform(K.PUBLISH_REVISION, world.push) == {"head": CANDIDATE}
     assert world.pushes == []
 
 
@@ -215,15 +232,13 @@ def test_a_repeatable_step_is_repeated_after_an_unclear_failure(
         return {"task": "task-1"}
 
     with pytest.raises(TimeoutError):
-        coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), flaky)
-    assert coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), flaky) == {
-        "task": "task-1"
-    }
+        coordinator.perform(K.CLAIM_TASK, flaky)
+    assert coordinator.perform(K.CLAIM_TASK, flaky) == {"task": "task-1"}
     assert len(calls) == 2
 
 
 def test_reconciliation_only_settles_unfinished_operations(coordinator: Coordinator) -> None:
-    coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), World().claim)
+    coordinator.perform(K.CLAIM_TASK, World().claim)
     with pytest.raises(LedgerIntegrityError, match="already succeeded"):
         coordinator.journal.reconcile("claim-task:e1:1", ST.FAILED, reason="x")
     with pytest.raises(LedgerIntegrityError, match="no operation"):
@@ -242,7 +257,7 @@ def test_a_superseded_coordinator_records_no_intent_and_acts_not(
         intruder.claim_instance("inst", now=at(5))
     world = World()
     with pytest.raises(FencingError):
-        coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push)
+        coordinator.perform(K.PUBLISH_REVISION, world.push)
     assert world.effects == []
     assert coordinator.store.inner.operation("publish-revision:e1:1") is None
 
@@ -259,7 +274,7 @@ def test_losing_ownership_after_the_intent_stops_the_effect(
     coordinator.store.after_commit = takeover
     world = World()
     with pytest.raises(FencingError):
-        coordinator.journal.perform(K.PUBLISH_REVISION, coordinator.execution(), world.push)
+        coordinator.perform(K.PUBLISH_REVISION, world.push)
     assert world.effects == []
     operation = coordinator.store.inner.operation("publish-revision:e1:1")
     assert operation is not None
@@ -277,7 +292,7 @@ def test_a_replaced_lock_file_stops_the_effect(
     coordinator.store.after_commit = replace_lock
     world = World()
     with pytest.raises(FencingError, match="replaced"):
-        coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), world.claim)
+        coordinator.perform(K.CLAIM_TASK, world.claim)
     assert world.effects == []
 
 
@@ -319,8 +334,11 @@ def test_freezing_records_the_candidate_atomically_with_verifying(
         )
         return Commit(applied=((updated, transition),))
 
-    coordinator.journal.perform(
-        K.FREEZE_CANDIDATE, execution, lambda: freeze_result(frozen), after=enter_verifying
+    coordinator.perform(
+        K.FREEZE_CANDIDATE,
+        execution=execution,
+        effect=lambda: freeze_result(frozen),
+        after=enter_verifying,
     )
     stored = coordinator.execution()
     assert (stored.state, stored.candidate_revision) == (S.VERIFYING, CANDIDATE)
@@ -342,7 +360,9 @@ def test_a_candidate_that_differs_from_its_freeze_is_refused(
     coordinator: Coordinator, tampered: CandidateRevision
 ) -> None:
     execution = running_agent(coordinator)
-    coordinator.journal.perform(K.FREEZE_CANDIDATE, execution, lambda: freeze_result(candidate()))
+    coordinator.perform(
+        K.FREEZE_CANDIDATE, execution=execution, effect=lambda: freeze_result(candidate())
+    )
     freeze = coordinator.store.inner.operation("freeze-candidate:e1:1")
     assert freeze is not None
     with pytest.raises(LedgerIntegrityError, match="does not match"):
@@ -357,7 +377,7 @@ STEPS = (K.CLAIM_TASK, K.PUBLISH_REVISION)  # one repeatable, one that needs rec
 def drive(c: Coordinator, world: World) -> None:
     for kind in STEPS:
         effect = world.claim if kind is K.CLAIM_TASK else world.push
-        c.journal.perform(kind, c.execution(), effect)
+        c.perform(kind, effect)
 
 
 def recover(c: Coordinator, world: World) -> None:
@@ -423,6 +443,174 @@ def test_a_crash_after_the_effect_leaves_an_intent_that_recovery_must_settle(
     (pending,) = second.store.inner.unfinished_operations()
     assert (pending.kind, pending.status) == (K.PUBLISH_REVISION, ST.INTENDED)
     with pytest.raises(AmbiguousOperationError):
-        second.journal.perform(K.PUBLISH_REVISION, second.execution(), world.push)
+        second.perform(K.PUBLISH_REVISION, world.push)
     assert world.pushes == [CANDIDATE]
     stop(second)
+
+
+# -- adversarial review of 0661847 -------------------------------------------------------
+
+
+def advance(c: Coordinator, target: ExecutionState) -> Execution:
+    updated, transition = MACHINE.advance(c.execution(), target, now=at(4), reason="other")
+    c.store.inner.apply(updated, transition, fence=c.ownership.fence)
+    return updated
+
+
+def test_a_worker_with_a_stale_view_records_no_intent_and_acts_not(
+    coordinator: Coordinator,
+) -> None:
+    stale = coordinator.execution()
+    advance(coordinator, S.CLAIMED)  # someone else moved the execution on
+    world = World()
+    with pytest.raises(ConcurrencyConflictError, match="stale"):
+        coordinator.perform(K.PUBLISH_REVISION, world.push, execution=stale)
+    assert world.effects == []
+    assert coordinator.store.inner.operation("publish-revision:e1:1") is None
+
+
+def test_a_change_after_the_intent_stops_the_effect(coordinator: Coordinator) -> None:
+    def move_on() -> None:
+        advance(coordinator, S.CLAIMED)
+
+    coordinator.store.after_commit = move_on
+    world = World()
+    with pytest.raises(ConcurrencyConflictError, match="changed after"):
+        coordinator.perform(K.PUBLISH_REVISION, world.push)
+    assert world.effects == []
+    operation = coordinator.store.inner.operation("publish-revision:e1:1")
+    assert operation is not None
+    assert operation.status is ST.INTENDED
+
+
+def test_only_the_lease_holder_acts_for_an_execution(coordinator: Coordinator) -> None:
+    lease = coordinator.lease()
+    with pytest.raises(ConflictError, match="another worker"):
+        coordinator.leases.acquire("e1")
+    other = coordinator.leases.acquire("e2")
+    world = World()
+    with pytest.raises(FencingError, match="cannot act for e1"):
+        coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), world.claim, lease=other)
+    lease.release()
+    with pytest.raises(FencingError, match="no longer held"):
+        coordinator.journal.perform(K.CLAIM_TASK, coordinator.execution(), world.claim, lease=lease)
+    assert world.effects == []
+    assert coordinator.leases.acquire("e1") is not lease  # free again after release
+
+
+def test_executions_run_in_parallel_under_one_coordinator(coordinator: Coordinator) -> None:
+    """Leadership is per instance; work is per execution, so nothing serialises them."""
+    ids = [f"p{n}" for n in range(6)]
+    for n, execution_id in enumerate(ids):
+        execution, transition = MACHINE.start(
+            TaskRef("fake", f"p{n}"), execution_id=execution_id, now=at(1)
+        )
+        coordinator.store.inner.create(execution, transition, fence=coordinator.ownership.fence)
+    barrier = threading.Barrier(len(ids))
+    inside: list[str] = []
+    errors: list[BaseException] = []
+
+    def work(execution_id: str) -> None:
+        try:
+            with coordinator.leases.acquire(execution_id) as lease:
+                execution = coordinator.store.inner.get(execution_id)
+                assert execution is not None
+
+                def effect() -> Mapping[str, str]:
+                    inside.append(execution_id)
+                    barrier.wait(timeout=10)  # every worker is inside its effect at once
+                    return {"ok": execution_id}
+
+                coordinator.journal.perform(K.CLAIM_TASK, execution, effect, lease=lease)
+        except BaseException as error:  # reported below
+            errors.append(error)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert sorted(inside) == ids
+    for execution_id in ids:
+        operation = coordinator.store.inner.operation(f"claim-task:{execution_id}:1")
+        assert operation is not None
+        assert operation.status is ST.SUCCEEDED
+
+
+def test_an_effect_whose_follow_up_is_refused_keeps_its_result(
+    coordinator: Coordinator,
+) -> None:
+    execution = running_agent(coordinator)
+    frozen = freeze_result(candidate())
+
+    def wrong_candidate(result: Mapping[str, str]) -> Commit:
+        updated, transition = MACHINE.advance(
+            execution, S.VERIFYING, now=at(3), reason="t", candidate_revision="c" * 40
+        )
+        return Commit(applied=((updated, transition),))
+
+    with pytest.raises(LedgerIntegrityError, match="follow-up changes were refused"):
+        coordinator.perform(
+            K.FREEZE_CANDIDATE, lambda: frozen, execution=execution, after=wrong_candidate
+        )
+    operation = coordinator.store.inner.operation("freeze-candidate:e1:1")
+    assert operation is not None
+    assert operation.status is ST.AMBIGUOUS
+    assert dict(operation.result) == frozen  # the knowledge is kept
+    assert coordinator.execution().state is S.RUNNING_AGENT  # nothing half-applied
+
+
+def test_a_failing_follow_up_builder_keeps_the_result_too(coordinator: Coordinator) -> None:
+    def broken(result: Mapping[str, str]) -> Commit:
+        raise KeyError("missing")
+
+    world = World()
+    with pytest.raises(LedgerIntegrityError):
+        coordinator.perform(K.PUBLISH_REVISION, world.push, after=broken)
+    operation = coordinator.store.inner.operation("publish-revision:e1:1")
+    assert operation is not None
+    assert (operation.status, dict(operation.result)) == (ST.AMBIGUOUS, {"head": CANDIDATE})
+    assert world.pushes == [CANDIDATE]
+    with pytest.raises(AmbiguousOperationError):  # never pushed again blindly
+        coordinator.perform(K.PUBLISH_REVISION, world.push)
+
+
+def test_a_freeze_can_never_be_reconciled_into_a_candidate(coordinator: Coordinator) -> None:
+    execution = running_agent(coordinator)
+
+    def crash() -> Mapping[str, str]:
+        raise TimeoutError
+
+    with pytest.raises(TimeoutError):
+        coordinator.perform(K.FREEZE_CANDIDATE, crash, execution=execution)
+    with pytest.raises(LedgerIntegrityError, match="never reconciled"):
+        coordinator.journal.reconcile(
+            "freeze-candidate:e1:1",
+            ST.SUCCEEDED,
+            reason="trust me",
+            result=freeze_result(candidate()),
+        )
+
+
+def test_a_worker_cannot_touch_another_executions_records(coordinator: Coordinator) -> None:
+    from ilmar.domain.ledger import Resource, ResourceKind
+
+    execution, transition = MACHINE.start(TaskRef("fake", "2"), execution_id="e2", now=at(1))
+    coordinator.store.inner.create(execution, transition, fence=coordinator.ownership.fence)
+    foreign = Resource.intended(
+        ResourceKind.WORKSPACE, "e2", 1, "/w/e2", owner_token="tok", now=at(2)
+    )
+    world = World()
+    with pytest.raises(LedgerIntegrityError, match="cannot change records of e2"):
+        coordinator.perform(K.CLAIM_TASK, world.claim, before=Commit(resources=(foreign,)))
+    with pytest.raises(LedgerIntegrityError, match="follow-up changes were refused") as info:
+        coordinator.perform(
+            K.PUBLISH_REVISION, world.push, after=lambda _: Commit(resources=(foreign,))
+        )
+    assert "cannot change records of e2" in str(info.value.__cause__)
+    assert world.effects == ["push"]  # the claim never ran; the push did, its result was kept
+    assert coordinator.store.inner.resources(execution_id="e2") == ()
+    publish = coordinator.store.inner.operation("publish-revision:e1:1")
+    assert publish is not None
+    assert publish.status is ST.AMBIGUOUS

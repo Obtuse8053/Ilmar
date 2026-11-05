@@ -128,6 +128,10 @@ def operation_key(kind: OperationKind, execution_id: str, attempt: int, step: st
     if attempt < 1:
         raise ValueError("attempt starts at 1")
     key = f"{kind.value}:{execution_id}:{attempt}"
+    if step and kind is OperationKind.FREEZE_CANDIDATE:
+        # One freeze per attempt: the store finds it by this exact key when a
+        # candidate is recorded (ADR-0020).
+        raise ValueError("a freeze has no step: there is exactly one per attempt")
     if step:
         if not _DISCRIMINATOR.match(step):
             raise ValueError("step must be a short identifier")
@@ -362,13 +366,18 @@ class Commit:
       ones (the usual version rules apply);
     * ``operations`` / ``resources``: version 1 inserts a new record, any
       later version replaces the stored version - 1 (otherwise the whole
-      commit fails with ``ConcurrencyConflictError``).
+      commit fails with ``ConcurrencyConflictError``);
+    * ``expected``: ``(execution_id, version)`` pairs that must hold once the
+      commit's own changes are applied. A worker uses it to write an intent
+      only while the execution is still the version it last wrote (ADR-0012
+      fencing level 2).
     """
 
     created: tuple[tuple[Execution, Transition], ...] = ()
     applied: tuple[tuple[Execution, Transition], ...] = ()
     operations: tuple[Operation, ...] = ()
     resources: tuple[Resource, ...] = ()
+    expected: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         keys = [o.key for o in self.operations] + [r.key for r in self.resources]

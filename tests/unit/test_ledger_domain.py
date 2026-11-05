@@ -139,3 +139,8 @@ def test_the_changed_paths_digest_ignores_order_and_duplicates() -> None:
 def test_fences_are_validated(instance_id: str, epoch: int) -> None:
     with pytest.raises(ValueError, match=r"identifier|epoch"):
         Fence(instance_id, epoch)
+
+
+def test_a_freeze_has_exactly_one_key_per_attempt() -> None:
+    with pytest.raises(ValueError, match="a freeze has no step"):
+        operation_key(K.FREEZE_CANDIDATE, "e1", 1, "retry-1")

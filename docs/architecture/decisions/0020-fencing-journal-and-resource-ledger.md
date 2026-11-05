@@ -73,6 +73,15 @@ Candidate integrity after a crash:
   fails.
 - `Ownership.check()` verifies the lock and that the store's current fence is
   still its own.
+- **Execution leases (ADR-0012 level 2).**
+  - Leadership is per instance; work is per execution. `ExecutionLeases`
+    gives each execution at most one in-process worker at a time.
+  - `Journal.perform` requires the lease of the execution it acts for.
+  - Different executions run in parallel, and nothing serialises them
+    except SQLite's short write transactions.
+  - Every state, journal and ledger record is keyed by execution and
+    attempt (and run, where a step repeats). A worker's journaled changes
+    may touch only its own execution's records.
 - **Every write carries the fence once a store has been claimed.** That
   covers `create`, `apply`, `append_evidence` and `commit`. A missing or
   superseded fence raises `FencingError` and changes nothing. The check runs
@@ -99,10 +108,15 @@ An `Operation` records one external side effect. Its fields:
              └───────────────────────────────────────────────────────┘
 ```
 
-- **Writing outcomes.** `Journal.perform(kind, execution, effect, ...)`:
+- **Writing outcomes.** `Journal.perform(kind, execution, effect, lease=...)`:
   1. commits the intent together with `before` (for example a resource
-     recorded as `INTENDED`);
-  2. calls `Ownership.check()`;
+     recorded as `INTENDED`). The commit also requires the execution to be
+     exactly the version this worker last saw (`Commit.expected`), so a
+     worker with a stale view records nothing;
+  2. immediately before the effect, checks again:
+     - `Ownership.check()`: the lock and the fence;
+     - the lease;
+     - the execution's stored version;
   3. runs the effect;
   4. records the outcome, depending on how the effect ended:
      - on success, commits `SUCCEEDED` with the result and `after(result)`
@@ -111,8 +125,12 @@ An `Operation` records one external side effect. Its fields:
      - an exception type the caller declares definitive is `FAILED`;
      - any other exception is `AMBIGUOUS`.
 
-     If writing the outcome fails, the operation stays `INTENDED`.
-     Recovery treats `INTENDED` exactly like `AMBIGUOUS`.
+     If the effect succeeded but `after(result)` fails or its commit is
+     refused, the operation becomes `AMBIGUOUS` *with the result*.
+     The knowledge that it happened is not lost, and
+     `LedgerIntegrityError` is raised. If writing any outcome fails, the
+     operation stays `INTENDED`. Recovery treats `INTENDED` exactly like
+     `AMBIGUOUS`.
 - **Replay** (same key):
   - `SUCCEEDED` returns the recorded result without acting;
   - `FAILED` raises `LedgerIntegrityError`, because only a new attempt, with
@@ -120,7 +138,13 @@ An `Operation` records one external side effect. Its fields:
   - `INTENDED` or `AMBIGUOUS` repeats the effect only for *repeatable*
     kinds. Otherwise it raises `AmbiguousOperationError` until
     `Journal.reconcile(key, SUCCEEDED | FAILED, reason, result)` settles it
-    from an observation of the external system.
+    from an observation of the external system. A freeze is never
+    reconciled: it is repeatable and is performed again, so a candidate's
+    identity always comes from an actual freeze.
+  - Retrying a step that `FAILED` within the same attempt uses a new
+    `step` (`retry-<n>`, *n* = the number of failed tries). A failed step
+    is never silently overwritten. Freezes have no step: exactly one per
+    attempt.
 
 **Idempotency keys and reconciliation rules.** A key is
 `<kind>:<execution>:<attempt>[:<step>]`, so the same logical step always gets
@@ -186,12 +210,16 @@ The rules are shared by every adapter (`check_fence`, `check_commit`):
 - immutable kind, owner, intent, creation time and identity;
 - operations carry the current epoch and belong to the execution's current
   attempt;
-- **a candidate is recorded only with its freeze.** A transition into
-  VERIFYING that sets `candidate_revision` needs a `SUCCEEDED`
-  `freeze-candidate` operation for that execution and attempt. It may be
-  stored already, or be in the same commit. Its result must name the same
-  revision and base revision and a changed-paths digest. Otherwise
-  `LedgerIntegrityError`.
+- **a candidate is recorded only with its freeze, on every path.**
+  - A new execution may not carry a candidate.
+  - Any transition that sets or changes `candidate_revision`, or changes
+    `base_revision` under it, needs a `SUCCEEDED` `freeze-candidate`
+    operation for that execution and attempt. It may be stored already, or
+    be in the same commit. Its result must name the same revision and base
+    revision and a changed-paths digest. This applies whatever the target
+    state.
+  - Otherwise `LedgerIntegrityError`;
+- `expected` versions must hold.
 
 SQLite schema v3 adds `owner`, `owner_history`, `operations`, `resources`
 and `ledger_events`, an append-only log of every operation and resource
@@ -203,7 +231,11 @@ adapter:
 - identity and intent are immutable;
 - versions grow by one.
 
-Version 1 and 2 databases migrate in place in one transaction.
+Version 1 and 2 databases migrate in place in one transaction. Every
+connection runs with `synchronous = FULL`, `foreign_keys = ON` and WAL. A
+commit, and therefore an intent, is durable before `commit` returns and
+before its side effect can start. Some builds default WAL databases to
+`NORMAL`, which can lose the last commits on power loss.
 
 ### Candidate integrity
 
@@ -221,8 +253,12 @@ Version 1 and 2 databases migrate in place in one transaction.
 
 1. At most one coordinator per instance runs: the lock.
 2. A coordinator whose fence is superseded can write nothing: the store.
-3. Every external side effect has a durable intent before it starts, and the
-   owner is re-checked immediately before it.
+3. Every external side effect has a durable intent before it starts. Right
+   before it, the owner, the lease and the execution's version are checked
+   again.
+3a. At most one worker acts for an execution at a time. A worker with a
+    stale view of its execution performs nothing. Workers of different
+    executions never touch each other's records.
 4. Every step has one deterministic idempotency key. A succeeded step never
    runs again. A failed step never runs again in the same attempt.
 5. An unclear outcome of a non-repeatable effect blocks the execution until
@@ -231,8 +267,10 @@ Version 1 and 2 databases migrate in place in one transaction.
 6. Every external resource is in the ledger before it is created and stays
    there until its release is confirmed. Its identity is fixed once known.
    Quarantined resources are never touched automatically.
-7. A candidate revision is recorded only together with the successful freeze
-   that produced it, including the digest of its changed paths.
+7. A candidate revision exists in the store only together with the
+   successful freeze that produced it, including the digest of its changed
+   paths. It cannot be created directly, swapped, re-based or reconciled
+   into existence.
 8. State, journal and ledger change together or not at all.
 
 ### Port contract changes
@@ -284,6 +322,21 @@ Version 1 and 2 databases migrate in place in one transaction.
   unfinished after recovery, and the outcome matches what the world shows.
 - Mutation checks: each of seven invariants, reverted on its own, fails a
   test.
+- Adversarial review of `0661847`:
+  - a stale-view worker records no intent; a change after the intent stops
+    the effect;
+  - a second lease is refused, as are a foreign or released lease;
+  - six executions run their effects at the same moment under one
+    coordinator;
+  - a refused follow-up keeps the result as ambiguous;
+  - a freeze cannot be reconciled;
+  - a candidate cannot be created, swapped or re-based;
+  - expected versions are enforced;
+  - one commit cannot create two active executions for a task;
+  - `synchronous = FULL`;
+  - a worker cannot touch another execution's records.
+
+  Each of these, reverted on its own, fails a test.
 
 ## Consequences
 
@@ -307,6 +360,13 @@ Version 1 and 2 databases migrate in place in one transaction.
     recorded by type name only for that reason.
   - SQLite must be on a local filesystem (ADR-0005). `flock` is not
     reliable on network filesystems.
+  - Two processes opening an old database at the same moment could both
+    try to migrate it. The second fails and changes nothing. The instance
+    lock makes this a manual-tool race only.
+  - Side effects are fenced only when they go through `Journal.perform`.
+    #11b must route every external call through it. An architecture test
+    there forbids the coordinator from calling adapters' mutating methods
+    any other way.
 
 ## Revisit when
 

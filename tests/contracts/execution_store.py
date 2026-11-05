@@ -335,6 +335,58 @@ class FencingContract:
         store.commit(fence, Commit(applied=((verifying, step),), operations=(done,)))
         assert store.get("e1") == verifying
 
+    def test_a_new_execution_cannot_carry_a_candidate(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        smuggled = dataclasses.replace(execution, base_revision=BASE, candidate_revision=CANDIDATE)
+        with pytest.raises(LedgerIntegrityError, match="cannot already carry a candidate"):
+            store.create(smuggled, transition, fence=fence)
+        assert store.get("e1") is None
+
+    def test_a_recorded_candidate_cannot_be_swapped_or_rebased_later(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = to_running_agent(store, fence, fenced_execution(store, fence))
+        first, done = freeze_op(fence)
+        store.commit(fence, Commit(operations=(first,)))
+        verifying, step = MACHINE.advance(
+            execution, S.VERIFYING, now=at(7), reason="t", candidate_revision=CANDIDATE
+        )
+        store.commit(fence, Commit(applied=((verifying, step),), operations=(done,)))
+        publishing, to_publish = MACHINE.advance(verifying, S.PUBLISHING, now=at(8), reason="t")
+        for tampered in (
+            dataclasses.replace(publishing, candidate_revision="e" * 40),
+            dataclasses.replace(publishing, base_revision="d" * 40),
+        ):
+            with pytest.raises(LedgerIntegrityError, match="no matching"):
+                store.apply(tampered, to_publish, fence=fence)
+        store.apply(publishing, to_publish, fence=fence)  # unchanged: fine
+        assert store.get("e1") == publishing
+
+    def test_an_intent_needs_the_version_its_writer_saw(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        claimed_execution, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="t")
+        store.apply(claimed_execution, step, fence=fence)
+        stale = Commit(operations=(intent(K.CLAIM_TASK, fence),), expected=(("e1", 1),))
+        with pytest.raises(ConcurrencyConflictError, match="stale"):
+            store.commit(fence, stale)
+        assert store.operations("e1") == ()
+        store.commit(
+            fence, Commit(operations=(intent(K.CLAIM_TASK, fence),), expected=(("e1", 2),))
+        )
+
+    def test_one_commit_cannot_create_two_active_executions_for_a_task(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        first = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        second = MACHINE.start(TASK_A, execution_id="e2", now=at(1))
+        with pytest.raises(DuplicateExecutionError):
+            store.commit(fence, Commit(created=(first, second)))
+        assert store.get("e1") is None
+
     def test_concurrent_intents_for_one_key_admit_exactly_one(self, store: ExecutionStore) -> None:
         fence = claimed(store)
         fenced_execution(store, fence)

@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Write-ahead journal for external side effects (ADR-0012, ADR-0020).
 
-Every external side effect runs through :meth:`Journal.perform`:
+Every external side effect runs through :meth:`Journal.perform`, by a worker
+holding the execution's lease:
 
 1. The *intent* is committed first, under the current fence, together with
    any ledger or state changes that must precede the effect (for example a
-   resource recorded as ``INTENDED`` before it is created).
-2. :meth:`Ownership.check` runs immediately before the effect. If ownership
-   was lost, the effect does not happen.
+   resource recorded as ``INTENDED`` before it is created). The commit also
+   requires the execution to be exactly the version this worker last saw.
+2. Immediately before the effect: the instance lock and fence
+   (:meth:`Ownership.check`), the lease, and the execution's stored version
+   are checked again. If any of them changed, the effect does not happen.
 3. The effect runs.
 4. The outcome is committed:
 
    * ``SUCCEEDED``, with its result and any follow-up changes, atomically;
    * ``FAILED`` for the exception types the caller declares definitive (the
      effect certainly did not happen);
-   * ``AMBIGUOUS`` for everything else.
+   * ``AMBIGUOUS`` for everything else;
+   * ``AMBIGUOUS`` *with the result* if the effect succeeded but its
+     follow-up changes were refused, so the knowledge that it happened is
+     never lost (``LedgerIntegrityError`` is raised).
 
 A crash, or a lost fence, between steps leaves the operation ``INTENDED``,
 which recovery treats exactly like ``AMBIGUOUS``.
@@ -34,9 +40,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
-from ilmar.core.ownership import Ownership
+from ilmar.core.ownership import ExecutionLease, Ownership
 from ilmar.domain.changes import CandidateRevision
-from ilmar.domain.errors import AmbiguousOperationError, LedgerIntegrityError
+from ilmar.domain.errors import (
+    AmbiguousOperationError,
+    ConcurrencyConflictError,
+    LedgerIntegrityError,
+)
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import (
     Commit,
@@ -70,6 +80,7 @@ class Journal:
         execution: Execution,
         effect: Callable[[], Result],
         *,
+        lease: ExecutionLease,
         step: str = "",
         intent: Mapping[str, str] | None = None,
         before: Commit = Commit(),  # noqa: B008 - an immutable, empty value
@@ -78,10 +89,16 @@ class Journal:
     ) -> Result:
         """Perform one side effect with write-ahead intent; see the module docstring.
 
-        ``before`` is committed atomically with the intent and ``after(result)``
+        ``execution`` is this worker's last view of the execution; ``before``
+        is committed atomically with the intent and ``after(result)``
         atomically with the success.
         """
+        lease.check(execution.id)
+        _check_scope(before, execution.id)
         fence = self._ownership.fence
+        expected = next(
+            (e.version for e, _ in before.applied if e.id == execution.id), execution.version
+        )
         key = operation_key(kind, execution.id, execution.attempt, step)
         existing = self._store.operation(key)
         if existing is not None:
@@ -110,9 +127,27 @@ class Journal:
                 step=step,
                 intent=intent,
             )
-        self._store.commit(fence, _with(before, operation))  # 1. intent, write-ahead
+        intent_commit = _with(before, operation)
+        self._store.commit(  # 1. intent, write-ahead, only on the version this worker saw
+            fence,
+            Commit(
+                created=intent_commit.created,
+                applied=intent_commit.applied,
+                operations=intent_commit.operations,
+                resources=intent_commit.resources,
+                expected=((execution.id, expected),),
+            ),
+        )
 
-        self._ownership.check()  # 2. still the owner, right before acting
+        # 2. Right before acting: still the owner, still the lease holder, and
+        # nobody else has moved the execution since.
+        self._ownership.check()
+        lease.check(execution.id)
+        stored = self._store.get(execution.id)
+        if stored is None or stored.version != expected:
+            raise ConcurrencyConflictError(
+                f"{execution.id} changed after {key} was recorded; no side effect"
+            )
         try:
             result = dict(effect())  # 3. the effect
         except definitive as error:
@@ -124,8 +159,18 @@ class Journal:
         succeeded = operation.moved(
             OperationStatus.SUCCEEDED, fence=fence, now=self._clock(), result=result
         )
-        follow_up = after(result) if after is not None else Commit()
-        self._store.commit(fence, _with(follow_up, succeeded))  # 4. the outcome
+        try:  # 4. the outcome, with its follow-up changes
+            follow_up = after(result) if after is not None else Commit()
+            _check_scope(follow_up, execution.id)
+            self._store.commit(fence, _with(follow_up, succeeded))
+        except Exception as error:
+            # The effect happened. Keep that knowledge (and its result) even
+            # though the follow-up was refused: recovery reconciles it.
+            self._keep_result(operation, result, error)
+            raise LedgerIntegrityError(
+                f"{key} succeeded but its follow-up changes were refused "
+                f"({type(error).__name__}); it is recorded as ambiguous with its result"
+            ) from error
         return result
 
     def reconcile(
@@ -149,6 +194,10 @@ class Journal:
             raise LedgerIntegrityError(f"no operation {key} to reconcile")
         if operation.status.is_final:
             raise LedgerIntegrityError(f"{key} is already {operation.status.value}")
+        if operation.kind is OperationKind.FREEZE_CANDIDATE:
+            # A candidate's identity must come from an actual freeze, never
+            # from an observation; a freeze is repeatable, so it is redone.
+            raise LedgerIntegrityError(f"{key}: a freeze is performed again, never reconciled")
         fence = self._ownership.fence
         if operation.status is OperationStatus.INTENDED:  # recovery sees it as ambiguous
             operation = operation.moved(
@@ -160,6 +209,19 @@ class Journal:
         )
         self._store.commit(fence, _with(changes, settled))
         return settled
+
+    def _keep_result(self, operation: Operation, result: Result, error: Exception) -> None:
+        try:
+            moved = operation.moved(
+                OperationStatus.AMBIGUOUS,
+                fence=self._ownership.fence,
+                now=self._clock(),
+                result=result,
+                note=f"effect succeeded; follow-up refused: {type(error).__name__}",
+            )
+            self._store.commit(self._ownership.fence, Commit(operations=(moved,)))
+        except Exception as failure:  # then it stays intended, which is also safe
+            error.add_note(f"{operation.key}: could not keep the result ({type(failure).__name__})")
 
     def _settle(self, operation: Operation, status: OperationStatus, error: BaseException) -> None:
         """Record a failed or ambiguous outcome.
@@ -209,6 +271,23 @@ def check_candidate(candidate: CandidateRevision, freeze: Operation) -> None:
         raise LedgerIntegrityError(
             f"candidate {candidate.revision[:12]} does not match what {freeze.key} recorded "
             "(revision, base revision or changed paths differ)"
+        )
+
+
+def _check_scope(changes: Commit, execution_id: str) -> None:
+    """A worker's journaled changes stay inside the execution it holds the lease for.
+
+    Executions run in parallel; one worker must never move another
+    execution's state, journal or resources (ADR-0020).
+    """
+    owners = {e.id for e, _ in (*changes.created, *changes.applied)}
+    owners |= {o.execution_id for o in changes.operations}
+    owners |= {r.execution_id for r in changes.resources}
+    owners |= {execution for execution, _ in changes.expected}
+    foreign = sorted(owners - {execution_id})
+    if foreign:
+        raise LedgerIntegrityError(
+            f"a worker for {execution_id} cannot change records of {', '.join(foreign)}"
         )
 
 

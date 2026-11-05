@@ -285,3 +285,12 @@ def test_a_second_process_claiming_fences_out_the_first(tmp_path: Path) -> None:
         with pytest.raises(FencingError):
             first.commit(old, Commit(operations=(operation,)))
         assert second.operations("e1") == ()
+
+
+def test_every_commit_is_durable_before_it_returns(tmp_path: Path) -> None:
+    """Write-ahead needs the intent on disk before the side effect (review of 0661847)."""
+    with SQLiteExecutionStore(tmp_path / "executions.sqlite3") as store:
+        conn = store._conn
+        assert conn.execute("PRAGMA synchronous").fetchone() == (2,)  # FULL
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
