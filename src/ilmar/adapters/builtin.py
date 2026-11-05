@@ -13,9 +13,10 @@ agent sandbox may reach come from the agent adapter, not from options.
 
 from __future__ import annotations
 
+import os
 import re
-import shutil
 import urllib.parse
+from pathlib import Path
 from typing import Any
 
 from ilmar.adapters.options import Options, Secrets
@@ -67,11 +68,35 @@ def _executable(options: Options, key: str, default: str) -> str:
     return options.string(key, default, pattern=_EXECUTABLE)
 
 
-def _resolve_executable(name: str, where: str) -> str:
-    found = shutil.which(name)
-    if found is None:
-        raise ConfigError(f"{where}: executable '{name}' not found")
-    return found
+def _host_executable(options: Options, key: str, default: str) -> str:
+    """A program the coordinator runs on the host: a bare name or an absolute path."""
+    name = _executable(options, key, default)
+    if "/" in name and not name.startswith("/"):
+        raise options.error(key, "must be a bare name or an absolute path")
+    return name
+
+
+def _resolve_executable(name: str, where: str, context: BuildContext) -> str:
+    """Find ``name`` on the host, never through a relative or agent-writable directory.
+
+    ``shutil.which`` would honour relative ``PATH`` entries such as ``.``, so a
+    program planted in the working directory (for example a repository
+    checkout) could be picked up. Only absolute ``PATH`` entries are searched,
+    and the result is resolved and must not lie under ``workspaces/``.
+    """
+    if name.startswith("/"):
+        candidates = [Path(name)]
+    else:
+        entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
+        candidates = [Path(entry) / name for entry in entries if os.path.isabs(entry)]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            resolved = candidate.resolve()
+            workspaces = context.layout.workspaces_root.resolve()
+            if resolved == workspaces or resolved.is_relative_to(workspaces):
+                raise ConfigError(f"{where}: '{name}' resolves under the workspaces directory")
+            return str(resolved)
+    raise ConfigError(f"{where}: executable '{name}' not found on an absolute PATH entry")
 
 
 # -- GitHub ------------------------------------------------------------------------------
@@ -130,7 +155,7 @@ def github_source_control(options: Options, context: BuildContext) -> Plan:
     token_env = options.env_name("token_env")
     api_url = options.https_url("api_url", DEFAULT_API_URL)
     git_base_url = options.https_url("git_base_url", "https://github.com")
-    git = _executable(options, "git", "git")
+    git = _host_executable(options, "git", "git")
     check_repository(repository)
     try:
         check_branch(base_branch)
@@ -153,7 +178,7 @@ def github_source_control(options: Options, context: BuildContext) -> Plan:
             state_dir=state_dir,
             git_base_url=git_base_url,
             allowed_protocols=("https",),
-            git=_resolve_executable(git, options.where),
+            git=_resolve_executable(git, options.where, context),
             ci_config_paths=ci_paths,
         )
 
@@ -171,7 +196,7 @@ def podman_runtime(options: Options, context: BuildContext) -> Plan:
     from ilmar.adapters.podman.runtime import EgressSettings, PodmanRuntime, SandboxProfile
 
     _refuse_weakening(options)
-    podman = _executable(options, "podman", "podman")
+    podman = _host_executable(options, "podman", "podman")
     proxy_image = options.optional_string("proxy_image", pattern=_IMAGE)
     egress_network = options.string("egress_network", "podman")
     defaults = SandboxProfile()
@@ -193,7 +218,7 @@ def podman_runtime(options: Options, context: BuildContext) -> Plan:
     def create(secrets: Secrets) -> PodmanRuntime:
         return PodmanRuntime(
             layout=context.layout,
-            podman=_resolve_executable(podman, options.where),
+            podman=_resolve_executable(podman, options.where, context),
             profile=profile,
             egress=egress,
             allow_unrestricted_network=False,  # never from configuration (ADR-0014)
@@ -229,7 +254,7 @@ def claude_code_runner(options: Options, context: BuildContext) -> Plan:
             api_key=secrets.get(api_key_env, where=options.where), settings=settings
         )
 
-    return Plan(create, environment=(api_key_env,), agent_sandbox=sandbox)
+    return Plan(create, environment=(api_key_env,), agent_sandbox=sandbox, enters_sandbox=True)
 
 
 # -- SQLite ------------------------------------------------------------------------------

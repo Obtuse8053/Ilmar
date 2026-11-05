@@ -22,7 +22,9 @@ The verification policy comes only from the configuration file
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,7 +36,7 @@ from ilmar.core.components import AgentSandbox, Components, Target, close_all
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.naming import safe_identifier
 from ilmar.domain.changes import RepositoryRef
-from ilmar.domain.errors import ConfigError, IlmarError, ProviderError
+from ilmar.domain.errors import ConfigError, ProviderError
 from ilmar.domain.verification import VerificationPolicy
 from ilmar.domain.workspace import NetworkPolicy
 from ilmar.ports.agent_runner import AgentRunner
@@ -78,6 +80,10 @@ class Plan:
     agent_sandbox: AgentSandbox | None = None
     networks: frozenset[NetworkPolicy] = frozenset({NetworkPolicy.NONE})
     task_repository: RepositoryRef | None = None
+    enters_sandbox: bool = False
+    """True if the secrets in ``environment`` are handed into a sandbox (the
+    agent's model credential, ADR-0006). They must then be distinct from every
+    other adapter's secrets, by name and by value."""
 
 
 Parser = Callable[[Options, BuildContext], Plan]
@@ -185,7 +191,9 @@ def build(
 ) -> Components:
     """Create every configured adapter. The caller owns the result and must close it."""
     blueprint = plan(config, registry=registry)
-    secrets = Secrets(os.environ if environ is None else environ)
+    environment = os.environ if environ is None else environ
+    _check_sandbox_secrets_by_value(blueprint.plans, environment)
+    secrets = Secrets(environment)
     created: dict[str, object] = {}
     closers: list[Callable[[], None]] = []
     try:
@@ -204,6 +212,13 @@ def build(
             for note in getattr(cleanup, "__notes__", ()):
                 error.add_note(secrets.redact(note))
         raise
+    provider = blueprint.target.repository.provider
+    if created["source_control"].name != provider:  # type: ignore[attr-defined]
+        close_all(list(reversed(closers)))
+        raise ConfigError(
+            "[adapters.source_control] the adapter's name does not match the provider "
+            f"'{provider}' of its target repository"
+        )
     context = blueprint.context
     return Components(
         instance_id=context.instance_id,
@@ -236,6 +251,8 @@ def _context(config: IlmarConfig) -> BuildContext:
         layout = WorkspaceLayout.under(config.state_dir)
     except ValueError as error:
         raise ConfigError(f"[ilmar] state_dir: {error}") from None
+    if config.source is not None:
+        _check_trusted_file(config.source)
     if config.source is not None and _inside(config.source, layout.workspaces_root):
         raise ConfigError(
             "the configuration file must not live under the workspaces directory, where "
@@ -268,6 +285,7 @@ def _check_combinations(
             f"{runtime} cannot enforce the {sandbox.network.value} network the agent "
             f"'{kinds['agent_runner']}' needs (for podman: set proxy_image)"
         )
+    _check_sandbox_secrets_by_name(plans)
     tasks = plans["task_provider"].task_repository
     if tasks is not None and tasks != target.repository:
         raise ConfigError(
@@ -277,16 +295,49 @@ def _check_combinations(
     return target, sandbox
 
 
+def _check_sandbox_secrets_by_name(plans: Mapping[str, Plan]) -> None:
+    inside = {name for p in plans.values() if p.enters_sandbox for name in p.environment}
+    outside = {name for p in plans.values() if not p.enters_sandbox for name in p.environment}
+    shared = sorted(inside & outside)
+    if shared:
+        raise ConfigError(
+            f"{', '.join(shared)} would be handed into the agent sandbox and is also a "
+            "task-tracker or source-control credential (ADR-0006); use separate variables"
+        )
+
+
+def _check_sandbox_secrets_by_value(plans: Mapping[str, Plan], environ: Mapping[str, str]) -> None:
+    def values(enters: bool) -> dict[str, str]:
+        return {
+            name: environ[name]
+            for p in plans.values()
+            if p.enters_sandbox is enters
+            for name in p.environment
+            if environ.get(name)
+        }
+
+    outside = values(False)
+    for name, value in values(True).items():
+        same = sorted(other for other, secret in outside.items() if secret == value)
+        if same:
+            raise ConfigError(
+                f"{name} holds the same value as {', '.join(same)}: a task-tracker or "
+                "source-control credential must never enter the agent sandbox (ADR-0006)"
+            )
+
+
 def _create(port: str, kind: str, step: Plan, secrets: Secrets) -> object:
     try:
         return step.create(secrets)
     except ConfigError as error:
         raise ConfigError(secrets.redact(str(error))) from None
-    except (ValueError, OSError, IlmarError) as error:
-        # Adapter errors may quote what they were given; a secret never survives.
-        detail = secrets.redact(str(error)) or type(error).__name__
+    except Exception as error:  # any adapter error may quote a secret
+        # Adapter errors may quote what they were given; a secret never survives,
+        # and nothing chained to this error carries the original text.
+        detail = secrets.redact(str(error)) or "no detail"
         raise ConfigError(
-            f"[adapters.{port}] kind '{kind}' could not be created: {detail}"
+            f"[adapters.{port}] kind '{kind}' could not be created "
+            f"({type(error).__name__}): {detail}"
         ) from None
 
 
@@ -301,15 +352,91 @@ def _closer(close: Callable[[Any], None], adapter: object, secrets: Secrets) -> 
 
 
 def _check_port(port: str, kind: str, adapter: object) -> None:
+    """Fail closed unless ``adapter`` can be used as the port's protocol.
+
+    Beyond the member names: properties must be readable (``name`` a non-empty
+    string), methods callable, and every parameter the port passes accepted
+    under the same name and kind, with no extra required parameter.
+    """
     protocol = _PORTS[port]
-    missing = [
-        name for name in vars(protocol) if not name.startswith("_") and not hasattr(adapter, name)
-    ]
-    if missing:
+    problems: list[str] = []
+    for member, declared in vars(protocol).items():
+        if member.startswith("_"):
+            continue
+        if isinstance(declared, property):
+            try:
+                value = getattr(adapter, member)
+            except Exception:  # reported as a problem
+                problems.append(f"{member} is not readable")
+                continue
+            if member == "name" and (not isinstance(value, str) or not value):
+                problems.append("name is not a non-empty string")
+            continue
+        if not callable(declared):
+            continue
+        actual = getattr(adapter, member, None)
+        if actual is None:
+            problems.append(f"{member} is missing")
+        elif not callable(actual):
+            problems.append(f"{member} is not callable")
+        else:
+            problem = _signature_problem(member, declared, actual)
+            if problem:
+                problems.append(problem)
+    if problems:
         raise ConfigError(
             f"[adapters.{port}] kind '{kind}' built something that is not a "
-            f"{protocol.__name__} (missing: {', '.join(sorted(missing))})"
+            f"{protocol.__name__}: {'; '.join(sorted(problems))}"
         )
+
+
+def _signature_problem(member: str, declared: Callable[..., Any], actual: Any) -> str | None:
+    try:
+        expected = list(inspect.signature(declared).parameters.values())[1:]  # without self
+        offered = inspect.signature(actual).parameters
+    except (TypeError, ValueError):
+        return f"{member} has no inspectable signature"
+    takes_any_keyword = any(p.kind is p.VAR_KEYWORD for p in offered.values())
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    for parameter in expected:
+        other = offered.get(parameter.name)
+        if other is None:
+            if takes_any_keyword and parameter.kind is parameter.KEYWORD_ONLY:
+                continue
+            return f"{member} does not accept {parameter.name}"
+        if parameter.kind is parameter.KEYWORD_ONLY and other.kind not in (
+            other.KEYWORD_ONLY,
+            other.POSITIONAL_OR_KEYWORD,
+        ):
+            return f"{member} must accept {parameter.name} by keyword"
+        if parameter.kind in positional and other.kind not in positional:
+            return f"{member} must accept {parameter.name} positionally"
+    names = {p.name for p in expected}
+    extra = [
+        p.name
+        for p in offered.values()
+        if p.default is p.empty
+        and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+        and p.name not in names
+    ]
+    if extra:
+        return f"{member} requires {', '.join(extra)}, which the port never passes"
+    return None
+
+
+def _check_trusted_file(path: Path) -> None:
+    """The verification policy is only as trustworthy as whoever can write the file."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return  # parsed from data; nothing on disk to trust or distrust
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ConfigError(
+            "the configuration file must not be writable by group or others: it defines "
+            "the verification policy (ADR-0018, ADR-0019)"
+        )
+    if info.st_uid not in {os.geteuid(), 0}:
+        raise ConfigError("the configuration file must be owned by this user or root")
 
 
 def _inside(path: Path, root: Path) -> bool:

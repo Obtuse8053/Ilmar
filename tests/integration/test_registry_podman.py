@@ -10,6 +10,7 @@ are only constructed.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -167,3 +168,27 @@ def test_a_wrong_podman_binary_fails_closed_without_leaking(tmp_path: Path) -> N
         build(load_config(path), environ=ENVIRON)
     assert "not found" in str(info.value)
     assert SECRET not in str(info.value)
+
+
+def test_a_bare_podman_name_resolves_only_through_absolute_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adversarial review of 60067d8: a planted podman on a relative PATH entry is ignored."""
+    planted = tmp_path / "checkout"
+    planted.mkdir()
+    fake = planted / "podman"
+    fake.write_text("#!/bin/sh\necho planted >&2\nexit 1\n")
+    fake.chmod(0o755)
+    monkeypatch.chdir(planted)
+    monkeypatch.setenv("PATH", f".{os.pathsep}{os.environ['PATH']}")
+    path = toml(tmp_path, proxy_image=PROXY_IMAGE)
+    path.write_text(path.read_text().replace(f'podman = "{PODMAN}"', 'podman = "podman"'))
+    with build(load_config(path), environ=ENVIRON) as components:
+        components.layout.workspaces_root.mkdir(parents=True)
+        assert components.container_runtime._podman == str(Path(PODMAN or "").resolve())  # type: ignore[attr-defined]
+        runtime = components.container_runtime
+        handle = runtime.start(spec(components, "reg1", agent=False))
+        try:
+            assert runtime.run(handle, ["true"], timeout_seconds=60).exit_code == 0
+        finally:
+            runtime.stop(handle, owner=ResourceOwner(INSTANCE, "reg1", 1, token="tok-reg1"))

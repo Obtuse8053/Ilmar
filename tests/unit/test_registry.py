@@ -525,3 +525,137 @@ def test_inline_secrets_are_still_rejected_by_the_loader(tmp_path: Path, secret_
     options(raw, "task_provider")[secret_like] = "literal"
     with pytest.raises(ConfigError, match="looks like a secret"):
         config(raw, tmp_path)
+
+
+# -- adversarial review of 60067d8 -------------------------------------------------------
+
+
+@pytest.mark.parametrize("error", ["TypeError", "KeyError"])
+def test_any_creation_error_is_redacted_and_cleaned_up(
+    tmp_path: Path, fakes_registry: Registry, error: str
+) -> None:
+    raw = fake_data(
+        task_provider={"secret_env": "GITHUB_TOKEN"},
+        container_runtime={"error": error, "secret_env": "GITHUB_TOKEN"},
+    )
+    with pytest.raises(ConfigError) as info:
+        build(config(raw, tmp_path), environ=ENVIRON, registry=fakes_registry)
+    assert GITHUB_SECRET not in str(info.value)
+    assert f"({error})" in str(info.value)
+    assert info.value.__cause__ is None
+    assert info.value.__suppress_context__
+    assert registry_fakes.EVENTS[-2:] == ["close source_control", "close task_provider"]
+
+
+def test_the_model_credential_variable_cannot_be_a_tracker_or_scm_credential(
+    tmp_path: Path,
+) -> None:
+    raw = data()
+    options(raw, "agent_runner")["api_key_env"] = "GITHUB_TOKEN"
+    message = plan_error(raw, tmp_path)
+    assert "GITHUB_TOKEN would be handed into the agent sandbox" in message
+
+
+def test_the_model_credential_value_cannot_be_a_tracker_or_scm_credential(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    same = {"GITHUB_TOKEN": GITHUB_SECRET, "ANTHROPIC_API_KEY": GITHUB_SECRET}
+    with pytest.raises(ConfigError) as info:
+        build(config(data(tools), tmp_path), environ=same)
+    assert "ANTHROPIC_API_KEY holds the same value as GITHUB_TOKEN" in str(info.value)
+    assert GITHUB_SECRET not in str(info.value)
+    assert not (tmp_path / "state").exists()  # refused before anything was created
+
+
+def test_a_relative_path_entry_cannot_supply_the_podman_binary(
+    tmp_path: Path, tools: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running from a repository checkout with "." on PATH must not pick up its podman."""
+    planted = tmp_path / "checkout"
+    planted.mkdir()
+    script = planted / "podman"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    monkeypatch.chdir(planted)
+    monkeypatch.setenv("PATH", ".")
+    raw = data(tools)
+    options(raw, "container_runtime")["podman"] = "podman"
+    with pytest.raises(ConfigError, match="not found on an absolute PATH entry"):
+        build(config(raw, tmp_path), environ=ENVIRON)
+
+
+def test_relative_executable_paths_are_refused(tmp_path: Path) -> None:
+    raw = data()
+    options(raw, "container_runtime")["podman"] = "bin/podman"
+    assert "bare name or an absolute path" in plan_error(raw, tmp_path)
+
+
+def test_an_executable_resolving_into_a_workspace_is_refused(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    workspace = tmp_path / "state" / "workspaces" / "e1" / "1" / "agent"
+    workspace.mkdir(parents=True)
+    agent_written = workspace / "podman"
+    agent_written.write_text("#!/bin/sh\nexit 0\n")
+    agent_written.chmod(0o755)
+    link = tmp_path / "bin" / "podman-link"
+    link.symlink_to(agent_written)
+    raw = data(tools)
+    options(raw, "container_runtime")["podman"] = str(link)
+    with pytest.raises(ConfigError, match="resolves under the workspaces directory"):
+        build(config(raw, tmp_path), environ=ENVIRON)
+
+
+@pytest.mark.parametrize(
+    ("shape", "problem"),
+    [
+        ("name-method", "name is not a non-empty string"),
+        ("missing-argument", "run does not accept timeout_seconds"),
+        ("extra-required", "stop requires force"),
+        ("positional-timeout", "run must accept timeout_seconds by keyword"),
+        ("not-callable", "is_running is not callable"),
+    ],
+)
+def test_ports_are_checked_beyond_member_names(
+    tmp_path: Path, fakes_registry: Registry, shape: str, problem: str
+) -> None:
+    raw = fake_data(container_runtime={"shape": shape})
+    with pytest.raises(ConfigError, match="not a ContainerRuntime") as info:
+        build(config(raw, tmp_path), environ={}, registry=fakes_registry)
+    assert problem in str(info.value)
+    assert "close container_runtime" in registry_fakes.EVENTS
+
+
+def test_every_built_in_adapter_passes_the_deep_port_check(built: Components) -> None:
+    assert built.source_control.name == built.target.repository.provider
+
+
+def test_the_source_control_must_own_its_target(tmp_path: Path, fakes_registry: Registry) -> None:
+    raw = fake_data(source_control={"target_provider": "github"})
+    with pytest.raises(ConfigError, match="does not match the provider 'github'"):
+        build(config(raw, tmp_path), environ={}, registry=fakes_registry)
+    assert registry_fakes.EVENTS[-1] == "close task_provider"
+
+
+def test_a_group_or_world_writable_configuration_is_refused(tmp_path: Path) -> None:
+    source = tmp_path / "ilmar.toml"
+    source.write_text("")
+    source.chmod(0o664)
+    with pytest.raises(ConfigError, match="writable by group or others"):
+        plan(config(data(), tmp_path, source=source))
+    source.chmod(0o644)
+    plan(config(data(), tmp_path, source=source))
+
+
+def test_a_configuration_owned_by_someone_else_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "ilmar.toml"
+    source.write_text("")
+    source.chmod(0o644)
+    if os.geteuid() == 0:  # root-owned files are trusted, so give it a stranger as owner
+        os.chown(source, 4242, -1)
+    owner = source.stat().st_uid
+    monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+    with pytest.raises(ConfigError, match="owned by this user or root"):
+        plan(config(data(), tmp_path, source=source))

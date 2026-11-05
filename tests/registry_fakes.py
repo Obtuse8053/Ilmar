@@ -7,7 +7,12 @@ Each parser builds a fake from ``tests/fakes.py`` and records what happens in
 * ``fail = true``: ``create`` raises, quoting the secret if one was read;
 * ``close_fails = true``: closing raises, quoting the secret;
 * ``secret_env``: the variable whose value ``create`` reads;
-* ``not_a_port = true``: ``create`` returns something that is not an adapter.
+* ``not_a_port = true``: ``create`` returns something that is not an adapter;
+* ``error = "TypeError"``: ``create`` raises that type, quoting the secret;
+* ``shape``: the container runtime is built with a broken interface
+  (``name-method``, ``missing-argument``, ``extra-required``,
+  ``positional-timeout``, ``not-callable``);
+* ``target_provider``: the source control's target belongs to that provider.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ def _plan(options: Options, port: str, make: Any, **facts: Any) -> Plan:
     fail = options.boolean("fail", False)
     close_fails = options.boolean("close_fails", False)
     not_a_port = options.boolean("not_a_port", False)
+    error = options.optional_string("error")
     secret_env = options.optional_string("secret_env")
 
     seen: dict[str, str] = {}
@@ -53,6 +59,9 @@ def _plan(options: Options, port: str, make: Any, **facts: Any) -> Plan:
         if fail:
             EVENTS.append(f"fail {port}")
             raise ValueError(f"{port} rejected credential {secret}")
+        if error:
+            EVENTS.append(f"fail {port}")
+            raise {"TypeError": TypeError, "KeyError": KeyError}[error](f"bad {secret}")
         EVENTS.append(f"create {port}")
         return object() if not_a_port else make()
 
@@ -74,13 +83,49 @@ def task_provider(options: Options, context: BuildContext) -> Plan:
 
 
 def source_control(options: Options, context: BuildContext) -> Plan:
-    target = Target(RepositoryRef("fake", "owner/repo"), "main")
+    provider = options.string("target_provider", "fake")
+    target = Target(RepositoryRef(provider, "owner/repo"), "main")
     return _plan(options, "source_control", FakeSourceControl, target=target)
 
 
 def container_runtime(options: Options, context: BuildContext) -> Plan:
     networks = frozenset({NetworkPolicy.NONE, NetworkPolicy.ALLOWLIST})
-    return _plan(options, "container_runtime", FakeContainerRuntime, networks=networks)
+    shape = options.optional_string("shape")
+    make = SHAPES[shape] if shape else FakeContainerRuntime
+    return _plan(options, "container_runtime", make, networks=networks)
+
+
+class _NameMethod(FakeContainerRuntime):
+    def name(self) -> str:  # type: ignore[override]
+        return "fake"
+
+
+class _MissingArgument(FakeContainerRuntime):
+    def run(self, handle: Any, argv: Any) -> Any:  # type: ignore[override]
+        raise AssertionError("never called")
+
+
+class _ExtraRequired(FakeContainerRuntime):
+    def stop(self, handle: Any, *, owner: Any, force: bool) -> None:  # type: ignore[override]
+        raise AssertionError("never called")
+
+
+class _PositionalTimeout(FakeContainerRuntime):
+    def run(self, handle: Any, argv: Any, timeout_seconds: float, /, env: Any = None) -> Any:  # type: ignore[override]
+        raise AssertionError("never called")
+
+
+class _NotCallable(FakeContainerRuntime):
+    is_running = True  # type: ignore[assignment]
+
+
+SHAPES: dict[str, Any] = {
+    "name-method": _NameMethod,
+    "missing-argument": _MissingArgument,
+    "extra-required": _ExtraRequired,
+    "positional-timeout": _PositionalTimeout,
+    "not-callable": _NotCallable,
+}
 
 
 def agent_runner(options: Options, context: BuildContext) -> Plan:

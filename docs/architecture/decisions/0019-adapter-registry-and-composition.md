@@ -67,9 +67,17 @@ One phase or two:
   `ilmar config validate` runs it. `--check-environment` additionally reports
   which named variables are set, by name only.
 - **`build(config, environ)`** runs `plan`, then creates the adapters in port
-  order. After creating each adapter, it checks that the object has every
-  member of its port's protocol. It returns `Components`, which the caller
-  owns:
+  order. After creating each adapter, it checks that the object can serve
+  as its port:
+  - every member of the port's protocol is present;
+  - properties are readable, and `name` is a non-empty string;
+  - methods are callable;
+  - every parameter the port passes is accepted under the same name and
+    kind (keyword-only stays accepted by keyword);
+  - no extra required parameter exists.
+
+  The source-control adapter's `name` must equal its target's provider. It
+  returns `Components`, which the caller owns:
   - `close()` releases every resource in reverse order, exactly once;
   - every closer is called even if one fails, and the failures are reported
     together;
@@ -79,12 +87,22 @@ One phase or two:
   reverse order before the error propagates. A failure during that cleanup is
   attached to the original error as a note and never replaces it.
 - **Secrets.** Secrets are read only in `create`, through `Secrets.get`, from
-  variables named by `*_env` options (ADR-0007). Error messages:
-  - name sections, keys and variables, never configured values;
-  - have every secret value read so far replaced by `[redacted]` before
-    they are raised, including cleanup notes;
-  - raise adapter errors `from None`, so no chained traceback carries the
+  variables named by `*_env` options (ADR-0007). Errors:
+  - the registry's own messages name sections, keys and variables, never
+    configured values. Validation messages from adapters may quote a
+    non-secret value; secrets cannot be in options;
+  - *every* exception from `create`, of any type, becomes a `ConfigError`
+    naming the original type. Every secret value read so far is replaced by
+    `[redacted]`, including in cleanup notes;
+  - errors are raised `from None`, so no chained traceback carries the
     original text.
+- **The agent's credential stays separate (ADR-0006).** A plan marks secrets
+  that are handed into a sandbox (`enters_sandbox`), which today is the model
+  credential. Such a variable must not also be a task-tracker or
+  source-control variable: `plan` checks this by name. `build` checks, before
+  creating anything, that its *value* differs from every other secret's.
+  Otherwise a configuration slip would put the GitHub token into the agent
+  sandbox.
 
   `Components.__repr__` shows no adapter internals.
 - **Fail-closed rules.**
@@ -100,9 +118,16 @@ One phase or two:
   - `[ilmar] instance_id` must be a safe identifier.
   - The execution store must not be under `workspaces/`, where agents and
     verification checkouts write.
-  - The configuration file itself must not be under `workspaces/`, so the
-    verification policy always comes from operator-controlled configuration,
-    never from a candidate (ADR-0018).
+  - The configuration file itself must not be under `workspaces/`. It must
+    not be writable by group or others, and must be owned by the running
+    user or root. The verification policy therefore always comes from
+    operator-controlled configuration, never from a candidate or another
+    local user (ADR-0018).
+  - Host executables (`podman`, `git`) are a bare name or an absolute
+    path. Bare names are looked up on *absolute* `PATH` entries only, so a
+    `.` entry cannot pick up a program planted in a repository checkout.
+    The result is resolved once, at `build`. It must not lie under
+    `workspaces/`, including through a symlink.
 - **Nothing that weakens the sandbox is configurable.**
   - The Podman options are the binary, `proxy_image`, `egress_network`,
     default `cpus`, `memory_mb` and `max_processes`, and `tmpfs_mb`.
@@ -151,6 +176,19 @@ One phase or two:
   - an unknown kind, a missing module, a non-parser and a parser returning no
     plan;
   - a missing secret named without values;
+  - adversarial cases:
+    - errors of any type redacted;
+    - a model-credential variable, or value, shared with a tracker or SCM
+      credential;
+    - a planted `podman` reached through a relative `PATH` entry;
+    - relative executable paths;
+    - an executable that resolves into a workspace through a symlink;
+    - five broken interface shapes;
+    - a source-control adapter that does not own its target;
+    - a group-writable or foreign-owned configuration file.
+
+    Mutation checks: each of these fixes, reverted on its own, fails at
+    least one test;
   - lifecycle, with fake parsers: reverse cleanup after a failure part-way;
     a failing cleanup kept as a redacted note; a non-adapter refused and
     cleaned up; `close()` reaching every resource, once, even when one
@@ -175,10 +213,21 @@ One phase or two:
   - Partial initialisation cannot leak resources, and errors cannot leak
     secrets that went through `Secrets`.
 - Bad:
-  - Redaction only covers secrets read through `Secrets`. An adapter that
-    reads a secret any other way is not covered.
-  - Port conformance is checked by member names, not signatures. mypy
-    covers the built-in kinds.
+  - Redaction only covers secrets read through `Secrets`, in the exact form
+    read. An adapter that reads a secret another way, or a message that
+    contains a transformed secret (base64 in an HTTP header, for example),
+    is not covered. The built-in adapters never put those into errors.
+  - The port check covers presence, kind and parameters, not types or
+    behaviour. The contract suites and mypy cover the built-in kinds.
+  - Some settings are trusted, not checked:
+    - the `podman` and `git` binaries and the proxy image (a permissive
+      proxy image would defeat the allow-list);
+    - the GitHub URLs, which receive the token;
+    - `base_url`, whose host the agent sandbox may reach.
+
+    They are the operator's, in a file only the operator can write.
+  - Executables are resolved once, at `build`. Replacing the binary at that
+    path afterwards is outside Ilmar's control.
   - Widening the agent sandbox (for example, a package registry the agent
     needs) is impossible without a code change. That is deliberate for now.
   - Strictness rejects configuration files written for newer versions
@@ -191,3 +240,6 @@ One phase or two:
   an explicit, reviewed opt-in, not a free-form list.
 - Tasks and changes must live in different repositories.
 - Several coordinators share one host or state directory.
+- A command that changes anything (`ilmar run`, #11) is added. It must take
+  an explicit configuration path, not default to `./ilmar.toml` in the
+  working directory, which may be a repository checkout.
