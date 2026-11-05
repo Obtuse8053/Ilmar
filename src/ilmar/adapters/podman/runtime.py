@@ -135,11 +135,24 @@ class Completed:
     timed_out: bool = False
 
 
+ENV_LOADER = (
+    'while IFS= read -r line && [ -n "$line" ]; do export "$line" || exit 125; done; exec "$@"'
+)
+"""Reads ``NAME=value`` lines from stdin up to an empty line, exports each, then runs
+the command. Values are expanded, never re-parsed: no quoting or eval is involved."""
+
+
+def env_stream(env: Mapping[str, str]) -> bytes:
+    """The loader's input. Names and single-line values are checked by the caller."""
+    return ("".join(f"{key}={value}\n" for key, value in env.items()) + "\n").encode()
+
+
 class Executor(Protocol):
     """Runs ``argv`` with exactly ``env`` and a timeout in seconds.
 
     ``pass_fds`` are inherited by the child under the same numbers: how values
-    reach ``--env-file /dev/fd/N`` without a file on disk.
+    reach ``--env-file /dev/fd/N`` without a file on disk. ``stdin`` is written
+    to the child's standard input, which is then closed (``None``: no input).
     """
 
     def __call__(
@@ -149,6 +162,7 @@ class Executor(Protocol):
         timeout: float,
         *,
         pass_fds: Sequence[int] = (),
+        stdin: bytes | None = None,
     ) -> Completed: ...
 
 
@@ -196,6 +210,7 @@ def subprocess_executor(
     timeout: float,
     *,
     pass_fds: Sequence[int] = (),
+    stdin: bytes | None = None,
     output_limit: int = OUTPUT_LIMIT_BYTES,
 ) -> Completed:
     """Run a command in its own process group; on timeout, kill the whole group.
@@ -207,7 +222,7 @@ def subprocess_executor(
         process = subprocess.Popen(  # noqa: S603 - argv is built by this adapter
             list(argv),
             env=dict(env),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -218,6 +233,11 @@ def subprocess_executor(
     if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE was requested
         raise ProviderError(f"cannot read the output of {argv[0]}")
     captures = (_Capture(process.stdout, output_limit), _Capture(process.stderr, output_limit))
+    if stdin is not None and process.stdin is not None:
+        with contextlib.suppress(BrokenPipeError):  # the command may not read it all
+            process.stdin.write(stdin)
+        with contextlib.suppress(BrokenPipeError):
+            process.stdin.close()
     deadline = time.monotonic() + timeout
     timed_out = False
     try:
@@ -464,13 +484,22 @@ class PodmanRuntime:
             raise ProviderError(f"container is not running: {handle.name}")
 
         began = self._clock()
-        with self._env_file(command_env) as (env_file, fds):
-            options = ["--env-file", env_file] if env_file else []
+        if command_env:
+            # Never `podman exec --env`/`--env-file`: Podman records an exec
+            # session's environment in its state database on disk (found on real
+            # Podman, review of PR #50). The values go through the command's
+            # stdin instead, which Podman streams and never records, and a POSIX
+            # sh loader exports them before exec-ing the command.
             done = self._executor(
-                [self._podman, "exec", *options, container_id, *argv],
+                [self._podman, "exec", "--interactive", container_id,
+                 "/bin/sh", "-c", ENV_LOADER, "ilmar-env", *argv],
                 self._environ,
                 timeout_seconds,
-                pass_fds=fds,
+                stdin=env_stream(command_env),
+            )  # fmt: skip
+        else:
+            done = self._executor(
+                [self._podman, "exec", container_id, *argv], self._environ, timeout_seconds
             )
         duration = max(0.0, self._clock() - began)
         if done.timed_out:

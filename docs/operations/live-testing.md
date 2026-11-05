@@ -18,12 +18,17 @@ end-to-end tests** (#11d).
     issue. Nothing existing is rewritten or force-pushed.
   - Everything a run made is closed or deleted afterwards. To keep it for
     inspection, set `ILMAR_LIVE_KEEP=1`.
-- **Restricted credentials, checked before anything is written:**
-  - the token is fine-grained (`github_pat_…`) and expires within 7 days;
-  - it cannot see a private repository outside the disposable one;
-  - it has no Administration and no Actions permission;
-  - it cannot write workflow files. This is probed with one attempted write
-    to a throwaway branch, deleted right away.
+- **Restricted credentials, checked before anything is written.** Too
+  much permission and too little are both refused, and an unclear answer
+  is never taken as "not granted". The token must:
+  - be fine-grained (`github_pat_…`) and expire within 7 days;
+  - be unable to see the private canary repository;
+  - have no Administration, Actions, Secrets or Webhooks permission
+    (each probe must get 403 or 404; anything else stops the run);
+  - be able to read issues and pull requests;
+  - on a throwaway branch, deleted afterwards: write a harmless file and
+    open (then close) a pull request, and have a workflow-file write
+    refused. A refusal counts only after the harmless write succeeded.
 - **Credentials never leak:**
   - Credentials are read only from the environment, wrapped so that they
     never print, and handed to the CLI only through its environment.
@@ -35,7 +40,23 @@ end-to-end tests** (#11d).
     - any process's command line during the run.
   - They also fail if the GitHub token is in any container's definition, or
     the model key in any container other than the agent's.
+  - They also fail if any process other than the coordinator and git holds
+    the GitHub token in its environment.
+  - 20-character fragments of each credential count as leaks too. Tools
+    record keys that way: Claude Code keeps the last 20 characters of
+    approved keys.
+- **Nothing is left behind, even on failure.** After every run, passed or
+  failed:
+  - every container and network of the run's instance is removed, so no
+    sandbox keeps a key in memory;
+  - any file found holding a credential is deleted and the test fails;
+  - the GitHub branch, label, issue and pull request are cleaned up.
+
+  After a pass, no process may still refer to the run's containers (for
+  example an orphaned `podman exec`).
 - **The agent reaches only the model API:**
+  - the agent's sandbox is attached to exactly one network, which is
+    internal;
   - the egress proxy allows exactly `api.anthropic.com`;
   - its log shows only that host, with no denials;
   - verification sandboxes have no network at all.
@@ -53,6 +74,45 @@ end-to-end tests** (#11d).
 
 Each passing test writes a JSON record, without credentials, to
 `$ILMAR_LIVE_REPORT_DIR`.
+
+## Quick start: two commands
+
+Linux with rootless Podman, Python 3.11+, git, and the `gh` CLI logged in as
+you (`gh auth login`). From a checkout of this repository:
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
+
+python3 scripts/live_setup.py --claude-version <x.y.z>   # once
+python3 scripts/live_run.py --post                       # each time
+```
+
+**`live_setup.py`** never sees a credential. It:
+- checks the host;
+- creates `<you>/ilmar-disposable` (private, with the topic) and the private
+  canary `<you>/ilmar-outside-canary` if missing. It refuses, and never
+  changes, an existing public one;
+- pulls the proxy image and builds the pinned Claude Code image;
+- writes the non-secret settings to `~/.config/ilmar-live/settings.env`
+  (mode 0600);
+- prints a **pre-filled link** for the GitHub token and the steps for the
+  Anthropic key. In the token form, the only thing to choose is
+  *Repository access → Only select repositories → `ilmar-disposable`*;
+  GitHub cannot pre-fill that.
+
+**`live_run.py`**:
+- asks for the two credentials with hidden input. They exist only in its
+  memory and in the environment of the test process: never in argv, a file,
+  the shell history or the output;
+- runs #44, then, only if #44 passed, the live end-to-end tests;
+- with `--post`, posts the credential-free records on #44 and #11 using
+  your `gh` login;
+- ignores `PYTEST_ADDOPTS` and the project's pytest options, so nothing can
+  add `--showlocals`.
+
+Afterwards, revoke the token and the key, or let them expire.
+
+The rest of this page explains each step, for review or a manual run.
 
 ## One-time setup
 
@@ -174,7 +234,9 @@ pytest -m integration -v -rs --tb=short tests/integration/test_live_end_to_end.p
 ```
 
 To give Claude Code more time before the kill, set
-`ILMAR_LIVE_CRASH_DELAY=<seconds>` (default 8).
+`ILMAR_LIVE_CRASH_DELAY=<seconds>`. The drill kills the coordinator this many seconds
+(default 2) after Claude Code first reaches the model, while the agent run is still in
+progress.
 
 Post the records on #11:
 

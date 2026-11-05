@@ -201,21 +201,56 @@ def test_values_travel_in_memory_never_in_argv_or_on_disk(
     spool.mkdir()
     monkeypatch.setenv("TMPDIR", str(spool))
     rt = runtime(layout, podman)
-    handle = rt.start(spec(workspace, env={"ANTHROPIC_API_KEY": "sk-model"}))
-    rt.run(handle, ["echo", "x"], timeout_seconds=5, env={"STEP": "two"})
+    handle = rt.start(spec(workspace, env={"PROFILE": "sandbox"}))
+    rt.run(handle, ["echo", "x"], timeout_seconds=5, env={"ANTHROPIC_API_KEY": "sk-model"})
     started = next(c for c in podman.calls if c.argv[1] == "run")
     executed = next(c for c in podman.calls if c.argv[1] == "exec")
-    assert started.env_file == {"HOME": "/home/ilmar", "ANTHROPIC_API_KEY": "sk-model"}
-    assert executed.env_file == {"STEP": "two"}
+    # The container's own environment: a memfd env file (it becomes part of the
+    # container's definition, so ContainerSpec.env never carries a secret).
+    assert started.env_file == {"HOME": "/home/ilmar", "PROFILE": "sandbox"}
+    env_file = started.argv[started.argv.index("--env-file") + 1]
+    assert env_file.startswith("/dev/fd/")
+    assert len(started.pass_fds) == 1
+    # A command's environment: stdin to an in-container loader, never --env or
+    # --env-file, which Podman records in its state database (review of PR #50).
+    assert executed.command_env == {"ANTHROPIC_API_KEY": "sk-model"}
+    assert executed.argv[2:3] == ["--interactive"]
+    assert "--env-file" not in executed.argv
+    assert executed.pass_fds == ()
     for call in podman.calls:
-        assert not any("sk-model" in arg or arg == "two" for arg in call.argv)
-    for call in (started, executed):
-        env_file = call.argv[call.argv.index("--env-file") + 1]
-        assert env_file.startswith("/dev/fd/")  # an inherited descriptor, not a path
-        assert len(call.pass_fds) == 1
+        assert not any("sk-model" in arg for arg in call.argv)
     open_memory = [link for link in _open_descriptors() if "ilmar-env" in link]
     assert open_memory == []  # every descriptor was closed right after use
     assert list(spool.iterdir()) == []  # nothing was ever written to disk
+
+
+def test_the_env_loader_exports_values_verbatim_without_evaluating_them(tmp_path: Path) -> None:
+    """The real loader in a real POSIX sh: hostile values stay data."""
+    import subprocess
+
+    from ilmar.adapters.podman.runtime import ENV_LOADER, env_stream
+
+    hostile = {"A": "$(touch pwned) `touch pwned2` ; rm -rf / # ' \" \\ *", "B": "=x=y", "C": ""}
+    done = subprocess.run(  # noqa: S603 - a fixed program
+        ["/bin/sh", "-c", ENV_LOADER, "ilmar-env", "/usr/bin/env"],
+        input=env_stream(hostile), capture_output=True, cwd=tmp_path, check=False,
+        env={"PATH": "/usr/bin:/bin"},
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    exported = dict(line.split("=", 1) for line in done.stdout.decode().splitlines())
+    assert {k: exported[k] for k in hostile} == hostile
+    assert list(tmp_path.iterdir()) == []  # nothing was executed
+
+
+def test_a_command_without_values_runs_as_before(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    rt.run(handle, ["echo", "x"], timeout_seconds=5)
+    executed = next(c for c in podman.calls if c.argv[1] == "exec")
+    assert "--interactive" not in executed.argv
+    assert executed.stdin is None
 
 
 def _open_descriptors() -> list[str]:

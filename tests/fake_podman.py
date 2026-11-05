@@ -54,6 +54,9 @@ class Call:
     timeout: float
     env_file: dict[str, str] | None = None
     pass_fds: tuple[int, ...] = ()
+    stdin: bytes | None = None
+    command_env: dict[str, str] | None = None
+    """What the in-container loader exported from stdin (``podman exec`` only)."""
 
 
 @dataclass
@@ -97,10 +100,11 @@ class FakePodman:
         timeout: float,
         *,
         pass_fds: Sequence[int] = (),
+        stdin: bytes | None = None,
     ) -> Completed:
         args = list(argv)
         assert args[0] == PODMAN, args
-        call = Call(args, dict(env), timeout, pass_fds=tuple(pass_fds))
+        call = Call(args, dict(env), timeout, pass_fds=tuple(pass_fds), stdin=stdin)
         self.calls.append(call)
         command, rest = args[1], args[2:]
         if command == "info":
@@ -271,9 +275,18 @@ class FakePodman:
         return Completed(125, "", f"Error: unsupported network action {action}\n")
 
     def _exec(self, rest: list[str], call: Call, timeout: float) -> Completed:
-        _read_env_file(rest, call)
-        if rest[0] == "--env-file":
-            rest = rest[2:]
+        recorded = "podman records exec environments on disk: values must go through stdin"
+        assert "--env-file" not in rest, recorded
+        assert "--env" not in rest, recorded
+        if rest[0] == "--interactive":
+            rest = rest[1:]
+            container_id, loader = rest[0], rest[1:5]
+            assert loader[:2] == ["/bin/sh", "-c"], loader
+            assert loader[3] == "ilmar-env", loader
+            assert call.stdin is not None
+            lines = call.stdin.decode().split("\n")
+            call.command_env = dict(line.split("=", 1) for line in lines[: lines.index("")])
+            rest = [container_id, *rest[5:]]
         container = self.containers.get(rest[0])
         if container is None or not container.running:
             return Completed(125, "", "Error: no such container\n")
