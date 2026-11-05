@@ -51,12 +51,36 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#11b (plan step 10b): the coordinator for one execution, written as a
-sequence of `Journal.perform` calls over the `Components` from ADR-0019,
-after #11a (ADR-0020) is merged. **Waiting for the maintainer's explicit
-go-ahead.**
+#11c (plan step 10c): crash recovery for every non-terminal state.
+- Reconcile unfinished operations by kind (ADR-0020, ADR-0021).
+- Add `SourceControlProvider.load_candidate`, checked against the freeze's
+  digest.
+- Clean up resources recorded as `INTENDED` or `ACTIVE`.
+- Lift ADR-0021's "unfinished operations block new work" rule for what it
+  reconciles.
+
+Only after #11b (ADR-0021) is merged. **Waiting for the maintainer's
+explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-05: #11b finished: one coordinator execution end to end
+  (ADR-0021, proposed).
+  - `ilmar run --once --config PATH`.
+  - The `Coordinator`, `ExecutionWorker` and `Effects` (the only core code
+    that changes the outside world; architecture-tested).
+  - Every step is journaled and fenced, and the published revision is
+    exactly the verified frozen candidate.
+  - Transient failures only are retried, with at most 3 attempts.
+  - The claim is kept while the change request is open, and released after
+    a merge or close (task completion) or on terminal failure.
+  - Successful workspaces are deleted; failed ones are kept.
+  - Exit codes 0, 1, 2, 3.
+  - New read-only port method `change_request_state`; a `run-agent`
+    operation kind; the Verifier writes evidence fenced.
+  - Real-Podman end-to-end test in CI.
+
+  Next recommended: #11c.
 
 - 2026-11-05: #11a finished: fencing, the write-ahead operation journal and
   the resource ledger (ADR-0020, accepted after an adversarial review on PR

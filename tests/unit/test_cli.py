@@ -83,3 +83,60 @@ def test_validate_requires_a_verification_policy(
     path.write_text(text.split("[verification]")[0])
     assert main(["config", "validate", str(path)]) == 1
     assert "[verification] is required" in capsys.readouterr().err
+
+
+def test_run_needs_an_explicit_configuration_and_once(capsys: pytest.CaptureFixture[str]) -> None:
+    for argv in (["run", "--once"], ["run", "--config", "ilmar.toml"]):
+        with pytest.raises(SystemExit) as info:
+            main(argv)
+        assert info.value.code == 2  # argparse usage error, before anything happens
+    capsys.readouterr()
+
+
+def test_run_with_an_invalid_configuration_exits_3(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "ilmar.toml"
+    path.write_text("[adapters.task_provider]\nkind = 'github'\n")
+    path.chmod(0o600)
+    assert main(["run", "--once", "--config", str(path)]) == 3
+    assert "error" in capsys.readouterr().err
+
+
+def test_run_on_a_locked_instance_exits_3_and_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import stat
+
+    from ilmar.core.layout import WorkspaceLayout
+    from ilmar.core.ownership import InstanceLock
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for name in ("podman", "git"):
+        (tools / name).write_text("#!/bin/sh\nexit 99\n")
+        (tools / name).chmod(stat.S_IRWXU)
+    text = (REPO_ROOT / "ilmar.example.toml").read_text()
+    text = text.replace('state_dir = ".ilmar"', f'state_dir = "{tmp_path / "state"}"')
+    text = text.replace('kind = "podman"\n', 'kind = "podman"\n', 1)
+    text = text.replace(
+        "options = { proxy_image", f'options = {{ podman = "{tools / "podman"}", proxy_image', 1
+    )
+    text = text.replace(
+        'base_branch = "main", token_env',
+        f'base_branch = "main", git = "{tools / "git"}", token_env',
+        1,
+    )
+    text = text.replace('path = ".ilmar/executions.sqlite3"', f'path = "{tmp_path / "db.sqlite3"}"')
+    config = tmp_path / "ilmar.toml"
+    config.write_text(text)
+    config.chmod(0o600)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-y")
+    (tmp_path / "state").mkdir()
+    held = InstanceLock.acquire(WorkspaceLayout.under((tmp_path / "state").resolve()))
+    try:
+        assert main(["run", "--once", "--config", str(config)]) == 3
+        assert "another coordinator" in capsys.readouterr().err
+    finally:
+        held.release()

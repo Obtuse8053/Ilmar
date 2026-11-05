@@ -16,7 +16,7 @@ import pytest
 
 from ilmar.adapters.github import GitHubClient
 from ilmar.adapters.github.source_control import GitHubSourceControl
-from ilmar.domain.changes import RepositoryRef
+from ilmar.domain.changes import ChangeRequest, RepositoryRef
 from ilmar.ports.source_control import SourceControlProvider
 
 from contracts.source_control import BASE_FILES, SourceControlContract
@@ -83,3 +83,11 @@ class TestGitHubSourceControlOnRealGit(SourceControlContract):
         self, provider: SourceControlProvider, repository: RepositoryRef, source_branch: str
     ) -> None:
         self._api.add_pull(source_branch, body="A human's pull request.")
+
+    def finish_change_request(
+        self, provider: SourceControlProvider, change_request: ChangeRequest, *, merged: bool
+    ) -> None:
+        pull = self._api.pulls[int(change_request.key)]
+        pull["state"] = "closed"
+        pull["merged"] = merged
+        pull["merged_at"] = "2026-11-05T12:00:00Z" if merged else None

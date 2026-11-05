@@ -74,6 +74,19 @@ class ChangeRequest:
     """All labels now on the change request, sorted."""
 
 
+class ChangeRequestState(enum.Enum):
+    """Where a change request stands on the platform (ADR-0021).
+
+    An execution *completes* when its change request is published; the task
+    *completes* only when the change request is merged.
+    """
+
+    OPEN = "open"
+    MERGED = "merged"
+    CLOSED = "closed"
+    """Closed without being merged."""
+
+
 class CheckState(enum.Enum):
     """Aggregated state of the automated checks on a change request."""
 

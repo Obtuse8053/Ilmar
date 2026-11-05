@@ -31,8 +31,9 @@ recorded in [`decisions/`](decisions/), the evidence behind those decisions is i
 - **Core** (`ilmar.core`): orchestration logic: the execution state machine
   (ADR-0004), the verification stage (ADR-0018), and `Components`, the
   provider-neutral bundle of configured ports the coordinator runs with
-  (ADR-0019), and ownership and the write-ahead journal (`ownership`,
-  `journal`, ADR-0020).
+  (ADR-0019), ownership and the write-ahead journal (`ownership`,
+  `journal`, ADR-0020), and the coordinator: `coordinator`, `worker`, and
+  `effects`, the only core code that changes the outside world (ADR-0021).
 - **Adapters** (`ilmar.adapters`): SQLite and in-memory execution stores
   (ADR-0005), GitHub tasks and source control (ADR-0013, ADR-0016), Podman
   (ADR-0014, ADR-0015) and Claude Code (ADR-0017). `ilmar.adapters.registry`
@@ -98,8 +99,8 @@ Milestone scope and status are tracked in [`../roadmap.md`](../roadmap.md).
 
 ## Not yet designed
 
-Structured event logging, the scheduler and coordinator loop, approval
-policies, and planning and review stages. Each will get an ADR when it is
+Structured event logging, a long-running scheduler loop, approval policies,
+and planning and review stages. Each will get an ADR when it is
 built.
 Open research findings that bear on these are listed in
 [`../research/findings.md`](../research/findings.md), and their scheduling is in

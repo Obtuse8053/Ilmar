@@ -10,6 +10,7 @@ from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
     ChangeRequestSpec,
+    ChangeRequestState,
     ChecksSummary,
     RepositoryRef,
 )
@@ -110,3 +111,7 @@ class SourceControlProvider(Protocol):
         ...
 
     def checks(self, change_request: ChangeRequest) -> ChecksSummary: ...
+
+    def change_request_state(self, change_request: ChangeRequest) -> ChangeRequestState:
+        """Whether ``change_request`` is open, merged or closed without merging. Read only."""
+        ...

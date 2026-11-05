@@ -50,6 +50,7 @@ from ilmar.domain.errors import (
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import (
     Commit,
+    Fence,
     Operation,
     OperationKind,
     OperationStatus,
@@ -73,6 +74,10 @@ class Journal:
         self._store = store
         self._ownership = ownership
         self._clock = clock
+
+    @property
+    def fence(self) -> Fence:
+        return self._ownership.fence
 
     def perform(
         self,

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from ilmar.domain.changes import RepositoryRef
+from ilmar.domain.changes import ChangeRequest, RepositoryRef
 from ilmar.domain.tasks import Task
 from ilmar.domain.workspace import (
     CommandResult,
@@ -116,6 +116,12 @@ class TestFakeSourceControl(SourceControlContract):
     ) -> None:
         assert isinstance(provider, FakeSourceControl)
         provider.open_foreign_change_request(repository, source_branch)
+
+    def finish_change_request(
+        self, provider: SourceControlProvider, change_request: ChangeRequest, *, merged: bool
+    ) -> None:
+        assert isinstance(provider, FakeSourceControl)
+        provider.finish_change_request(change_request, merged=merged)
 
 
 def _result_line(*, is_error: bool, summary: str) -> str:

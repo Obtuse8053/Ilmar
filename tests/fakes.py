@@ -22,6 +22,7 @@ from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
     ChangeRequestSpec,
+    ChangeRequestState,
     ChecksSummary,
     CheckState,
     RepositoryRef,
@@ -278,6 +279,7 @@ class _ChangeRequestRecord:
     ilmar_marker: bool
     checks: ChecksSummary = field(default_factory=lambda: ChecksSummary(CheckState.NONE))
     labels: set[str] = field(default_factory=set)
+    state: ChangeRequestState = ChangeRequestState.OPEN
 
 
 class FakeSourceControl:
@@ -404,6 +406,8 @@ class FakeSourceControl:
     def upsert_change_request(self, spec: ChangeRequestSpec) -> ChangeRequest:
         key = (spec.repository, spec.source_branch)
         record = self._change_requests.get(key)
+        if record is not None and record.state is not ChangeRequestState.OPEN:
+            record = None  # like GitHub: only open change requests are updated
         description = f"{spec.description}\n\n{self.MARKER} task={spec.task}"
         if record is not None:
             if not record.ilmar_marker:
@@ -428,6 +432,21 @@ class FakeSourceControl:
             request, spec.title, description, ilmar_marker=True, labels=set(spec.labels)
         )
         return request
+
+    def finish_change_request(self, change_request: ChangeRequest, *, merged: bool) -> None:
+        """Simulate a human merging or closing a change request."""
+        key = (change_request.repository, change_request.source_branch)
+        self._change_requests[key].state = (
+            ChangeRequestState.MERGED if merged else ChangeRequestState.CLOSED
+        )
+
+    def change_request_state(self, change_request: ChangeRequest) -> ChangeRequestState:
+        record = self._change_requests.get(
+            (change_request.repository, change_request.source_branch)
+        )
+        if record is None or record.request.key != change_request.key:
+            raise ProviderError(f"unknown change request: {change_request.key}")
+        return record.state
 
     def checks(self, change_request: ChangeRequest) -> ChecksSummary:
         record = self._change_requests.get(
