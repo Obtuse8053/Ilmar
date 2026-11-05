@@ -101,10 +101,16 @@ python3 scripts/live_run.py --post                       # each time
   GitHub cannot pre-fill that.
 
 **`live_run.py`**:
+- first checks that Podman is rootless and both images exist, so nothing is
+  asked for, or touched, if the host isn't ready;
+- must be run in an interactive terminal. It refuses to read credentials
+  from a pipe or a file, where `getpass` would echo them;
 - asks for the two credentials with hidden input. They exist only in its
   memory and in the environment of the test process: never in argv, a file,
   the shell history or the output;
-- runs #44, then, only if #44 passed, the live end-to-end tests;
+- runs #44, then, only if #44 passed, the live end-to-end tests. A stage
+  passes only if its tests passed *and* wrote their records, so a skipped
+  test never counts as a pass;
 - with `--post`, posts the credential-free records on #44 and #11 using
   your `gh` login;
 - ignores `PYTEST_ADDOPTS` and the project's pytest options, so nothing can

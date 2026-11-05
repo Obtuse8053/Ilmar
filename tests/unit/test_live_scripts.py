@@ -124,6 +124,33 @@ def answers(*values: str) -> Any:
     return lambda prompt: queue.pop(0)
 
 
+class Terminal:
+    def isatty(self) -> bool:
+        return True
+
+
+class Pipe:
+    def isatty(self) -> bool:
+        return False
+
+
+ROOTLESS: dict[tuple[str, ...], tuple[int, str, str]] = {("podman", "info"): (0, "true\n", "")}
+
+
+@pytest.fixture(autouse=True)
+def _podman_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+
+def records_for(reports: Path, argv: Sequence[str]) -> None:
+    """What the real tests write when they pass."""
+    reports.mkdir(exist_ok=True)
+    names = (["issue-44-smoke-test.json"] if argv[-1] == live_run.SMOKE
+             else ["preflight.json", "end-to-end-r1.json", "crash-drill-r1.json"])  # fmt: skip
+    for name in names:
+        (reports / name).write_text('{"ok": true}')
+
+
 def test_run_refuses_settings_that_are_not_private_or_carry_more(settings_file: Path) -> None:
     settings_file.chmod(0o644)
     with pytest.raises(live_run.RunError, match="private"):
@@ -153,17 +180,26 @@ def test_credentials_reach_the_tests_only_through_their_environment(
 ) -> None:
     monkeypatch.setenv("PYTEST_ADDOPTS", "--showlocals")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-some-other-key-in-the-shell-xxxxxxxx")
-    run = Recorder()
-    code = live_run.main(["--settings", str(settings_file)], ask=answers(TOKEN, KEY), run=run)
+    run = Recorder(ROOTLESS)
+    reports = settings_file.parent / "r"
+
+    def passing(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[-1] in (live_run.SMOKE, live_run.LIVE):
+            records_for(reports, argv)
+        return run(argv, **kwargs)
+
+    code = live_run.main(["--settings", str(settings_file)], ask=answers(TOKEN, KEY),
+                         run=passing, stdin=Terminal())  # fmt: skip
     assert code == 0
-    assert [c[-1] for c in run.calls] == [live_run.SMOKE, live_run.LIVE]
-    for argv in run.calls:
+    tests = [c for c in run.calls if c[0].startswith("python")]
+    assert [c[-1] for c in tests] == [live_run.SMOKE, live_run.LIVE]
+    for argv in tests:
         assert not [a for a in argv if TOKEN in a or KEY in a]  # never in argv
         assert "-l" not in argv
         assert "--showlocals" not in argv
         assert "addopts=" in argv
-    env = run.kwargs[0]["env"]
-    assert env is run.kwargs[1]["env"]
+    test_kwargs = [k for c, k in zip(run.calls, run.kwargs, strict=True) if c in tests]
+    assert test_kwargs[0]["env"] is test_kwargs[1]["env"]
     output = capsys.readouterr()
     assert TOKEN not in output.out + output.err
     assert KEY not in output.out + output.err
@@ -179,38 +215,86 @@ def test_the_environment_drops_pytest_options_and_overrides_shell_credentials() 
 
 
 def test_a_failing_smoke_test_stops_before_the_live_tests(settings_file: Path) -> None:
-    run = Recorder()
+    calls: list[list[str]] = []
 
     def failing(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        run.calls.append(list(argv))
-        return subprocess.CompletedProcess(argv, 1, "", "")
+        calls.append(list(argv))
+        if argv[1:3] == ["info", "--format"]:
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        code = 1 if argv[-1] == live_run.SMOKE else 0
+        return subprocess.CompletedProcess(argv, code, "", "")
 
-    code = live_run.main(["--settings", str(settings_file)], ask=answers(TOKEN, KEY), run=failing)
+    code = live_run.main(["--settings", str(settings_file)], ask=answers(TOKEN, KEY),
+                         run=failing, stdin=Terminal())  # fmt: skip
     assert code == 1
-    assert len(run.calls) == 1
-    assert run.calls[0][-1] == live_run.SMOKE
+    tests = [c for c in calls if c[-1] in (live_run.SMOKE, live_run.LIVE)]
+    assert [c[-1] for c in tests] == [live_run.SMOKE]
+
+
+def test_a_skipped_smoke_test_is_not_a_pass(settings_file: Path) -> None:
+    """Review of main: pytest exits 0 when #44 skips; without its record it did not pass."""
+    run = Recorder(ROOTLESS)  # every test "passes" but writes no record
+    code = live_run.main(["--settings", str(settings_file)], ask=answers(TOKEN, KEY),
+                         run=run, stdin=Terminal())  # fmt: skip
+    assert code == 1
+    assert [c[-1] for c in run.calls if c[0].startswith("python")] == [live_run.SMOKE]
+
+
+def test_credentials_are_never_read_without_a_terminal(settings_file: Path) -> None:
+    """Review of main: without a terminal, getpass falls back to echoing the input."""
+    asked: list[str] = []
+    code = live_run.main(["--settings", str(settings_file)], ask=asked.append,  # type: ignore[arg-type]
+                         run=Recorder(ROOTLESS), stdin=Pipe())  # fmt: skip
+    assert code == 1
+    assert asked == []
+
+
+def test_closing_the_input_stops_cleanly(settings_file: Path,
+                                         capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    def closed(prompt: str) -> str:
+        raise EOFError
+
+    code = live_run.main(["--settings", str(settings_file)], ask=closed,
+                         run=Recorder(ROOTLESS), stdin=Terminal())  # fmt: skip
+    assert code == 1
+    assert "nothing was run" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("answers_by_call", "message"),
+    [
+        ({("podman", "info"): (0, "false\n", "")}, "rootless"),
+        ({**ROOTLESS, ("podman", "image", "exists"): (1, "", "")}, "is missing"),
+    ],
+)
+def test_prerequisites_are_checked_before_any_credential_is_asked(
+    settings_file: Path, answers_by_call: dict[tuple[str, ...], tuple[int, str, str]],
+    message: str, capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    asked: list[str] = []
+    code = live_run.main(["--settings", str(settings_file)], ask=asked.append,  # type: ignore[arg-type]
+                         run=Recorder(answers_by_call), stdin=Terminal())  # fmt: skip
+    assert code == 1
+    assert asked == []
+    assert message in capsys.readouterr().err
 
 
 def test_records_are_posted_on_the_right_issues_without_credentials_in_reach(
     settings_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reports = tmp_path / "r"
-    run = Recorder()
+    run = Recorder(ROOTLESS)
 
     def tests_write_records(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if argv[-1] == live_run.SMOKE:
-            reports.mkdir(exist_ok=True)
-            (reports / "issue-44-smoke-test.json").write_text('{"hosts": ["api.anthropic.com"]}')
-        elif argv[-1] == live_run.LIVE:
-            (reports / "end-to-end-r1.json").write_text('{"pull_request": "u"}')
+        if argv[-1] in (live_run.SMOKE, live_run.LIVE):
+            records_for(reports, argv)
         return run(argv, **kwargs)
 
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/gh")
     code = live_run.main(["--settings", str(settings_file), "--post"], ask=answers(TOKEN, KEY),
-                         run=tests_write_records)  # fmt: skip
+                         run=tests_write_records, stdin=Terminal())  # fmt: skip
     assert code == 0
     posts = [(c, k) for c, k in zip(run.calls, run.kwargs, strict=True) if c[0] == "gh"]
-    assert [c[3] for c, _ in posts] == ["11", "44"]
+    assert sorted(c[3] for c, _ in posts) == ["11", "11", "11", "44"]
     for argv, kwargs in posts:
         assert "--body-file" in argv  # the body goes through stdin
         assert TOKEN not in kwargs["input"]

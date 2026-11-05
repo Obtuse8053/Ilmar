@@ -29,6 +29,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from live_setup import SETTING_NAMES, SETTINGS
 
@@ -64,11 +65,44 @@ def read_settings(path: Path) -> dict[str, str]:
     return values
 
 
+def require_terminal(stdin: object = sys.stdin) -> None:
+    """Hidden input needs a terminal: without one, getpass would echo the value."""
+    if not getattr(stdin, "isatty", lambda: False)():
+        raise RunError("run this in an interactive terminal: credentials are never read "
+                       "from a pipe or a file, where they could be echoed or logged")  # fmt: skip
+
+
+def check_prerequisites(settings: Mapping[str, str], run: Callable[..., Any]) -> None:
+    """Before any credential is asked for: Podman is rootless and both images exist."""
+    podman = shutil.which("podman")
+    if podman is None:
+        raise RunError("podman is not installed")
+    rootless = run([podman, "info", "--format", "{{.Host.Security.Rootless}}"],
+                   capture_output=True, text=True, check=False)  # fmt: skip
+    if str(rootless.stdout).strip() != "true":
+        raise RunError("podman must run rootless (as your user)")
+    for key in ("ILMAR_TEST_CLAUDE_IMAGE", "ILMAR_TEST_PODMAN_PROXY_IMAGE"):
+        exists = run([podman, "image", "exists", settings[key]], check=False)
+        if exists.returncode != 0:
+            raise RunError(f"image {settings[key]} is missing: run scripts/live_setup.py again")
+
+
+def missing_records(reports: Path, expected: Sequence[str], since: float) -> list[str]:
+    """Patterns with no record written this run: a test was skipped or did not finish."""
+    return [
+        pattern for pattern in expected
+        if not [r for r in reports.glob(pattern) if r.stat().st_mtime >= since]
+    ]  # fmt: skip
+
+
 def ask_credentials(ask: Callable[[str], str]) -> dict[str, str]:
-    token = ask("GitHub token (github_pat_…, input hidden): ").strip()
+    try:
+        token = ask("GitHub token (github_pat_…, input hidden): ").strip()
+        key = ask("Anthropic key (input hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise RunError("no credentials given; nothing was run") from None
     if not token.startswith("github_pat_"):
         raise RunError("that is not a fine-grained GitHub token (github_pat_…)")
-    key = ask("Anthropic key (input hidden): ").strip()
     if not key.startswith("sk-ant-") or key == token:
         raise RunError("that is not an Anthropic API key (sk-ant-…)")
     return {GITHUB_TOKEN_ENV: token, ANTHROPIC_KEY_ENV: key}
@@ -116,6 +150,7 @@ def main(
     *,
     ask: Callable[[str], str] = getpass.getpass,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    stdin: object = sys.stdin,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--post", action="store_true", help="post the records on #44 and #11")
@@ -123,6 +158,8 @@ def main(
     args = parser.parse_args(argv)
     try:
         settings = read_settings(Path(args.settings))
+        check_prerequisites(settings, run)
+        require_terminal(stdin)
         credentials = ask_credentials(ask)
     except RunError as error:
         print(f"error: {error}", file=sys.stderr)
@@ -131,13 +168,23 @@ def main(
     credentials.clear()
     reports = Path(settings["ILMAR_LIVE_REPORT_DIR"])
     started = time.time()
-    for stage, target in (("#44 smoke test", SMOKE), ("#11d live end-to-end", LIVE)):
+    stages = (
+        ("#44 smoke test", SMOKE, ("issue-44-smoke-test.json",)),
+        ("#11d live end-to-end", LIVE,
+         ("preflight.json", "end-to-end-*.json", "crash-drill-*.json")),
+    )  # fmt: skip
+    for stage, target, expected in stages:
         print(f"\n== {stage} ==", flush=True)
         done = run(pytest_command(target), cwd=ROOT, env=env, check=False)
         if done.returncode != 0:
             print(f"\n{stage} FAILED (exit {done.returncode}). Nothing more was run.")
             print("The tests removed what they made; see docs/operations/live-testing.md.")
             return int(done.returncode)
+        if missing := missing_records(reports, expected, started):
+            # A skipped test exits 0 too: without its record, it did not pass.
+            print(f"\n{stage} did not pass: no record {', '.join(missing)} was written "
+                  "(a test was skipped). Nothing more was run.")  # fmt: skip
+            return 1
     env.clear()
     records = sorted(r for r in reports.glob("*.json") if r.stat().st_mtime >= started)
     print("\nAll live tests passed. Records (no credentials):")
