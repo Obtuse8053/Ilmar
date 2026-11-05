@@ -45,10 +45,37 @@ COMPLETED = AgentResult(AgentOutcome.COMPLETED, "I fixed it and all tests pass."
 
 
 class RecordingRuntime(FakeContainerRuntime):
+    """Records sandboxes, and offers programs that touch their own sandbox's state.
+
+    ``tamper`` writes into the checkout and leaves a background "process";
+    ``clean`` fails if it sees either. They show what a job can and cannot
+    affect.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.started: list[ContainerSpec] = []
         self.stopped: list[str] = []
+        self.processes: dict[str, set[str]] = {}
+
+    def run(
+        self,
+        handle: ContainerHandle,
+        argv: Sequence[str],
+        *,
+        timeout_seconds: float,
+        env: Mapping[str, str] | None = None,
+    ) -> CommandResult:
+        if argv and argv[0] in {"tamper", "clean"}:
+            workspace = self._containers[handle.id].spec.host_workspace
+            strays = self.processes.setdefault(handle.id, set())
+            if argv[0] == "tamper":
+                (workspace / "tests" / "test_app.py").write_text("assert True  # weakened\n")
+                strays.add("background-helper")
+                return CommandResult(0, "", "", 0.1)
+            dirty = (workspace / "tests" / "test_app.py").read_text() != "ok\n" or strays
+            return CommandResult(1 if dirty else 0, "", "", 0.1)
+        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env)
 
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         self.started.append(spec)
@@ -259,8 +286,8 @@ def test_verification_sandbox_has_no_network_no_credential_and_a_fresh_checkout(
     assert dict(spec.env) == {}
     assert spec.image == "localhost/verify:1"
     assert spec.limits == ResourceLimits(memory_mb=512)
-    assert spec.name == "ilmar-inst-e9-1-verify-1"
-    assert spec.host_workspace == world.layout.verification_checkout("e9", 1, 1)
+    assert spec.name == "ilmar-inst-e9-1-verify-1-default"
+    assert spec.host_workspace == world.layout.verification_checkout("e9", 1, 1) / "default"
     assert (spec.host_workspace / "src" / "app.py").read_text() == "print(2)\n"
     assert spec.owner == OWNER
     assert world.runtime.stopped  # the sandbox is discarded
@@ -271,7 +298,7 @@ def test_each_run_uses_a_new_checkout_and_sandbox(world: World) -> None:
     verify(world, {"src/app.py": "print(2)\n"}, run=1)
     verify(world, {"src/app.py": "print(2)\n"}, run=2)
     names = [spec.name for spec in world.runtime.started]
-    assert names == ["ilmar-inst-e9-1-verify-1", "ilmar-inst-e9-1-verify-2"]
+    assert names == ["ilmar-inst-e9-1-verify-1-default", "ilmar-inst-e9-1-verify-2-default"]
     with pytest.raises(ProviderError):  # a checkout directory is never reused
         verify(world, {"src/app.py": "print(2)\n"}, run=1)
 
@@ -353,3 +380,76 @@ def test_only_a_verifying_execution_can_be_verified(world: World) -> None:
             execution=publishing, repository=REPO, candidate=candidate,
             agent_result=COMPLETED, owner=OWNER,
         )  # fmt: skip
+
+
+# -- isolation boundary: the job (PR #45 review) ------------------------------------------
+
+
+def test_commands_of_one_job_share_one_checkout_and_sandbox(world: World) -> None:
+    lint = VerificationCommand("lint", ("lint",), job="static")
+    types = VerificationCommand("types", ("tests",), job="static")
+    record = verify(world, {"src/app.py": "print(2)\n"}, lint, types)
+    (spec,) = world.runtime.started  # one sandbox start and one checkout for the job
+    assert spec.name.endswith("-verify-1-static")
+    assert [c.job for c in record.checks if c.check_class is CheckClass.CANDIDATE_EXECUTED] == [
+        "static",
+        "static",
+    ]
+
+
+def test_each_job_gets_its_own_checkout_and_sandbox(world: World) -> None:
+    commands = (
+        VerificationCommand("lint", ("lint",), job="static"),
+        VerificationCommand("unit", ("tests",), job="unit"),
+        VerificationCommand("types", ("tests",), job="static"),
+    )
+    verify(world, {"src/app.py": "print(2)\n"}, *commands)
+    names = [spec.name for spec in world.runtime.started]
+    paths = [spec.host_workspace for spec in world.runtime.started]
+    assert names == ["ilmar-inst-e9-1-verify-1-static", "ilmar-inst-e9-1-verify-1-unit"]
+    assert len(set(paths)) == 2
+    assert len(world.runtime.stopped) == 2
+
+
+def test_a_job_cannot_affect_another_jobs_files_or_processes(world: World) -> None:
+    """The regression the review asked for: interference stops at the job boundary."""
+    commands = (
+        VerificationCommand("tamper", ("tamper",), job="first"),
+        VerificationCommand("clean-second", ("clean",), job="second"),
+    )
+    record = verify(world, {"src/app.py": "print(2)\n"}, *commands)
+    by_name = {c.name: c for c in record.checks}
+    assert by_name["tamper"].passed
+    assert by_name["clean-second"].passed  # fresh checkout, no stray processes
+    first, second = world.runtime.started
+    assert (first.host_workspace / "tests" / "test_app.py").read_text() != "ok\n"
+    assert (second.host_workspace / "tests" / "test_app.py").read_text() == "ok\n"
+
+
+def test_within_a_job_later_commands_see_earlier_ones(world: World) -> None:
+    """The documented trade-off: steps of one job share state, as in CI."""
+    commands = (
+        VerificationCommand("tamper", ("tamper",), job="shared"),
+        VerificationCommand("clean-after", ("clean",), job="shared"),
+    )
+    record = verify(world, {"src/app.py": "print(2)\n"}, *commands)
+    assert not {c.name: c for c in record.checks}["clean-after"].passed
+
+
+def test_a_timeout_ends_only_its_own_job(world: World) -> None:
+    world.program_results["slow"] = CommandResult(-9, "", "", 0, timed_out=True)
+    commands = (
+        VerificationCommand("slow", ("slow",), job="first"),
+        VerificationCommand("after-slow", ("tests",), job="first"),
+        VerificationCommand("other-job", ("tests",), job="second"),
+    )
+    record = verify(world, {"src/app.py": "print(2)\n"}, *commands)
+    by_name = {c.name: c for c in record.checks}
+    assert "not run" in by_name["after-slow"].detail
+    assert by_name["other-job"].passed
+    assert record.verdict is Verdict.REJECTED_CHECKS_FAILED
+
+
+def test_job_names_are_validated() -> None:
+    with pytest.raises(ValueError, match="job"):
+        VerificationCommand("x", ("x",), job="../evil")

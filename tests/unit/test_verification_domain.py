@@ -98,6 +98,7 @@ def test_policy_digest_is_stable_and_sensitive_to_every_field() -> None:
         policy(commands=(VerificationCommand("tests", ("pytest",)),)),
         policy(commands=(VerificationCommand("tests", ("pytest", "-q"), timeout_seconds=5),)),
         policy(commands=(VerificationCommand("tests", ("pytest", "-q"), required=False),)),
+        policy(commands=(VerificationCommand("tests", ("pytest", "-q"), job="other"),)),
         policy(protected_paths=("X",)),
         policy(check_influencing_paths=("X",)),
         policy(ci_config_paths=("X",)),
@@ -193,3 +194,10 @@ def test_evidence_has_no_field_for_ci_results() -> None:
     """CI results on a change request are never verification evidence (ADR-0010 §5)."""
     fields = {f.name for f in dataclasses.fields(EvidenceRecord)}
     assert not any("ci_result" in f or "external" in f for f in fields)
+
+
+def test_jobs_group_commands_in_order_of_first_appearance() -> None:
+    a = VerificationCommand("a", ("a",), job="static")
+    b = VerificationCommand("b", ("b",))
+    c = VerificationCommand("c", ("c",), job="static")
+    assert policy(commands=(a, b, c)).jobs() == (("static", (a, c)), ("default", (b,)))

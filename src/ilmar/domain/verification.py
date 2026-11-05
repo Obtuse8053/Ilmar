@@ -153,18 +153,30 @@ DEFAULT_CI_CONFIG_PATHS: tuple[str, ...] = (
 # -- policy ---------------------------------------------------------------------------
 
 
+DEFAULT_JOB = "default"
+_JOB = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
+
+
 @dataclass(frozen=True, slots=True)
 class VerificationCommand:
-    """One candidate-executed check: ``argv`` run in the verification sandbox."""
+    """One candidate-executed check: ``argv`` run in its job's verification sandbox.
+
+    Commands with the same ``job`` run in order in one shared checkout and
+    sandbox, like the steps of a CI job. Different jobs never share anything
+    (ADR-0018).
+    """
 
     name: str
     argv: tuple[str, ...]
     timeout_seconds: float = 600.0
     required: bool = True
+    job: str = DEFAULT_JOB
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._:-]{0,63}", self.name):
             raise ValueError(f"invalid check name: {self.name!r}")
+        if not _JOB.match(self.job):
+            raise ValueError(f"check {self.name}: invalid job name {self.job!r}")
         if not self.argv or not all(isinstance(a, str) and a for a in self.argv):
             raise ValueError(f"check {self.name}: argv must be non-empty strings")
         if self.timeout_seconds <= 0:
@@ -200,12 +212,19 @@ class VerificationPolicy:
         ):
             _compile(pattern)
 
+    def jobs(self) -> tuple[tuple[str, tuple[VerificationCommand, ...]], ...]:
+        """Commands grouped by job, jobs in order of first appearance."""
+        grouped: dict[str, list[VerificationCommand]] = {}
+        for command in self.commands:
+            grouped.setdefault(command.job, []).append(command)
+        return tuple((job, tuple(commands)) for job, commands in grouped.items())
+
     def digest(self) -> str:
         """``sha256:`` of the canonical policy, recorded in every evidence record."""
         canonical = {
             "image": self.image,
             "commands": [
-                [c.name, list(c.argv), c.timeout_seconds, c.required] for c in self.commands
+                [c.name, list(c.argv), c.timeout_seconds, c.required, c.job] for c in self.commands
             ],
             "protected_paths": list(self.protected_paths),
             "check_influencing_paths": list(self.check_influencing_paths),
@@ -232,6 +251,8 @@ class CheckEvidence:
     output_digest: str | None = None
     """``sha256:`` of stdout and stderr; the output itself is not evidence."""
     required: bool = True
+    job: str = ""
+    """The verification job (sandbox) a candidate-executed check ran in."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +340,7 @@ def _encode(record: EvidenceRecord) -> dict[str, Any]:
                 "duration_seconds": c.duration_seconds,
                 "output_digest": c.output_digest,
                 "required": c.required,
+                "job": c.job,
             }
             for c in record.checks
         ],
@@ -348,4 +370,5 @@ def _decode_check(data: Mapping[str, Any]) -> CheckEvidence:
         duration_seconds=data["duration_seconds"],
         output_digest=data["output_digest"],
         required=data["required"],
+        job=data.get("job", ""),
     )

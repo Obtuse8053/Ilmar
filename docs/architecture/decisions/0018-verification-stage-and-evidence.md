@@ -59,20 +59,22 @@ Evidence storage:
   2. If CI configuration changed, nothing of the candidate is executed.
      The verdict is `REJECTED_CI_CONFIG` (`ci-config-modified`), and a
      human takes over.
-  3. Otherwise the candidate revision is materialised into a fresh
-     `verify-<run>` directory by the source-control adapter (ADR-0016).
-     Each run gets a fresh sandbox:
+  3. Otherwise the commands run **per job** (see "Isolation boundary"
+     below). For each job, the source-control adapter (ADR-0016)
+     materialises the candidate revision into a fresh `verify-<run>/<job>`
+     directory, and the job gets its own sandbox:
      - network `NONE`;
      - an empty environment, so no credential;
      - the policy's image and limits;
-     - the name `…-verify-<run>`, owned per ADR-0012.
+     - the name `…-verify-<run>-<job>`, owned per ADR-0012.
 
-     A checkout directory is never reused.
+     The job's commands then run in order in that sandbox, and the sandbox
+     is removed. A checkout directory is never reused.
   4. Each command's pass or fail is **only** its harness-measured exit
      status and timeout. Output is reduced to a `sha256` digest. Any report
      the candidate writes is never read. A timeout fails that check, and
-     the remaining checks are recorded as "not run", because the runtime
-     removed the sandbox (ADR-0014).
+     the job's remaining checks are recorded as "not run", because the
+     runtime removed the job's sandbox (ADR-0014). Other jobs still run.
   5. The verdict follows ADR-0010 §5:
 
      | Diff | Required checks | Verdict | `independence` |
@@ -88,6 +90,29 @@ Evidence storage:
      reported, and never changes the verdict. The record has no field for
      change-request CI results, which are never evidence.
   7. The record is appended to the store **before** it is returned.
+- **Isolation boundary: the job.** This replaces the first draft's claim
+  that every check ran fresh; it never did (PR #45 review).
+  - A command names a `job` in the policy (default `default`). Jobs are
+    lowercase identifiers and run in order of first appearance.
+  - **Between jobs:** separate checkout, separate container, separate
+    `/tmp` and home tmpfs, separate process namespace. Nothing one job
+    writes or leaves running is visible to another.
+  - **Within a job:** commands share the checkout, `/tmp` and any
+    processes left running, as steps of one CI job do. A later command can
+    see, and can be misled by, what an earlier command of the same job
+    did. Commands that must not influence each other belong in different
+    jobs.
+  - The rules that matter for security do not depend on the job: every
+    job has network `NONE`, an empty environment and a read-only root, and
+    the policy is read from `ilmar.toml`, never from the candidate.
+  - Cost: each job pays one checkout and one container start and stop
+    (seconds, dominated by the image being present locally). Commands
+    within a job pay nothing extra. A container per command was rejected:
+    it multiplies those costs by the number of commands and breaks
+    legitimate steps that build on each other (for example, a build
+    followed by its tests). Dependencies are expected in the image, so no
+    job installs anything (ADR-0011 §7).
+  - Evidence records each check's `job`.
 - **Evidence records** hold:
   - execution, attempt and time;
   - base and candidate revisions;
@@ -126,7 +151,10 @@ Evidence storage:
   - the exit status as the only verdict (a candidate printing "PASSED" and
     exiting 1 fails);
   - the agent's claim ignored both ways;
-  - the sandbox settings and a fresh checkout per run;
+  - the sandbox settings and a fresh checkout per run and job;
+  - job isolation: one sandbox per job, one start for all of a job's
+    commands, a tampered checkout or stray process in one job invisible
+    to another, shared state within a job, a timeout ending only its job;
   - timeouts, then "not run";
   - optional checks;
   - evidence appended before return;
@@ -150,7 +178,10 @@ Evidence storage:
 - End to end on real Podman (CI): a real git candidate (ADR-0016) is
   verified in a real sandbox whose checks prove no network, no credential
   (with one set in the coordinator) and a read-only root. A fixed candidate
-  publishes. An unfixed one is rejected whatever the agent claims.
+  publishes. An unfixed one is rejected whatever the agent claims. A
+  two-job run shows that a file written to the checkout, a file in `/tmp`
+  and a background process left by the first job are visible to the
+  first job's later commands and to nothing in the second job.
 
 ## Consequences
 
@@ -167,6 +198,9 @@ Evidence storage:
     [R7]).
   - The verification image must carry every tool the checks need, and no
     network is available at verification time (ADR-0011 §7).
+  - Commands within one job can influence each other. The policy author
+    decides the grouping; the default puts everything in one job, which is
+    the cheapest and the weakest setting.
   - Evidence grows with every attempt. Pruning is a later decision, made
     explicitly.
 

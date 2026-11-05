@@ -69,11 +69,14 @@ def container_name(instance_id: str, execution_id: str, attempt: int) -> str:
     return name
 
 
-def verification_container_name(instance_id: str, execution_id: str, attempt: int, run: int) -> str:
-    """``ilmar-<instance>-<execution>-<attempt>-verify-<run>``: one sandbox per verification run."""
+def verification_container_name(
+    instance_id: str, execution_id: str, attempt: int, run: int, job: str
+) -> str:
+    """``ilmar-<instance>-<execution>-<attempt>-verify-<run>-<job>``: one sandbox per job."""
     if run < 1:
         raise ValueError("run starts at 1")
-    name = f"{container_name(instance_id, execution_id, attempt)}-verify-{run}"
+    safe_identifier(job, "job")
+    name = f"{container_name(instance_id, execution_id, attempt)}-verify-{run}-{job}"
     if len(name) > CONTAINER_NAME_LIMIT:
         raise ValueError(f"container name longer than {CONTAINER_NAME_LIMIT}: {name!r}")
     return name

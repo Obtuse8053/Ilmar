@@ -53,18 +53,22 @@ image = "localhost/ilmar-verify:pinned"
 memory_mb = 4096
 extra_protected_paths = ["docs/architecture/decisions/"]
 
+# Commands of one job share a checkout and sandbox; separate jobs are isolated.
 [[verification.commands]]
 name = "lint"
+job = "static"
 argv = ["ruff", "check", "."]
 timeout_seconds = 300
 
 [[verification.commands]]
 name = "types"
+job = "static"
 argv = ["mypy"]
 timeout_seconds = 600
 
 [[verification.commands]]
 name = "tests"
+job = "tests"
 argv = ["pytest", "-q"]
 timeout_seconds = 1200
 

@@ -42,7 +42,11 @@ pytestmark = pytest.mark.integration
 S = ExecutionState
 REPO = RepositoryRef("github", "owner/repo")
 OWNER = ResourceOwner(instance_id="it", execution_id="verify", attempt=1, token="tok-v")
-NAMES = tuple(f"ilmar-it-verify-1-verify-{run}" for run in (1, 2, 3))
+NAMES = tuple(
+    f"ilmar-it-verify-1-verify-{run}-{job}"
+    for run in (1, 2, 3)
+    for job in ("default", "first", "second")
+)
 SECRET = "sk-ant-must-not-reach-verification"
 
 POLICY_COMMANDS = (
@@ -71,7 +75,9 @@ def _require(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 def scenario(
-    tmp_path: Path, files: dict[str, str]
+    tmp_path: Path,
+    files: dict[str, str],
+    commands: tuple[VerificationCommand, ...] = POLICY_COMMANDS,
 ) -> tuple[Verifier, Execution, CandidateRevision]:
     tmp = tmp_path.resolve()
     human = PlainGit(tmp / "human-home")
@@ -118,7 +124,7 @@ def scenario(
         runtime=PodmanRuntime(layout=layout),
         store=store,
         layout=layout,
-        policy=VerificationPolicy(image=IMAGE, commands=POLICY_COMMANDS),
+        policy=VerificationPolicy(image=IMAGE, commands=commands),
         instance_id="it",
         clock=lambda: at(100),
     )
@@ -154,3 +160,45 @@ def test_an_unfixed_candidate_fails_whatever_the_agent_claims(tmp_path: Path) ->
     assert by_name["no-network"].passed
     assert by_name["no-credential"].passed
     assert by_name["read-only-root"].passed
+
+
+# The marker is assembled at run time so the checking shell's own command line
+# never contains it.
+_SEES_STRAY = 'm=stray; m="$m-marker"; grep -qs -- "$m" /proc/[0-9]*/cmdline'
+
+
+def job_commands(job: str, *, expect_tampered: bool) -> tuple[VerificationCommand, ...]:
+    if expect_tampered:
+        checks = ("grep -q weakened src/app.py", "[ -e /tmp/left-behind ]", _SEES_STRAY)
+    else:
+        checks = (
+            "! grep -q weakened src/app.py",
+            "[ ! -e /tmp/left-behind ]",
+            f"! {{ {_SEES_STRAY}; }}",
+        )
+    return tuple(
+        VerificationCommand(f"{job}-{index}", ("sh", "-c", check), timeout_seconds=60, job=job)
+        for index, check in enumerate(checks)
+    )
+
+
+TAMPER = (
+    "echo weakened >> src/app.py; touch /tmp/left-behind; "
+    "sh -c 'while :; do sleep 1; done' stray-marker >/dev/null 2>&1 &"
+)
+
+
+def test_jobs_are_isolated_from_each_other_but_not_internally(tmp_path: Path) -> None:
+    """Regression for the PR #45 review: files, /tmp and processes stop at the job."""
+    commands = (
+        VerificationCommand("tamper", ("sh", "-c", TAMPER), timeout_seconds=60, job="first"),
+        *job_commands("first", expect_tampered=True),
+        *job_commands("second", expect_tampered=False),
+    )
+    verifier, execution, candidate = scenario(
+        tmp_path, {"src/app.py": "print('fixed')\n"}, commands
+    )
+    record = run(verifier, execution, candidate)
+    failed = [(c.name, c.detail) for c in record.checks if not c.passed]
+    assert failed == []
+    assert {c.job for c in record.checks if c.job} == {"first", "second"}

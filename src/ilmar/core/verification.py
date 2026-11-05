@@ -7,9 +7,11 @@ The :class:`Verifier` decides only from evidence Ilmar produces itself:
    data against the policy's path classes. Nothing is executed.
 2. If CI configuration changed, nothing of the candidate runs, and the
    verdict is ``REJECTED_CI_CONFIG``: a human must take over (ADR-0010 §5).
-3. Otherwise the candidate revision is checked out from the coordinator's
-   repository into a fresh directory, and each policy command runs in a fresh
-   sandbox: network ``NONE``, no credential, the policy's image and limits.
+3. Otherwise each **job** of the policy gets its own fresh checkout of the
+   candidate revision and its own fresh sandbox: network ``NONE``, no
+   credential, the policy's image and limits. The job's commands run there in
+   order and share that checkout and sandbox, like the steps of a CI job; no
+   two jobs ever share files or processes (the isolation boundary, ADR-0018).
    Pass or fail comes only from the exit status and timeout the harness
    measures. Output is reduced to a digest; reports the candidate writes are
    never read.
@@ -173,9 +175,27 @@ class Verifier:
     ) -> list[CheckEvidence]:
         layout = self._layout
         ensure_directory(
-            layout.attempt_dir(execution.id, execution.attempt), root=layout.workspaces_root
-        )
-        checkout = layout.verification_checkout(execution.id, execution.attempt, run)
+            layout.verification_checkout(execution.id, execution.attempt, run),
+            root=layout.workspaces_root,
+        )  # fails if this run already exists: a run's directories are never reused
+        results: list[CheckEvidence] = []
+        for job, commands in self._policy.jobs():
+            results += self._run_job(execution, repository, candidate, owner, run, job, commands)
+        return results
+
+    def _run_job(
+        self,
+        execution: Execution,
+        repository: RepositoryRef,
+        candidate: CandidateRevision,
+        owner: ResourceOwner,
+        run: int,
+        job: str,
+        commands: tuple[VerificationCommand, ...],
+    ) -> list[CheckEvidence]:
+        """One job: a fresh checkout and a fresh sandbox, shared by its commands only."""
+        layout = self._layout
+        checkout = layout.verification_checkout(execution.id, execution.attempt, run) / job
         self._source_control.checkout_revision(
             repository, revision=candidate.revision, destination=checkout
         )
@@ -187,7 +207,7 @@ class Verifier:
                 image=self._policy.image,
                 host_workspace=checkout,
                 name=verification_container_name(
-                    self._instance, execution.id, execution.attempt, run
+                    self._instance, execution.id, execution.attempt, run, job
                 ),
                 owner=owner,
                 workspace_identity=identity,
@@ -198,7 +218,7 @@ class Verifier:
         results: list[CheckEvidence] = []
         sandbox_gone = False
         try:
-            for command in self._policy.commands:
+            for command in commands:
                 if sandbox_gone:
                     results.append(_not_run(command))
                     continue
@@ -250,6 +270,7 @@ def _evidence(command: VerificationCommand, result: CommandResult) -> CheckEvide
         duration_seconds=round(result.duration_seconds, 3),
         output_digest=f"sha256:{digest}",
         required=command.required,
+        job=command.job,
     )
 
 
@@ -258,9 +279,10 @@ def _not_run(command: VerificationCommand) -> CheckEvidence:
         name=command.name,
         check_class=CheckClass.CANDIDATE_EXECUTED,
         passed=False,
-        detail="not run: the sandbox ended after an earlier timeout",
+        detail="not run: the job's sandbox ended after an earlier timeout",
         command=command.argv,
         required=command.required,
+        job=command.job,
     )
 
 

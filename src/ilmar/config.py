@@ -7,7 +7,7 @@ The file has these sections::
     [limits]                     # execution limits
     [adapters.<port>]            # one table per port: kind + options
     [verification]               # the verification policy (ADR-0010, ADR-0018)
-    [[verification.commands]]    # one table per check: name, argv, timeout, required
+    [[verification.commands]]    # one per check: name, argv, timeout, required, job
 
 The verification policy lives here, never in the repository being changed.
 Its path classes can only be *extended* (``extra_*``); the built-in protected,
@@ -32,6 +32,7 @@ from ilmar.domain.errors import ConfigError
 from ilmar.domain.verification import (
     DEFAULT_CHECK_INFLUENCING_PATHS,
     DEFAULT_CI_CONFIG_PATHS,
+    DEFAULT_JOB,
     DEFAULT_PROTECTED_PATHS,
     VerificationCommand,
     VerificationPolicy,
@@ -138,7 +139,7 @@ def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
         at = f"[[verification.commands]] #{index + 1}"
         if not isinstance(entry, Mapping):
             raise ConfigError(f"{at} must be a table")
-        _reject_unknown(entry, {"name", "argv", "timeout_seconds", "required"}, at)
+        _reject_unknown(entry, {"name", "argv", "timeout_seconds", "required", "job"}, at)
         argv = entry.get("argv")
         if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
             raise ConfigError(f"{at} argv must be a list of strings")
@@ -151,7 +152,11 @@ def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
         try:
             commands.append(
                 VerificationCommand(
-                    str(entry.get("name", "")), tuple(argv), float(timeout), required
+                    str(entry.get("name", "")),
+                    tuple(argv),
+                    float(timeout),
+                    required,
+                    str(entry.get("job", DEFAULT_JOB)),
                 )
             )
         except ValueError as exc:

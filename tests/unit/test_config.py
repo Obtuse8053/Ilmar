@@ -159,6 +159,7 @@ def test_verification_policy_is_parsed() -> None:
         900.0,
         True,
     )
+    assert command.job == "default"
     assert (policy.limits.memory_mb, policy.limits.cpus, policy.limits.max_processes) == (
         2048,
         2.0,
@@ -195,6 +196,7 @@ def test_path_classes_can_only_be_extended() -> None:
         ({"commands": [{"name": "t", "argv": ["x"], "required": "yes"}]}, "required"),
         ({"commands": [{"name": "t", "argv": ["x"], "shell": True}]}, "unknown"),
         ({"commands": [{"name": "bad/name", "argv": ["x"]}]}, "check name"),
+        ({"commands": [{"name": "t", "argv": ["x"], "job": "Bad Job"}]}, "job"),
         ({"ci_config_paths": []}, "unknown"),
         ({"extra_ci_config_paths": "x"}, "list"),
         ({"extra_protected_paths": ["/abs"]}, "pattern"),
