@@ -1,6 +1,6 @@
 # ADR-0022: Crash recovery: durable state is the only memory
 
-- Status: Proposed
+- Status: Accepted (maintainer approval on PR #49, 2026-11-05)
 - Date: 2026-11-05
 - Sources: [R1], [R3] · Findings: F-004, F-021
 - Implements: #11c; builds on ADR-0010, ADR-0012, ADR-0018, ADR-0020, ADR-0021

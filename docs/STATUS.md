@@ -51,20 +51,24 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#11d (plan step 10d): an opt-in live test on a disposable GitHub repository
-with Claude Code, and the M2 close-out. It depends on #44.
+#11d (plan step 10d): an opt-in live test of one task end to end on a
+disposable GitHub repository with real Claude Code, then the M2 close-out.
+- Restricted credentials: a fine-grained token for the disposable
+  repository only, and a capped model key.
+- Smoke test #44 must pass first, and gates any unattended operation.
+- The plan is posted on issue #11.
 
-Only after #11c (ADR-0022) is merged. **Waiting for the maintainer's
-explicit go-ahead.**
+**Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
 
-- 2026-11-05: #11c implemented on PR (pending review): crash recovery
-  (ADR-0022, Proposed).
+- 2026-11-05: #11c finished: crash recovery (ADR-0022, accepted after an
+  adversarial review on PR #49).
   - Every worker step is decided from the journal, the ledger and trusted
     external observations, so recovery and normal running are one path.
-  - Recovery runs before new work. Only executions that cannot be proven
-    safe are blocked; others continue.
+  - Recovery runs before new work. Each execution has its own boundary:
+    one that cannot be proven safe, or hits an unexpected error, is blocked
+    alone; others continue.
   - New port methods: `ContainerRuntime.remove_owned` and
     `SourceControlProvider.load_candidate`. Evidence format 2 records its
     verification run; format-1 digests are unchanged.
@@ -72,7 +76,18 @@ explicit go-ahead.**
     agent never runs after a freeze. A moved branch blocks and is never
     overwritten. A fenced-out process stops.
   - Crash injection at every store write and before every external effect,
-    plus real-Podman recovery tests in CI.
+    and repeated crashes, on six paths. Real-Podman recovery tests in CI.
+  - The review added:
+    - recorded security and policy failures are never retried after a
+      crash;
+    - interrupted provisioning stays transient through a second crash;
+    - restart-safe, non-decreasing timestamps;
+    - publishing requires evidence for the policy in force;
+    - Podman networks are removed by inspected ID;
+    - `reconcile` checks the lease;
+    - candidate parents are read from the raw commit;
+    - the architecture test derives the mutating port methods from the
+      ports.
 
   #11 stays open for #11d. Next recommended: #11d.
 
