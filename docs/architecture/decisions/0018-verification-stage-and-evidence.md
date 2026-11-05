@@ -1,6 +1,6 @@
 # ADR-0018: Verification stage, policy and append-only evidence
 
-- Status: Proposed
+- Status: Accepted (maintainer approval on PR #45, 2026-11-05)
 - Date: 2026-11-04
 - Sources: [R3], [R7], [R9] · Findings: F-004, F-005, F-022
 - Implements: ADR-0010 §3–7 (#9); schema v2 of ADR-0005's store
