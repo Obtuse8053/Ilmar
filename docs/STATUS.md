@@ -65,7 +65,7 @@ explicit go-ahead.**
 ## Change log
 
 - 2026-11-05: #11b finished: one coordinator execution end to end
-  (ADR-0021, proposed).
+  (ADR-0021, accepted after an adversarial review on PR #48).
   - `ilmar run --once --config PATH`.
   - The `Coordinator`, `ExecutionWorker` and `Effects` (the only core code
     that changes the outside world; architecture-tested).
@@ -79,8 +79,16 @@ explicit go-ahead.**
   - New read-only port method `change_request_state`; a `run-agent`
     operation kind; the Verifier writes evidence fenced.
   - Real-Podman end-to-end test in CI.
+  - The review added:
+    - security, policy and containment failures are never retried;
+    - failed tasks are never re-run automatically;
+    - late-stage failures re-verify or re-push the same frozen candidate
+      instead of re-running the agent, and block after three tries;
+    - branch-head checks around the change request;
+    - interrupted releases are resumed;
+    - only non-repeatable unfinished operations block new work.
 
-  Next recommended: #11c.
+  #11 stays open for #11c and #11d. Next recommended: #11c.
 
 - 2026-11-05: #11a finished: fencing, the write-ahead operation journal and
   the resource ledger (ADR-0020, accepted after an adversarial review on PR

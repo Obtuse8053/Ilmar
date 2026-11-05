@@ -1,6 +1,6 @@
 # ADR-0021: One coordinator execution: steps, failure classes, claims and task completion
 
-- Status: Proposed
+- Status: Accepted (maintainer approval on PR #48, 2026-11-05)
 - Date: 2026-11-05
 - Sources: [R1], [R3] · Findings: F-004, F-021
 - Implements: #11b; builds on ADR-0010, ADR-0012, ADR-0013, ADR-0018 to ADR-0020
