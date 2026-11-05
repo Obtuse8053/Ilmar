@@ -386,6 +386,18 @@ class GitHubSourceControl:
         )
 
 
+def check_repository(slug: str) -> None:
+    """Raise ``ValueError`` unless ``slug`` looks like ``owner/name`` (ADR-0019)."""
+    if not _SLUG.match(slug) or ".." in slug:
+        raise ValueError("repository must look like 'owner/name'")
+
+
+def check_branch(name: str) -> None:
+    """Raise ``ValueError`` unless ``name`` is a branch name Ilmar accepts (ADR-0019)."""
+    if not _BRANCH.match(name):
+        raise ValueError("not a valid branch name")
+
+
 def _branch(name: str) -> str:
     if not _BRANCH.match(name):
         raise ProviderError(f"invalid branch name: {name!r}")

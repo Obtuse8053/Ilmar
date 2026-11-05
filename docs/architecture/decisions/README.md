@@ -24,7 +24,8 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0015](0015-egress-proxy-sidecar.md) | Egress allow-list as a per-execution proxy sidecar | Accepted |
 | [0016](0016-host-git-and-github-publishing.md) | Plumbing-only host git and GitHub publishing | Accepted |
 | [0017](0017-claude-code-agent-runner.md) | Claude Code agent runner | Accepted |
-| [0018](0018-verification-stage-and-evidence.md) | Verification stage, policy and append-only evidence | Proposed |
+| [0018](0018-verification-stage-and-evidence.md) | Verification stage, policy and append-only evidence | Accepted |
+| [0019](0019-adapter-registry-and-composition.md) | Adapter registry, two-phase construction and the `Components` bundle | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

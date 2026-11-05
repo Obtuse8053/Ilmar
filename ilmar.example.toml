@@ -4,12 +4,18 @@
 # `options` holds adapter-specific settings. Secrets are never written here;
 # options ending in `_env` name the environment variable that holds them.
 #
-# The github, podman and claude-code adapters arrive in milestone M2.
-# `ilmar config validate` checks structure only; it does not check that an
-# adapter kind is installed.
+# `ilmar config validate` checks the structure, every adapter's options and
+# the rules between ports (ADR-0019). It reads no secret; add
+# `--check-environment` to check that the named variables are set.
+#
+# Keep this file outside the state directory's workspaces: verification
+# policy must come from configuration nobody but the operator can change.
 
 [ilmar]
 state_dir = ".ilmar"
+# Names this coordinator's resources (containers, claims). One instance per
+# repository (ADR-0013).
+instance_id = "default"
 
 [limits]
 max_attempts = 3
@@ -32,13 +38,17 @@ options = { repository = "Obtuse8053/Ilmar", base_branch = "main", token_env = "
 
 [adapters.container_runtime]
 kind = "podman"
-options = { image = "localhost/ilmar-claude-code:pinned" }
+# ADR-0015: the egress proxy that lets agent sandboxes reach only their
+# model endpoint. Settings that would weaken the sandbox (network, user,
+# mounts, capabilities) are not configurable.
+options = { proxy_image = "docker.io/library/python:3.12-alpine" }
 
 [adapters.agent_runner]
 kind = "claude-code"
 # ADR-0017: the only secret in the agent sandbox; passed per command, never stored.
 # Build the image from images/claude-code/Containerfile at a pinned version.
-options = { api_key_env = "ANTHROPIC_API_KEY" }
+# The agent sandbox reaches only api.anthropic.com (or the host of base_url).
+options = { image = "localhost/ilmar-claude-code:pinned", api_key_env = "ANTHROPIC_API_KEY" }
 
 [adapters.execution_store]
 kind = "sqlite"

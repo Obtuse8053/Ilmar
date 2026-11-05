@@ -28,11 +28,17 @@ recorded in [`decisions/`](decisions/), the evidence behind those decisions is i
 - **Domain** (`ilmar.domain`): value types such as `Task`, `Execution`,
   `ChangeRequest` and `ContainerSpec`, plus errors. Standard library only.
 - **Ports** (`ilmar.ports`): five `Protocol` interfaces. See ADR-0002.
-- **Core** (`ilmar.core`): orchestration logic. In M1, only the execution state
-  machine (ADR-0004).
-- **Adapters** (`ilmar.adapters`): in M1, the SQLite and in-memory execution
-  stores (ADR-0005). GitHub, Podman and Claude Code arrive in M2.
-- **Config** (`ilmar.config`): TOML loading and validation (ADR-0007).
+- **Core** (`ilmar.core`): orchestration logic: the execution state machine
+  (ADR-0004), the verification stage (ADR-0018), and `Components`, the
+  provider-neutral bundle of configured ports the coordinator runs with
+  (ADR-0019).
+- **Adapters** (`ilmar.adapters`): SQLite and in-memory execution stores
+  (ADR-0005), GitHub tasks and source control (ADR-0013, ADR-0016), Podman
+  (ADR-0014, ADR-0015) and Claude Code (ADR-0017). `ilmar.adapters.registry`
+  is the composition root: it maps `(port, kind)` to lazily imported parsers
+  and builds `Components` from `ilmar.toml` (ADR-0019).
+- **Config** (`ilmar.config`): TOML loading and structural validation
+  (ADR-0007). Adapter options are validated by the registry.
 
 ## Execution lifecycle
 
@@ -90,9 +96,9 @@ Milestone scope and status are tracked in [`../roadmap.md`](../roadmap.md).
 
 ## Not yet designed
 
-Structured event logging, the scheduler and coordinator loop, verification and
-approval policies, planning and review stages, network allow-listing for
-sandboxes, and the adapter registry. Each will get an ADR when it is built.
+Structured event logging, the scheduler and coordinator loop, approval
+policies, and planning and review stages. Each will get an ADR when it is
+built.
 Open research findings that bear on these are listed in
 [`../research/findings.md`](../research/findings.md), and their scheduling is in
 [`../roadmap.md`](../roadmap.md).
