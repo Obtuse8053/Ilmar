@@ -115,7 +115,7 @@ class ShellAgent:
 
 def coordinator_process(
     tmp: Path, layout: WorkspaceLayout, world: tuple[FakeTaskProvider, FakeSourceControl],
-    agent: ShellAgent, switch: Switch, ids: Iterator[str],
+    agent: ShellAgent, switch: Switch, ids: Iterator[str], clock: Clock,
 ) -> tuple[SQLiteExecutionStore, Ownership, Coordinator]:  # fmt: skip
     tasks, scm = world
     inner = SQLiteExecutionStore(tmp / "executions.sqlite3")
@@ -143,7 +143,6 @@ def coordinator_process(
         target=Target(REPO, "main"),
         verification=policy,
     )
-    clock = Clock()
     owner = Ownership.take(layout=layout, store=inner, instance_id=INSTANCE, now=clock())
     coordinator = Coordinator.create(
         components,
@@ -166,10 +165,11 @@ def test_a_coordinator_killed_mid_agent_run_recovers_on_real_podman(tmp_path: Pa
     scm.seed(REPO, "main", BASE_FILES)
     world = (FakeTaskProvider((task("1"),)), scm)
     ids = iter(["e1"])
+    clock = Clock()  # time moves on across the restart, as a wall clock does
 
     switch = Switch()
     killer = ShellAgent(switch)
-    store, owner, coordinator = coordinator_process(tmp, layout, world, killer, switch, ids)
+    store, owner, coordinator = coordinator_process(tmp, layout, world, killer, switch, ids, clock)
     with pytest.raises(Crash):
         coordinator.run_once()
     owner.release()  # the kernel drops the lock of a dead process
@@ -178,7 +178,7 @@ def test_a_coordinator_killed_mid_agent_run_recovers_on_real_podman(tmp_path: Pa
     assert sandbox_parts(first) == {"container": True, "sidecar": True, "network": True}
 
     agent = ShellAgent()
-    store, owner, coordinator = coordinator_process(tmp, layout, world, agent, Switch(), ids)
+    store, owner, coordinator = coordinator_process(tmp, layout, world, agent, Switch(), ids, clock)
     report: PassReport = coordinator.run_once()
     try:
         assert report.code == 0, report.summary
