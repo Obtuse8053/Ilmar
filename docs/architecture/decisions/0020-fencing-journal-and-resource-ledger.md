@@ -1,6 +1,6 @@
 # ADR-0020: Fencing, the write-ahead operation journal and the resource ledger
 
-- Status: Proposed
+- Status: Accepted (maintainer approval on PR #47, 2026-11-05)
 - Date: 2026-11-05
 - Sources: [R1], [R3] · Findings: F-004
 - Implements: #11a; ADR-0012 rules 1 to 4 (fencing, write-ahead,

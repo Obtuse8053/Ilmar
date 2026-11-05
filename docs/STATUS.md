@@ -59,7 +59,8 @@ go-ahead.**
 ## Change log
 
 - 2026-11-05: #11a finished: fencing, the write-ahead operation journal and
-  the resource ledger (ADR-0020, proposed). #11 is split into #11a–#11d.
+  the resource ledger (ADR-0020, accepted after an adversarial review on PR
+  #47). #11 is split into #11a–#11d.
   - An exclusive instance lock plus a store fencing epoch: a superseded
     coordinator can write nothing.
   - Every side effect gets a durable intent, an ownership re-check right
@@ -70,8 +71,16 @@ go-ahead.**
     digest.
   - Store schema v3, with triggers.
   - `ExecutionStore` port: new methods and an optional `fence` keyword.
+  - The review added:
+    - per-execution leases, so executions can run in parallel under one
+      coordinator;
+    - stale-view checks right before every effect;
+    - candidate integrity on every path (no direct, swapped, re-based or
+      reconciled candidates);
+    - results kept when a follow-up is refused;
+    - `synchronous = FULL`.
 
-  Next recommended: #11b.
+  #11 stays open for #11b–#11d. Next recommended: #11b.
 
 - 2026-11-05: #10 finished: adapter registry (ADR-0019, accepted after an
   adversarial review on PR #46).
