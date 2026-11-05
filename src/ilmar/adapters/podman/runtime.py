@@ -479,6 +479,47 @@ class PodmanRuntime:
             raise OwnershipConflictError(f"container {handle.name} is owned by someone else")
         self._remove_sandbox(container_id, handle.name)
 
+    def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
+        """See the port. Needs no in-memory state: labels identify the owner."""
+        try:
+            container = self.find(name)
+            proxy = self.find(name + EGRESS_PROXY_SUFFIX)
+        except ProviderError as error:
+            if "more than one" in str(error):
+                raise OwnershipConflictError(f"{name} is ambiguous: {error}") from None
+            raise
+        network = name + EGRESS_NETWORK_SUFFIX
+        network_exists = self._podman_call(["network", "exists", network]).returncode == 0
+        network_owner = None
+        if network_exists:
+            labels = self._network(network).get("labels") or {}
+            network_owner = _owner({"Config": {"Labels": labels}})
+        # Ownership is checked for everything before anything is removed.
+        for found, what in ((container, name), (proxy, name + EGRESS_PROXY_SUFFIX)):
+            if found is not None and found.owner != owner:
+                raise OwnershipConflictError(f"{what} is not owned by the recorded execution")
+        if network_exists and network_owner != owner:
+            raise OwnershipConflictError(f"{network} is not owned by the recorded execution")
+        if container is not None:
+            self._remove(container.handle.id, name)
+            self._mounted.pop(container.handle.id, None)
+        if proxy is not None:
+            self._remove(proxy.handle.id, proxy.handle.name)
+        if network_exists:
+            removed = self._podman_call(["network", "rm", network])
+            if self._podman_call(["network", "exists", network]).returncode == 0:
+                detail = removed.stderr.strip().splitlines()[-1:] or [f"exit {removed.returncode}"]
+                raise ContainmentError(
+                    f"network {network} could not be confirmed removed: {detail[0][:200]}",
+                    container_id=container.handle.id if container else "",
+                    name=name,
+                )
+        for workspace, owed in list(self._obligations.items()):  # nothing is owed any more
+            owed.difference_update({c for c in owed if c.name == name})
+            if not owed:
+                self._obligations.pop(workspace, None)
+        return container is not None or proxy is not None or network_exists
+
     # -- podman arguments --------------------------------------------------
 
     def _run_arguments(

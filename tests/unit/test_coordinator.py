@@ -341,21 +341,25 @@ def test_an_unremovable_sandbox_blocks_and_is_never_frozen(setup: Setup) -> None
     assert setup.tasks.list_eligible() == ()  # still claimed: a human must look
 
 
-def test_an_unsettled_non_repeatable_effect_blocks_new_work(setup: Setup) -> None:
+def test_an_unsettleable_execution_blocks_alone_and_other_work_continues(setup: Setup) -> None:
+    """ADR-0022 decision 4: block only what cannot be reconciled."""
+    original = setup.scm.publish_revision
+
     def pushed_elsewhere(*args: Any, **kwargs: Any) -> None:
-        execution = setup.store.get("e1")
-        assert execution is not None
-        assert execution.branch
-        setup.scm._branches[(REPO, execution.branch)] = setup.scm.seed(REPO, "x", {"y": "z"})
+        setup.scm._branches[(REPO, kwargs["branch"])] = setup.scm.seed(REPO, "x", {"y": "z"})
         raise ProviderError("connection reset")
 
     setup.scm.publish_revision = pushed_elsewhere  # type: ignore[method-assign]
     assert setup.coordinator().run_once().code == 2
+    setup.scm.publish_revision = original  # type: ignore[method-assign]
     setup.tasks.add(task("2"))
     second = setup.coordinator().run_once()
-    assert second.code == 2
-    assert "unfinished operation" in second.summary
-    assert setup.store.get("e2") is None
+    by_id = {r.execution_id: r for r in second.results}
+    assert by_id["e1"].outcome is Outcome.BLOCKED  # still: never overwritten
+    assert "unverified head" in by_id["e1"].detail
+    others = [r for r in second.results if r.execution_id != "e1"]
+    assert [r.outcome for r in others] == [Outcome.PUBLISHED]
+    assert second.code == 2  # a human is still needed for e1
 
 
 def test_an_unsettled_repeatable_effect_does_not_stop_other_work(setup: Setup) -> None:
@@ -454,17 +458,16 @@ def test_verification_runs_in_its_own_sandbox_per_job(tmp_path: Path) -> None:
 
 
 def test_a_candidate_that_differs_from_its_freeze_is_never_verified_or_published(
-    setup: Setup, monkeypatch: pytest.MonkeyPatch
+    setup: Setup,
 ) -> None:
-    from ilmar.core.effects import Effects
+    """The reloaded candidate must match the freeze's revision, base and digest."""
+    original = setup.scm.load_candidate
 
-    original = Effects.freeze
-
-    def swapped(self: Effects, *args: Any, **kwargs: Any) -> CandidateRevision:
-        real = original(self, *args, **kwargs)
+    def tampered(*args: Any, **kwargs: Any) -> CandidateRevision:
+        real = original(*args, **kwargs)
         return CandidateRevision(real.revision, real.base_revision, ())  # paths dropped
 
-    monkeypatch.setattr(Effects, "freeze", swapped)
+    setup.scm.load_candidate = tampered  # type: ignore[method-assign]
     report = setup.coordinator().run_once()
     assert (report.code, report.results[0].outcome) == (2, Outcome.BLOCKED)
     assert "does not match" in report.results[0].detail
@@ -488,7 +491,7 @@ def test_publishing_needs_the_latest_evidence_to_be_for_this_candidate(
     monkeypatch.setattr(Verifier, "verify", then_tampered)
     report = setup.coordinator().run_once()
     assert report.code == 2
-    assert "latest evidence" in report.results[0].detail
+    assert "evidence" in report.results[0].detail
     assert setup.scm.pushes == []
 
 

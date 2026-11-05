@@ -160,6 +160,32 @@ class GitHubSourceControl:
         paths = sorted({p.decode("utf-8", "replace") for p in changed.split(b"\0") if p})
         return CandidateRevision(revision, base_revision, tuple(paths))
 
+    def load_candidate(
+        self,
+        repository: RepositoryRef,
+        *,
+        base_revision: str,
+        revision: str,
+    ) -> CandidateRevision:
+        if not _SHA.match(revision) or not _SHA.match(base_revision):
+            raise CandidateRejectedError("not a full revision")
+        git, _ = self._repository(repository)
+        ref = f"refs/ilmar/candidates/{revision}"
+        found = git.run("rev-parse", "--verify", "--quiet", ref, check=False).text().strip()
+        if found != revision:
+            raise CandidateRejectedError(
+                f"{revision[:12]} is not a candidate this coordinator froze"
+            )
+        parents = git.run("rev-list", "--parents", "-n", "1", revision).text().split()
+        if parents[1:] != [base_revision]:
+            raise CandidateRejectedError(f"{revision[:12]} is not frozen on {base_revision[:12]}")
+        changed = git.run(
+            "diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-ext-diff",
+            "--no-textconv", base_revision, revision,
+        ).stdout  # fmt: skip
+        paths = sorted({p.decode("utf-8", "replace") for p in changed.split(b"\0") if p})
+        return CandidateRevision(revision, base_revision, tuple(paths))
+
     def checkout_revision(
         self,
         repository: RepositoryRef,

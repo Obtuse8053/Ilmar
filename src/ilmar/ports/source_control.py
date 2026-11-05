@@ -68,6 +68,23 @@ class SourceControlProvider(Protocol):
         """
         ...
 
+    def load_candidate(
+        self,
+        repository: RepositoryRef,
+        *,
+        base_revision: str,
+        revision: str,
+    ) -> CandidateRevision:
+        """Rebuild a candidate this coordinator froze earlier (ADR-0022), read only.
+
+        ``changed_paths`` are recomputed from the stored revisions exactly as
+        ``freeze_candidate`` computed them. Fails closed with
+        ``CandidateRejectedError`` if ``revision`` was not frozen by this
+        coordinator or its parent is not ``base_revision``. The caller still
+        checks the result against the journal's changed-paths digest.
+        """
+        ...
+
     def checkout_revision(
         self,
         repository: RepositoryRef,

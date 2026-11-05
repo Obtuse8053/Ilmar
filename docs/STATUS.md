@@ -51,18 +51,30 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#11c (plan step 10c): crash recovery for every non-terminal state.
-- Reconcile unfinished operations by kind (ADR-0020, ADR-0021).
-- Add `SourceControlProvider.load_candidate`, checked against the freeze's
-  digest.
-- Clean up resources recorded as `INTENDED` or `ACTIVE`.
-- Lift ADR-0021's "unfinished operations block new work" rule for what it
-  reconciles.
+#11d (plan step 10d): an opt-in live test on a disposable GitHub repository
+with Claude Code, and the M2 close-out. It depends on #44.
 
-Only after #11b (ADR-0021) is merged. **Waiting for the maintainer's
+Only after #11c (ADR-0022) is merged. **Waiting for the maintainer's
 explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-05: #11c implemented on PR (pending review): crash recovery
+  (ADR-0022, Proposed).
+  - Every worker step is decided from the journal, the ledger and trusted
+    external observations, so recovery and normal running are one path.
+  - Recovery runs before new work. Only executions that cannot be proven
+    safe are blocked; others continue.
+  - New port methods: `ContainerRuntime.remove_owned` and
+    `SourceControlProvider.load_candidate`. Evidence format 2 records its
+    verification run; format-1 digests are unchanged.
+  - An interrupted agent run gets a new sandbox and a new attempt. The
+    agent never runs after a freeze. A moved branch blocks and is never
+    overwritten. A fenced-out process stops.
+  - Crash injection at every store write and before every external effect,
+    plus real-Podman recovery tests in CI.
+
+  #11 stays open for #11d. Next recommended: #11d.
 
 - 2026-11-05: #11b finished: one coordinator execution end to end
   (ADR-0021, accepted after an adversarial review on PR #48).

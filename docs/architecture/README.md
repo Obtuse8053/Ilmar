@@ -34,6 +34,8 @@ recorded in [`decisions/`](decisions/), the evidence behind those decisions is i
   (ADR-0019), ownership and the write-ahead journal (`ownership`,
   `journal`, ADR-0020), and the coordinator: `coordinator`, `worker`, and
   `effects`, the only core code that changes the outside world (ADR-0021).
+  Every worker step is decided from durable state, so recovering after a
+  crash and running normally are the same code (ADR-0022).
 - **Adapters** (`ilmar.adapters`): SQLite and in-memory execution stores
   (ADR-0005), GitHub tasks and source control (ADR-0013, ADR-0016), Podman
   (ADR-0014, ADR-0015) and Claude Code (ADR-0017). `ilmar.adapters.registry`

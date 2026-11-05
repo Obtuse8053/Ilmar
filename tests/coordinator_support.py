@@ -82,6 +82,12 @@ class WorkspaceRuntime(FakeContainerRuntime):
             self.stop_hook(handle)
         super().stop(handle, owner=owner)
 
+    def remove_owned(self, name: str, *, owner: Any) -> bool:
+        found = self.find(name)
+        if self.stop_hook is not None and found is not None:
+            self.stop_hook(found.handle)
+        return super().remove_owned(name, owner=owner)
+
 
 @dataclass
 class ScriptedAgent:

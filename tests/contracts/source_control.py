@@ -208,6 +208,41 @@ class SourceControlContract:
         second = self._freeze(provider, repo, workspace, message="same")
         assert first == second
 
+    def test_a_frozen_candidate_can_be_loaded_exactly(
+        self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
+    ) -> None:
+        base, candidate = self._frozen(provider, repo, tmp_path)
+        loaded = provider.load_candidate(repo, base_revision=base, revision=candidate.revision)
+        assert loaded == candidate
+
+    def test_loading_refuses_anything_not_frozen_on_that_base(
+        self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
+    ) -> None:
+        base, candidate = self._frozen(provider, repo, tmp_path)
+        with pytest.raises(CandidateRejectedError):
+            provider.load_candidate(repo, base_revision=base, revision="e" * 40)
+        with pytest.raises(CandidateRejectedError):  # the base itself was never frozen
+            provider.load_candidate(repo, base_revision=base, revision=base)
+        with pytest.raises(CandidateRejectedError):
+            provider.load_candidate(
+                repo, base_revision=candidate.revision, revision=candidate.revision
+            )
+
+    def _frozen(
+        self, provider: SourceControlProvider, repo: RepositoryRef, tmp_path: Path
+    ) -> tuple[str, CandidateRevision]:
+        workspace = tmp_path / "agent-load"
+        base = provider.checkout(
+            repo, base_branch="main", branch="ilmar/load-1", destination=workspace
+        )
+        (workspace / "src").mkdir(exist_ok=True)
+        (workspace / "src" / "new.py").write_text("print('new')\n")
+        candidate = provider.freeze_candidate(
+            repo, base_revision=base, workspace=workspace, message="load"
+        )
+        assert candidate.changed_paths
+        return base, candidate
+
     def test_freeze_rejects_unknown_base(
         self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path
     ) -> None:

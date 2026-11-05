@@ -4,10 +4,10 @@
 The coordinator owns the instance (the lock and the fence, ADR-0020); work is
 per execution. A pass:
 
-1. refuses to start anything while the journal has unfinished operations
-   that are not safe to repeat, because recovery (#11c) must settle them
-   first (exit 2). Unfinished *repeatable* operations (a claim release, a
-   stop) are simply performed again by the step they belong to;
+1. **recovers** every execution that is not finished, and every finished one
+   with unsettled operations or live sandboxes (ADR-0022): each is driven
+   from its durable state by a worker under its own lease. Executions that
+   cannot be reconciled stay blocked on their own; nothing else waits;
 2. follows up published executions: a change request that was **merged**
    completes the task, one **closed** without merging abandons it. Either
    way Ilmar's claim is released. While it is open the task stays claimed;
@@ -37,9 +37,15 @@ from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.core.verification import Verifier
-from ilmar.core.worker import MAX_ATTEMPTS, ExecutionWorker, Outcome, WorkerResult
+from ilmar.core.worker import (
+    MAX_ATTEMPTS,
+    ExecutionWorker,
+    Outcome,
+    WorkerResult,
+    needs_attention,
+)
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
-from ilmar.domain.errors import ConflictError, ProviderError
+from ilmar.domain.errors import ConflictError, FencingError, ProviderError
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
 from ilmar.domain.tasks import Task
@@ -55,6 +61,14 @@ class ExitCode(enum.IntEnum):
     """Manual intervention is needed (ambiguous effect, quarantine, unfinished journal)."""
     CONFIGURATION = 3
     """The configuration is invalid or this coordinator does not own the instance."""
+
+
+_CODES = {
+    Outcome.PUBLISHED: ExitCode.SUCCESS,
+    Outcome.CANCELLED: ExitCode.SUCCESS,
+    Outcome.FAILED: ExitCode.FAILURE,
+    Outcome.BLOCKED: ExitCode.BLOCKED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,36 +152,49 @@ class Coordinator:
         return self._c.execution_store
 
     def run_once(self) -> PassReport:
-        unfinished = [o for o in self._store.unfinished_operations() if not o.kind.repeatable]
-        if unfinished:
-            keys = ", ".join(o.key for o in unfinished[:10])
-            return PassReport(
-                ExitCode.BLOCKED,
-                f"{len(unfinished)} unfinished operation(s) need reconciliation first: {keys}",
-            )
+        results = list(self.recover())
         completed = self.follow_up_change_requests()
         task = self._pick()
-        if task is None:
+        if task is not None:
+            execution, transition = self._machine.start(
+                task.ref, execution_id=self._new_id(), now=self._clock()
+            )
+            self._store.create(execution, transition, fence=self._effects.fence)
+            results.append(self.dispatch(execution.id, task))
+        if not results:
             return PassReport(ExitCode.SUCCESS, "no eligible task", completed_tasks=completed)
-        execution, transition = self._machine.start(
-            task.ref, execution_id=self._new_id(), now=self._clock()
+        code = max(_CODES[r.outcome] for r in results)
+        summary = "; ".join(
+            f"{r.execution_id}: {r.outcome.value} {r.detail}".strip() for r in results
         )
-        self._store.create(execution, transition, fence=self._effects.fence)
-        result = self.dispatch(execution.id, task)
-        code = {
-            Outcome.PUBLISHED: ExitCode.SUCCESS,
-            Outcome.CANCELLED: ExitCode.SUCCESS,
-            Outcome.FAILED: ExitCode.FAILURE,
-            Outcome.BLOCKED: ExitCode.BLOCKED,
-        }[result.outcome]
-        return PassReport(
-            code,
-            f"{execution.id}: {result.outcome.value} {result.detail}".strip(),
-            (result,),
-            completed,
-        )
+        return PassReport(code, summary, tuple(results), completed)
 
-    def dispatch(self, execution_id: str, task: Task) -> WorkerResult:
+    def recover(self) -> tuple[WorkerResult, ...]:
+        """Drive every execution that still has work, from its durable state (ADR-0022)."""
+        active = self._store.list_in_states({s for s in ExecutionState if not s.is_terminal})
+        finished = [
+            e
+            for e in self._store.list_in_states({s for s in ExecutionState if s.is_terminal})
+            if needs_attention(self._store, e)
+        ]
+        results = []
+        for execution in sorted([*active, *finished], key=lambda e: (e.created_at, e.id)):
+            try:
+                task = self._c.task_provider.get(execution.task)  # read only
+            except ProviderError:
+                results.append(
+                    WorkerResult(execution.id, Outcome.BLOCKED, "the tracker could not be read")
+                )
+                continue
+            try:
+                results.append(self.dispatch(execution.id, task))
+            except FencingError:
+                raise  # this process no longer owns the instance: stop, never skip
+            except ConflictError:
+                continue  # another worker holds this execution's lease
+        return tuple(results)
+
+    def dispatch(self, execution_id: str, task: Task | None) -> WorkerResult:
         """Run one execution's worker. Safe to call concurrently for different executions."""
         return self._worker.run(execution_id, task)
 
@@ -206,6 +233,8 @@ class Coordinator:
             merged = state is ChangeRequestState.MERGED
             try:
                 lease = self.leases.acquire(execution.id)
+            except FencingError:
+                raise
             except ConflictError:
                 continue  # a worker holds it; asked again next pass
             with lease:

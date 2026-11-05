@@ -87,7 +87,13 @@ def test_the_rule_detects_a_direct_call(tmp_path: Path) -> None:
     assert _port_mutations(sample) == ["sample.py:2 .publish_revision()"]
 
 
+READ_ONLY = {"load_candidate"}
+"""Public ``Effects`` methods that change nothing; they may not call a mutating method."""
+
+
 def test_every_effect_goes_through_the_journal() -> None:
+    """Each public ``Effects`` method acts through ``perform`` or settles through
+    ``reconcile`` (both journaled and fenced), or is declared read-only."""
     tree = ast.parse((CORE / "effects.py").read_text())
     (effects,) = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Effects"]
     public = [
@@ -99,12 +105,24 @@ def test_every_effect_goes_through_the_journal() -> None:
     ]
     assert public
     for method in public:
-        calls = [
-            n
+        journal_calls = {
+            n.func.attr
             for n in ast.walk(method)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "perform"
+            and n.func.attr in {"perform", "reconcile"}
             and "_journal" in _receiver_names(n.func.value)
-        ]
-        assert calls, f"Effects.{method.name} does not go through the journal"
+        }
+        if method.name in READ_ONLY:
+            mutating = [
+                n.func.attr
+                for n in ast.walk(method)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in MUTATING
+                and _receiver_names(n.func.value) & PORTS
+            ]
+            assert not journal_calls, f"Effects.{method.name} is not read-only"
+            assert not mutating, f"Effects.{method.name} is not read-only"
+        else:
+            assert journal_calls, f"Effects.{method.name} does not go through the journal"
