@@ -47,13 +47,30 @@ fill any gaps between M2 steps.
 
 ## Recommended next task
 
-#10, the adapter registry (plan step 9): it builds the configured adapters
-(GitHub, Podman, Claude Code, SQLite) and the verification policy from
-`ilmar.toml`, and is the last piece before #11 (coordinator loop and
-end-to-end test, which closes M2). **Waiting for the maintainer's explicit
-go-ahead.**
+#11, the coordinator loop and end-to-end acceptance test (plan step 10), which
+closes M2. It consumes `Components` from `ilmar.adapters.registry.build`
+(ADR-0019) and must pass `changed_paths` from `freeze_candidate` straight to
+the Verifier (ADR-0018). #44 (the live Claude Code smoke test) still blocks
+unattended operation. **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-05: #10 finished: adapter registry (ADR-0019, accepted after an
+  adversarial review on PR #46).
+  `(port, kind)` maps to lazily imported parsers. `plan()` validates every
+  adapter's options and the rules between ports without secrets or side
+  effects (`ilmar config validate`, plus `--check-environment`). `build()`
+  creates `Components`, which owns cleanup, including after a partial
+  failure. Secrets are redacted from every error. Nothing that weakens the
+  sandbox is configurable, the agent sandbox's hosts come from the agent
+  adapter, and `[verification]` is required. Configuration: `[ilmar]
+  instance_id`; the agent image moved to `[adapters.agent_runner]`.
+  The review added four rules. Every creation error is redacted. The model
+  credential may not share a variable or a value with tracker or SCM
+  credentials. Host executables come only from absolute `PATH` entries and
+  never from `workspaces/`. The configuration file must not be writable by
+  others. Ports are now checked by signature, not just member names. #11
+  must take an explicit configuration path. Next recommended: #11.
 
 - 2026-11-05: #9 finished: verification stage (ADR-0018, accepted after an
   adversarial review on PR #45). The policy lives in `[verification]` of

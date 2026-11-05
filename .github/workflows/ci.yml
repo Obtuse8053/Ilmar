@@ -79,6 +79,7 @@ jobs:
           tests/integration/test_podman_egress.py
           tests/integration/test_claude_code_podman.py
           tests/integration/test_verification_podman.py
+          tests/integration/test_registry_podman.py
 
   licenses:
     name: Dependency licenses

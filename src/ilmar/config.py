@@ -3,7 +3,7 @@
 
 The file has these sections::
 
-    [ilmar]                      # general settings
+    [ilmar]                      # general settings: state_dir, instance_id
     [limits]                     # execution limits
     [adapters.<port>]            # one table per port: kind + options
     [verification]               # the verification policy (ADR-0010, ADR-0018)
@@ -13,9 +13,11 @@ The verification policy lives here, never in the repository being changed.
 Its path classes can only be *extended* (``extra_*``); the built-in protected,
 check-influencing and CI-configuration paths always apply.
 
-Validation is structural: it does not check that an adapter ``kind`` is
-installed. Option keys that look like secrets are rejected unless they end in
-``_env``, which means "the name of an environment variable" (ADR-0007).
+This module validates structure. Adapter kinds and their options are
+validated by the adapter registry (``ilmar.adapters.registry``, ADR-0019),
+which ``ilmar config validate`` also runs. Option keys that look like
+secrets are rejected unless they end in ``_env``, which means "the name of an
+environment variable" (ADR-0007).
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ _SECRET_LIKE = re.compile(
     r"(token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)", re.IGNORECASE
 )
 _KIND = re.compile(r"^[a-z][a-z0-9-]*$")
+DEFAULT_INSTANCE_ID = "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +76,11 @@ class IlmarConfig:
     adapters: Mapping[str, AdapterConfig]
     verification: VerificationPolicy | None = None
     """``None`` when the file has no ``[verification]``; nothing can be verified then."""
+    instance_id: str = DEFAULT_INSTANCE_ID
+    base_dir: Path | None = None
+    """The directory relative option paths resolve against (the file's directory)."""
+    source: Path | None = None
+    """The file this configuration was read from, if any."""
 
 
 def load_config(path: Path) -> IlmarConfig:
@@ -84,15 +92,20 @@ def load_config(path: Path) -> IlmarConfig:
         raise ConfigError(f"configuration file not found: {path}") from None
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
-    return parse_config(data, base_dir=path.resolve().parent)
+    return parse_config(data, base_dir=path.resolve().parent, source=path.resolve())
 
 
-def parse_config(data: Mapping[str, Any], *, base_dir: Path) -> IlmarConfig:
+def parse_config(
+    data: Mapping[str, Any], *, base_dir: Path, source: Path | None = None
+) -> IlmarConfig:
     """Validate already-parsed configuration data."""
     _reject_unknown(data, {"ilmar", "limits", "adapters", "verification"}, "top level")
 
     general = _table(data, "ilmar", "[ilmar]")
-    _reject_unknown(general, {"state_dir"}, "[ilmar]")
+    _reject_unknown(general, {"state_dir", "instance_id"}, "[ilmar]")
+    instance_id = general.get("instance_id", DEFAULT_INSTANCE_ID)
+    if not isinstance(instance_id, str) or not instance_id:
+        raise ConfigError("[ilmar] instance_id must be a non-empty string")
     state_dir_raw = general.get("state_dir", ".ilmar")
     if not isinstance(state_dir_raw, str) or not state_dir_raw:
         raise ConfigError("[ilmar] state_dir must be a non-empty string")
@@ -109,6 +122,9 @@ def parse_config(data: Mapping[str, Any], *, base_dir: Path) -> IlmarConfig:
             if "verification" in data
             else None
         ),
+        instance_id=instance_id,
+        base_dir=base_dir,
+        source=source,
     )
 
 

@@ -47,6 +47,26 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _CLAIM = re.compile(r"<!-- ilmar:claim instance=([A-Za-z0-9_-]+) token=([0-9a-f]{16,64}) -->")
 
 
+def check_settings(
+    *,
+    repository: str,
+    eligible_label: str,
+    claimed_label: str,
+    excluded_labels: Sequence[str],
+    human_claim_labels: Sequence[str],
+) -> None:
+    """The rules for a provider's settings; used before any provider is built (ADR-0019)."""
+    if not _REPOSITORY.match(repository):
+        raise ValueError("repository must look like 'owner/name'")
+    if eligible_label == claimed_label:
+        raise ValueError("eligible_label and claimed_label must differ")
+    if claimed_label in {*excluded_labels, *human_claim_labels}:
+        raise ValueError(
+            "claimed_label is owned by Ilmar and must not also be an excluded "
+            "or human claim label (ADR-0013)"
+        )
+
+
 class GitHubTaskProvider:
     def __init__(
         self,
@@ -62,15 +82,13 @@ class GitHubTaskProvider:
         skip_assigned: bool = True,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
-        if not _REPOSITORY.match(repository):
-            raise ValueError(f"repository must look like 'owner/name', got {repository!r}")
-        if eligible_label == claimed_label:
-            raise ValueError("eligible_label and claimed_label must differ")
-        if claimed_label in {*excluded_labels, *human_claim_labels}:
-            raise ValueError(
-                "claimed_label is owned by Ilmar and must not also be an excluded "
-                "or human claim label (ADR-0013)"
-            )
+        check_settings(
+            repository=repository,
+            eligible_label=eligible_label,
+            claimed_label=claimed_label,
+            excluded_labels=excluded_labels,
+            human_claim_labels=human_claim_labels,
+        )
         self._client = client
         self._repository = repository
         self._instance = safe_identifier(instance_id, "instance id")
