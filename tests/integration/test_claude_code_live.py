@@ -62,10 +62,19 @@ def record_smoke_test(contacted: list[str]) -> None:
     print(f"#44 record written to {path}")
 
 
-@pytest.mark.skipif(
-    not (PODMAN and IMAGE and KEY and PROXY_IMAGE),
-    reason="set ILMAR_TEST_CLAUDE_IMAGE, ILMAR_TEST_PODMAN_PROXY_IMAGE and ANTHROPIC_API_KEY",
-)
+REQUIRED = os.environ.get("ILMAR_LIVE_REQUIRED") == "1"
+MISSING = not (PODMAN and IMAGE and KEY and PROXY_IMAGE)
+NEEDS = "podman, ILMAR_TEST_CLAUDE_IMAGE, ILMAR_TEST_PODMAN_PROXY_IMAGE and ANTHROPIC_API_KEY"
+
+
+@pytest.fixture(autouse=True)
+def _required_never_skips() -> None:
+    """Under ``ILMAR_LIVE_REQUIRED=1`` (scripts/live_run.py) a missing need fails the run."""
+    if MISSING and REQUIRED:
+        pytest.fail(f"#44 needs {NEEDS}")
+
+
+@pytest.mark.skipif(MISSING and not REQUIRED, reason=f"set {NEEDS}")
 def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Path) -> None:
     layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
     layout.workspaces_root.mkdir(parents=True)
