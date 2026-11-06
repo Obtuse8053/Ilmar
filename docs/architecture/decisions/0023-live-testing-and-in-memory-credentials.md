@@ -119,6 +119,27 @@ switch for it.
   - optionally posts the credential-free records on #44 and #11 with the
     maintainer's `gh` login.
 
+### Or in GitHub Actions: a manual, protected workflow
+
+`.github/workflows/live.yml` runs the same stages (`scripts/live_ci.py`
+shares them with `live_run.py`) on a GitHub-hosted runner with rootless
+Podman:
+- **Trigger and permissions:** it is started only by `workflow_dispatch`,
+  and holds `permissions: {}` unless a job asks.
+- **Secrets:**
+  - the secrets live in the protected `live` environment. The maintainer
+    configures it with required reviewers and restricts it to `main`, so a
+    modified workflow on another branch cannot receive them;
+  - they reach exactly one step's environment, which `exec`s into Python,
+    so no shell keeps them.
+- **Untrusted input:** the version input is expanded only from the
+  environment, never inside a script.
+- **Output:** only the credential-free JSON records are uploaded. A separate
+  post job, with no environment and no secrets, comments them on #44 and #11
+  with the repository's own token (`issues: write`).
+- **Checked offline:** `tests/unit/test_live_workflow.py` checks these rules
+  structurally. `ci.yml` never runs a live test.
+
 ### The live harness (`tests/live_harness.py`)
 
 - **Guard (`preflight`), before anything is written.** The run is refused

@@ -1,0 +1,109 @@
+name: Live tests (manual)
+
+# #44 and the #11d live end-to-end tests against real GitHub (the disposable
+# `ilmar-disposable` repository), real rootless Podman and real Claude Code.
+#
+# - Started only by hand, and only after a required reviewer approves the
+#   protected `live` environment that holds the two secrets.
+# - The secrets reach exactly one step's environment; the tests prove they
+#   leak nowhere.
+# - Only credential-free JSON records leave the job.
+# - Nothing here runs on push or pull_request. Unattended operation stays
+#   disabled (#20).
+# See docs/operations/live-testing.md and ADR-0023.
+
+on:
+  workflow_dispatch:
+    inputs:
+      claude_version:
+        description: "Claude Code version to pin (x.y.z)"
+        required: true
+        type: string
+      post_records:
+        description: "Post the credential-free records on #44 and #11"
+        required: true
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: live-tests
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: Live tests (#44, #11d)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: live
+    permissions:
+      contents: read
+    env:
+      # Untrusted input: only ever expanded from the environment, never in `run:`.
+      ILMAR_TEST_CLAUDE_VERSION: ${{ inputs.claude_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Check the version input
+        run: |
+          [[ "$ILMAR_TEST_CLAUDE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "claude_version must be x.y.z" >&2; exit 1; }
+      - name: Podman environment
+        run: |
+          podman version
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+      - name: Images (built here, never published)
+        run: |
+          podman pull docker.io/library/python:3.12-alpine
+          podman build --build-arg CLAUDE_CODE_VERSION="$ILMAR_TEST_CLAUDE_VERSION" \
+            -t "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION" images/claude-code
+          podman image inspect --format '{{.Id}}' "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION"
+      - name: Live tests
+        env:
+          ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # exec: no shell keeps the secrets in its environment (the leak check
+        # trusts only the coordinator and git).
+        run: exec python scripts/live_ci.py
+      - name: Keep the records (no credentials)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-records
+          path: ${{ runner.temp }}/live-reports/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  post:
+    name: Post the records on #44 and #11
+    needs: live
+    if: inputs.post_records
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # No environment and no live secrets here: only the records, and this
+    # repository's own token, allowed to comment on issues.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-records
+          path: ${{ runner.temp }}/live-records
+      - name: Post
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/live_ci.py --post "$RUNNER_TEMP/live-records"

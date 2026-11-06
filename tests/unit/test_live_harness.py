@@ -594,8 +594,9 @@ def test_the_assertion_guard_finds_what_it_looks_for() -> None:
 
 
 def test_live_tests_are_opt_in_and_never_in_ci() -> None:
-    workflows = Path(__file__).resolve().parents[2] / ".github" / "workflows"
-    ci = "\n".join(p.read_text() for p in workflows.glob("*.yml"))
+    """Never in the CI that runs on every push and pull request; only in the manual
+    ``live`` workflow, which test_live_workflow.py checks."""
+    ci = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text()
     for name in LIVE_FILES:
         source = (INTEGRATION / name).read_text()
         assert "pytestmark = pytest.mark.integration" in source

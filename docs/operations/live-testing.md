@@ -75,7 +75,7 @@ end-to-end tests** (#11d).
 Each passing test writes a JSON record, without credentials, to
 `$ILMAR_LIVE_REPORT_DIR`.
 
-## Quick start: two commands
+## Quick start: two commands (your own Linux machine)
 
 Linux with rootless Podman, Python 3.11+, git, and the `gh` CLI logged in as
 you (`gh auth login`). From a checkout of this repository:
@@ -119,6 +119,57 @@ python3 scripts/live_run.py --post                       # each time
 Afterwards, revoke the token and the key, or let them expire.
 
 The rest of this page explains each step, for review or a manual run.
+
+## Or: run it in GitHub Actions (no Linux machine needed)
+
+The manual workflow `.github/workflows/live.yml` runs the same stages on a
+GitHub-hosted Ubuntu runner, with rootless Podman. You don't need a Linux
+machine, Podman or a local build, and you never type a credential anywhere
+but GitHub's secret form.
+
+**One-time setup:** in a browser, or with `gh` on any OS.
+
+1. **Create the two private repositories:**
+   ```sh
+   gh repo create ilmar-disposable --private --add-readme
+   gh repo edit "$(gh api user --jq .login)/ilmar-disposable" --add-topic ilmar-disposable
+   gh repo create ilmar-outside-canary --private --add-readme
+   ```
+   They must belong to the same owner as Ilmar's repository (the workflow
+   derives their names from it).
+2. **Create the GitHub token and the Anthropic key** as in steps 2 and 3
+   below. The token is fine-grained, only for `ilmar-disposable`, expires
+   within 7 days, and has Contents, Issues and Pull requests read/write.
+   The key is in a spend-capped `ilmar-live` workspace.
+3. **Create the environment.** In Ilmar's repository, go to **Settings →
+   Environments → New environment** and name it `live`. Then:
+   - **Required reviewers:** add yourself, and tick *Prevent self-review* only
+     if someone else will approve;
+   - **Deployment branches and tags:** *Selected branches and tags* → `main`
+     only. This keeps a modified workflow on another branch from ever
+     receiving the secrets;
+   - **Environment secrets:** `ILMAR_LIVE_GITHUB_TOKEN` (the token) and
+     `ANTHROPIC_API_KEY` (the key).
+
+**Each run:**
+
+```sh
+gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
+  -f claude_version=<x.y.z> -f post_records=true
+```
+
+Or go to **Actions → Live tests (manual) → Run workflow**. Then approve the
+pending `live` deployment when GitHub asks.
+
+What the run does:
+- builds the Claude Code image on the runner; it is never published;
+- runs #44, then the live tests;
+- uploads only the credential-free records (artifact `live-records`);
+- with `post_records`, posts them on #44 and #11 from a separate job that
+  has no access to the secrets.
+
+**Afterwards:** delete the two environment secrets, and revoke the token and
+the key (or let them expire).
 
 ## One-time setup
 
