@@ -75,7 +75,7 @@ end-to-end tests** (#11d).
 Each passing test writes a JSON record, without credentials, to
 `$ILMAR_LIVE_REPORT_DIR`.
 
-## Quick start: two commands
+## Quick start: two commands (your own Linux machine)
 
 Linux with rootless Podman, Python 3.11+, git, and the `gh` CLI logged in as
 you (`gh auth login`). From a checkout of this repository:
@@ -119,6 +119,118 @@ python3 scripts/live_run.py --post                       # each time
 Afterwards, revoke the token and the key, or let them expire.
 
 The rest of this page explains each step, for review or a manual run.
+
+## Or: run it in GitHub Actions (no Linux machine needed)
+
+The manual workflow `.github/workflows/live.yml` runs the same stages on a
+GitHub-hosted Ubuntu runner, with rootless Podman. You don't need a Linux
+machine, Podman or a local build, and you never type a credential anywhere
+but GitHub's secret form.
+
+**One-time setup:** in a browser, or with `gh` on any OS.
+
+1. **Create the two private repositories:**
+   ```sh
+   gh repo create ilmar-disposable --private --add-readme
+   gh repo edit "$(gh api user --jq .login)/ilmar-disposable" --add-topic ilmar-disposable
+   gh repo create ilmar-outside-canary --private --add-readme
+   ```
+   They must belong to the same owner as Ilmar's repository (the workflow
+   derives their names from it).
+2. **Create the GitHub token and the Anthropic key** as in steps 2 and 3
+   below. The token is fine-grained, only for `ilmar-disposable`, expires
+   within 7 days, and has Contents, Issues and Pull requests read/write.
+   The key is in a spend-capped `ilmar-live` workspace.
+3. **Configure the GitHub settings below.** The workflow's `guard` job reads
+   them, without any secret, and **refuses to run** unless they are exactly
+   so.
+
+### GitHub settings (checked by the guard, fail closed)
+
+In `Obtuse8053/Ilmar` → **Settings**:
+
+1. **Rules → Rulesets → New ruleset → New branch ruleset**:
+   - **Name:** `main`
+   - **Enforcement status:** Active
+   - **Bypass list:** empty
+   - **Target branches:** *Add target → Include default branch*
+   - **Rules:** tick **Restrict deletions**, **Block force pushes** and
+     **Require a pull request before merging** (0 required approvals is
+     enough for a single maintainer)
+   - **Create**
+
+   Why: a workflow changed directly on `main` would receive the secrets
+   legitimately. With this, `main` changes only through reviewed pull
+   requests, including changes by automation such as Claude sessions.
+2. **Environments → New environment** named `live`:
+   - **Required reviewers:** add yourself. Leave **Prevent self-review**
+     off if you are the only maintainer.
+   - **Allow administrators to bypass configured protection rules:**
+     **unticked**.
+   - **Deployment branches and tags:** *Selected branches and tags* → *Add
+     deployment branch or tag rule* → Ref type **Branch**, pattern **`main`**.
+     That must be the only rule.
+   - **Environment secrets:** `ILMAR_LIVE_GITHUB_TOKEN` (the token) and
+     `ANTHROPIC_API_KEY` (the key). Add no environment variables.
+3. **Actions → General:**
+   - keep **Workflow permissions** at *Read repository contents and
+     packages permissions*;
+   - leave **Allow GitHub Actions to create and approve pull requests**
+     **unticked**.
+
+   The workflow sets its own minimal permissions either way.
+
+What the guard cannot see, so you must keep it true yourself:
+- **Who can approve:** only people you trust are required reviewers.
+- **No other workflow** uses `environment: live`. Changing one would need a
+  pull request into `main`.
+- **No repository-wide or organisation-wide secrets** hold these credentials.
+  Only the `live` environment does.
+
+**Each run.** Review what is on `main`, then pin that exact commit:
+
+```sh
+SHA=$(gh api repos/Obtuse8053/Ilmar/commits/main --jq .sha)   # the commit you reviewed
+gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
+  -f expected_sha="$SHA" -f claude_version=<x.y.z> -f post_records=true
+```
+
+Then:
+1. Wait for `guard` and `prepare` to pass, and approve the pending `live`
+   deployment. Do not merge anything into `main` in between: the `live`
+   job checks again that `main` still points at `expected_sha`, and refuses
+   if not. Then dispatch it again with the new commit.
+2. `prepare` (no secrets) downloads the hash-locked wheels
+   (`requirements/live.txt`) and builds the Claude Code image (never
+   published) from its digest-pinned base. `live` checks out exactly
+   `expected_sha`, checks the commit, the wheels' digests and the image's
+   digest before any secret, and runs #44 and then the live tests. Nothing
+   is installed or downloaded after that.
+3. After a failure or cancellation, it removes `ilmar-live/*` leftovers from
+   `ilmar-disposable` and every container.
+4. It uploads only credential-free records (artifact `live-records`, kept 7
+   days), plus `run-summary.json`, which binds the outcome to the commit.
+5. With `post_records`, a separate job without any secret posts the records
+   on #44 and #11, but only if the run passed, at that commit, and every
+   record passes its checks.
+
+**Afterwards:** delete the two environment secrets, and revoke the token and
+the key (or let them expire).
+
+**Changing a pin** happens only in a reviewed pull request:
+- the agent image's base: the digest in `images/claude-code/Containerfile`;
+- the proxy image: `PROXY_IMAGE` in `scripts/live_ci.py`;
+- the wheels: a version and its sha256 in `requirements/live.txt`. Take
+  the sha256 from PyPI's file page; CI's `pip download --require-hashes`
+  fails closed and prints the digest it got.
+
+**Not pinned by digest** (built in `prepare`, with no secrets, and then
+fixed by the archive's digest):
+- the Debian packages the Containerfile installs;
+- Claude Code's npm dependencies below the version you name.
+
+They run with the Anthropic key inside the sandbox, as the agent always
+does.
 
 ## One-time setup
 

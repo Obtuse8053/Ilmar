@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import urllib.parse
@@ -300,3 +301,28 @@ def test_records_are_posted_on_the_right_issues_without_credentials_in_reach(
         assert TOKEN not in kwargs["input"]
         assert "ILMAR_LIVE_GITHUB_TOKEN" not in kwargs["env"]
         assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+
+
+def test_records_count_by_the_file_systems_clock_not_the_wall_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (CI flake on Python 3.11): the kernel stamps files from a coarser
+    clock than time.time(), so a record written right after a time.time() start
+    could look older than its run, and a passed run would count as failed.
+    With the wall clock far ahead of file timestamps, this run's records still
+    count, and a record left by an earlier run still does not."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    old = reports / "preflight.json"
+    old.write_text("{}")
+    os.utime(old, (1_000_000, 1_000_000))  # an earlier run's record
+    monkeypatch.setattr("time.time", lambda: 4_000_000_000.0)
+    started = live_run.run_start(reports)
+    record = reports / "issue-44-smoke-test.json"
+    record.write_text("{}")
+    os.utime(record, (started, started))  # same tick as the start: still this run's
+    assert live_run.new_records(reports, started) == [record]
+    assert live_run.missing_records(reports, ["issue-44-*.json", "preflight.json"], started) == [
+        "preflight.json"
+    ]
+    assert not list(reports.glob(".run-start*.json"))  # the marker is never a record

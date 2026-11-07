@@ -70,6 +70,21 @@ jobs:
             podman pull "$image"
             podman image inspect --format "$image digest={{.Digest}}" "$image"
           done
+      - name: Live workflow inputs (hash-locked wheels, digest-pinned agent base image)
+        # The manual live workflow installs exactly requirements/live.txt and builds
+        # from the Containerfile's pinned base: prove both still resolve, the hashes
+        # match, the set is complete (pip check) and live_ci.py unpacks it.
+        run: |
+          python -m pip download --require-hashes --no-deps --only-binary=:all: --no-cache-dir \
+            --dest "$RUNNER_TEMP/live-wheels" --requirement requirements/live.txt
+          python -m venv "$RUNNER_TEMP/lock-check"
+          "$RUNNER_TEMP/lock-check/bin/python" -m pip install --no-index --no-deps --require-hashes \
+            --find-links "$RUNNER_TEMP/live-wheels" --requirement requirements/live.txt
+          "$RUNNER_TEMP/lock-check/bin/python" -m pip check
+          python scripts/live_ci.py --install-wheels "$RUNNER_TEMP/live-wheels" "$RUNNER_TEMP/live-site"
+          PYTHONPATH="$RUNNER_TEMP/live-site" PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+            /usr/bin/python3 -c 'import os, pytest; assert pytest.__file__.startswith(os.environ["PYTHONPATH"]), pytest.__file__; print("pytest", pytest.__version__)'
+          podman pull "$(sed -n 's/^FROM //p' images/claude-code/Containerfile)"
       - name: Let the tests bind self-hosted targets on ports 53, 80 and 443
         run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
       - name: Podman integration tests

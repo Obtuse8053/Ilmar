@@ -119,6 +119,81 @@ switch for it.
   - optionally posts the credential-free records on #44 and #11 with the
     maintainer's `gh` login.
 
+### Or in GitHub Actions: a manual, protected workflow
+
+`.github/workflows/live.yml` runs the same stages (`scripts/live_ci.py`
+shares them with `live_run.py`) on a GitHub-hosted runner with rootless
+Podman. Hardened in the security review of PR #54:
+
+- **`guard` job, with no secrets and no environment.** It refuses (fails
+  closed) unless:
+  - the run was started by `workflow_dispatch`, from `live.yml` on
+    `refs/heads/main`, at exactly the `expected_sha` the maintainer gave
+    (`GITHUB_SHA` and `GITHUB_WORKFLOW_SHA`);
+  - `main` still points at `expected_sha`, read from the API at that moment
+    (`git/ref/heads/main`), not taken from the event;
+  - the `live` environment has required reviewers, no administrator bypass,
+    and deployment limited to exactly the branch `main`;
+  - `main`'s rulesets require pull requests and block force pushes and
+    deletion.
+
+  It reads these through the repository's token (`actions: read`), never
+  following a redirect. It runs `main`'s own code (the default checkout),
+  never code from `expected_sha` before that SHA is confirmed to be `main`. GitHub releases environment secrets to any job the
+  environment's rules allow, so those rules, plus `main` changing only
+  through pull requests, are the boundary. The guard makes a misconfigured
+  boundary stop the run. It cannot detect an untrustworthy reviewer;
+  `docs/operations/live-testing.md` lists those manual checks.
+- **`prepare` job, with no secrets and no environment** (finalisation of
+  PR #54): every download and build of the run happens here, in a job of its
+  own, so nothing it runs can wait on the runner for the secrets:
+  - the wheels of `requirements/live.txt`: pytest and its full dependency
+    closure on CPython 3.12 / Linux, each pinned to an exact version and one
+    sha256, downloaded with `pip download --require-hashes --no-deps
+    --only-binary=:all:`;
+  - the Claude Code image, built from its base pinned by digest
+    (`node:22-bookworm-slim@sha256:…`) and saved as an archive. The job's
+    outputs are the image ID and the archive's sha256.
+- **`live` job, in the protected environment:**
+  - it checks out exactly `expected_sha`, not a branch;
+  - before any secret, it checks again: the context, that the checked-out
+    tree is `expected_sha`, and that `main` still points at it. A reviewer
+    approving hours later after another merge gets a refusal; that run must
+    be dispatched again. It then checks each wheel's sha256 against the lock
+    *of this commit* and unpacks the wheels with `live_ci.py`. No pip and no
+    wheel code run while they are installed: only pure-Python
+    `py3-none-any` wheels with no `.data`, no links and no paths leaving the
+    directory. It loads the image archive only if its sha256 and image ID
+    are the prepare job's, and pulls the proxy image by digest;
+  - nothing is installed, built, pulled or fetched after the secrets. The
+    tests run on the runner's system Python with only the unpacked wheels,
+    user site-packages off and pytest plugin autoload off. The runtime starts
+    containers with `--pull=never`, and both images must exist first. Only
+    four steps may follow the first secret step, each listed with its
+    justification in the workflow test: the two `exec` steps, a
+    `podman rm`, and `upload-artifact` pinned by commit, which gets no
+    secret;
+  - every action is pinned by full commit SHA;
+  - the secrets reach only the test step and the cleanup step, which both
+    `exec` into Python;
+  - after failure or cancellation, a cleanup step removes `ilmar-live/*`
+    leftovers in the disposable repository, which it first verifies by
+    name, privacy and topic. Another step removes every container;
+  - only checked JSON records are uploaded (kept 7 days), with a
+    `run-summary.json` that binds the outcome to the commit.
+- **`post` job, with no environment and no secrets:** it posts only if the
+  run passed, and only records whose names are expected. Each must be valid
+  JSON under 64 KiB, with nothing credential-shaped, and the summary must be
+  "passed" for this commit. It uses `issues: write` with the repository's own
+  token.
+- **Untrusted inputs** are expanded only into the environment, never inside
+  a script.
+- **Checked offline:** `tests/unit/test_live_workflow.py` checks all of
+  this, structurally and behaviourally. `ci.yml` never runs a live test.
+  On every pull request it does download the lock against its hashes,
+  `pip check` it, unpack it with `live_ci.py`, and pull the agent image's
+  pinned base.
+
 ### The live harness (`tests/live_harness.py`)
 
 - **Guard (`preflight`), before anything is written.** The run is refused
