@@ -160,11 +160,22 @@ In `Obtuse8053/Ilmar` → **Settings**:
    - **Create**
 
    Why: a workflow changed directly on `main` would receive the secrets
-   legitimately. With this, `main` changes only through reviewed pull
-   requests, including changes by automation such as Claude sessions.
+   legitimately. With this, `main` changes only through pull requests,
+   including changes by automation such as Claude sessions.
+
+   With 0 required approvals, anyone who can merge (including automation
+   acting as you) can still merge their own pull request. The approval in
+   step 2 is what keeps a run from starting without a person who did not
+   start it.
 2. **Environments → New environment** named `live`:
-   - **Required reviewers:** add yourself. Leave **Prevent self-review**
-     off if you are the only maintainer.
+   - **Required reviewers:** add a GitHub account that **no automation can
+     use**: not the account Claude (or any other agent, bot or CI token)
+     acts as. If Claude's GitHub connection acts as your main account,
+     that means a second account of your own. Give that account only the
+     repository access it needs to approve.
+   - **Prevent self-review:** **ticked**. The guard refuses to run without
+     it. The account that starts a run then cannot approve it, so a
+     dispatch by automation acting as you still needs the reviewer account.
    - **Allow administrators to bypass configured protection rules:**
      **unticked**.
    - **Deployment branches and tags:** *Selected branches and tags* → *Add
@@ -181,7 +192,18 @@ In `Obtuse8053/Ilmar` → **Settings**:
    The workflow sets its own minimal permissions either way.
 
 What the guard cannot see, so you must keep it true yourself:
-- **Who can approve:** only people you trust are required reviewers.
+- **Who can approve:** only people you trust are required reviewers, and
+  no reviewer account is reachable by Claude or other automation (no
+  connected app, token, SSH key or saved session for it in an agent's
+  environment).
+- **Administration and approval are separate.** An account with
+  administration access to this repository can change rulesets and
+  environments, merge, and dispatch. It must not also be able to approve
+  its own live deployment. Keep "Prevent self-review" on, and keep the
+  reviewer an account other than the one that holds administration (and
+  that automation acts as). If an administrator account is also a
+  reviewer, it can approve runs started by someone else, so it must be one
+  no automation can use.
 - **No other workflow** uses `environment: live`. Changing one would need a
   pull request into `main`.
 - **No repository-wide or organisation-wide secrets** hold these credentials.
@@ -197,7 +219,7 @@ gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
 
 Then:
 1. Wait for `guard` and `prepare` to pass, and approve the pending `live`
-   deployment. Do not merge anything into `main` in between: the `live`
+   deployment **in the browser, signed in as the reviewer account**. Do not merge anything into `main` in between: the `live`
    job checks again that `main` still points at `expected_sha`, and refuses
    if not. Then dispatch it again with the new commit.
 2. `prepare` (no secrets) downloads the hash-locked wheels
