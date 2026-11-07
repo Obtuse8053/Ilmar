@@ -4,13 +4,20 @@ name: Live tests (manual)
 # `ilmar-disposable` repository), real rootless Podman and real Claude Code.
 #
 # Order and boundaries:
-# 1. `guard` (no secrets): refuses unless the run was started by hand on main
-#    at the expected commit, and the protected `live` environment is
-#    configured as docs/operations/live-testing.md requires.
-# 2. `live` (the environment, after a required reviewer approves): checks the
-#    commit again, then gives the two secrets to exactly one step; cleans up
-#    after failures and cancellations.
-# 3. `post` (no environment, no secrets): posts only checked, credential-free
+# 1. `guard` (no secrets): refuses unless the run was started by hand on main,
+#    main still points at expected_sha, and the protected `live` environment
+#    and main's rules are configured as docs/operations/live-testing.md says.
+#    It runs main's own code (the default checkout), never expected_sha's.
+# 2. `prepare` (no secrets, no environment): every download and build of the
+#    run: the hash-locked wheels (requirements/live.txt) and the agent image
+#    from its digest-pinned base, saved with its digest.
+# 3. `live` (the environment, after a required reviewer approves): checks out
+#    expected_sha and checks, before any secret, the context, the tree, that
+#    main still points at it, the wheels' digests and the image's digest and
+#    ID. Then two steps get the secrets; nothing is installed, pulled, built
+#    or fetched after them (tests/unit/test_live_workflow.py lists what may
+#    run there and why).
+# 4. `post` (no environment, no secrets): posts only checked, credential-free
 #    records of a passed run of this commit.
 # Nothing here runs on push or pull_request. Unattended operation stays
 # disabled (#20). See ADR-0023.
@@ -53,17 +60,51 @@ jobs:
       actions: read
       contents: read
     steps:
+      # Default ref: the dispatched commit on main, so the guard is main's code.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Check the context and the live environment
+      - name: Check the context, main and the live environment
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/live_ci.py --guard
 
+  prepare:
+    name: Prepare the wheels and the agent image (no secrets)
+    needs: guard
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      image_id: ${{ steps.prepare.outputs.image_id }}
+      archive_sha256: ${{ steps.prepare.outputs.archive_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.ILMAR_EXPECTED_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Download the locked wheels and build the agent image
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/live_ci.py --guard-context
+          python scripts/live_ci.py --prepare "$RUNNER_TEMP/live-inputs"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-inputs
+          path: ${{ runner.temp }}/live-inputs
+          if-no-files-found: error
+          retention-days: 1
+
   live:
     name: Live tests (#44, #11d)
-    needs: guard
+    needs: [guard, prepare]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 80
@@ -73,27 +114,27 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ env.ILMAR_EXPECTED_SHA }}
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          python-version: "3.12"
-      - name: Install (only what the tests run, at exact versions)
-        run: |
-          python -m pip install --no-deps -e .
-          python -m pip install --no-deps pytest==9.2.0 pluggy==1.7.0 iniconfig==2.3.1 \
-            packaging==26.3 pygments==2.21.0
+          name: live-inputs
+          path: ${{ runner.temp }}/live-inputs
       - name: Check the context and the commit again (before any secret)
-        run: python scripts/live_ci.py --guard-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/live_ci.py --guard-context
+      - name: Install the locked wheels (digests checked, nothing resolved)
+        run: python3 scripts/live_ci.py --install-wheels "$RUNNER_TEMP/live-inputs/wheels" "$RUNNER_TEMP/live-site"
       - name: Podman environment
         run: |
           podman version
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
-      - name: Images (built here, never published)
-        run: |
-          podman pull docker.io/library/python:3.12-alpine@sha256:213242b537a1c166a0c53e903461fc18d5518e7196c93dbecda452660a848918
-          podman build --build-arg CLAUDE_CODE_VERSION="$ILMAR_TEST_CLAUDE_VERSION" \
-            -t "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION" images/claude-code
-          podman image inspect --format '{{.Id}}' "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION"
+      - name: Load the images (by digest; nothing is built here)
+        env:
+          ILMAR_IMAGE_ID: ${{ needs.prepare.outputs.image_id }}
+          ILMAR_IMAGE_SHA256: ${{ needs.prepare.outputs.archive_sha256 }}
+        run: python3 scripts/live_ci.py --load-images "$RUNNER_TEMP/live-inputs/claude-code.tar"
       - name: Live tests
         timeout-minutes: 65
         env:
@@ -101,14 +142,14 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # exec: no shell keeps the secrets in its environment (the leak check
         # trusts only the coordinator and git).
-        run: exec python scripts/live_ci.py
+        run: exec python3 scripts/live_ci.py
       - name: Clean up after a failure or cancellation
         if: failure() || cancelled()
         timeout-minutes: 5
         env:
           ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: exec python scripts/live_ci.py --cleanup
+        run: exec python3 scripts/live_ci.py --cleanup
       - name: Remove every container (no secrets)
         if: always()
         run: |
@@ -137,6 +178,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ env.ILMAR_EXPECTED_SHA }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

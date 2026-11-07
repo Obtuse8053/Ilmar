@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run #44 and the live end-to-end tests (#11d) inside the manual ``live`` workflow.
 
-    python scripts/live_ci.py            # in the live job
-    python scripts/live_ci.py --post DIR # in the post job: records only
+    python3 scripts/live_ci.py --guard            # guard job: context, environment, main
+    python3 scripts/live_ci.py --prepare DIR      # prepare job: wheels and the agent image
+    python3 scripts/live_ci.py --guard-context    # live job, before any secret
+    python3 scripts/live_ci.py --install-wheels WHEELS SITE
+    python3 scripts/live_ci.py --load-images TAR  # live job, before any secret
+    python3 scripts/live_ci.py                    # live job: the tests (the secrets)
+    python3 scripts/live_ci.py --post DIR         # post job: records only
 
 The GitHub Actions counterpart of ``scripts/live_run.py``. It runs the same
 stages, record checks and posting. The only difference is where the
@@ -17,6 +22,7 @@ with its terminal-only prompt is the way.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +60,10 @@ PROXY_IMAGE = (
     "@sha256:213242b537a1c166a0c53e903461fc18d5518e7196c93dbecda452660a848918"
 )
 """Pinned by digest: it runs the egress proxy and the verification commands."""
+LOCK = ROOT / "requirements" / "live.txt"
+WORKFLOW_FILE = ".github/workflows/live.yml"
+SITE_MARKER = ".ilmar-live-lock"
+IMAGE_ARCHIVE = "claude-code.tar"
 SUMMARY = "run-summary.json"
 RECORDS = re.compile(
     r"(issue-44-smoke-test|preflight|end-to-end-[a-z0-9-]+|crash-drill-[a-z0-9-]+|run-summary)\.json"
@@ -79,6 +90,11 @@ def check_context(env: Mapping[str, str]) -> list[str]:
         problems.append("expected_sha must be the full 40-character commit")
     elif env.get("GITHUB_SHA") != expected:
         problems.append("the workflow is not running the expected commit")
+    elif env.get("GITHUB_WORKFLOW_SHA") != expected:
+        problems.append("the workflow file is not from the expected commit")
+    repository = env.get("GITHUB_REPOSITORY", "")
+    if env.get("GITHUB_WORKFLOW_REF") != f"{repository}/{WORKFLOW_FILE}@refs/heads/main":
+        problems.append(f"this is not {WORKFLOW_FILE} on main")
     if not VERSION.fullmatch(env.get("ILMAR_TEST_CLAUDE_VERSION", "")):
         problems.append("claude_version must be x.y.z")
     return problems
@@ -162,13 +178,190 @@ def guard(env: Mapping[str, str], get: Callable[[str, str], Any] = github_get) -
         return [*problems, f"cannot read the '{ENVIRONMENT}' environment or main's rules: {error}"]
     if not isinstance(rules, list):
         return [*problems, "main's rules could not be read"]
-    return [*problems, *check_environment(environment, policies), *check_main_rules(rules)]
+    return [
+        *problems,
+        *check_environment(environment, policies),
+        *check_main_rules(rules),
+        *check_main_head(env, get),
+    ]
+
+
+def check_main_head(env: Mapping[str, str], get: Callable[[str, str], Any]) -> list[str]:
+    """Asked of GitHub now, not taken from the event: main still points at the
+    commit the maintainer approved. A later push to main (even a merged pull
+    request) refuses the run; dispatch it again for the new commit."""
+    repository = env.get("GITHUB_REPOSITORY", "")
+    token = env.get("GH_TOKEN", "")
+    if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+", repository) or not token:
+        return ["GITHUB_REPOSITORY and GH_TOKEN are needed to read main"]
+    try:
+        ref = get(f"/repos/{repository}/git/ref/heads/main", token)
+    except RunError as error:
+        return [f"cannot read main: {error}"]
+    head = ref.get("object", {}).get("sha") if isinstance(ref, dict) else None
+    if not isinstance(head, str) or head != env.get("ILMAR_EXPECTED_SHA"):
+        return ["main no longer points at the expected commit"]
+    return []
 
 
 def checked_out_commit(root: Path = ROOT, run: Callable[..., Any] = subprocess.run) -> str:
     done = run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True,
                check=False, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})  # fmt: skip
     return str(done.stdout).strip()
+
+
+# -- dependencies: exact versions and digests, unpacked by this script ---------------------
+
+LOCK_LINE = re.compile(r"([a-z0-9][a-z0-9_.-]*)==([0-9][0-9a-z.]*)((?: --hash=sha256:[0-9a-f]{64})+)")
+
+
+def parse_lock(text: str) -> dict[str, tuple[str, frozenset[str]]]:
+    """requirements/live.txt: one ``name==version --hash=sha256:…`` per line, nothing else
+    (no ranges, URLs, indexes, includes or options)."""
+    lock: dict[str, tuple[str, frozenset[str]]] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        match = LOCK_LINE.fullmatch(line.strip())
+        if match is None:
+            raise RunError(f"requirements/live.txt:{number}: not an exact, hashed requirement")
+        name, version, hashes = match.groups()
+        if name in lock:
+            raise RunError(f"requirements/live.txt:{number}: {name} is listed twice")
+        lock[name] = (version, frozenset(re.findall(r"[0-9a-f]{64}", hashes)))
+    if not lock:
+        raise RunError("requirements/live.txt lists nothing")
+    return lock
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def install_wheels(wheels: Path, site: Path, lock_text: str) -> list[str]:
+    """Unpack exactly the locked pure-Python wheels into SITE, after checking each digest.
+
+    No pip and no build step: nothing from a wheel runs while it is installed.
+    Any wheel too many or too few, any digest or file name that differs, any
+    platform-specific or data-carrying wheel and any path leaving SITE stops it
+    with SITE untouched.
+    """
+    lock = parse_lock(lock_text)
+    expected = {f"{name}-{version}-py3-none-any.whl": (name, hashes)
+                for name, (version, hashes) in lock.items()}  # fmt: skip
+    present = sorted(p.name for p in wheels.iterdir()) if wheels.is_dir() else []
+    if present != sorted(expected):
+        raise RunError(f"the wheels are not exactly the locked ones: {present}")
+    plans: list[tuple[Path, list[zipfile.ZipInfo]]] = []
+    for file_name, (name, hashes) in sorted(expected.items()):
+        wheel = wheels / file_name
+        if wheel.is_symlink() or not wheel.is_file():
+            raise RunError(f"{file_name} is not a regular file")
+        if sha256_of(wheel) not in hashes:
+            raise RunError(f"{file_name} does not match its locked sha256")
+        with zipfile.ZipFile(wheel) as archive:
+            members = archive.infolist()
+        for member in members:
+            parts = Path(member.filename).parts
+            if member.filename.startswith("/") or ".." in parts or "\\" in member.filename:
+                raise RunError(f"{file_name}: {member.filename} leaves the install directory")
+            if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                raise RunError(f"{file_name}: {member.filename} is a symbolic link")
+            if parts and parts[0].endswith(".data"):
+                raise RunError(f"{file_name} installs files outside site-packages")
+        plans.append((wheel, members))
+    if site.exists():
+        raise RunError(f"{site} already exists")
+    site.mkdir(parents=True)
+    for wheel, members in plans:
+        with zipfile.ZipFile(wheel) as archive:
+            for member in members:
+                archive.extract(member, site)
+    (site / SITE_MARKER).write_text(hashlib.sha256(lock_text.encode()).hexdigest() + "\n")
+    return sorted(expected)
+
+
+def check_site(site: Path, lock_text: str) -> None:
+    """The run uses only what install_wheels unpacked from this commit's lock."""
+    marker = site / SITE_MARKER
+    wanted = hashlib.sha256(lock_text.encode()).hexdigest()
+    if not marker.is_file() or marker.read_text().strip() != wanted:
+        raise RunError("the hash-checked dependencies are not installed (--install-wheels)")
+
+
+# -- the agent image: built in the prepare job, loaded by digest in the live job ----------
+
+
+def podman_output(run: Callable[..., Any], *argv: str) -> str:
+    done = run(["podman", *argv], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise RunError(f"podman {argv[0]} failed")
+    return str(done.stdout).strip()
+
+
+def prepare(out: Path, env: Mapping[str, str], run: Callable[..., Any]) -> dict[str, str]:
+    """In the prepare job (no secrets): every download and build of the run happens here.
+
+    Wheels come only by exact version and digest; the agent image is built from
+    the digest-pinned base and saved, so the live job loads exactly these bytes.
+    """
+    version = env.get("ILMAR_TEST_CLAUDE_VERSION", "")
+    if not VERSION.fullmatch(version):
+        raise RunError("ILMAR_TEST_CLAUDE_VERSION must be a pinned x.y.z version")
+    out.mkdir(parents=True, exist_ok=False)
+    pip = [sys.executable, "-m", "pip", "download", "--require-hashes", "--no-deps",
+           "--only-binary=:all:", "--no-cache-dir", "--dest", str(out / "wheels"),
+           "--requirement", str(LOCK)]  # fmt: skip
+    if run(pip, check=False).returncode != 0:
+        raise RunError("the locked wheels could not be downloaded against their hashes")
+    tag = f"localhost/ilmar-claude-code:{version}"
+    build = ["podman", "build", "--pull=missing", "--build-arg",
+             f"CLAUDE_CODE_VERSION={version}", "--tag", tag, str(ROOT / "images" / "claude-code")]  # fmt: skip
+    if run(build, check=False).returncode != 0:
+        raise RunError("the agent image did not build")
+    image_id = podman_output(run, "image", "inspect", "--format", "{{.Id}}", tag)
+    archive = out / IMAGE_ARCHIVE
+    if run(["podman", "save", "--format", "docker-archive", "--output", str(archive), tag],
+           check=False).returncode != 0:  # fmt: skip
+        raise RunError("the agent image could not be saved")
+    return {"image_id": image_id, "archive_sha256": sha256_of(archive)}
+
+
+def load_images(archive: Path, env: Mapping[str, str], run: Callable[..., Any]) -> None:
+    """In the live job, before any secret: the prepared image, checked by digest and
+    ID, and the proxy image by its pinned digest. The tests then never pull
+    (the runtime passes --pull=never and the prerequisites check both exist)."""
+    version = env.get("ILMAR_TEST_CLAUDE_VERSION", "")
+    image_id = env.get("ILMAR_IMAGE_ID", "")
+    archive_sha = env.get("ILMAR_IMAGE_SHA256", "")
+    if not VERSION.fullmatch(version):
+        raise RunError("ILMAR_TEST_CLAUDE_VERSION must be a pinned x.y.z version")
+    if not re.fullmatch(r"(sha256:)?[0-9a-f]{64}", image_id) or not re.fullmatch(
+        r"[0-9a-f]{64}", archive_sha
+    ):
+        raise RunError("the prepare job's image ID and archive digest are missing")
+    if archive.is_symlink() or not archive.is_file() or sha256_of(archive) != archive_sha:
+        raise RunError("the agent image archive is not the one the prepare job built")
+    podman_output(run, "load", "--quiet", "--input", str(archive))
+    tag = f"localhost/ilmar-claude-code:{version}"
+    podman_output(run, "tag", image_id.removeprefix("sha256:"), tag)
+    loaded = podman_output(run, "image", "inspect", "--format", "{{.Id}}", tag)
+    if loaded.removeprefix("sha256:") != image_id.removeprefix("sha256:"):
+        raise RunError("the loaded agent image is not the one the prepare job built")
+    podman_output(run, "pull", "--quiet", PROXY_IMAGE)
+
+
+def write_outputs(env: Mapping[str, str], outputs: Mapping[str, str]) -> None:
+    path = env.get("GITHUB_OUTPUT", "")
+    if not path:
+        raise RunError("GITHUB_OUTPUT is not set")
+    with open(path, "a", encoding="utf-8") as handle:
+        for key, value in outputs.items():
+            handle.write(f"{key}={value}\n")
 
 
 # -- records ------------------------------------------------------------------------------
@@ -229,6 +422,10 @@ def ci_settings(env: Mapping[str, str]) -> dict[str, str]:
         "ILMAR_TEST_CLAUDE_IMAGE": f"localhost/ilmar-claude-code:{version}",
         "ILMAR_TEST_PODMAN_PROXY_IMAGE": PROXY_IMAGE,
         "ILMAR_LIVE_REPORT_DIR": str(Path(temp) / "live-reports"),
+        # pytest and its dependencies, only as install_wheels unpacked them.
+        "PYTHONPATH": str(Path(temp) / "live-site"),
+        "PYTHONNOUSERSITE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",  # no plugin from the runner's system Python
     }
 
 
@@ -247,7 +444,7 @@ def cleanup(env: Mapping[str, str]) -> list[str]:
     disposable repository. Only `ilmar-live/*` branches, `ilmar-live:*` labels,
     their issues and the pull requests into those branches; only in a repository
     the guard accepts (name, privacy, topic)."""
-    sys.path.insert(0, str(ROOT / "tests"))
+    sys.path[:0] = [str(ROOT / "src"), str(ROOT / "tests")]  # Ilmar is not installed
     import live_harness as h
     from ilmar.adapters.github.client import urllib_transport
 
@@ -299,10 +496,19 @@ def main(
         "--guard-context", action="store_true", help="check the context and the checked-out commit"
     )
     mode.add_argument("--cleanup", action="store_true", help="remove leftovers of live runs")
+    mode.add_argument("--prepare", metavar="DIR", help="download the wheels, build the image")
+    mode.add_argument("--install-wheels", nargs=2, metavar=("WHEELS", "SITE"),
+                      help="unpack the locked wheels after checking their digests")  # fmt: skip
+    mode.add_argument("--load-images", metavar="TAR", help="load the prepared images by digest")
     mode.add_argument("--post", metavar="DIR", help="post the records in DIR on #44 and #11")
     args = parser.parse_args(argv)
     source = dict(os.environ if environ is None else environ)
     try:
+        if args.install_wheels:  # also run by ci.yml, outside the live workflow
+            wheels, site = (Path(p) for p in args.install_wheels)
+            for name in install_wheels(wheels, site, LOCK.read_text()):
+                print(f"installed {name}")
+            return 0
         if args.guard:
             if problems := guard(source, get):
                 for problem in problems:
@@ -313,10 +519,21 @@ def main(
             return 0
         if problems := check_context(source):
             raise RunError("; ".join(problems))
+        if checked_out_commit(run=run) != source["ILMAR_EXPECTED_SHA"]:
+            raise RunError("the checked-out tree is not the expected commit")
         if args.guard_context:
-            if checked_out_commit(run=run) != source["ILMAR_EXPECTED_SHA"]:
-                raise RunError("the checked-out tree is not the expected commit")
-            print("Running the expected commit on main.")
+            if problems := check_main_head(source, get):
+                raise RunError("; ".join(problems))
+            print("Running the expected commit, and main still points at it.")
+            return 0
+        if args.prepare:
+            outputs = prepare(Path(args.prepare), source, run)
+            write_outputs(source, outputs)
+            print(f"Prepared the wheels and image {outputs['image_id']}.")
+            return 0
+        if args.load_images:
+            load_images(Path(args.load_images), source, run)
+            print("Loaded the prepared agent image and the pinned proxy image.")
             return 0
         if args.post:
             records = checked_records(Path(args.post), source["GITHUB_SHA"])
@@ -328,9 +545,8 @@ def main(
             for item in cleanup(source):
                 print(f"removed {item}")
             return 0
-        if checked_out_commit(run=run) != source["ILMAR_EXPECTED_SHA"]:
-            raise RunError("the checked-out tree is not the expected commit")
         settings = ci_settings(source)
+        check_site(Path(settings["PYTHONPATH"]), LOCK.read_text())
         check_prerequisites(settings, run)
         credentials = ci_credentials(source)
     except RunError as error:

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Everything the manual live workflow (.github/workflows/live.yml) runs that
+# is not Ilmar itself or the standard library: pytest and its dependencies on
+# CPython 3.12 / Linux, every one pinned to an exact version and the sha256 of
+# its pure-Python wheel. Nothing is resolved: pip downloads with --no-deps
+# --require-hashes in the prepare job (no secrets), and scripts/live_ci.py
+# checks every digest again before it unpacks a wheel in the live job.
+#
+# Change it only in a reviewed pull request; CI downloads every wheel against
+# these hashes and runs `pip check` on the result.
+iniconfig==2.3.1 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+packaging==26.3 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+pluggy==1.7.0 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+pygments==2.21.0 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+pytest==9.2.0 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
