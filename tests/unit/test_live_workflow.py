@@ -34,15 +34,15 @@ KEY = "sk-ant-api03-" + "Zy9Xw8Vu" * 8
 SECRET = re.compile(r"\$\{\{\s*secrets\.")
 
 
-def jobs() -> dict[str, str]:
+def jobs(workflow: str = WORKFLOW) -> dict[str, str]:
     """Each job's block of the workflow, by name."""
-    body = WORKFLOW.split("\njobs:\n", 1)[1]
+    body = workflow.split("\njobs:\n", 1)[1]
     parts = re.split(r"^  ([a-z][a-z0-9_-]*):\n", body, flags=re.MULTILINE)
     return dict(zip(parts[1::2], parts[2::2], strict=True))
 
 
-def steps(job: str) -> list[str]:
-    return re.split(r"^      - ", jobs()[job], flags=re.MULTILINE)[1:]
+def steps(job: str, workflow: str = WORKFLOW) -> list[str]:
+    return re.split(r"^      - ", jobs(workflow)[job], flags=re.MULTILINE)[1:]
 
 
 def test_it_runs_only_when_started_by_hand() -> None:
@@ -97,32 +97,102 @@ def test_everything_is_checked_before_any_secret_in_this_order() -> None:
     assert "ILMAR_IMAGE_SHA256: ${{ needs.prepare.outputs.archive_sha256 }}" in before[5]
 
 
-# What may run once a step has held the secrets, and why. Anything else (an
-# install, a pull, a build, a download, another action) fails this test.
+# What may run once a step has held the secrets: each step's exact text, and why
+# it is acceptable. A name kept with a changed body (another command, another
+# env entry, another action input) fails, not only the known-bad patterns.
 AFTER_THE_SECRETS = {
-    "name: Live tests": "the tests themselves (exec, the secrets)",
-    "name: Clean up after a failure or cancellation": "our script, the secrets, no installs",
-    "name: Remove every container (no secrets)": "the runner's own podman, no secrets",
-    "name: Keep the records (no credentials)": (
-        "actions/upload-artifact pinned to a full commit (immutable, GitHub's own); its "
-        "step gets no secret, and the records are leak-checked before they are written"
-    ),
+    # The tests themselves: our script, exec'd, from the checked-out expected_sha.
+    "name: Live tests": """name: Live tests
+        timeout-minutes: 65
+        env:
+          ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # exec: no shell keeps the secrets in its environment (the leak check
+        # trusts only the coordinator and git).
+        run: exec python3 scripts/live_ci.py
+""",
+    # Our script again; it only calls GitHub's API for the disposable repository.
+    "name: Clean up after a failure or cancellation": """\
+name: Clean up after a failure or cancellation
+        if: failure() || cancelled()
+        timeout-minutes: 5
+        env:
+          ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: exec python3 scripts/live_ci.py --cleanup
+""",
+    # The runner's own podman; no secret in its environment.
+    "name: Remove every container (no secrets)": """name: Remove every container (no secrets)
+        if: always()
+        run: |
+          podman rm --all --force --time 0 || true
+          podman network prune --force || true
+""",
+    # GitHub's upload-artifact, pinned to a full commit (immutable); no secret in
+    # its step; every record was leak-checked in all encodings when written.
+    "name: Keep the records (no credentials)": """name: Keep the records (no credentials)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-records
+          path: ${{ runner.temp }}/live-reports/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+""",
 }
 FORBIDDEN_AFTER_SECRETS = re.compile(
     r"\bpip\b|\bnpm\b|\bnpx\b|\bcurl\b|\bwget\b|\bapt(-get)?\b|git (clone|fetch|pull)"
-    r"|podman (pull|build|load|import|run|create|exec)|setup-python|download-artifact"
+    r"|\bdocker\b|\bgh\b|python3? -c|podman (pull|build|load|import|run|create|exec)"
+    r"|setup-python|download-artifact"
 )
 
 
+def after_secret_problems(workflow: str) -> list[str]:
+    """Every way the steps after the first secret step differ from the reviewed list."""
+    live = steps("live", workflow)
+    first = next(i for i, step in enumerate(live) if SECRET.search(step))
+    after = live[first:]
+    names = [step.splitlines()[0] for step in after]
+    if names != list(AFTER_THE_SECRETS):
+        return [f"steps after the secrets: {names}"]
+    problems = []
+    for step, (name, expected) in zip(after, AFTER_THE_SECRETS.items(), strict=True):
+        if step.rstrip("\n") + "\n" != expected:
+            problems.append(f"{name}: changed")
+        if FORBIDDEN_AFTER_SECRETS.search(step):
+            problems.append(f"{name}: runs something forbidden")
+    return problems
+
+
 def test_nothing_is_installed_pulled_or_fetched_after_the_secrets() -> None:
-    after = steps("live")[first_secret_step() :]
-    assert [s.splitlines()[0] for s in after] == list(AFTER_THE_SECRETS)
-    for step in after:
-        assert not FORBIDDEN_AFTER_SECRETS.search(step), step
-    uses = [u for s in after for u in re.findall(r"uses: (\S+)", s)]
-    assert uses == ["actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"]
-    assert not SECRET.search(after[-1])
-    assert not SECRET.search(after[-2])
+    assert after_secret_problems(WORKFLOW) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # Same name, another command.
+        ("podman network prune --force || true\n",
+         "podman network prune --force || true\n          docker run attacker/image\n"),
+        # Same command, one more env entry for the tests.
+        ("        run: exec python3 scripts/live_ci.py\n",
+         "          PYTHONPATH: ./elsewhere\n        run: exec python3 scripts/live_ci.py\n"),
+        # Another commit of the upload action.
+        ("upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n        with:\n"
+         "          name: live-records",
+         "upload-artifact@" + "f" * 40 + " # v4.6.2\n        with:\n          name: live-records"),
+        # A new step after the secrets.
+        ("      - name: Keep the records (no credentials)\n",
+         "      - name: Fetch a helper\n        run: gh release download x\n"
+         "      - name: Keep the records (no credentials)\n"),
+        # The cleanup taught to install something first.
+        ("        run: exec python3 scripts/live_ci.py --cleanup\n",
+         "        run: python3 -m pip install x && exec python3 scripts/live_ci.py --cleanup\n"),
+    ],
+)  # fmt: skip
+def test_a_changed_or_added_step_after_the_secrets_is_caught(old: str, new: str) -> None:
+    assert WORKFLOW.count(old) == 1, old
+    assert after_secret_problems(WORKFLOW.replace(old, new)) != []
 
 
 def test_the_live_job_never_installs_builds_or_resolves() -> None:
