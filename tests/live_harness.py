@@ -434,11 +434,41 @@ class LiveRun:
     issue: int
 
 
-def seed_run(github: LiveGitHub, repository: str, default_branch: str, run_id: str) -> LiveRun:
+# How long the seeded issue may take to appear in the coordinator's own query.
+# Not a run timeout: a precondition. If GitHub has not listed the issue by then,
+# the run stops here, saying so, instead of the coordinator finding no task.
+SEED_LISTING_TIMEOUT = 60.0
+
+
+def eligible_issues_path(repository: str, label: str) -> str:
+    """Exactly the listing GitHubTaskProvider.list_eligible asks GitHub for."""
+    query = urllib.parse.urlencode({"state": "open", "labels": label, "per_page": "100"})
+    return f"/repos/{repository}/issues?{query}"
+
+
+def issue_is_listed(github: LiveGitHub, repository: str, label: str, issue: int) -> bool:
+    reply = github.call("GET", eligible_issues_path(repository, label))
+    return (
+        reply.status == 200
+        and isinstance(reply.data, list)
+        and any(isinstance(i, dict) and i.get("number") == issue for i in reply.data)
+    )
+
+
+def seed_run(
+    github: LiveGitHub, repository: str, default_branch: str, run_id: str, *,
+    clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+) -> LiveRun:  # fmt: skip
     """A fresh base branch holding only the seed project, and one issue for it.
 
     Nothing existing is rewritten: the branch is new and its commit's parent is
     the default branch's head.
+
+    The issue is ready only once the coordinator can see it: the run's label is
+    created and put on the issue through endpoints that fail loudly (GitHub
+    silently drops labels passed when an issue is created, if the caller may
+    not set them), and the issue must appear in the coordinator's own listing.
+    Otherwise this stops, says which, and removes what it made.
     """
     if not re.fullmatch(r"[a-z0-9-]{6,40}", run_id):
         raise ValueError("run id: lowercase letters, digits and dashes")
@@ -461,12 +491,41 @@ def seed_run(github: LiveGitHub, repository: str, default_branch: str, run_id: s
     base = f"ilmar-live/{run_id}"
     github.ok("POST", f"/repos/{repository}/git/refs", {"ref": f"refs/heads/{base}", "sha": commit})
     label = f"ilmar-live:{run_id}"
-    issue = github.ok(
-        "POST",
-        f"/repos/{repository}/issues",
-        {"title": f"{ISSUE_TITLE} ({run_id})", "body": ISSUE_BODY, "labels": [label]},
-    )["number"]
-    return LiveRun(run_id, base, label, int(issue))
+    run = LiveRun(run_id, base, label, 0)
+    try:
+        made = github.call("POST", f"/repos/{repository}/labels", {
+            "name": label, "color": "c5def5", "description": "Ilmar live test run; safe to delete",
+        })  # fmt: skip
+        if made.status != 201:
+            raise LiveGuardError(f"the run's label could not be created (HTTP {made.status})")
+        created = github.ok("POST", f"/repos/{repository}/issues",
+                            {"title": f"{ISSUE_TITLE} ({run_id})", "body": ISSUE_BODY})  # fmt: skip
+        run = LiveRun(run_id, base, label, int(created["number"]))
+        labelled = github.call("POST", f"/repos/{repository}/issues/{run.issue}/labels",
+                               {"labels": [label]})  # fmt: skip
+        names = (
+            {str(item.get("name")) for item in labelled.data if isinstance(item, dict)}
+            if labelled.status == 200 and isinstance(labelled.data, list)
+            else set()
+        )
+        if label not in names:
+            raise LiveGuardError(
+                f"GitHub did not put the run's label on the seeded issue (HTTP "
+                f"{labelled.status}); the token needs Issues write"
+            )
+        listed = wait_for(
+            lambda: issue_is_listed(github, repository, label, run.issue),
+            timeout=SEED_LISTING_TIMEOUT, interval=1.0, clock=clock, sleep=sleep,
+        )  # fmt: skip
+        if not listed:
+            raise LiveGuardError(
+                f"GitHub did not list the seeded issue under its label within "
+                f"{SEED_LISTING_TIMEOUT:.0f} s, so the coordinator would find no task"
+            )
+    except BaseException:
+        cleanup_run(github, repository, run)  # best effort; the original error wins
+        raise
+    return run
 
 
 def change_requests_for(github: LiveGitHub, repository: str, base: str) -> list[dict[str, Any]]:
@@ -888,6 +947,30 @@ def wait_for(
         if clock() >= deadline:
             return False
         sleep(interval)
+
+
+def wait_while_running(
+    running: Callable[[], bool], condition: Callable[[], bool], *, timeout: float,
+    interval: float = 0.5, clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:  # fmt: skip
+    """Wait for ``condition`` while a process runs: ``"met"``, ``"exited"`` or ``"timeout"``.
+
+    A process that has stopped can no longer make the condition true, so the
+    wait ends there instead of running out the timeout.
+    """
+    outcome = "timeout"
+
+    def settled() -> bool:
+        nonlocal outcome
+        if condition():
+            outcome = "met"
+        elif not running():
+            outcome = "exited"
+        return outcome != "timeout"
+
+    wait_for(settled, timeout=timeout, interval=interval, clock=clock, sleep=sleep)
+    return outcome
 
 
 # -- the record for #44 and #11d ---------------------------------------------------------------
