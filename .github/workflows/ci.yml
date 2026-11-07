@@ -75,6 +75,9 @@ jobs:
         # from the Containerfile's pinned base: prove both still resolve, the hashes
         # match, the set is complete (pip check) and live_ci.py unpacks it.
         run: |
+          sed 's/ --hash.*//' requirements/live.txt > "$RUNNER_TEMP/unhashed.txt"
+          python -m pip download --no-deps --only-binary=:all: --no-cache-dir --dest "$RUNNER_TEMP/tmp-wheels" -r "$RUNNER_TEMP/unhashed.txt"
+          sha256sum "$RUNNER_TEMP"/tmp-wheels/* | sed 's|  .*/|  HASHLINE |'
           python -m pip download --require-hashes --no-deps --only-binary=:all: --no-cache-dir \
             --dest "$RUNNER_TEMP/live-wheels" --requirement requirements/live.txt
           python -m venv "$RUNNER_TEMP/lock-check"
