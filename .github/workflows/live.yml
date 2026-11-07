@@ -3,18 +3,25 @@ name: Live tests (manual)
 # #44 and the #11d live end-to-end tests against real GitHub (the disposable
 # `ilmar-disposable` repository), real rootless Podman and real Claude Code.
 #
-# - Started only by hand, and only after a required reviewer approves the
-#   protected `live` environment that holds the two secrets.
-# - The secrets reach exactly one step's environment; the tests prove they
-#   leak nowhere.
-# - Only credential-free JSON records leave the job.
-# - Nothing here runs on push or pull_request. Unattended operation stays
-#   disabled (#20).
-# See docs/operations/live-testing.md and ADR-0023.
+# Order and boundaries:
+# 1. `guard` (no secrets): refuses unless the run was started by hand on main
+#    at the expected commit, and the protected `live` environment is
+#    configured as docs/operations/live-testing.md requires.
+# 2. `live` (the environment, after a required reviewer approves): checks the
+#    commit again, then gives the two secrets to exactly one step; cleans up
+#    after failures and cancellations.
+# 3. `post` (no environment, no secrets): posts only checked, credential-free
+#    records of a passed run of this commit.
+# Nothing here runs on push or pull_request. Unattended operation stays
+# disabled (#20). See ADR-0023.
 
 on:
   workflow_dispatch:
     inputs:
+      expected_sha:
+        description: "The full commit SHA on main that you reviewed and want to run"
+        required: true
+        type: string
       claude_version:
         description: "Claude Code version to pin (x.y.z)"
         required: true
@@ -31,60 +38,95 @@ concurrency:
   group: live-tests
   cancel-in-progress: false
 
+env:
+  # Untrusted inputs: only ever expanded from the environment, never in `run:`.
+  ILMAR_EXPECTED_SHA: ${{ inputs.expected_sha }}
+  ILMAR_TEST_CLAUDE_VERSION: ${{ inputs.claude_version }}
+
 jobs:
+  guard:
+    name: Guard (no secrets)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the context and the live environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/live_ci.py --guard
+
   live:
     name: Live tests (#44, #11d)
+    needs: guard
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 80
     environment: live
     permissions:
       contents: read
-    env:
-      # Untrusted input: only ever expanded from the environment, never in `run:`.
-      ILMAR_TEST_CLAUDE_VERSION: ${{ inputs.claude_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - name: Install
-        run: python -m pip install -e ".[dev]"
-      - name: Check the version input
+      - name: Install (only what the tests run, at exact versions)
         run: |
-          [[ "$ILMAR_TEST_CLAUDE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "claude_version must be x.y.z" >&2; exit 1; }
+          python -m pip install --no-deps -e .
+          python -m pip install --no-deps pytest==9.2.0 pluggy==1.7.0 iniconfig==2.3.1 \
+            packaging==26.3 pygments==2.21.0
+      - name: Check the context and the commit again (before any secret)
+        run: python scripts/live_ci.py --guard-context
       - name: Podman environment
         run: |
           podman version
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
       - name: Images (built here, never published)
         run: |
-          podman pull docker.io/library/python:3.12-alpine
+          podman pull docker.io/library/python:3.12-alpine@sha256:213242b537a1c166a0c53e903461fc18d5518e7196c93dbecda452660a848918
           podman build --build-arg CLAUDE_CODE_VERSION="$ILMAR_TEST_CLAUDE_VERSION" \
             -t "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION" images/claude-code
           podman image inspect --format '{{.Id}}' "localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION"
       - name: Live tests
+        timeout-minutes: 65
         env:
           ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         # exec: no shell keeps the secrets in its environment (the leak check
         # trusts only the coordinator and git).
         run: exec python scripts/live_ci.py
+      - name: Clean up after a failure or cancellation
+        if: failure() || cancelled()
+        timeout-minutes: 5
+        env:
+          ILMAR_LIVE_GITHUB_TOKEN: ${{ secrets.ILMAR_LIVE_GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: exec python scripts/live_ci.py --cleanup
+      - name: Remove every container (no secrets)
+        if: always()
+        run: |
+          podman rm --all --force --time 0 || true
+          podman network prune --force || true
       - name: Keep the records (no credentials)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: live-records
           path: ${{ runner.temp }}/live-reports/*.json
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 7
 
   post:
     name: Post the records on #44 and #11
     needs: live
-    if: inputs.post_records
+    if: success() && inputs.post_records && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # No environment and no live secrets here: only the records, and this
@@ -93,17 +135,14 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: live-records
           path: ${{ runner.temp }}/live-records
-      - name: Post
+      - name: Post (only checked records of a passed run of this commit)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python scripts/live_ci.py --post "$RUNNER_TEMP/live-records"
+        run: python3 scripts/live_ci.py --post "$RUNNER_TEMP/live-records"

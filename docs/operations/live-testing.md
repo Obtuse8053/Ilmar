@@ -141,32 +141,71 @@ but GitHub's secret form.
    below. The token is fine-grained, only for `ilmar-disposable`, expires
    within 7 days, and has Contents, Issues and Pull requests read/write.
    The key is in a spend-capped `ilmar-live` workspace.
-3. **Create the environment.** In Ilmar's repository, go to **Settings →
-   Environments → New environment** and name it `live`. Then:
-   - **Required reviewers:** add yourself, and tick *Prevent self-review* only
-     if someone else will approve;
-   - **Deployment branches and tags:** *Selected branches and tags* → `main`
-     only. This keeps a modified workflow on another branch from ever
-     receiving the secrets;
-   - **Environment secrets:** `ILMAR_LIVE_GITHUB_TOKEN` (the token) and
-     `ANTHROPIC_API_KEY` (the key).
+3. **Configure the GitHub settings below.** The workflow's `guard` job reads
+   them, without any secret, and **refuses to run** unless they are exactly
+   so.
 
-**Each run:**
+### GitHub settings (checked by the guard, fail closed)
+
+In `Obtuse8053/Ilmar` → **Settings**:
+
+1. **Rules → Rulesets → New ruleset → New branch ruleset**:
+   - **Name:** `main`
+   - **Enforcement status:** Active
+   - **Bypass list:** empty
+   - **Target branches:** *Add target → Include default branch*
+   - **Rules:** tick **Restrict deletions**, **Block force pushes** and
+     **Require a pull request before merging** (0 required approvals is
+     enough for a single maintainer)
+   - **Create**
+
+   Why: a workflow changed directly on `main` would receive the secrets
+   legitimately. With this, `main` changes only through reviewed pull
+   requests, including changes by automation such as Claude sessions.
+2. **Environments → New environment** named `live`:
+   - **Required reviewers:** add yourself. Leave **Prevent self-review**
+     off if you are the only maintainer.
+   - **Allow administrators to bypass configured protection rules:**
+     **unticked**.
+   - **Deployment branches and tags:** *Selected branches and tags* → *Add
+     deployment branch or tag rule* → Ref type **Branch**, pattern **`main`**.
+     That must be the only rule.
+   - **Environment secrets:** `ILMAR_LIVE_GITHUB_TOKEN` (the token) and
+     `ANTHROPIC_API_KEY` (the key). Add no environment variables.
+3. **Actions → General:**
+   - keep **Workflow permissions** at *Read repository contents and
+     packages permissions*;
+   - leave **Allow GitHub Actions to create and approve pull requests**
+     **unticked**.
+
+   The workflow sets its own minimal permissions either way.
+
+What the guard cannot see, so you must keep it true yourself:
+- **Who can approve:** only people you trust are required reviewers.
+- **No other workflow** uses `environment: live`. Changing one would need a
+  pull request into `main`.
+- **No repository-wide or organisation-wide secrets** hold these credentials.
+  Only the `live` environment does.
+
+**Each run.** Review what is on `main`, then pin that exact commit:
 
 ```sh
+SHA=$(gh api repos/Obtuse8053/Ilmar/commits/main --jq .sha)   # the commit you reviewed
 gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
-  -f claude_version=<x.y.z> -f post_records=true
+  -f expected_sha="$SHA" -f claude_version=<x.y.z> -f post_records=true
 ```
 
-Or go to **Actions → Live tests (manual) → Run workflow**. Then approve the
-pending `live` deployment when GitHub asks.
-
-What the run does:
-- builds the Claude Code image on the runner; it is never published;
-- runs #44, then the live tests;
-- uploads only the credential-free records (artifact `live-records`);
-- with `post_records`, posts them on #44 and #11 from a separate job that
-  has no access to the secrets.
+Then:
+1. Wait for `guard` to pass, and approve the pending `live` deployment.
+2. The run checks the commit again, builds the Claude Code image (never
+   published), and runs #44 and then the live tests.
+3. After a failure or cancellation, it removes `ilmar-live/*` leftovers from
+   `ilmar-disposable` and every container.
+4. It uploads only credential-free records (artifact `live-records`, kept 7
+   days), plus `run-summary.json`, which binds the outcome to the commit.
+5. With `post_records`, a separate job without any secret posts the records
+   on #44 and #11, but only if the run passed, at that commit, and every
+   record passes its checks.
 
 **Afterwards:** delete the two environment secrets, and revoke the token and
 the key (or let them expire).

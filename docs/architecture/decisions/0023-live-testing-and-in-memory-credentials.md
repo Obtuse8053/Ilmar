@@ -123,22 +123,46 @@ switch for it.
 
 `.github/workflows/live.yml` runs the same stages (`scripts/live_ci.py`
 shares them with `live_run.py`) on a GitHub-hosted runner with rootless
-Podman:
-- **Trigger and permissions:** it is started only by `workflow_dispatch`,
-  and holds `permissions: {}` unless a job asks.
-- **Secrets:**
-  - the secrets live in the protected `live` environment. The maintainer
-    configures it with required reviewers and restricts it to `main`, so a
-    modified workflow on another branch cannot receive them;
-  - they reach exactly one step's environment, which `exec`s into Python,
-    so no shell keeps them.
-- **Untrusted input:** the version input is expanded only from the
-  environment, never inside a script.
-- **Output:** only the credential-free JSON records are uploaded. A separate
-  post job, with no environment and no secrets, comments them on #44 and #11
-  with the repository's own token (`issues: write`).
-- **Checked offline:** `tests/unit/test_live_workflow.py` checks these rules
-  structurally. `ci.yml` never runs a live test.
+Podman. Hardened in the security review of PR #54:
+
+- **`guard` job, with no secrets and no environment.** It refuses (fails
+  closed) unless:
+  - the run was started by `workflow_dispatch`, on `refs/heads/main`, at
+    exactly the `expected_sha` the maintainer gave;
+  - the `live` environment has required reviewers, no administrator bypass,
+    and deployment limited to exactly the branch `main`;
+  - `main`'s rulesets require pull requests and block force pushes and
+    deletion.
+
+  It reads these through the repository's token (`actions: read`), never
+  following a redirect. GitHub releases environment secrets to any job the
+  environment's rules allow, so those rules, plus `main` changing only
+  through pull requests, are the boundary. The guard makes a misconfigured
+  boundary stop the run. It cannot detect an untrustworthy reviewer;
+  `docs/operations/live-testing.md` lists those manual checks.
+- **`live` job, in the protected environment:**
+  - it checks the context and the checked-out commit again before any
+    secret;
+  - it installs only Ilmar and pytest's exact versions, without resolving
+    dependencies;
+  - images from registries are pinned by digest, and every action by full
+    commit SHA;
+  - the secrets reach only the test step and the cleanup step, which both
+    `exec` into Python;
+  - after failure or cancellation, a cleanup step removes `ilmar-live/*`
+    leftovers in the disposable repository, which it first verifies by
+    name, privacy and topic. Another step removes every container;
+  - only checked JSON records are uploaded (kept 7 days), with a
+    `run-summary.json` that binds the outcome to the commit.
+- **`post` job, with no environment and no secrets:** it posts only if the
+  run passed, and only records whose names are expected. Each must be valid
+  JSON under 64 KiB, with nothing credential-shaped, and the summary must be
+  "passed" for this commit. It uses `issues: write` with the repository's own
+  token.
+- **Untrusted inputs** are expanded only into the environment, never inside
+  a script.
+- **Checked offline:** `tests/unit/test_live_workflow.py` checks all of
+  this, structurally and behaviourally. `ci.yml` never runs a live test.
 
 ### The live harness (`tests/live_harness.py`)
 
