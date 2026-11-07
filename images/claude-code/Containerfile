@@ -12,7 +12,10 @@
 # The version is required and pinned: nothing is installed or updated at run
 # time, and ClaudeCodeSettings(expected_version=...) can check it.
 
-FROM docker.io/library/node:22-bookworm-slim
+# Pinned by digest (the multi-platform index of node:22-bookworm-slim, 2026-11-05):
+# a rebuild uses exactly this base. Update the digest deliberately, in a reviewed
+# change; CI pulls it to prove it resolves.
+FROM docker.io/library/node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
 
 ARG CLAUDE_CODE_VERSION
 RUN test -n "${CLAUDE_CODE_VERSION}" \

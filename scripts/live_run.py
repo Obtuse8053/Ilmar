@@ -101,6 +101,11 @@ def ask_credentials(ask: Callable[[str], str]) -> dict[str, str]:
         key = ask("Anthropic key (input hidden): ").strip()
     except (EOFError, KeyboardInterrupt):
         raise RunError("no credentials given; nothing was run") from None
+    return validate_credentials(token, key)
+
+
+def validate_credentials(token: str, key: str) -> dict[str, str]:
+    """Shape checks only; the messages never contain the values."""
     if not token.startswith("github_pat_"):
         raise RunError("that is not a fine-grained GitHub token (github_pat_…)")
     if not key.startswith("sk-ant-") or key == token:
@@ -145,6 +150,45 @@ def post(run: Callable[..., subprocess.CompletedProcess[str]], issue: int, body:
         raise RunError(f"posting on #{issue} failed: {done.stderr.strip()[:200]}")
 
 
+STAGES = (
+    ("#44 smoke test", SMOKE, ("issue-44-smoke-test.json",)),
+    ("#11d live end-to-end", LIVE, ("preflight.json", "end-to-end-*.json", "crash-drill-*.json")),
+)
+"""Each stage, its tests and the records that prove it passed (a skip writes none)."""
+
+
+def run_stages(
+    env: Mapping[str, str], reports: Path, started: float, run: Callable[..., Any]
+) -> int:
+    """Run #44, then the live tests only if #44 passed. Shared by live_run and live_ci."""
+    for stage, target, expected in STAGES:
+        print(f"\n== {stage} ==", flush=True)
+        done = run(pytest_command(target), cwd=ROOT, env=env, check=False)
+        if done.returncode != 0:
+            print(f"\n{stage} FAILED (exit {done.returncode}). Nothing more was run.")
+            print("The tests removed what they made; see docs/operations/live-testing.md.")
+            return int(done.returncode)
+        if missing := missing_records(reports, expected, started):
+            # A skipped test exits 0 too: without its record, it did not pass.
+            print(f"\n{stage} did not pass: no record {', '.join(missing)} was written "
+                  "(a test was skipped). Nothing more was run.")  # fmt: skip
+            return 1
+    print("\nAll live tests passed. Records (no credentials):")
+    for record in new_records(reports, started):
+        print(f"  {record}")
+    return 0
+
+
+def new_records(reports: Path, started: float) -> list[Path]:
+    return sorted(r for r in reports.glob("*.json") if r.stat().st_mtime >= started)
+
+
+def post_records(run: Callable[..., Any], records: Sequence[Path]) -> None:
+    for record in records:
+        issue = 44 if record.name.startswith("issue-44") else 11
+        post(run, issue, comment_body("Live test record", record))
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -168,33 +212,14 @@ def main(
     credentials.clear()
     reports = Path(settings["ILMAR_LIVE_REPORT_DIR"])
     started = time.time()
-    stages = (
-        ("#44 smoke test", SMOKE, ("issue-44-smoke-test.json",)),
-        ("#11d live end-to-end", LIVE,
-         ("preflight.json", "end-to-end-*.json", "crash-drill-*.json")),
-    )  # fmt: skip
-    for stage, target, expected in stages:
-        print(f"\n== {stage} ==", flush=True)
-        done = run(pytest_command(target), cwd=ROOT, env=env, check=False)
-        if done.returncode != 0:
-            print(f"\n{stage} FAILED (exit {done.returncode}). Nothing more was run.")
-            print("The tests removed what they made; see docs/operations/live-testing.md.")
-            return int(done.returncode)
-        if missing := missing_records(reports, expected, started):
-            # A skipped test exits 0 too: without its record, it did not pass.
-            print(f"\n{stage} did not pass: no record {', '.join(missing)} was written "
-                  "(a test was skipped). Nothing more was run.")  # fmt: skip
-            return 1
+    code = run_stages(env, reports, started, run)
     env.clear()
-    records = sorted(r for r in reports.glob("*.json") if r.stat().st_mtime >= started)
-    print("\nAll live tests passed. Records (no credentials):")
-    for record in records:
-        print(f"  {record}")
+    if code != 0:
+        return code
+    records = new_records(reports, started)
     if args.post:
         try:
-            for record in records:
-                issue = 44 if record.name.startswith("issue-44") else 11
-                post(run, issue, comment_body("Live test record", record))
+            post_records(run, records)
         except RunError as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
