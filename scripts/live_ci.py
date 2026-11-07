@@ -212,7 +212,9 @@ def checked_out_commit(root: Path = ROOT, run: Callable[..., Any] = subprocess.r
 
 # -- dependencies: exact versions and digests, unpacked by this script ---------------------
 
-LOCK_LINE = re.compile(r"([a-z0-9][a-z0-9_.-]*)==([0-9][0-9a-z.]*)((?: --hash=sha256:[0-9a-f]{64})+)")
+LOCK_LINE = re.compile(
+    r"([a-z0-9][a-z0-9_.-]*)==([0-9][0-9a-z.]*)((?: --hash=sha256:[0-9a-f]{64})+)"
+)
 
 
 def parse_lock(text: str) -> dict[str, tuple[str, frozenset[str]]]:
@@ -257,7 +259,7 @@ def install_wheels(wheels: Path, site: Path, lock_text: str) -> list[str]:
     if present != sorted(expected):
         raise RunError(f"the wheels are not exactly the locked ones: {present}")
     plans: list[tuple[Path, list[zipfile.ZipInfo]]] = []
-    for file_name, (name, hashes) in sorted(expected.items()):
+    for file_name, (_name, hashes) in sorted(expected.items()):
         wheel = wheels / file_name
         if wheel.is_symlink() or not wheel.is_file():
             raise RunError(f"{file_name} is not a regular file")
@@ -319,8 +321,9 @@ def prepare(out: Path, env: Mapping[str, str], run: Callable[..., Any]) -> dict[
     if run(pip, check=False).returncode != 0:
         raise RunError("the locked wheels could not be downloaded against their hashes")
     tag = f"localhost/ilmar-claude-code:{version}"
+    context = str(ROOT / "images" / "claude-code")
     build = ["podman", "build", "--pull=missing", "--build-arg",
-             f"CLAUDE_CODE_VERSION={version}", "--tag", tag, str(ROOT / "images" / "claude-code")]  # fmt: skip
+             f"CLAUDE_CODE_VERSION={version}", "--tag", tag, context]  # fmt: skip
     if run(build, check=False).returncode != 0:
         raise RunError("the agent image did not build")
     image_id = podman_output(run, "image", "inspect", "--format", "{{.Id}}", tag)

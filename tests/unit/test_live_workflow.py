@@ -115,13 +115,14 @@ FORBIDDEN_AFTER_SECRETS = re.compile(
 
 
 def test_nothing_is_installed_pulled_or_fetched_after_the_secrets() -> None:
-    after = steps("live")[first_secret_step():]
+    after = steps("live")[first_secret_step() :]
     assert [s.splitlines()[0] for s in after] == list(AFTER_THE_SECRETS)
     for step in after:
         assert not FORBIDDEN_AFTER_SECRETS.search(step), step
     uses = [u for s in after for u in re.findall(r"uses: (\S+)", s)]
     assert uses == ["actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"]
-    assert not SECRET.search(after[-1]) and not SECRET.search(after[-2])
+    assert not SECRET.search(after[-1])
+    assert not SECRET.search(after[-2])
 
 
 def test_the_live_job_never_installs_builds_or_resolves() -> None:
@@ -317,10 +318,14 @@ def fake_api(
         ({"ILMAR_TEST_CLAUDE_VERSION": "latest"}, "x.y.z"),
         ({"GITHUB_ACTIONS": "false"}, "GitHub Actions"),
         ({"GITHUB_WORKFLOW_SHA": "b" * 40}, "workflow file"),
-        ({"GITHUB_WORKFLOW_REF": "Obtuse8053/Ilmar/.github/workflows/live.yml@refs/heads/x"},
-         "live.yml on main"),
-        ({"GITHUB_WORKFLOW_REF": "Obtuse8053/Ilmar/.github/workflows/ci.yml@refs/heads/main"},
-         "live.yml on main"),
+        (
+            {"GITHUB_WORKFLOW_REF": "Obtuse8053/Ilmar/.github/workflows/live.yml@refs/heads/x"},
+            "live.yml on main",
+        ),
+        (
+            {"GITHUB_WORKFLOW_REF": "Obtuse8053/Ilmar/.github/workflows/ci.yml@refs/heads/main"},
+            "live.yml on main",
+        ),
     ],
 )
 def test_the_context_must_be_a_manual_run_of_the_expected_commit_on_main(
@@ -695,8 +700,8 @@ def wheel(directory: Path, name: str, version: str, files: dict[str, bytes] | No
     directory.mkdir(parents=True, exist_ok=True)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        for path, data in (files or {f"{name}/__init__.py": b"VALUE = 1\n"}).items():
-            archive.writestr(path, data)
+        for member, data in (files or {f"{name}/__init__.py": b"VALUE = 1\n"}).items():
+            archive.writestr(member, data)
         if symlink:
             info = zipfile.ZipInfo(symlink)
             info.external_attr = 0o120777 << 16
@@ -820,7 +825,7 @@ class Podman(Recorder):
 def test_prepare_downloads_by_hash_and_builds_from_the_pinned_base(tmp_path: Path) -> None:
     run = Podman()
     outputs = live_ci.prepare(tmp_path / "out", actions(), run)
-    pip, build, inspect, save = run.calls
+    pip, build, _inspect, save = run.calls
     assert pip[1:4] == ["-m", "pip", "download"]
     assert {"--require-hashes", "--no-deps", "--only-binary=:all:"} <= set(pip)
     assert pip[-1] == str(live_ci.LOCK)

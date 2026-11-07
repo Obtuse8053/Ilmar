@@ -196,9 +196,16 @@ gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
 ```
 
 Then:
-1. Wait for `guard` to pass, and approve the pending `live` deployment.
-2. The run checks the commit again, builds the Claude Code image (never
-   published), and runs #44 and then the live tests.
+1. Wait for `guard` and `prepare` to pass, and approve the pending `live`
+   deployment. Do not merge anything into `main` in between: the `live`
+   job checks again that `main` still points at `expected_sha`, and refuses
+   if not. Then dispatch it again with the new commit.
+2. `prepare` (no secrets) downloads the hash-locked wheels
+   (`requirements/live.txt`) and builds the Claude Code image (never
+   published) from its digest-pinned base. `live` checks out exactly
+   `expected_sha`, checks the commit, the wheels' digests and the image's
+   digest before any secret, and runs #44 and then the live tests. Nothing
+   is installed or downloaded after that.
 3. After a failure or cancellation, it removes `ilmar-live/*` leftovers from
    `ilmar-disposable` and every container.
 4. It uploads only credential-free records (artifact `live-records`, kept 7
@@ -209,6 +216,21 @@ Then:
 
 **Afterwards:** delete the two environment secrets, and revoke the token and
 the key (or let them expire).
+
+**Changing a pin** happens only in a reviewed pull request:
+- the agent image's base: the digest in `images/claude-code/Containerfile`;
+- the proxy image: `PROXY_IMAGE` in `scripts/live_ci.py`;
+- the wheels: a version and its sha256 in `requirements/live.txt`. Take
+  the sha256 from PyPI's file page; CI's `pip download --require-hashes`
+  fails closed and prints the digest it got.
+
+**Not pinned by digest** (built in `prepare`, with no secrets, and then
+fixed by the archive's digest):
+- the Debian packages the Containerfile installs;
+- Claude Code's npm dependencies below the version you name.
+
+They run with the Anthropic key inside the sandbox, as the agent always
+does.
 
 ## One-time setup
 
