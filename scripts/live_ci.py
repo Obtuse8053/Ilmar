@@ -104,13 +104,18 @@ def check_environment(environment: Mapping[str, Any], policies: Mapping[str, Any
     """The `live` environment must be set up exactly as docs/operations/live-testing.md says.
 
     GitHub releases environment secrets to any job its rules allow, so the
-    rules are the boundary: required reviewers, main only, no admin bypass.
+    rules are the boundary: required reviewers who cannot approve their own
+    runs, main only, no admin bypass.
     """
     problems = []
     rules = environment.get("protection_rules") or []
     reviewers = [r for r in rules if r.get("type") == "required_reviewers"]
     if not reviewers or not any(r.get("reviewers") for r in reviewers):
         problems.append("the environment has no required reviewers")
+    elif not all(r.get("prevent_self_review") is True for r in reviewers):
+        # Whoever starts a run (a person, or automation acting as one) must
+        # not be able to approve it: the approval has to come from someone else.
+        problems.append("'Prevent self-review' is not enabled for the required reviewers")
     if environment.get("can_admins_bypass") is not False:
         problems.append("administrators can bypass the environment's rules")
     branch = environment.get("deployment_branch_policy") or {}

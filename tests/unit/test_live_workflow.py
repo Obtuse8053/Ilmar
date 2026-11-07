@@ -346,7 +346,7 @@ GOOD_ENVIRONMENT = {
     "name": "live",
     "can_admins_bypass": False,
     "protection_rules": [
-        {"type": "required_reviewers", "prevent_self_review": False,
+        {"type": "required_reviewers", "prevent_self_review": True,
          "reviewers": [{"type": "User", "reviewer": {"login": "Obtuse8053"}}]},
         {"type": "branch_policy"},
     ],
@@ -447,6 +447,45 @@ def test_a_weaker_environment_is_refused(
     get = fake_api(environment, policies)
     assert live_ci.main(["--guard"], environ=actions(GH_TOKEN="actions-token"), get=get) == 1
     assert message in capsys.readouterr().err
+
+
+def _reviewers(**rule: Any) -> dict[str, Any]:
+    reviewers = [{"type": "User", "reviewer": {"login": "a-separate-reviewer"}}]
+    return {**GOOD_ENVIRONMENT, "protection_rules": [
+        {"type": "required_reviewers", "reviewers": reviewers, **rule}, {"type": "branch_policy"},
+    ]}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        _reviewers(prevent_self_review=False),  # the dispatcher could approve their own run
+        _reviewers(),  # the field missing: never assumed on
+        _reviewers(prevent_self_review="true"),  # only the boolean true counts
+        _reviewers(prevent_self_review=None),
+    ],
+)
+def test_reviewers_who_may_approve_their_own_run_are_refused(
+    environment: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    get = fake_api(environment, GOOD_POLICIES)
+    assert live_ci.main(["--guard"], environ=actions(GH_TOKEN="actions-token"), get=get) == 1
+    assert "'Prevent self-review' is not enabled" in capsys.readouterr().err
+
+
+def test_prevent_self_review_is_enough_to_pass_with_a_separate_reviewer() -> None:
+    environment = _reviewers(prevent_self_review=True)
+    assert live_ci.check_environment(environment, GOOD_POLICIES) == []
+
+
+def test_every_reviewers_rule_must_prevent_self_review() -> None:
+    reviewers = [{"type": "User", "reviewer": {"login": "a-separate-reviewer"}}]
+    environment = {**GOOD_ENVIRONMENT, "protection_rules": [
+        {"type": "required_reviewers", "reviewers": reviewers, "prevent_self_review": True},
+        {"type": "required_reviewers", "reviewers": reviewers, "prevent_self_review": False},
+    ]}  # fmt: skip
+    problems = live_ci.check_environment(environment, GOOD_POLICIES)
+    assert problems == ["'Prevent self-review' is not enabled for the required reviewers"]
 
 
 @pytest.mark.parametrize(
