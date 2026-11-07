@@ -28,7 +28,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +45,7 @@ from live_run import (
     new_records,
     post_records,
     run_stages,
+    run_start,
     test_environment,
     validate_credentials,
 )
@@ -560,7 +560,7 @@ def main(
     secrets = list(credentials.values())
     credentials.clear()
     reports = Path(settings["ILMAR_LIVE_REPORT_DIR"])
-    started = time.time()
+    started = run_start(reports)
     code = 1
     try:
         code = run_stages(env, reports, started, run)

@@ -26,7 +26,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -179,6 +178,20 @@ def run_stages(
     return 0
 
 
+def run_start(reports: Path) -> float:
+    """When this run started, on the file system's clock.
+
+    Records count as this run's when their mtime is at least this. The kernel
+    stamps files from a coarser clock than ``time.time()``, so a record
+    written just after a ``time.time()`` start could look older than the run.
+    Taking the start from a file stamped by the same clock avoids that.
+    """
+    reports.mkdir(parents=True, exist_ok=True)
+    marker = reports / ".run-start"  # not *.json: never uploaded or posted
+    marker.touch()
+    return marker.stat().st_mtime
+
+
 def new_records(reports: Path, started: float) -> list[Path]:
     return sorted(r for r in reports.glob("*.json") if r.stat().st_mtime >= started)
 
@@ -211,7 +224,7 @@ def main(
     env = test_environment(os.environ, settings, credentials)
     credentials.clear()
     reports = Path(settings["ILMAR_LIVE_REPORT_DIR"])
-    started = time.time()
+    started = run_start(reports)
     code = run_stages(env, reports, started, run)
     env.clear()
     if code != 0:
