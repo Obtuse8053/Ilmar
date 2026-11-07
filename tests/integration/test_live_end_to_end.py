@@ -311,7 +311,7 @@ def image_digest(image: str) -> str:
 
 
 def test_preflight(checked: h.Preflight, live: h.LiveSettings) -> None:
-    assert len(checked.checks) == 11
+    assert len(checked.checks) == 12
     h.write_report(live.report_dir, "preflight", {
         "repository": checked.repository, "token_expires": checked.token_expires,
         "checks": checked.checks, "at": datetime.now(UTC).isoformat(),

@@ -28,7 +28,12 @@ end-to-end tests** (#11d).
   - be able to read issues and pull requests;
   - on a throwaway branch, deleted afterwards: write a harmless file and
     open (then close) a pull request, and have a workflow-file write
-    refused. A refusal counts only after the harmless write succeeded.
+    refused. A refusal counts only after the harmless write succeeded;
+  - have Issues write: create a probe issue, create a label, add it (and
+    GitHub must keep it) and comment, as seeding a run and claiming its
+    task do. The probe issue is closed and its label deleted afterwards.
+    Creating the issue comes first, because Pull requests write alone also
+    allows the label calls.
 - **Credentials never leak:**
   - Credentials are read only from the environment, wrapped so that they
     never print, and handed to the CLI only through its environment.

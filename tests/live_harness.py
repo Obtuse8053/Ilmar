@@ -355,7 +355,53 @@ def preflight(github: LiveGitHub, settings: LiveSettings, *, now: datetime) -> P
     probe_write_permissions(github, settings.repository, result.default_branch, now=now)
     result.checks.append("token: can write contents and pull requests")
     result.checks.append("token: cannot write workflows")
+    probe_issue_permissions(github, settings.repository, now=now)
+    result.checks.append("token: can write issues, labels and comments")
     return result
+
+
+def probe_issue_permissions(github: LiveGitHub, repository: str, *, now: datetime) -> None:
+    """Prove Issues write: everything seeding a run and claiming its task does.
+
+    Pull requests write alone also allows the label calls, so the probe starts
+    with creating an issue, which needs Issues write. It then creates a label,
+    adds it (checking GitHub kept it) and comments, as Ilmar's claim does. The
+    probe issue is closed and its label deleted afterwards, whatever happens.
+    Every refusal names Issues write.
+    """
+    label = f"ilmar-live:probe-{now:%Y%m%d%H%M%S}"
+    created = github.call("POST", f"/repos/{repository}/issues", {
+        "title": "ilmar permission probe (closed at once)",
+        "body": "Created and closed by Ilmar's live-test preflight.",
+    })  # fmt: skip
+    if created.status != 201 or not isinstance(created.data, dict):
+        raise LiveGuardError(
+            f"the token cannot create issues (HTTP {created.status}): it needs Issues write"
+        )
+    number = int(created.data["number"])
+    try:
+        steps: tuple[tuple[str, str, str, Any, int], ...] = (
+            ("create labels", "POST", f"/repos/{repository}/labels",
+             {"name": label, "color": "ededed"}, 201),
+            ("add labels to issues", "POST", f"/repos/{repository}/issues/{number}/labels",
+             {"labels": [label]}, 200),
+            ("comment on issues", "POST", f"/repos/{repository}/issues/{number}/comments",
+             {"body": "ilmar permission probe"}, 201),
+        )  # fmt: skip
+        for what, method, path, body, expected in steps:
+            reply = github.call(method, path, body)
+            if reply.status != expected:
+                raise LiveGuardError(
+                    f"the token cannot {what} (HTTP {reply.status}): it needs Issues write"
+                )
+            if what == "add labels to issues" and not (
+                isinstance(reply.data, list)
+                and any(isinstance(i, dict) and i.get("name") == label for i in reply.data)
+            ):
+                raise LiveGuardError("GitHub did not keep the label on the probe issue")
+    finally:
+        github.call("PATCH", f"/repos/{repository}/issues/{number}", {"state": "closed"})
+        github.call("DELETE", f"/repos/{repository}/labels/{urllib.parse.quote(label, safe='')}")
 
 
 def refuse_if_granted(reply: Reply, permission: str) -> None:

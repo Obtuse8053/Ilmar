@@ -221,10 +221,12 @@ def test_preflight_accepts_the_required_repository_and_token() -> None:
     result = run_preflight(fake)
     assert result.default_branch == "main"
     assert result.token_expires == expiry(NOW + timedelta(days=6))[:16] + " UTC"
-    assert len(result.checks) == 11
+    assert len(result.checks) == 12
+    assert result.checks[-1] == "token: can write issues, labels and comments"
     probe = [p for p in fake.calls("DELETE") if "probe" in p]
-    assert probe == [
-        f"/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/probe-{NOW:%Y%m%d%H%M%S}"
+    assert probe == [  # the probe branch, then the probe label: nothing stays
+        f"/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/probe-{NOW:%Y%m%d%H%M%S}",
+        f"/repos/owner/ilmar-disposable/labels/ilmar-live%3Aprobe-{NOW:%Y%m%d%H%M%S}",
     ]
     for request in fake.requests:  # the token goes only into the Authorization header
         assert TOKEN not in request.url
@@ -343,10 +345,58 @@ def test_preflight_refuses_a_token_with_too_little(endpoint: tuple[str, str], me
         run_preflight(fake)
 
 
+PROBE_LABEL = "/repos/owner/ilmar-disposable/labels/ilmar-live%3Aprobe-20261105200000"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        # Issues read only: creating an issue is refused (Pull requests write
+        # alone would still allow the label calls, so this comes first).
+        (("POST", "/repos/owner/ilmar-disposable/issues"), "cannot create issues"),
+        (("POST", "/repos/owner/ilmar-disposable/labels"), "cannot create labels"),
+        (("POST", "/repos/owner/ilmar-disposable/issues/7/labels"), "cannot add labels"),
+        (("POST", "/repos/owner/ilmar-disposable/issues/7/comments"), "cannot comment"),
+    ],
+)
+def test_preflight_names_a_missing_issues_write(endpoint: tuple[str, str], message: str) -> None:
+    fake = FakeGitHub(statuses={endpoint: 403})
+    with pytest.raises(h.LiveGuardError, match=f"{message}.*HTTP 403.*needs Issues write"):
+        run_preflight(fake)
+    if endpoint[1].endswith("/issues"):
+        assert "/repos/owner/ilmar-disposable/issues/7" not in fake.calls("PATCH")  # none made
+    else:  # the probe issue and label never stay behind
+        assert "/repos/owner/ilmar-disposable/issues/7" in fake.calls("PATCH")
+        assert PROBE_LABEL in fake.calls("DELETE")
+
+
+def test_preflight_refuses_a_label_github_did_not_keep() -> None:
+    fake = FakeGitHub(drop_labels=True)
+    with pytest.raises(h.LiveGuardError, match="did not keep the label"):
+        run_preflight(fake)
+    assert PROBE_LABEL in fake.calls("DELETE")
+
+
+def test_preflight_probes_issues_before_any_run_is_seeded() -> None:
+    fake = FakeGitHub()
+    run_preflight(fake)
+    posts = [r.url.removeprefix(h.API) for r in fake.requests if r.method == "POST"]
+    probe = posts.index("/repos/owner/ilmar-disposable/issues")
+    assert posts[probe:] == [
+        "/repos/owner/ilmar-disposable/issues",
+        "/repos/owner/ilmar-disposable/labels",
+        "/repos/owner/ilmar-disposable/issues/7/labels",
+        "/repos/owner/ilmar-disposable/issues/7/comments",
+    ]
+
+
 def test_the_probe_pull_request_is_closed_and_its_branch_deleted() -> None:
     fake = FakeGitHub()
     run_preflight(fake)
-    assert fake.calls("PATCH") == ["/repos/owner/ilmar-disposable/pulls/9"]
+    assert fake.calls("PATCH") == [
+        "/repos/owner/ilmar-disposable/pulls/9",
+        "/repos/owner/ilmar-disposable/issues/7",  # the Issues probe, closed too
+    ]
     assert [p for p in fake.calls("DELETE") if "probe" in p]
 
 
