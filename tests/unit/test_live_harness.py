@@ -877,3 +877,38 @@ def test_every_subprocess_in_the_live_files_sets_its_environment() -> None:
             ):
                 keywords = {k.arg for k in node.keywords}
                 assert "env" in keywords, f"{path.name}:{node.lineno}"
+
+
+# -- following a container's log ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "print('ALLOW host=api.anthropic.com')",  # ends by itself, like a removed proxy
+        "import time; print('ALLOW host=x', flush=True); time.sleep(60)",  # never ends
+    ],
+)
+def test_a_stopped_follower_closes_its_pipe(script: str) -> None:
+    """Regression (second live run): each `podman logs -f` follower left its stdout
+    pipe open; the garbage collector later raised a ResourceWarning (an error
+    here) inside whichever test was running, so the crash drill failed for two
+    proxies' followers of the test before it."""
+    import gc
+    import sys
+    import warnings
+
+    def follow_and_stop() -> tuple[bool, bool]:
+        follower = h._Follower([sys.executable, "-c", script])
+        h.wait_for(lambda: "ALLOW host=" in follower.text(), timeout=10, interval=0.05)
+        follower.stop()
+        process = follower._process
+        stdout = process.stdout
+        return process.returncode is not None, stdout is not None and stdout.closed
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ended, closed = follow_and_stop()
+        gc.collect()  # the follower is unreferenced now: nothing may warn
+    assert ended  # the process ended (or was ended)
+    assert closed
