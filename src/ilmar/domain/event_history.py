@@ -15,7 +15,7 @@ import enum
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from ilmar.domain.events import Event, EventType, resource_ref
+from ilmar.domain.events import CorruptEventError, Event, EventType, resource_ref
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import Operation, Resource
 
@@ -123,11 +123,61 @@ _RESOURCE_CHANGES = {
 }
 
 
+_BLOCK_ORDER = (
+    ("executions", EventType.EXECUTION_BASELINE),
+    ("operations", EventType.OPERATION_BASELINE),
+    ("resources", EventType.RESOURCE_BASELINE),
+)
+
+
+def _check_baseline_block(fold: _Fold, events: Sequence[Event]) -> None:
+    """The marker's counts are exact, and the baseline is one block right after it.
+
+    ``events.coverage_started`` at seq 1 states how many executions,
+    operations and resources were baselined. Exactly that many baseline
+    events of each kind must exist, and they must be the events at seq 2
+    onwards: all executions, then all operations, then all resources, with
+    nothing else in between (ADR-0024 §8). A missing baseline, an extra one,
+    one out of order, or a covered event inside the block is a failure.
+    """
+    marker = next((e for e in events if e.type is EventType.COVERAGE_STARTED), None)
+    if marker is None:
+        return
+    counts = {name: int(marker.data[name]) for name, _ in _BLOCK_ORDER}
+    found = {name: sum(1 for e in events if e.type is kind) for name, kind in _BLOCK_ORDER}
+    for name, kind in _BLOCK_ORDER:
+        if found[name] != counts[name]:
+            fold.fail("baseline-count-mismatch", "store",
+                      f"the marker baselines {counts[name]} {name}, found {found[name]} "
+                      f"{kind.value} events")  # fmt: skip
+    expected = [kind for name, kind in _BLOCK_ORDER for _ in range(counts[name])]
+    after_marker = [e for e in events if e.seq is not None and e.seq > (marker.seq or 1)]
+    block = after_marker[: len(expected)]
+    for position, (event, kind) in enumerate(zip(block, expected, strict=False)):
+        if event.type is not kind:
+            fold.fail("baseline-out-of-order", "store",
+                      f"seq {event.seq}: {event.type.value} where baseline {position + 1} of "
+                      f"{len(expected)} ({kind.value}) belongs")  # fmt: skip
+            break
+    if len(block) < len(expected):
+        fold.fail(
+            "baseline-count-mismatch",
+            "store",
+            f"the stream ends after {len(block)} of {len(expected)} baseline events",
+        )
+    for event in after_marker[len(expected) :]:
+        if event.type in _BASELINES:
+            fold.fail("baseline-outside-block", "store",
+                      f"seq {event.seq}: {event.type.value} after the baseline block")  # fmt: skip
+
+
 def _fold(events: Iterable[Event]) -> tuple[_Fold, bool]:
     fold = _Fold()
+    materialised = list(events)
+    _check_baseline_block(fold, materialised)
     expected_seq = 1
     marker_seen = False
-    for event in events:
+    for event in materialised:
         if event.seq != expected_seq:
             fold.fail("seq-gap", "store", f"expected seq {expected_seq}, found {event.seq}")
             expected_seq = (event.seq or expected_seq) + 1
@@ -216,11 +266,43 @@ def _apply_row(fold: _Fold, rows: dict[str, _Row], subject: str, key: str, event
     known.status, known.version = status, version
 
 
+def load_events(lines: Iterable[str]) -> tuple[list[Event], list[Finding]]:
+    """Read persisted events strictly (:meth:`Event.from_json`).
+
+    A corrupt line is an integrity failure, reported with its position and
+    left out of the fold. It is never repaired, so the events after it show
+    a ``seq`` gap and whatever its absence breaks.
+    """
+    events: list[Event] = []
+    findings: list[Finding] = []
+    for number, line in enumerate(lines, 1):
+        try:
+            events.append(Event.from_json(line))
+        except CorruptEventError as error:
+            findings.append(Finding(FindingClass.INTEGRITY, "corrupt-event", "store",
+                                    f"line {number}: {error}"))  # fmt: skip
+    return events, findings
+
+
+def verify_lines(lines: Iterable[str], stored: StoredState) -> Report:
+    """:func:`verify` over persisted lines, as ``ilmar events verify`` reads them."""
+    materialised = list(lines)
+    if not materialised:
+        return Report(covered=False)
+    events, corrupt = load_events(materialised)
+    report = _verify(events, stored)  # even if every line was corrupt
+    return Report(covered=True, findings=(*corrupt, *report.findings))
+
+
 def verify(events: Iterable[Event], stored: StoredState) -> Report:
     """Check I11 for every stored entity and every event; see the module docstring."""
     materialised = list(events)
     if not materialised:
         return Report(covered=False)
+    return _verify(materialised, stored)
+
+
+def _verify(materialised: Sequence[Event], stored: StoredState) -> Report:
     fold, marker_seen = _fold(materialised)
     if not marker_seen:
         fold.fail("no-coverage-marker", "store", "events exist without events.coverage_started")

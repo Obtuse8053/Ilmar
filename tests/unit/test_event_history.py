@@ -9,12 +9,21 @@ then checks I11 from creation or from the migration baseline (§8).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
-from ilmar.domain.event_history import FindingClass, Report, StoredState, verify
+from ilmar.domain.event_history import (
+    FindingClass,
+    Report,
+    StoredState,
+    load_events,
+    verify,
+    verify_lines,
+)
 from ilmar.domain.events import (
     BaselineExecution,
     Event,
@@ -388,3 +397,151 @@ def test_a_change_whose_from_disagrees_with_the_history_is_a_fold_mismatch() -> 
     replay.operations[done.key] = done
     replay.append(event.with_previous("ambiguous"))  # it was intended
     assert failures(replay.verify()) == [("fold-mismatch", f"operation:{done.key}")]
+
+
+# -- the baseline block is exact (review of PR #64) ------------------------------------------
+
+
+def renumbered(events: list[Event]) -> list[Event]:
+    return [dataclasses.replace(e, seq=n) for n, e in enumerate(events, 1)]
+
+
+def migrated() -> Replay:
+    replay = pre_migration_store()
+    replay.migrate()
+    return replay
+
+
+@pytest.mark.parametrize(
+    ("kind", "subject_prefix"),
+    [
+        (EventType.EXECUTION_BASELINE, "execution:"),
+        (EventType.OPERATION_BASELINE, "operation:"),
+        (EventType.RESOURCE_BASELINE, "resource:"),
+    ],
+)
+def test_a_missing_baseline_is_detected(kind: EventType, subject_prefix: str) -> None:
+    """The migration lost one snapshot: the marker's count catches it, and so does
+    the row that now has no coverage event."""
+    replay = migrated()
+    victim = next(e for e in replay.events if e.type is kind)
+    replay.events = renumbered([e for e in replay.events if e is not victim])
+    found = failures(replay.verify())
+    assert ("baseline-count-mismatch", "store") in found
+    assert any(c == "no-coverage-event" and s.startswith(subject_prefix) for c, s in found)
+    assert replay.verify().exit_code == 1
+
+
+def test_an_extra_baseline_is_detected() -> None:
+    replay = migrated()
+    extra = next(e for e in replay.events if e.type is EventType.RESOURCE_BASELINE)
+    position = replay.events.index(extra)
+    replay.events = renumbered([*replay.events[: position + 1], extra,
+                                *replay.events[position + 1 :]])  # fmt: skip
+    found = failures(replay.verify())
+    assert ("baseline-count-mismatch", "store") in found
+
+
+def test_a_marker_whose_counts_were_changed_is_detected() -> None:
+    replay = migrated()
+    marker = replay.events[0]
+    forged = dataclasses.replace(marker, data={**marker.data, "executions": 2})
+    replay.events = [forged, *replay.events[1:]]
+    assert ("baseline-count-mismatch", "store") in failures(replay.verify())
+
+
+def test_baselines_out_of_order_are_detected() -> None:
+    """Counts are right, but an operation snapshot comes before an execution's."""
+    replay = migrated()
+    first_execution = next(i for i, e in enumerate(replay.events)
+                           if e.type is EventType.EXECUTION_BASELINE)  # fmt: skip
+    first_operation = next(i for i, e in enumerate(replay.events)
+                           if e.type is EventType.OPERATION_BASELINE)  # fmt: skip
+    events = list(replay.events)
+    events[first_execution], events[first_operation] = (events[first_operation],
+                                                        events[first_execution])  # fmt: skip
+    replay.events = renumbered(events)
+    found = failures(replay.verify())
+    assert ("baseline-out-of-order", "store") in found
+    assert ("baseline-count-mismatch", "store") not in found  # the counts are right
+
+
+def test_a_covered_event_inside_the_baseline_block_is_detected() -> None:
+    replay = migrated()
+    replay.commit(created("e4"))
+    covered = replay.events[-1]
+    events = [e for e in replay.events if e is not covered]
+    events.insert(2, covered)  # between two snapshots
+    replay.events = renumbered(events)
+    assert ("baseline-out-of-order", "store") in failures(replay.verify())
+
+
+def test_a_baseline_after_the_block_is_detected() -> None:
+    replay = migrated()
+    replay.commit(created("e4"))
+    late = next(e for e in replay.events if e.type is EventType.EXECUTION_BASELINE)
+    replay.events = renumbered([e for e in replay.events if e is not late] + [late])
+    found = failures(replay.verify())
+    assert ("baseline-outside-block", "store") in found
+
+
+def test_an_exact_baseline_block_passes() -> None:
+    replay = migrated()
+    replay.commit(created("e4"))
+    assert replay.verify().failures == ()
+
+
+# -- persisted lines are read strictly -------------------------------------------------------
+
+
+def lines(replay: Replay) -> list[str]:
+    return [e.to_json() for e in replay.events]
+
+
+def test_every_event_the_store_would_hold_reads_back_strictly() -> None:
+    replay = migrated()
+    replay.commit(created("e4"))
+    replay.commit(move(replay, S.CLAIMED, "e4"))
+    events, problems = load_events(lines(replay))
+    assert problems == []
+    assert [e.to_json() for e in events] == lines(replay)
+    assert verify_lines(lines(replay), replay.stored()).exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda text: text.replace('"status":"intended"', '"status":"maybe"', 1),
+        lambda text: text.replace('"version":', '"version_":', 1),
+        lambda text: text.replace('{"actor":', '{"note":"x","actor":', 1),
+        lambda text: text.replace(",", ", ", 1),  # not canonical
+        lambda text: text[:-5],  # truncated on disk
+        lambda text: "",
+    ],
+    ids=["enum", "renamed key", "extra field", "whitespace", "cut off", "empty"],
+)
+def test_a_corrupt_stored_line_is_an_integrity_failure_never_repaired(corrupt: Any) -> None:
+    replay = migrated()
+    stored_lines = lines(replay)
+    target = next(i for i, text in enumerate(stored_lines) if '"status":"intended"' in text)
+    stored_lines[target] = corrupt(stored_lines[target])
+    report = verify_lines(stored_lines, replay.stored())
+    assert report.exit_code == 1
+    checks = [f.check for f in report.failures]
+    assert "corrupt-event" in checks
+    assert "seq-gap" in checks  # the corrupt line is left out, not mended
+    detail = next(f.detail for f in report.failures if f.check == "corrupt-event")
+    assert detail.startswith(f"line {target + 1}:")
+
+
+def test_a_store_whose_every_line_is_corrupt_still_reports_its_rows() -> None:
+    replay = migrated()
+    report = verify_lines(["{}"] * len(replay.events), replay.stored())
+    assert report.covered is True
+    checks = {f.check for f in report.failures}
+    assert {"corrupt-event", "no-coverage-event"} <= checks
+
+
+def test_no_stored_lines_means_no_coverage() -> None:
+    replay = pre_migration_store()
+    assert verify_lines([], replay.stored()).exit_code == 2

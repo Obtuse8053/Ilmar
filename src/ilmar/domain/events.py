@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NoReturn
 
 from ilmar.domain.errors import (
     CandidateRejectedError,
@@ -65,6 +65,15 @@ REDACTED = "<redacted>"
 
 class EventEnvelopeError(ValueError):
     """An envelope identifier is invalid: the event cannot be attributed (ADR-0024 §7)."""
+
+
+class CorruptEventError(EventEnvelopeError):
+    """A persisted event does not meet the schema it claims.
+
+    Raised by :meth:`Event.from_json`. A stored event is reported, never
+    repaired: reading it back drops nothing, redacts nothing and fills in
+    nothing, so a corrupted record cannot pass as a clean one.
+    """
 
 
 # -- reason codes (ADR-0024 §4) --------------------------------------------------------
@@ -243,7 +252,32 @@ _VERDICTS = _one_of(v.value for v in Verdict)
 _COUNT = _integer(0)
 _POSITIVE = _integer(1)
 
-_MESSAGE_PARAMS: Mapping[str, Check] = MappingProxyType({"reason": _code, "kind": _RES_KINDS})
+_MESSAGE_PARAM_VALUES: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"reason": frozenset(REASON_CODES), "kind": frozenset(k.value for k in ResourceKind)}
+)
+_MESSAGE_PARAMS: Mapping[str, Check] = MappingProxyType(
+    {name: _one_of(values) for name, values in _MESSAGE_PARAM_VALUES.items()}
+)
+
+
+def _template_pattern(text: str) -> re.Pattern[str]:
+    """A rendering of ``text`` with every allowed parameter value, and nothing else."""
+    parts = _PARAM.split(text)  # literal, name, literal, name, ...
+    pattern = "".join(
+        re.escape(part) if index % 2 == 0
+        else "(?:" + "|".join(re.escape(v) for v in sorted(_MESSAGE_PARAM_VALUES[part])) + ")"
+        for index, part in enumerate(parts)
+    )  # fmt: skip
+    return re.compile(pattern)
+
+
+_RENDERED = tuple(_template_pattern(text) for text in MESSAGES.values())
+
+
+def is_rendered_message(text: str) -> bool:
+    """``True`` if ``text`` is exactly a registered template's rendering."""
+    return any(p.fullmatch(text) for p in _RENDERED)
+
 
 # Resource kinds whose names are Ilmar's own identifiers (containers, networks,
 # branches). Directory names are host paths and stay out of events (§7).
@@ -448,22 +482,9 @@ class Event:
         flags: set[str] = set()
         # 1. The envelope: identifiers come from validated domain values, so a
         #    failure here is a broken invariant, never "dropped and flagged".
-        if not _IDENTIFIER.match(instance):
-            raise EventEnvelopeError("instance is not an identifier")
-        # Only the migration may write epoch 0: a store never owned (ADR-0024 §8).
-        if type(epoch) is not int or epoch < (0 if kind in _MIGRATION_TYPES else 1):
-            raise EventEnvelopeError("epoch starts at 1")
-        if pass_id is not None and not _PASS.match(pass_id):
-            raise EventEnvelopeError("pass is not a pass id")
-        if execution is not None and not _IDENTIFIER.match(execution):
-            raise EventEnvelopeError("execution is not an identifier")
-        for name, value in (("attempt", attempt), ("run", run)):
-            if value is not None and (type(value) is not int or value < 1):
-                raise EventEnvelopeError(f"{name} starts at 1")
-        if operation is not None and not _OPERATION_KEY.match(operation):
-            raise EventEnvelopeError("operation is not a journal key")
-        if reason is not None and reason not in REASON_CODES:
-            raise EventEnvelopeError(f"unknown reason code {reason!r}")
+        _check_envelope(kind, instance=instance, epoch=epoch, pass_id=pass_id,
+                        execution=execution, attempt=attempt, operation=operation, run=run,
+                        reason=reason, error=EventEnvelopeError)  # fmt: skip
         if reason is None and kind in _NEEDS_REASON:
             reason = "unclassified"
         # The task key is opaque to the core (TaskRef): only a safe form is kept.
@@ -556,27 +577,119 @@ class Event:
 
     @classmethod
     def from_json(cls, text: str) -> Event:
-        """Read an event back. Unknown top-level fields are ignored (§8)."""
-        raw = json.loads(text)
-        if not isinstance(raw, dict) or raw.get("schema") != SCHEMA:
-            raise EventEnvelopeError("not an ilmar.event/1 event")
+        """Read a persisted event back, strictly.
+
+        The same guarantees as :meth:`create`, checked rather than applied:
+        every envelope identifier, every ``data`` key and value against the
+        type's allowlist, required keys, reason codes, templates for the
+        message, flags, and ``seq``. A credential shape that ``create``
+        would have redacted is refused, and so is ``<redacted>`` without the
+        ``redacted`` flag. Finally the line must be exactly the canonical
+        encoding of the event it decodes to. Anything else raises
+        :class:`CorruptEventError`: nothing is dropped, redacted or filled in.
+
+        This is the reader for Ilmar's own store. External consumers of the
+        exported lines may ignore unknown fields (ADR-0024 §8); this reader
+        does not, because within one schema version Ilmar writes none.
+        """
+
+        def bad(reason: str) -> NoReturn:
+            raise CorruptEventError(reason)
+
         try:
-            kind = EventType(raw["type"])
-            actor_raw = raw["actor"]
-            actor = Actor(ActorKind(actor_raw["kind"]), actor_raw.get("ref"))
-        except (KeyError, ValueError, TypeError) as error:
-            raise EventEnvelopeError(f"unreadable event: {error}") from None
-        seq = raw.get("seq")
-        if seq is not None and (type(seq) is not int or seq < 1):
-            raise EventEnvelopeError("seq starts at 1")
+            raw = json.loads(text)
+        except ValueError:
+            bad("not JSON")
+        if not isinstance(raw, dict):
+            bad("not a JSON object")
+        if unknown := sorted(raw.keys() - _TOP_LEVEL):
+            bad(f"unknown fields {unknown}")
+        if raw.get("schema") != SCHEMA:
+            bad("not an ilmar.event/1 event")
+        try:
+            kind = EventType(raw.get("type"))
+        except ValueError:
+            bad(f"unknown event type {raw.get('type')!r}")
+        flags = set()
+        for flag in _FLAGS:
+            if flag in raw:
+                if raw[flag] is not True:
+                    bad(f"flag {flag} must be true when present")
+                flags.add(flag)
+        actor_raw = raw.get("actor")
+        if not isinstance(actor_raw, dict) or not actor_raw.keys() <= {"kind", "ref"}:
+            bad("actor must be an object with kind and ref only")
+        try:
+            actor = Actor(ActorKind(actor_raw.get("kind")), actor_raw.get("ref"))
+        except ValueError as error:
+            bad(f"actor: {error}")
+        seq, at, instance, epoch = (
+            raw.get("seq"),
+            raw.get("at"),
+            raw.get("instance"),
+            raw.get("epoch"),
+        )
+        if type(seq) is not int or seq < 1:
+            bad("a persisted event has a seq of at least 1")
+        if not isinstance(at, str) or not _AT_FORMAT.match(at):
+            bad("at is not an RFC 3339 UTC time with microseconds")
+        try:
+            datetime.strptime(at, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError:
+            bad("at is not a valid time")
+        for name in ("instance", "pass", "execution", "operation", "reason", "task", "message"):
+            if name in raw and not isinstance(raw[name], str):
+                bad(f"{name} must be a string")
+        if not isinstance(instance, str) or type(epoch) is not int:
+            bad("instance and epoch are required")
+        _check_envelope(kind, instance=instance, epoch=epoch, pass_id=raw.get("pass"),
+                        execution=raw.get("execution"), attempt=raw.get("attempt"),
+                        operation=raw.get("operation"), run=raw.get("run"),
+                        reason=raw.get("reason"), error=CorruptEventError)  # fmt: skip
+        if kind in _NEEDS_REASON and "reason" not in raw:
+            bad(f"{kind.value} always records a reason")
+        redactions = 0
+
+        def text_value(name: str, value: str, valid: Callable[[str], bool]) -> None:
+            nonlocal redactions
+            if value == REDACTED:
+                if "redacted" not in flags:
+                    bad(f"{name} is redacted but the event is not flagged")
+                redactions += 1
+            elif not valid(value):
+                bad(f"{name} is not valid")
+            elif looks_like_a_credential(value):
+                bad(f"{name} looks like a credential and was not redacted")
+
+        if "task" in raw:
+            text_value("task", raw["task"], lambda v: _TASK.match(v) is not None)
+        if "message" in raw:
+            text_value("message", raw["message"], is_rendered_message)
         data = raw.get("data", {})
-        if not isinstance(data, dict):
-            raise EventEnvelopeError("data must be an object")
-        return cls(
+        if not isinstance(data, dict) or ("data" in raw and not data):
+            bad("data must be a non-empty object when present")
+        schema = DATA_SCHEMAS[kind]
+        for key, value in data.items():
+            if key not in schema:
+                bad(f"data.{key} is not allowed for {kind.value}")
+            check = schema[key][0]
+            if isinstance(value, str):
+                text_value(f"data.{key}", value, check)
+            elif not check(value):
+                bad(f"data.{key} is not valid")
+        missing = [k for k, (_, required) in schema.items() if required and k not in data]
+        if "truncated" in flags:
+            if data:
+                bad("a truncated event has no data")
+        elif missing:
+            bad(f"{kind.value} needs {missing}")
+        if "redacted" in flags and not redactions:
+            bad("flagged redacted but nothing is redacted")
+        event = cls(
             type=kind,
-            at=str(raw["at"]),
-            instance=str(raw["instance"]),
-            epoch=int(raw["epoch"]),
+            at=at,
+            instance=instance,
+            epoch=epoch,
             actor=actor,
             data=MappingProxyType(dict(sorted(data.items()))),
             pass_id=raw.get("pass"),
@@ -588,8 +701,51 @@ class Event:
             reason=raw.get("reason"),
             message=raw.get("message"),
             seq=seq,
-            flags=frozenset(k for k in ("invalid", "redacted", "truncated") if raw.get(k)),
+            flags=frozenset(flags),
         )
+        if event.to_json() != text:
+            bad("not in canonical form")
+        return event
+
+
+_FLAGS = ("invalid", "redacted", "truncated")
+_TOP_LEVEL = frozenset(
+    {"schema", "seq", "at", "instance", "epoch", "actor", "type", "pass", "execution",
+     "attempt", "task", "operation", "run", "reason", "message", "data", *_FLAGS}
+)  # fmt: skip
+_AT_FORMAT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+
+
+def _check_envelope(
+    kind: EventType,
+    *,
+    instance: str,
+    epoch: int,
+    pass_id: str | None,
+    execution: str | None,
+    attempt: object,
+    operation: str | None,
+    run: object,
+    reason: str | None,
+    error: type[EventEnvelopeError],
+) -> None:
+    """The envelope rules, for building and for reading alike."""
+    if not _IDENTIFIER.match(instance):
+        raise error("instance is not an identifier")
+    # Only the migration may write epoch 0: a store never owned (ADR-0024 §8).
+    if type(epoch) is not int or epoch < (0 if kind in _MIGRATION_TYPES else 1):
+        raise error("epoch starts at 1")
+    if pass_id is not None and not _PASS.match(pass_id):
+        raise error("pass is not a pass id")
+    if execution is not None and not _IDENTIFIER.match(execution):
+        raise error("execution is not an identifier")
+    for name, value in (("attempt", attempt), ("run", run)):
+        if value is not None and (type(value) is not int or value < 1):
+            raise error(f"{name} starts at 1")
+    if operation is not None and not _OPERATION_KEY.match(operation):
+        raise error("operation is not a journal key")
+    if reason is not None and reason not in REASON_CODES:
+        raise error(f"unknown reason code {reason!r}")
 
 
 def _replace(event: Event, **changes: Any) -> Event:

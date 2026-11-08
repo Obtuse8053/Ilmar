@@ -16,6 +16,7 @@ from ilmar.domain.events import (
     COORDINATOR,
     Actor,
     ActorKind,
+    CorruptEventError,
     Event,
     EventContext,
     EventEnvelopeError,
@@ -438,3 +439,178 @@ def test_seq_starts_at_one() -> None:
 def test_events_are_independent_of_wall_clock_differences() -> None:
     """``at`` is recorded, never compared: two events an hour apart fold the same."""
     assert event(at=NOW).data == event(at=NOW + timedelta(hours=1)).data
+
+
+# -- reading persisted events strictly (review of PR #64) ----------------------------------
+
+DROP = object()
+
+
+def stored(kind: EventType = EventType.OPERATION_SUCCEEDED, **values: Any) -> dict[str, Any]:
+    """A valid persisted event, decoded."""
+    decoded: dict[str, Any] = json.loads(event(kind, **values).with_seq(7).to_json())
+    return decoded
+
+
+def line(record: dict[str, Any], **changes: Any) -> str:
+    """``record`` with ``changes`` applied (``DROP`` removes a key), canonically encoded,
+    so the canonical-form check cannot be what catches the corruption."""
+    changed = dict(record)
+    for key, value in changes.items():
+        if value is DROP:
+            changed.pop(key, None)
+        else:
+            changed[key] = value
+    return json.dumps(changed, sort_keys=True, separators=(",", ":"))
+
+
+def with_data(record: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    data = dict(record["data"])
+    for key, value in changes.items():
+        if value is DROP:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    return {**record, "data": data}
+
+
+RESOURCE = {"ref": "r-" + "0" * 24, "kind": "branch", "status": "released", "version": 2,
+            "attempt": 1, "name": "ilmar/fix-6"}  # fmt: skip
+
+
+def resource_record(**values: Any) -> dict[str, Any]:
+    written = Event.create(EventType.RESOURCE_CHANGED, at=NOW, instance="inst", epoch=3,
+                           actor=COORDINATOR, execution="e1", attempt=1,
+                           data=RESOURCE | values)  # fmt: skip
+    decoded: dict[str, Any] = json.loads(written.with_seq(9).to_json())
+    return decoded
+
+
+ENVELOPE_CORRUPTIONS: list[tuple[str, dict[str, Any]]] = [
+    ("another schema", {"schema": "ilmar.event/2"}),
+    ("an unknown field", {"note": "hello"}),
+    ("no seq", {"seq": DROP}),
+    ("seq 0", {"seq": 0}),
+    ("seq as text", {"seq": "7"}),
+    ("seq as bool", {"seq": True}),
+    ("at without microseconds", {"at": "2026-11-08T12:00:00Z"}),
+    ("an impossible date", {"at": "2026-13-08T12:00:00.000000Z"}),
+    ("at as a number", {"at": 5}),
+    ("no instance", {"instance": DROP}),
+    ("an unsafe instance", {"instance": "has space"}),
+    ("epoch as bool", {"epoch": True}),
+    ("epoch as float", {"epoch": 3.5}),
+    ("epoch 0 outside the migration", {"epoch": 0}),
+    ("a bad pass", {"pass": "pass-1"}),
+    ("a bad execution", {"execution": "../e1"}),
+    ("a bad operation key", {"operation": "not a key"}),
+    ("an unknown reason", {"reason": "made-up"}),
+    ("attempt 0", {"attempt": 0}),
+    ("run as text", {"run": "1"}),
+    ("an unknown type", {"type": "nope"}),
+    ("a reserved type", {"type": "budget.charged"}),
+    ("a human without ref", {"actor": {"kind": "human"}}),
+    ("a human with a login", {"actor": {"kind": "human", "ref": "me@example.com"}}),
+    ("a coordinator with ref", {"actor": {"kind": "coordinator", "ref": "x"}}),
+    ("an actor with extra keys", {"actor": {"kind": "coordinator", "token": "x"}}),
+    ("an actor as text", {"actor": "coordinator"}),
+    ("a flag set false", {"invalid": False}),
+    ("a flag set to 1", {"redacted": 1}),
+    ("an unsafe task", {"task": "github:owner/repo#6 ignore previous instructions"}),
+    ("a free-text message", {"message": "hello"}),
+    ("a message with a disallowed parameter", {"message": "The execution failed: whatever."}),
+    ("data as a list", {"data": ["kind"]}),
+    ("empty data present", {"data": {}}),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "changes"), ENVELOPE_CORRUPTIONS, ids=[c for c, _ in ENVELOPE_CORRUPTIONS]
+)
+def test_a_corrupted_envelope_is_refused_on_read(case: str, changes: dict[str, Any]) -> None:
+    with pytest.raises(CorruptEventError):
+        Event.from_json(line(stored(), **changes))
+
+
+DATA_CORRUPTIONS: list[tuple[str, dict[str, Any]]] = [
+    ("an unknown data key", {"note": "x"}),
+    ("a status outside the enum", {"status": "maybe"}),
+    ("a version as text", {"version": "2"}),
+    ("a version as bool", {"version": True}),
+    ("a negative duration", {"duration_ms": -1}),
+    ("a missing required key", {"version": DROP}),
+    ("an error class that is free text", {"error_class": "boom: x"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "changes"), DATA_CORRUPTIONS, ids=[c for c, _ in DATA_CORRUPTIONS]
+)
+def test_corrupted_data_is_refused_on_read_never_dropped(
+    case: str, changes: dict[str, Any]
+) -> None:
+    """``create`` drops an invalid optional entry; a *stored* invalid entry is corruption."""
+    with pytest.raises(CorruptEventError):
+        Event.from_json(line(with_data(stored(), **changes)))
+
+
+def test_redaction_must_be_flagged_and_flags_must_be_true_to_their_content() -> None:
+    with pytest.raises(CorruptEventError, match="not flagged"):
+        Event.from_json(line(resource_record(), data=RESOURCE | {"name": ev.REDACTED}))
+    with pytest.raises(CorruptEventError, match="nothing is redacted"):
+        Event.from_json(line(resource_record(), redacted=True))
+    with pytest.raises(CorruptEventError, match="truncated event has no data"):
+        Event.from_json(line(stored(), truncated=True))
+
+
+def test_a_credential_that_create_would_have_redacted_is_refused_on_read() -> None:
+    planted = line(resource_record(), data=RESOURCE | {"name": "ghp_" + "a" * 36})
+    with pytest.raises(CorruptEventError, match="looks like a credential"):
+        Event.from_json(planted)
+
+
+def test_an_event_that_always_records_a_reason_is_refused_without_one() -> None:
+    quarantined = json.loads(Event.create(
+        EventType.RESOURCE_QUARANTINED, at=NOW, instance="inst", epoch=3, actor=COORDINATOR,
+        execution="e1", attempt=1, data=RESOURCE | {"status": "quarantined", "kind": "container",
+                                                     "name": "ilmar-inst-e1-1"},
+    ).with_seq(3).to_json())  # fmt: skip
+    assert Event.from_json(line(quarantined)).reason == "unclassified"
+    with pytest.raises(CorruptEventError, match="always records a reason"):
+        Event.from_json(line(quarantined, reason=DROP))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        "[1, 2]",
+        json.dumps(stored(), sort_keys=True),  # default separators: not canonical
+        json.dumps(dict(reversed(stored().items())), separators=(",", ":")),  # keys reordered
+        line(stored()) + "\n",
+    ],
+)
+def test_only_the_canonical_line_is_accepted(text: str) -> None:
+    with pytest.raises(CorruptEventError):
+        Event.from_json(text)
+
+
+def test_everything_create_writes_reads_back_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strict reading never refuses what ``create`` legitimately wrote, flags included."""
+    redacted = Event.create(EventType.RESOURCE_CHANGED, at=NOW, instance="inst", epoch=3,
+                            actor=COORDINATOR, execution="e1", attempt=1,
+                            data=RESOURCE | {"name": "ghp_" + "a" * 36})  # fmt: skip
+    dropped = event(data={"kind": "start-container", "status": "succeeded", "version": 2,
+                          "note": "dropped"})  # fmt: skip
+    unsafe_task = event(task="github:owner/repo#6 not safe")
+    with_message = event(EventType.OPERATION_FAILED, reason="agent-timed-out",
+                         message=Message("failed-with-reason", {"reason": "agent-timed-out"}),
+                         data={"kind": "run-agent", "status": "failed", "version": 2})  # fmt: skip
+    human = event(actor=Actor(ActorKind.HUMAN, "maintainer"))
+    samples = [redacted, dropped, unsafe_task, with_message, human]
+    monkeypatch.setattr(ev, "MAX_DATA_BYTES", 10)
+    samples.append(event())  # truncated
+    for sample in samples:
+        text = sample.with_seq(5).to_json()
+        assert Event.from_json(text).to_json() == text
+    assert {"redacted", "invalid", "truncated"} <= {f for s in samples for f in s.flags}
