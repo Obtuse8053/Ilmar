@@ -955,11 +955,24 @@ class _Follower:
         return "".join(self._chunks)
 
     def stop(self) -> None:
+        """End the follower and release its pipe.
+
+        The pipe must be closed here: left to the garbage collector it raises a
+        ResourceWarning (an error under this project's pytest settings) in
+        whichever test happens to be running then.
+        """
         with contextlib.suppress(subprocess.TimeoutExpired):
             self._process.wait(timeout=5)  # ends by itself when the proxy is removed
         if self._process.poll() is None:
             self._process.terminate()
-        self._reader.join(timeout=5)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+        self._reader.join(timeout=5)  # the pipe is at EOF now that the process ended
+        if self._process.stdout is not None:
+            self._process.stdout.close()
 
 
 # -- reading the state the coordinator left ----------------------------------------------------

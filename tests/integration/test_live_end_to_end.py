@@ -41,6 +41,7 @@ import pytest
 import live_harness as h
 from ilmar.adapters.github.client import urllib_transport
 from ilmar.adapters.sqlite import SQLiteExecutionStore
+from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import OperationKind, OperationStatus, ResourceKind, ResourceStatus
 
@@ -330,7 +331,14 @@ def test_a_task_is_published_verified_merged_and_completed(session: Session) -> 
     contained = sandboxes_were_contained(session, watcher)
     nothing_leaked(session, execution, request)
     nothing_left_running(session, watcher)
-    assert not session.state.joinpath("workspaces", execution.id).exists()  # deleted on success
+    # ADR-0021: after SUCCEEDED the attempt directory (agent workspace and
+    # verification checkouts) is deleted; the per-execution parent may stay, but
+    # nothing may be left in it.
+    layout = WorkspaceLayout.under(session.state)
+    assert not layout.attempt_dir(execution.id, execution.attempt).exists()  # deleted on success
+    parent = layout.workspaces_root / execution.id
+    left = sorted(p.name for p in parent.iterdir()) if parent.exists() else []
+    assert left == []
     assert "ilmar:claimed" in labels(session)  # held while the pull request is open
 
     repo = session.live.repository
