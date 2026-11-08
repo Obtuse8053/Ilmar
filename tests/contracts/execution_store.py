@@ -594,6 +594,41 @@ class EventLogContract:
         assert store.operations("e1") == ()
         assert store.resources() == ()
 
+    @pytest.mark.parametrize("code", ["unclassified", "not-a-code"])
+    @pytest.mark.parametrize("where", ["commit", "context"])
+    def test_an_explicit_invalid_code_rolls_back_rows_and_events(
+        self, store: ExecutionStore, code: str, where: str
+    ) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        before = (store.events(), store.history("e1"))
+        updated, step = MACHINE.advance(execution, S.FAILED, now=at(2), reason="r", error="x")
+        failed = intent(K.CLAIM_TASK, fence)
+        reasons = {"e1": code}
+        changes = Commit(applied=((updated, step),), operations=(failed,),
+                         reasons=reasons if where == "commit" else {})  # fmt: skip
+        context = EventContext(at=at(2), instance="inst", epoch=fence.epoch,
+                               reasons=reasons if where == "context" else {})  # fmt: skip
+        with pytest.raises(LedgerIntegrityError, match="not a reason code"):
+            store.commit(fence, changes, context=context)
+        assert (store.events(), store.history("e1")) == before
+        assert store.get("e1") == execution
+        assert store.operations("e1") == ()
+
+    def test_a_missing_code_is_the_documented_fallback_and_reads_back(
+        self, store: ExecutionStore
+    ) -> None:
+        """The store's own fallback (ADR-0024 §2): a caller outside the coordinator that
+        gives no code is recorded as ``unclassified``, and that history reads back. The
+        coordinator never reaches it: its boundary refuses such a commit first."""
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        updated, step = MACHINE.advance(execution, S.FAILED, now=at(2), reason="r", error="x")
+        store.commit(fence, Commit(applied=((updated, step),)))
+        last = store.events()[-1]
+        assert (last.type, last.reason) == (EventType.EXECUTION_TRANSITIONED, "unclassified")
+        assert Event.from_json(last.to_json()) == last  # historical reading is strict and works
+
     def test_events_are_read_after_a_seq_and_up_to_a_limit(self, store: ExecutionStore) -> None:
         for _ in range(4):
             claimed(store)

@@ -475,6 +475,7 @@ def test_a_candidate_that_differs_from_its_freeze_is_never_verified_or_published
     assert setup.scm.pushes == []
 
 
+@pytest.mark.events_unchecked  # the test itself appends forged evidence, outside any pass
 def test_publishing_needs_the_latest_evidence_to_be_for_this_candidate(
     setup: Setup, monkeypatch: pytest.MonkeyPatch
 ) -> None:

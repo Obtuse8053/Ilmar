@@ -112,6 +112,14 @@ A read-only open (`SQLiteExecutionStore.open_read_only`) never migrates and
 never writes. `ilmar.domain.event_history` checks invariant I11: the events
 rebuild the stored rows.
 
+The core supplies what rows do not hold (`ilmar.core.event_context`): a
+random `pass` id per coordinator pass, each effect's duration measured with the
+monotonic clock, the error class and stable reason code of every failure
+(`Commit.reasons` carries a transition's or quarantine's code with the change),
+and what each reconciliation observed. No supported path writes an
+`unclassified`, `invalid`, `redacted` or `truncated` event; the test suite
+checks this, and I11, after every coordinator pass and every crash point.
+
 ## Not yet designed
 
 A long-running scheduler loop, approval policies,

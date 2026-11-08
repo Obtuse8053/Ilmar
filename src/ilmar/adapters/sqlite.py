@@ -398,7 +398,13 @@ class SQLiteExecutionStore:
             for row in rows
         )
 
-    def append_evidence(self, record: EvidenceRecord, *, fence: Fence | None = None) -> None:
+    def append_evidence(
+        self,
+        record: EvidenceRecord,
+        *,
+        fence: Fence | None = None,
+        context: EventContext | None = None,
+    ) -> None:
         with self._transaction() as conn:
             if fence is None:
                 _check_unfenced(conn)
@@ -423,7 +429,7 @@ class SQLiteExecutionStore:
                 ),
             )
             if fence is not None:
-                _append_events(conn, (event_log.evidence_event(record, fence),))
+                _append_events(conn, (event_log.evidence_event(record, fence, context),))
 
     def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
         with self._reading() as conn:

@@ -27,6 +27,7 @@ import hashlib
 from collections.abc import Callable
 from datetime import datetime
 
+from ilmar.core.event_context import PassEvents
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.naming import verification_container_name
 from ilmar.core.safe_fs import directory_identity, ensure_directory
@@ -74,6 +75,7 @@ class Verifier:
         instance_id: str,
         clock: Callable[[], datetime],
         fence: Fence | None = None,
+        events: PassEvents | None = None,
     ) -> None:
         self._source_control = source_control
         self._runtime = runtime
@@ -83,6 +85,7 @@ class Verifier:
         self._instance = instance_id
         self._clock = clock
         self._fence = fence  # evidence is a fenced write once a coordinator owns the store
+        self._events = events
 
     def verify(
         self,
@@ -164,7 +167,12 @@ class Verifier:
             ),
             run=run,
         )
-        self._store.append_evidence(record, fence=self._fence)
+        context = (
+            self._events.context(self._fence)
+            if self._events is not None and self._fence is not None
+            else None
+        )
+        self._store.append_evidence(record, fence=self._fence, context=context)
         return record
 
     # -- candidate-executed checks ---------------------------------------------------

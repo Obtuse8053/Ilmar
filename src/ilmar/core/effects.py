@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ilmar.core.components import Components
+from ilmar.core.event_context import CodedError, PassEvents, failure_code
 from ilmar.core.journal import Journal, check_candidate, freeze_result
 from ilmar.core.mounts import authorize_mount
 from ilmar.core.naming import container_name, verification_container_name
@@ -43,7 +44,6 @@ from ilmar.domain.errors import (
     CandidateRejectedError,
     ContainmentError,
     FencingError,
-    IlmarError,
     LeaseConflictError,
     LedgerIntegrityError,
     NonFastForwardError,
@@ -79,8 +79,10 @@ Then = Callable[[Mapping[str, str]], Commit]
 _SUMMARY_LIMIT = 2000
 
 
-class TransientError(IlmarError):
+class TransientError(CodedError):
     """The step failed for a reason a repetition may not meet (ADR-0021)."""
+
+    default_code = "transient-provider-error"
 
 
 ABANDONED = "interrupted; the attempt is abandoned"
@@ -89,7 +91,7 @@ ABANDONED = "interrupted; the attempt is abandoned"
 Such a failure is transient: it says nothing about the step itself (ADR-0022)."""
 
 
-class DeterministicError(IlmarError):
+class DeterministicError(CodedError):
     """The step failed in a way that repeating it would only reproduce (ADR-0021)."""
 
 
@@ -143,6 +145,14 @@ class Effects:
         return self._journal.fence
 
     @property
+    def events(self) -> PassEvents:
+        return self._journal.events
+
+    @property
+    def journal(self) -> Journal:
+        return self._journal
+
+    @property
     def _store(self) -> ExecutionStore:
         return self._c.execution_store
 
@@ -181,6 +191,8 @@ class Effects:
                 key,
                 OperationStatus.FAILED,
                 reason="the note may or may not exist; not repeated",
+                observed="outcome-unknown",
+                code="transient-provider-error",
                 lease=lease,
             )
             return False
@@ -262,7 +274,9 @@ class Effects:
             # Not retried: a checkout fails the same way again (unknown base
             # branch, an unsafe tree refused by the adapter).
             self._settle_partial(execution, lease, planned, path)
-            raise DeterministicError(f"checkout failed: {type(error).__name__}") from error
+            raise DeterministicError(
+                f"checkout failed: {type(error).__name__}", code="checkout-failed"
+            ) from error
         return Checkout(
             result["base_revision"],
             result["branch_head"] or None,
@@ -313,17 +327,12 @@ class Effects:
             )
         except OwnershipConflictError:
             latest = [self._store.resource(r.key) or r for r in releasing]
-            self._commit(
-                lease,
-                execution,
-                Commit(
-                    resources=tuple(
-                        r.moved(R.QUARANTINED, now=self._clock(), note="replaced on disk")
-                        for r in latest
-                        if r.status not in (R.RELEASED, R.QUARANTINED)
-                    )
-                ),
+            replaced = tuple(
+                r.moved(R.QUARANTINED, now=self._clock(), note="replaced on disk")
+                for r in latest
+                if r.status not in (R.RELEASED, R.QUARANTINED)
             )
+            self._commit(lease, execution, _quarantined(replaced, "resource-ownership-conflict"))
             raise
         return True
 
@@ -389,7 +398,10 @@ class Effects:
             )
             raise
         except ContainmentError:
-            self._quarantine(execution, lease, planned, "start could not be cleaned up")
+            self._quarantine(
+                execution, lease, planned, "start could not be cleaned up",
+                code="containment-unconfirmed",
+            )  # fmt: skip
             raise
         except NEVER_TRANSIENT:
             raise
@@ -400,6 +412,8 @@ class Effects:
                     key,
                     OperationStatus.FAILED,
                     reason="no container exists under the name",
+                    observed="sandbox-absent",
+                    code="transient-provider-error",
                     changes=Commit(
                         resources=(
                             planned.moved(R.RELEASED, now=self._clock(), note="never created"),
@@ -445,6 +459,8 @@ class Effects:
                 key,
                 OperationStatus.FAILED,
                 reason="outcome unknown; the attempt is abandoned",
+                observed="outcome-unknown",
+                code="transient-provider-error",
                 lease=lease,
             )
             raise TransientError(f"the agent run was interrupted: {error}") from error
@@ -506,12 +522,17 @@ class Effects:
             )
         except (OwnershipConflictError, ContainmentError) as error:
             latest = self._store.resource(current.key) or current
-            self._quarantine(execution, lease, latest, f"not removed: {type(error).__name__}")
+            code = failure_code(error)
+            self._quarantine(
+                execution, lease, latest, f"not removed: {type(error).__name__}", code=code
+            )
             if (op := self._store.operation(key)) is not None and not op.status.is_final:
                 self._journal.reconcile(
                     key,
                     OperationStatus.FAILED,
                     reason=f"quarantined: {type(error).__name__}",
+                    observed="resource-quarantined",
+                    code=code,
                     lease=lease,
                 )
             raise
@@ -528,13 +549,18 @@ class Effects:
         )
         if planned is not None and planned.status is R.INTENDED:
             self._settle_partial(execution, lease, planned, path)
-        self._journal.reconcile(key, OperationStatus.FAILED, reason=ABANDONED, lease=lease)
+        self._journal.reconcile(
+            key, OperationStatus.FAILED, reason=ABANDONED, observed="outcome-unknown",
+            code="interrupted", lease=lease,
+        )  # fmt: skip
 
     def abandon_agent_run(self, execution: Execution, lease: ExecutionLease) -> None:
         self._journal.reconcile(
             operation_key(K.RUN_AGENT, execution.id, execution.attempt),
             OperationStatus.FAILED,
             reason="outcome unknown after a restart; the attempt is abandoned",
+            observed="outcome-unknown",
+            code="interrupted",
             lease=lease,
         )
 
@@ -543,6 +569,8 @@ class Effects:
             operation_key(K.START_CONTAINER, execution.id, execution.attempt, name),
             OperationStatus.FAILED,
             reason="interrupted before the agent ran; the sandbox was removed",
+            observed="sandbox-removed",
+            code="interrupted",
             lease=lease,
         )
 
@@ -551,6 +579,8 @@ class Effects:
             operation_key(K.POST_UPDATE, execution.id, execution.attempt, step),
             OperationStatus.FAILED,
             reason="the note may or may not exist; not repeated",
+            observed="outcome-unknown",
+            code="interrupted",
             lease=lease,
         )
 
@@ -606,6 +636,7 @@ class Effects:
                 key,
                 OperationStatus.SUCCEEDED,
                 reason=f"evidence of run {run} exists",
+                observed="evidence-present",
                 result=result,
                 changes=_merge(Commit(resources=settled_checkout), then(result)),
                 lease=lease,
@@ -617,6 +648,8 @@ class Effects:
             key,
             OperationStatus.FAILED,
             reason=f"run {run} left no evidence",
+            observed="evidence-absent",
+            code="interrupted",
             changes=Commit(resources=settled_checkout),
             lease=lease,
         )
@@ -644,14 +677,16 @@ class Effects:
                 key,
                 OperationStatus.SUCCEEDED,
                 reason="the branch is at the candidate",
+                observed="branch-at-candidate",
                 result={"head": head},
                 lease=lease,
             )
             return True
         if head == expected_head:
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
-            )
+                key, OperationStatus.FAILED, reason="the branch did not move",
+                observed="branch-unmoved", code="interrupted", lease=lease,
+            )  # fmt: skip
             return False
         raise LedgerIntegrityError(
             f"{branch} moved to an unverified head; a human must decide (it is never "
@@ -675,6 +710,7 @@ class Effects:
                 key,
                 OperationStatus.SUCCEEDED,
                 reason="the directory is gone",
+                observed="directory-absent",
                 result={"removed": "true"},
                 changes=Commit(
                     resources=tuple(r.moved(R.RELEASED, now=now, note="deleted") for r in group)
@@ -684,15 +720,19 @@ class Effects:
             return True
         if identity_text(found) == top.identity:
             self._journal.reconcile(
-                key, OperationStatus.FAILED, reason="the directory is still there", lease=lease
-            )
+                key, OperationStatus.FAILED, reason="the directory is still there",
+                observed="directory-unchanged", code="interrupted", lease=lease,
+            )  # fmt: skip
             return False
         self._journal.reconcile(
             key,
             OperationStatus.FAILED,
             reason="the directory was replaced",
-            changes=Commit(
-                resources=tuple(r.moved(R.QUARANTINED, now=now, note="replaced") for r in group)
+            observed="directory-replaced",
+            code="resource-ownership-conflict",
+            changes=_quarantined(
+                tuple(r.moved(R.QUARANTINED, now=now, note="replaced") for r in group),
+                "resource-ownership-conflict",
             ),
             lease=lease,
         )
@@ -834,7 +874,10 @@ class Effects:
         except ContainmentError as error:
             for planned in containers:
                 if planned.name == error.name:
-                    self._quarantine(execution, lease, planned, "removal could not be confirmed")
+                    self._quarantine(
+                        execution, lease, planned, "removal could not be confirmed",
+                        code="containment-unconfirmed",
+                    )  # fmt: skip
             raise
         except NEVER_TRANSIENT:
             raise
@@ -846,6 +889,8 @@ class Effects:
                     key,
                     OperationStatus.FAILED,
                     reason="verification did not finish and left no sandbox",
+                    observed="sandbox-absent",
+                    code="transient-provider-error",
                     changes=Commit(
                         resources=(
                             *(
@@ -910,14 +955,16 @@ class Effects:
                     key,
                     OperationStatus.SUCCEEDED,
                     reason="the branch is at the candidate",
+                    observed="branch-at-candidate",
                     result={"head": revision},
                     lease=lease,
                 )
                 return
             if head == expected_head:
                 self._journal.reconcile(
-                    key, OperationStatus.FAILED, reason="the branch did not move", lease=lease
-                )
+                    key, OperationStatus.FAILED, reason="the branch did not move",
+                    observed="branch-unmoved", code="transient-provider-error", lease=lease,
+                )  # fmt: skip
                 raise TransientError(f"the push did not happen: {error}") from error
             raise  # the branch moved elsewhere: left ambiguous for a human
 
@@ -1037,16 +1084,19 @@ class Effects:
         return planned.moved(R.ACTIVE, now=self._clock(), identity=identity)
 
     def _quarantine(
-        self, execution: Execution, lease: ExecutionLease, resource: Resource, note: str
+        self,
+        execution: Execution,
+        lease: ExecutionLease,
+        resource: Resource,
+        note: str,
+        *,
+        code: str,
     ) -> None:
         current = self._store.resource(resource.key) or resource
         if current.status in (R.RELEASED, R.QUARANTINED):
             return
-        self._commit(
-            lease,
-            execution,
-            Commit(resources=(current.moved(R.QUARANTINED, now=self._clock(), note=note),)),
-        )
+        moved = current.moved(R.QUARANTINED, now=self._clock(), note=note)
+        self._commit(lease, execution, _quarantined((moved,), code))
 
     def _observed_checkout(self, checkout: Resource, run_dir: Path) -> Resource:
         """What a verification run left on disk, as the ledger should record it."""
@@ -1080,8 +1130,11 @@ class Effects:
         return found
 
     def _commit(self, lease: ExecutionLease, execution: Execution, changes: Commit) -> None:
-        lease.check(execution.id)
-        self._store.commit(self._journal.fence, changes)
+        self._journal.record(changes, lease=lease, execution_id=execution.id)
+
+
+def _quarantined(resources: tuple[Resource, ...], code: str) -> Commit:
+    return Commit(resources=resources, reasons={r.key: code for r in resources})
 
 
 def _merge(first: Commit, second: Commit) -> Commit:
@@ -1091,4 +1144,5 @@ def _merge(first: Commit, second: Commit) -> Commit:
         operations=first.operations + second.operations,
         resources=first.resources + second.resources,
         expected=first.expected + second.expected,
+        reasons={**first.reasons, **second.reasons},
     )
