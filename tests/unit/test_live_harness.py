@@ -10,7 +10,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import stat
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,6 +66,9 @@ class FakeGitHub:
     )
     statuses: dict[tuple[str, str], int] = field(default_factory=dict)
     requests: list[HttpRequest] = field(default_factory=list)
+    labelled: dict[int, set[str]] = field(default_factory=dict)  # issue: labels it carries
+    drop_labels: bool = False  # answer an add-labels call without adding them
+    unlisted_reads: int = 0  # how many label listings miss a labelled issue (lag)
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
         self.requests.append(request)
@@ -81,6 +86,20 @@ class FakeGitHub:
             return HttpResponse(201, {}, b'{"content":{}}')
         if key == ("POST", "/repos/owner/ilmar-disposable/pulls"):
             return HttpResponse(201, {}, b'{"number":9}')
+        if key[0] == "POST" and (match := re.fullmatch(r".*/issues/(\d+)/labels", key[1])):
+            names = self.labelled.setdefault(int(match.group(1)), set())
+            if not self.drop_labels:
+                names |= set(json.loads(request.body or b"{}")["labels"])
+            return HttpResponse(200, {}, json.dumps([{"name": n} for n in sorted(names)]).encode())
+        if key[0] == "GET" and key[1].endswith("/issues") and "labels=" in path:
+            wanted = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["labels"][0]
+            if self.unlisted_reads > 0:
+                self.unlisted_reads -= 1
+                return HttpResponse(200, {}, b"[]")
+            listed = [
+                {"number": n} for n, names in sorted(self.labelled.items()) if wanted in names
+            ]
+            return HttpResponse(200, {}, json.dumps(listed).encode())
         if key[0] == "GET" and key[1].endswith(("/issues", "/pulls")):
             return HttpResponse(200, {}, b"[]")
         if key[1].endswith("/git/ref/heads/main"):
@@ -202,10 +221,12 @@ def test_preflight_accepts_the_required_repository_and_token() -> None:
     result = run_preflight(fake)
     assert result.default_branch == "main"
     assert result.token_expires == expiry(NOW + timedelta(days=6))[:16] + " UTC"
-    assert len(result.checks) == 11
+    assert len(result.checks) == 12
+    assert result.checks[-1] == "token: can write issues, labels and comments"
     probe = [p for p in fake.calls("DELETE") if "probe" in p]
-    assert probe == [
-        f"/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/probe-{NOW:%Y%m%d%H%M%S}"
+    assert probe == [  # the probe branch, then the probe label: nothing stays
+        f"/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/probe-{NOW:%Y%m%d%H%M%S}",
+        f"/repos/owner/ilmar-disposable/labels/ilmar-live%3Aprobe-{NOW:%Y%m%d%H%M%S}",
     ]
     for request in fake.requests:  # the token goes only into the Authorization header
         assert TOKEN not in request.url
@@ -324,10 +345,58 @@ def test_preflight_refuses_a_token_with_too_little(endpoint: tuple[str, str], me
         run_preflight(fake)
 
 
+PROBE_LABEL = "/repos/owner/ilmar-disposable/labels/ilmar-live%3Aprobe-20261105200000"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        # Issues read only: creating an issue is refused (Pull requests write
+        # alone would still allow the label calls, so this comes first).
+        (("POST", "/repos/owner/ilmar-disposable/issues"), "cannot create issues"),
+        (("POST", "/repos/owner/ilmar-disposable/labels"), "cannot create labels"),
+        (("POST", "/repos/owner/ilmar-disposable/issues/7/labels"), "cannot add labels"),
+        (("POST", "/repos/owner/ilmar-disposable/issues/7/comments"), "cannot comment"),
+    ],
+)
+def test_preflight_names_a_missing_issues_write(endpoint: tuple[str, str], message: str) -> None:
+    fake = FakeGitHub(statuses={endpoint: 403})
+    with pytest.raises(h.LiveGuardError, match=f"{message}.*HTTP 403.*needs Issues write"):
+        run_preflight(fake)
+    if endpoint[1].endswith("/issues"):
+        assert "/repos/owner/ilmar-disposable/issues/7" not in fake.calls("PATCH")  # none made
+    else:  # the probe issue and label never stay behind
+        assert "/repos/owner/ilmar-disposable/issues/7" in fake.calls("PATCH")
+        assert PROBE_LABEL in fake.calls("DELETE")
+
+
+def test_preflight_refuses_a_label_github_did_not_keep() -> None:
+    fake = FakeGitHub(drop_labels=True)
+    with pytest.raises(h.LiveGuardError, match="did not keep the label"):
+        run_preflight(fake)
+    assert PROBE_LABEL in fake.calls("DELETE")
+
+
+def test_preflight_probes_issues_before_any_run_is_seeded() -> None:
+    fake = FakeGitHub()
+    run_preflight(fake)
+    posts = [r.url.removeprefix(h.API) for r in fake.requests if r.method == "POST"]
+    probe = posts.index("/repos/owner/ilmar-disposable/issues")
+    assert posts[probe:] == [
+        "/repos/owner/ilmar-disposable/issues",
+        "/repos/owner/ilmar-disposable/labels",
+        "/repos/owner/ilmar-disposable/issues/7/labels",
+        "/repos/owner/ilmar-disposable/issues/7/comments",
+    ]
+
+
 def test_the_probe_pull_request_is_closed_and_its_branch_deleted() -> None:
     fake = FakeGitHub()
     run_preflight(fake)
-    assert fake.calls("PATCH") == ["/repos/owner/ilmar-disposable/pulls/9"]
+    assert fake.calls("PATCH") == [
+        "/repos/owner/ilmar-disposable/pulls/9",
+        "/repos/owner/ilmar-disposable/issues/7",  # the Issues probe, closed too
+    ]
     assert [p for p in fake.calls("DELETE") if "probe" in p]
 
 
@@ -347,16 +416,140 @@ def test_an_unreadable_expiry_is_no_expiry() -> None:
 # -- setting up a run --------------------------------------------------------------------------
 
 
+def seed(fake: FakeGitHub, *, clock: Any = None) -> h.LiveRun:
+    live = settings()
+    ticks = iter(range(10_000))
+    return h.seed_run(
+        h.LiveGitHub(live.github_token, fake), live.repository, "main", "r-0001ab",
+        clock=clock or (lambda: float(next(ticks))), sleep=lambda _: None,
+    )  # fmt: skip
+
+
 def test_a_run_gets_a_new_base_branch_and_issue_and_rewrites_nothing() -> None:
     fake = FakeGitHub()
-    live = settings()
-    run = h.seed_run(h.LiveGitHub(live.github_token, fake), live.repository, "main", "r-0001ab")
+    run = seed(fake)
     assert run == h.LiveRun("r-0001ab", "ilmar-live/r-0001ab", "ilmar-live:r-0001ab", 7)
     refs = [json.loads(r.body or b"{}") for r in fake.requests if r.url.endswith("/git/refs")]
     assert refs == [{"ref": "refs/heads/ilmar-live/r-0001ab", "sha": "c" * 40}]
     assert fake.calls("PATCH") == []  # no existing ref is moved, nothing is forced
     commit = next(r for r in fake.requests if r.url.endswith("/git/commits"))
     assert json.loads(commit.body or b"{}")["parents"] == ["a" * 40]
+
+
+LABEL = "ilmar-live:r-0001ab"
+LISTING = (
+    "/repos/owner/ilmar-disposable/issues?state=open&labels=ilmar-live%3Ar-0001ab&per_page=100"
+)
+
+
+def test_the_seeded_issue_is_labelled_loudly_and_listed_before_the_run() -> None:
+    """Regression (first live run): the coordinator found no task, because nothing
+    proved the seeded issue was listed under its label. Now the label is created
+    and added by endpoints that fail loudly, and the issue must be in the listing."""
+    fake = FakeGitHub()
+    run = seed(fake)
+    posts = [(r.url.removeprefix(h.API), json.loads(r.body or b"{}"))
+             for r in fake.requests if r.method == "POST"]  # fmt: skip
+    label_post = ("/repos/owner/ilmar-disposable/labels",
+                  {"name": LABEL, "color": "c5def5",
+                   "description": "Ilmar live test run; safe to delete"})  # fmt: skip
+    assert label_post in posts
+    (issue,) = [b for u, b in posts if u == "/repos/owner/ilmar-disposable/issues"]
+    assert "labels" not in issue  # never the silently dropped form
+    assert ("/repos/owner/ilmar-disposable/issues/7/labels", {"labels": [LABEL]}) in posts
+    assert fake.calls("GET")[-1] == LISTING
+    assert run.issue == 7
+
+
+def test_the_harness_checks_exactly_the_listing_the_coordinator_reads() -> None:
+    from ilmar.adapters.github import GitHubClient, GitHubTaskProvider
+
+    seen: list[str] = []
+
+    def transport(request: HttpRequest) -> HttpResponse:
+        seen.append(request.url.removeprefix(h.API))
+        return HttpResponse(200, {}, b"[]")
+
+    provider = GitHubTaskProvider(GitHubClient("t" * 40, transport=transport),
+                                  repository="owner/ilmar-disposable", instance_id="live-x",
+                                  eligible_label=LABEL)  # fmt: skip
+    assert provider.list_eligible() == ()
+    assert seen == [h.eligible_issues_path("owner/ilmar-disposable", LABEL)] == [LISTING]
+
+
+def test_a_listing_that_lags_is_waited_for_within_the_bound() -> None:
+    fake = FakeGitHub(unlisted_reads=3)
+    assert seed(fake).issue == 7
+    assert fake.calls("GET").count(LISTING) == 4
+
+
+def made_and_removed(fake: FakeGitHub) -> None:
+    deleted = fake.calls("DELETE")
+    assert "/repos/owner/ilmar-disposable/git/refs/heads/ilmar-live/r-0001ab" in deleted
+    assert "/repos/owner/ilmar-disposable/labels/ilmar-live%3Ar-0001ab" in deleted
+
+
+def test_an_issue_github_never_lists_stops_the_run_and_is_removed() -> None:
+    fake = FakeGitHub(unlisted_reads=10_000)
+    with pytest.raises(h.LiveGuardError, match="did not list the seeded issue"):
+        seed(fake)
+    assert fake.calls("GET").count(LISTING) <= h.SEED_LISTING_TIMEOUT + 2  # bounded
+    assert "/repos/owner/ilmar-disposable/issues/7" in fake.calls("PATCH")  # closed
+    made_and_removed(fake)
+
+
+def test_a_label_github_drops_stops_the_run_and_is_removed() -> None:
+    fake = FakeGitHub(drop_labels=True)
+    with pytest.raises(h.LiveGuardError, match="did not put the run's label"):
+        seed(fake)
+    assert LISTING not in fake.calls("GET")  # stopped before waiting on it
+    assert "/repos/owner/ilmar-disposable/issues/7" in fake.calls("PATCH")
+    made_and_removed(fake)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "message"),
+    [
+        (("POST", "/repos/owner/ilmar-disposable/labels"), "label could not be created"),
+        (("POST", "/repos/owner/ilmar-disposable/issues/7/labels"), "did not put the run's label"),
+    ],
+)
+def test_a_refused_label_call_stops_the_run(endpoint: tuple[str, str], message: str) -> None:
+    fake = FakeGitHub(statuses={endpoint: 403})
+    with pytest.raises(h.LiveGuardError, match=message):
+        seed(fake)
+    made_and_removed(fake)
+
+
+# -- waiting on a running process ---------------------------------------------------------------
+
+
+def test_a_wait_ends_as_soon_as_the_process_has_exited() -> None:
+    """Regression (first live run): the crash drill waited the full 600 s for a
+    coordinator that had already exited, then said only "never reached the model"."""
+    polls: list[int] = []
+
+    def never() -> bool:
+        polls.append(1)
+        return False
+
+    ticks = iter(range(10_000))
+    outcome = h.wait_while_running(
+        lambda: len(polls) < 3, never,
+        timeout=600, clock=lambda: float(next(ticks)), sleep=lambda _: None,
+    )  # fmt: skip
+    assert outcome == "exited"
+    assert len(polls) == 3  # stopped at the check that saw the exit, not after 600 s
+
+
+def test_a_wait_reports_the_condition_and_the_timeout() -> None:
+    ticks = iter(range(10_000))
+    assert h.wait_while_running(lambda: True, lambda: True, timeout=5) == "met"
+    assert h.wait_while_running(lambda: True, lambda: False, timeout=3,
+                                clock=lambda: float(next(ticks)),
+                                sleep=lambda _: None) == "timeout"  # fmt: skip
+    # Met in the same check that sees the exit: the condition wins.
+    assert h.wait_while_running(lambda: False, lambda: True, timeout=5) == "met"
 
 
 def test_cleanup_closes_and_deletes_only_what_the_run_made() -> None:

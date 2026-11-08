@@ -355,7 +355,53 @@ def preflight(github: LiveGitHub, settings: LiveSettings, *, now: datetime) -> P
     probe_write_permissions(github, settings.repository, result.default_branch, now=now)
     result.checks.append("token: can write contents and pull requests")
     result.checks.append("token: cannot write workflows")
+    probe_issue_permissions(github, settings.repository, now=now)
+    result.checks.append("token: can write issues, labels and comments")
     return result
+
+
+def probe_issue_permissions(github: LiveGitHub, repository: str, *, now: datetime) -> None:
+    """Prove Issues write: everything seeding a run and claiming its task does.
+
+    Pull requests write alone also allows the label calls, so the probe starts
+    with creating an issue, which needs Issues write. It then creates a label,
+    adds it (checking GitHub kept it) and comments, as Ilmar's claim does. The
+    probe issue is closed and its label deleted afterwards, whatever happens.
+    Every refusal names Issues write.
+    """
+    label = f"ilmar-live:probe-{now:%Y%m%d%H%M%S}"
+    created = github.call("POST", f"/repos/{repository}/issues", {
+        "title": "ilmar permission probe (closed at once)",
+        "body": "Created and closed by Ilmar's live-test preflight.",
+    })  # fmt: skip
+    if created.status != 201 or not isinstance(created.data, dict):
+        raise LiveGuardError(
+            f"the token cannot create issues (HTTP {created.status}): it needs Issues write"
+        )
+    number = int(created.data["number"])
+    try:
+        steps: tuple[tuple[str, str, str, Any, int], ...] = (
+            ("create labels", "POST", f"/repos/{repository}/labels",
+             {"name": label, "color": "ededed"}, 201),
+            ("add labels to issues", "POST", f"/repos/{repository}/issues/{number}/labels",
+             {"labels": [label]}, 200),
+            ("comment on issues", "POST", f"/repos/{repository}/issues/{number}/comments",
+             {"body": "ilmar permission probe"}, 201),
+        )  # fmt: skip
+        for what, method, path, body, expected in steps:
+            reply = github.call(method, path, body)
+            if reply.status != expected:
+                raise LiveGuardError(
+                    f"the token cannot {what} (HTTP {reply.status}): it needs Issues write"
+                )
+            if what == "add labels to issues" and not (
+                isinstance(reply.data, list)
+                and any(isinstance(i, dict) and i.get("name") == label for i in reply.data)
+            ):
+                raise LiveGuardError("GitHub did not keep the label on the probe issue")
+    finally:
+        github.call("PATCH", f"/repos/{repository}/issues/{number}", {"state": "closed"})
+        github.call("DELETE", f"/repos/{repository}/labels/{urllib.parse.quote(label, safe='')}")
 
 
 def refuse_if_granted(reply: Reply, permission: str) -> None:
@@ -434,11 +480,41 @@ class LiveRun:
     issue: int
 
 
-def seed_run(github: LiveGitHub, repository: str, default_branch: str, run_id: str) -> LiveRun:
+# How long the seeded issue may take to appear in the coordinator's own query.
+# Not a run timeout: a precondition. If GitHub has not listed the issue by then,
+# the run stops here, saying so, instead of the coordinator finding no task.
+SEED_LISTING_TIMEOUT = 60.0
+
+
+def eligible_issues_path(repository: str, label: str) -> str:
+    """Exactly the listing GitHubTaskProvider.list_eligible asks GitHub for."""
+    query = urllib.parse.urlencode({"state": "open", "labels": label, "per_page": "100"})
+    return f"/repos/{repository}/issues?{query}"
+
+
+def issue_is_listed(github: LiveGitHub, repository: str, label: str, issue: int) -> bool:
+    reply = github.call("GET", eligible_issues_path(repository, label))
+    return (
+        reply.status == 200
+        and isinstance(reply.data, list)
+        and any(isinstance(i, dict) and i.get("number") == issue for i in reply.data)
+    )
+
+
+def seed_run(
+    github: LiveGitHub, repository: str, default_branch: str, run_id: str, *,
+    clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+) -> LiveRun:  # fmt: skip
     """A fresh base branch holding only the seed project, and one issue for it.
 
     Nothing existing is rewritten: the branch is new and its commit's parent is
     the default branch's head.
+
+    The issue is ready only once the coordinator can see it: the run's label is
+    created and put on the issue through endpoints that fail loudly (GitHub
+    silently drops labels passed when an issue is created, if the caller may
+    not set them), and the issue must appear in the coordinator's own listing.
+    Otherwise this stops, says which, and removes what it made.
     """
     if not re.fullmatch(r"[a-z0-9-]{6,40}", run_id):
         raise ValueError("run id: lowercase letters, digits and dashes")
@@ -461,12 +537,41 @@ def seed_run(github: LiveGitHub, repository: str, default_branch: str, run_id: s
     base = f"ilmar-live/{run_id}"
     github.ok("POST", f"/repos/{repository}/git/refs", {"ref": f"refs/heads/{base}", "sha": commit})
     label = f"ilmar-live:{run_id}"
-    issue = github.ok(
-        "POST",
-        f"/repos/{repository}/issues",
-        {"title": f"{ISSUE_TITLE} ({run_id})", "body": ISSUE_BODY, "labels": [label]},
-    )["number"]
-    return LiveRun(run_id, base, label, int(issue))
+    run = LiveRun(run_id, base, label, 0)
+    try:
+        made = github.call("POST", f"/repos/{repository}/labels", {
+            "name": label, "color": "c5def5", "description": "Ilmar live test run; safe to delete",
+        })  # fmt: skip
+        if made.status != 201:
+            raise LiveGuardError(f"the run's label could not be created (HTTP {made.status})")
+        created = github.ok("POST", f"/repos/{repository}/issues",
+                            {"title": f"{ISSUE_TITLE} ({run_id})", "body": ISSUE_BODY})  # fmt: skip
+        run = LiveRun(run_id, base, label, int(created["number"]))
+        labelled = github.call("POST", f"/repos/{repository}/issues/{run.issue}/labels",
+                               {"labels": [label]})  # fmt: skip
+        names = (
+            {str(item.get("name")) for item in labelled.data if isinstance(item, dict)}
+            if labelled.status == 200 and isinstance(labelled.data, list)
+            else set()
+        )
+        if label not in names:
+            raise LiveGuardError(
+                f"GitHub did not put the run's label on the seeded issue (HTTP "
+                f"{labelled.status}); the token needs Issues write"
+            )
+        listed = wait_for(
+            lambda: issue_is_listed(github, repository, label, run.issue),
+            timeout=SEED_LISTING_TIMEOUT, interval=1.0, clock=clock, sleep=sleep,
+        )  # fmt: skip
+        if not listed:
+            raise LiveGuardError(
+                f"GitHub did not list the seeded issue under its label within "
+                f"{SEED_LISTING_TIMEOUT:.0f} s, so the coordinator would find no task"
+            )
+    except BaseException:
+        cleanup_run(github, repository, run)  # best effort; the original error wins
+        raise
+    return run
 
 
 def change_requests_for(github: LiveGitHub, repository: str, base: str) -> list[dict[str, Any]]:
@@ -888,6 +993,30 @@ def wait_for(
         if clock() >= deadline:
             return False
         sleep(interval)
+
+
+def wait_while_running(
+    running: Callable[[], bool], condition: Callable[[], bool], *, timeout: float,
+    interval: float = 0.5, clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:  # fmt: skip
+    """Wait for ``condition`` while a process runs: ``"met"``, ``"exited"`` or ``"timeout"``.
+
+    A process that has stopped can no longer make the condition true, so the
+    wait ends there instead of running out the timeout.
+    """
+    outcome = "timeout"
+
+    def settled() -> bool:
+        nonlocal outcome
+        if condition():
+            outcome = "met"
+        elif not running():
+            outcome = "exited"
+        return outcome != "timeout"
+
+    wait_for(settled, timeout=timeout, interval=interval, clock=clock, sleep=sleep)
+    return outcome
 
 
 # -- the record for #44 and #11d ---------------------------------------------------------------

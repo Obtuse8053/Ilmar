@@ -22,6 +22,7 @@ credential is written to ``ILMAR_LIVE_REPORT_DIR``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets as random
 import signal
@@ -122,6 +123,11 @@ class Session:
         """The CLI's output for an assertion message, with every credential redacted."""
         return h.redact(f"exit {done.returncode}\n{done.stdout}\n{done.stderr}", self.live.secrets)
 
+    def last_shown(self) -> str:
+        """The coordinator's last output, redacted, for a failure message."""
+        last = self.outputs[-1] if self.outputs else "(nothing)"
+        return "the coordinator's last output:\n" + h.redact(last, self.live.secrets)
+
     def store(self) -> SQLiteExecutionStore:
         return SQLiteExecutionStore(self.database)
 
@@ -153,7 +159,10 @@ def session(
 
 def published(session: Session) -> Execution:
     with session.store() as store:
-        (execution,) = store.list_in_states(set(ExecutionState))
+        executions = store.list_in_states(set(ExecutionState))
+        # Zero means the coordinator found no task; its output says why.
+        assert len(executions) == 1, session.last_shown()
+        (execution,) = executions
         assert execution.state is ExecutionState.SUCCEEDED, execution.last_error
         assert store.unfinished_operations() == ()
         rows = store.resources(execution_id=execution.id)
@@ -302,7 +311,7 @@ def image_digest(image: str) -> str:
 
 
 def test_preflight(checked: h.Preflight, live: h.LiveSettings) -> None:
-    assert len(checked.checks) == 11
+    assert len(checked.checks) == 12
     h.write_report(live.report_dir, "preflight", {
         "repository": checked.repository, "token_expires": checked.token_expires,
         "checks": checked.checks, "at": datetime.now(UTC).isoformat(),
@@ -373,22 +382,29 @@ def test_a_coordinator_killed_mid_agent_recovers_with_one_pull_request(session: 
         )  # fmt: skip
         try:
             # Mid-agent for real: the agent's run is recorded as in progress and
-            # Claude Code has reached the model through the proxy.
-            talking = h.wait_for(
+            # Claude Code has reached the model through the proxy. A coordinator
+            # that has already exited never will: stop waiting then.
+            outcome = h.wait_while_running(
+                lambda: process.poll() is None,
                 lambda: (
                     agent_in_progress()
                     and f"ALLOW host={h.ANTHROPIC_HOST}" in watcher.proxy_log_so_far()
                 ),
                 timeout=600,
             )
-            assert talking, "Claude Code never reached the model"
-            time.sleep(delay)
-            assert agent_in_progress(), "the agent finished before the kill; lower the delay"
-            assert process.poll() is None, "the coordinator finished before the crash"
+            if outcome == "met":
+                time.sleep(delay)
+                assert agent_in_progress(), "the agent finished before the kill; lower the delay"
+                assert process.poll() is None, "the coordinator finished before the crash"
         finally:
-            os.killpg(process.pid, signal.SIGKILL)  # the coordinator dies; no cleanup runs
+            with contextlib.suppress(ProcessLookupError):  # already exited and reaped
+                os.killpg(process.pid, signal.SIGKILL)  # the coordinator dies; no cleanup runs
             output, _ = process.communicate(timeout=60)
             session.outputs.append(output)
+        if outcome == "exited":
+            pytest.fail(f"the coordinator exited before Claude Code reached the model; "
+                        f"{session.last_shown()}")  # fmt: skip
+        assert outcome == "met", "Claude Code never reached the model"
         interrupted = [s.name for s in watcher.sandboxes() if "-verify-" not in s.name]
         assert len(interrupted) == 1
         left = subprocess.run(  # noqa: S603 - fixed argv

@@ -28,7 +28,12 @@ end-to-end tests** (#11d).
   - be able to read issues and pull requests;
   - on a throwaway branch, deleted afterwards: write a harmless file and
     open (then close) a pull request, and have a workflow-file write
-    refused. A refusal counts only after the harmless write succeeded.
+    refused. A refusal counts only after the harmless write succeeded;
+  - have Issues write: create a probe issue, create a label, add it (and
+    GitHub must keep it) and comment, as seeding a run and claiming its
+    task do. The probe issue is closed and its label deleted afterwards.
+    Creating the issue comes first, because Pull requests write alone also
+    allows the label calls.
 - **Credentials never leak:**
   - Credentials are read only from the environment, wrapped so that they
     never print, and handed to the CLI only through its environment.
@@ -235,6 +240,17 @@ Then:
 5. With `post_records`, a separate job without any secret posts the records
    on #44 and #11, but only if the run passed, at that commit, and every
    record passes its checks.
+
+**If a run says GitHub did not label or list the seeded issue,** the
+coordinator would have found no task. The harness creates the run's label,
+adds it to the issue through endpoints that fail loudly, and waits up to
+60 s for the issue to appear in the coordinator's own listing. A refused
+label means the token lacks Issues write. A listing that never shows the
+issue is GitHub's side; dispatch again later.
+
+**Do not re-run with "Enable debug logging"** unless you need it. Masked
+values stay masked, but debug output also prints request details and
+signed URLs into the run's log, and this repository's logs are public.
 
 **Afterwards:** delete the two environment secrets, and revoke the token and
 the key (or let them expire).
