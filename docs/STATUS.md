@@ -31,14 +31,15 @@ GitHub shows as finished.
 
 | Step | Issue | Depends on |
 | --- | --- | --- |
-| 1 | #15 Restart recovery: check against ADR-0022 and the #11c tests; close it as delivered, or narrow it to what is missing | — |
-| 2 | #17 Structured event logging (ADR for the event schema) | — |
+| 1 | #15 Restart recovery: audit against ADR-0012, ADR-0020 and ADR-0022, with the missing tests | — |
+| 2 | #17 Structured event logging (ADR for the event schema, including stable reason codes such as `resource-ownership-conflict`) | — |
 | 3 | #16 Cancellation of running executions (ownership-verified, ADR-0012 rule 3) | #17 |
-| 4 | #12 Reconcile executions against tracker state every cycle | #16 |
+| 4 | #12 Reconcile executions against tracker state every cycle, including orphaned-claim release (needs an ADR for the `TaskProvider` extension) | #16 |
 | 5 | #13 Retry backoff and stall detection (first schema migration) | #17 |
 | 6 | #18 Execution limits and budgets, including the F-019 gateway evaluation | #13, #16 |
 | 7 | #14 Attempt handoff and legible verification output | #13 |
 | 8 | #51 Stateful GitHub emulator over real git, with fault injection | can run in parallel; before #12 if possible |
+| 9 | #59 Human-controlled resolution of quarantined resources (ADR first; quarantine stays final for automation, ADR-0020) | #17; before #20 |
 
 Why this order:
 - Events come first, because cancellation, stall detection and budgets all
@@ -47,24 +48,46 @@ Why this order:
   ineligible while running has to be cancelled.
 - Limits come last among the core items, because they build on backoff and
   cancellation.
+- Quarantine resolution (#59) comes after events, so that a resolution can be
+  recorded as an event. It must exist before unattended operation (#20),
+  because a quarantined execution can otherwise never finish.
 
 Unattended operation stays disabled throughout M3. Enabling it is #20 (M4),
 which revisits ADR-0023.
 
 ## Recommended next task
 
-#15 (plan step 1): a short audit, not new code. ADR-0022 and the #11c
-crash-injection tests already define and test recovery for every
-non-terminal state.
-- **Close #15** if its criteria (including the ADR-0012 per-state table)
-  are met, linking the evidence.
-- **Otherwise narrow #15** to what is missing.
+#17 (plan step 2): structured event logging. It starts with an ADR for the
+event schema:
+- JSON lines, each carrying the execution ID;
+- an event for every state transition and provider call;
+- stable reason codes, among them `resource-ownership-conflict` (moved from
+  #15).
 
-Then #17.
+Cancellation (#16), stall detection (#13) and budgets (#18) build on it.
 
 **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-08: **#15 finished** (restart recovery): audited against ADR-0012,
+  ADR-0020, ADR-0022, the code and the tests. The evidence matrix is on #15.
+  - Recovery, fencing and ownership were already complete from #11c. No
+    production code changed.
+  - PR #60 added tests:
+    - a container swapped for a stranger's right after its labels were read
+      is untouched;
+    - a failed proxy or network removal stays quarantined and blocked across
+      restarts, each with a fresh runtime, and is never retried
+      (ADR-0020);
+    - every non-terminal state has a crash point.
+  - Maintainer decisions:
+    - quarantine stays final for automation; human resolution is #59 (new,
+      approved);
+    - orphaned-claim release moved to #12, with an ADR for the
+      `TaskProvider` extension;
+    - the stable `resource-ownership-conflict` reason code moved to #17.
+  - Next recommended: #17.
 
 - 2026-11-08: **M2 complete.** The live workflow passed in full
   ([run 42465684121](https://github.com/Obtuse8053/Ilmar/actions/runs/42465684121)
