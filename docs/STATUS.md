@@ -9,9 +9,9 @@ GitHub is right; fix this file in your next PR. See `docs/workflow.md`,
 
 ## Current milestone
 
-**M2 End-to-end execution**
-([milestone](https://github.com/Obtuse8053/Ilmar/milestone/2)). M1 was merged
-in PR #1.
+**M3 Reliability**
+([milestone](https://github.com/Obtuse8053/Ilmar/milestone/3)). M2 ended on
+2026-11-08, when the live end-to-end tests passed (ADR-0023, accepted).
 
 ## Live state (query, don't copy)
 
@@ -22,49 +22,82 @@ in PR #1.
   [`needs:maintainer` issues](https://github.com/Obtuse8053/Ilmar/issues?q=is%3Aopen+label%3Aneeds%3Amaintainer)
 - Milestone progress: the milestone page linked above
 
-## Planned order (M2)
+## Planned order (M3)
 
-Dependency order for M2. This plan is owned here; issues do not repeat it.
-Skip any step whose issue GitHub shows as finished.
+Dependency order for M3 (MANIFEST §10: restart recovery, duplicate-work
+prevention, retries, cancellation, structured logs and execution limits).
+This plan is owned here; issues do not repeat it. Skip any step whose issue
+GitHub shows as finished.
 
 | Step | Issue | Depends on |
 | --- | --- | --- |
-| 1 | #2 Session-resume workflow | — |
-| 1a | #33 M2 design review (ADR-0010, ADR-0011, ADR-0012) | #2 |
-| 2 | #3 Contract suites and fakes for `SourceControlProvider` and `AgentRunner` | #33 |
-| 3 | #4 Safe workspace path derivation | #3 |
-| 4 | #6 GitHub `TaskProvider` | #3 |
-| 5 | #5 Podman `ContainerRuntime` and sandbox profile (network `NONE`) | #4 |
-| 5a | #40 Sandbox egress allow-list and the ADR-0011 §9 suite | #5 |
-| 6 | #7 GitHub `SourceControlProvider` | #3, #4 |
-| 7 | #8 Claude Code `AgentRunner` | #3, #40 |
-| 8 | #9 Verification stage | #5, #7 |
-| 9 | #10 Adapter registry | before #11 |
-| 10 | #11 Coordinator loop and end-to-end test (closes M2), in four PRs: | all of the above |
-| 10a | #11a Instance lock, fencing, operation journal, resource ledger (ADR-0020) | #10 |
-| 10b | #11b One execution end to end with write-ahead ordering; `ilmar run --once --config PATH` | 10a |
-| 10c | #11c Crash recovery for every state; `load_candidate`; crash-injection harness | 10b |
-| 10d | #11d Opt-in live test on a disposable repository; M2 close-out | 10c, #44 |
+| 1 | #15 Restart recovery: check against ADR-0022 and the #11c tests; close it as delivered, or narrow it to what is missing | — |
+| 2 | #17 Structured event logging (ADR for the event schema) | — |
+| 3 | #16 Cancellation of running executions (ownership-verified, ADR-0012 rule 3) | #17 |
+| 4 | #12 Reconcile executions against tracker state every cycle | #16 |
+| 5 | #13 Retry backoff and stall detection (first schema migration) | #17 |
+| 6 | #18 Execution limits and budgets, including the F-019 gateway evaluation | #13, #16 |
+| 7 | #14 Attempt handoff and legible verification output | #13 |
+| 8 | #51 Stateful GitHub emulator over real git, with fault injection | can run in parallel; before #12 if possible |
 
-Steps 3 and 4 can run in parallel. Maintenance issues without a milestone can
-fill any gaps between M2 steps.
+Why this order:
+- Events come first, because cancellation, stall detection and budgets all
+  need to say what they did.
+- Cancellation comes before reconciliation, because a task that becomes
+  ineligible while running has to be cancelled.
+- Limits come last among the core items, because they build on backoff and
+  cancellation.
+
+Unattended operation stays disabled throughout M3. Enabling it is #20 (M4),
+which revisits ADR-0023.
 
 ## Recommended next task
 
-#11d (plan step 10d): an opt-in live test of one task end to end on a
-disposable GitHub repository with real Claude Code, then the M2 close-out.
-- Restricted credentials: a fine-grained token for the disposable
-  repository only, and a capped model key.
-- Smoke test #44 must pass first, and gates any unattended operation.
-- The plan is posted on issue #11.
+#15 (plan step 1): a short audit, not new code. ADR-0022 and the #11c
+crash-injection tests already define and test recovery for every
+non-terminal state.
+- **Close #15** if its criteria (including the ADR-0012 per-state table)
+  are met, linking the evidence.
+- **Otherwise narrow #15** to what is missing.
+
+Then #17.
 
 **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
 
-- 2026-11-05: #11d harness on PR #50 (adversarial review done; awaiting approval and the
-  maintainer's live run): live end-to-end tests and the #44 record (ADR-0023,
-  Proposed).
+- 2026-11-08: **M2 complete.** The live workflow passed in full
+  ([run 42465684121](https://github.com/Obtuse8053/Ilmar/actions/runs/42465684121)
+  at `f9078dc`). ADR-0023 is accepted.
+  - **#44 passed:** Claude Code 2.1.318 contacted only `api.anthropic.com`,
+    and nothing was denied.
+  - **#11d passed:**
+    - the preflight passed all 12 checks;
+    - one task ran end to end in one attempt;
+    - in the crash drill, killed mid-agent, the run recovered with exactly
+      one pull request.
+  - **Records:** on #44 and #11. The research access log has the #44 result
+    under R13.
+  - **How the live tests run** (PRs #54 and #55): in GitHub Actions, through
+    a manual workflow.
+    - Supply chain: the wheels are hash-locked and the agent base image is
+      pinned by digest.
+    - Before any secret, it checks that exactly `expected_sha` is checked
+      out and that `main` still points at it. Nothing is installed after
+      the secrets.
+    - Approval: the guard requires required reviewers with Prevent
+      self-review on. The approver must be an account no automation can
+      use.
+  - **Fixes from the first two runs:**
+    - PR #56: the seeded issue is proven labelled and listed, and the
+      preflight proves Issues write.
+    - PR #57: log followers close their pipes, and the workspace check
+      follows ADR-0021.
+  - Unattended operation stays disabled. Next recommended: #15 (audit),
+    then #17.
+
+- 2026-11-05: #11d harness, merged in PR #50 (after an adversarial review):
+  live end-to-end tests and the #44 record (ADR-0023, then Proposed).
   - Run locally with two commands: `scripts/live_setup.py` once, then
     `scripts/live_run.py` (`docs/operations/live-testing.md`).
   - Found and fixed:

@@ -29,7 +29,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0020](0020-fencing-journal-and-resource-ledger.md) | Fencing, the write-ahead operation journal and the resource ledger | Accepted |
 | [0021](0021-coordinator-execution.md) | One coordinator execution: steps, failure classes, claims and task completion | Accepted |
 | [0022](0022-crash-recovery.md) | Crash recovery: durable state is the only memory | Accepted |
-| [0023](0023-live-testing-and-in-memory-credentials.md) | Live end-to-end testing, and credentials that never touch disk | Proposed |
+| [0023](0023-live-testing-and-in-memory-credentials.md) | Live end-to-end testing, and credentials that never touch disk | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
