@@ -870,6 +870,34 @@ def test_remove_owned_never_removes_a_network_replaced_after_its_labels_were_rea
     assert podman.by_name(name + "-egress") is None
 
 
+@pytest.mark.parametrize("part", ["", "-egress"])
+def test_remove_owned_never_removes_a_container_replaced_after_its_labels_were_read(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, part: str
+) -> None:
+    """#15: an ownership change between validation and operation. Ours is replaced
+    by a stranger's container of the same name after its labels were read; the
+    removal targets the ID read with the labels, so the stranger's is untouched."""
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace))
+    name = "ilmar-exec-1-1" + part
+    ours = podman.by_name(name)
+    assert ours is not None
+    strangers: list[str] = []
+
+    def replace(container_id: str) -> None:  # right after its labels were read
+        if container_id == ours.id:
+            podman.after_container_inspect = None
+            del podman.containers[ours.id]
+            strangers.append(podman.create(name, {"io.ilmar.owner.token": "other"}))
+
+    podman.after_container_inspect = replace
+    fresh = runtime(layout, podman, egress=EGRESS)
+    assert fresh.remove_owned("ilmar-exec-1-1", owner=OWNER) is True
+    (stranger,) = strangers
+    assert podman.containers[stranger].labels == {"io.ilmar.owner.token": "other"}
+    assert podman.by_name(name) is podman.containers[stranger]  # still there, still theirs
+    assert stranger not in [c.argv[-1] for c in podman.calls if c.argv[1] == "rm"]
+
+
 def test_remove_owned_works_without_any_memory_of_the_sandbox(
     layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
 ) -> None:
