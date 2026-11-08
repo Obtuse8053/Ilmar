@@ -197,6 +197,10 @@ class Actor:
     ref: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.kind, ActorKind):
+            raise ValueError("an actor kind must be an ActorKind")
+        if self.ref is not None and not isinstance(self.ref, str):
+            raise ValueError("an actor ref must be a string")
         if self.kind is ActorKind.HUMAN:
             if self.ref is None or not _ACTOR_REF.match(self.ref):
                 raise ValueError("a human actor needs a ref matching ^[a-z][a-z0-9-]{0,31}$")
@@ -600,6 +604,10 @@ class Event:
             raw = json.loads(text)
         except ValueError:
             bad("not JSON")
+        except RecursionError:
+            # json.loads recurses per nesting level; a hostile or damaged
+            # line must be reported, not crash the reader.
+            bad("JSON nested too deeply")
         if not isinstance(raw, dict):
             bad("not a JSON object")
         if unknown := sorted(raw.keys() - _TOP_LEVEL):

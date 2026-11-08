@@ -614,3 +614,38 @@ def test_everything_create_writes_reads_back_unchanged(monkeypatch: pytest.Monke
         text = sample.with_seq(5).to_json()
         assert Event.from_json(text).to_json() == text
     assert {"redacted", "invalid", "truncated"} <= {f for s in samples for f in s.flags}
+
+
+@pytest.mark.parametrize("ref", [1, True, ["ops"], {"ref": "ops"}, b"ops"])
+@pytest.mark.parametrize("kind", list(ActorKind))
+def test_an_actor_ref_of_the_wrong_type_is_refused(kind: ActorKind, ref: Any) -> None:
+    with pytest.raises(ValueError, match="must be a string"):
+        Actor(kind, ref)
+
+
+@pytest.mark.parametrize("kind", ["human", 1, None, ["human"], ActorKind.HUMAN.value.upper()])
+def test_an_actor_kind_that_is_not_an_actor_kind_is_refused(kind: Any) -> None:
+    with pytest.raises(ValueError, match="must be an ActorKind"):
+        Actor(kind)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("type", 1), ("type", ["operation.succeeded"]), ("type", {"type": "x"}),
+        ("actor", {"kind": "human", "ref": 7}), ("actor", {"kind": "human", "ref": ["ops"]}),
+        ("actor", {"kind": "human", "ref": {}}), ("actor", {"kind": 1}),
+        ("actor", {"kind": ["coordinator"]}), ("actor", {"kind": "coordinator", "ref": 0}),
+    ],
+)  # fmt: skip
+def test_wrong_json_types_in_enum_valued_fields_are_corrupt(field: str, value: Any) -> None:
+    with pytest.raises(CorruptEventError):
+        Event.from_json(line(stored(), **{field: value}))
+
+
+@pytest.mark.parametrize("depth", [1_000, 100_000])
+def test_deeply_nested_json_is_corrupt_not_a_recursion_error(depth: int) -> None:
+    with pytest.raises(CorruptEventError):
+        Event.from_json("[" * depth + "]" * depth)
+    with pytest.raises(CorruptEventError):
+        Event.from_json('{"data":' * depth + "{}" + "}" * depth)

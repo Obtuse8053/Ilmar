@@ -10,6 +10,7 @@ then checks I11 from creation or from the migration baseline (§8).
 from __future__ import annotations
 
 import dataclasses
+import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -26,6 +27,7 @@ from ilmar.domain.event_history import (
 )
 from ilmar.domain.events import (
     BaselineExecution,
+    CorruptEventError,
     Event,
     EventContext,
     EventType,
@@ -545,3 +547,128 @@ def test_a_store_whose_every_line_is_corrupt_still_reports_its_rows() -> None:
 def test_no_stored_lines_means_no_coverage() -> None:
     replay = pre_migration_store()
     assert verify_lines([], replay.stored()).exit_code == 2
+
+
+# -- type confusion: every malformed line is an integrity failure, never a crash -----------
+
+# One of every JSON type, plus strings that look like the enum values a field may hold.
+WRONG_TYPES: tuple[Any, ...] = (
+    None, True, False, 0, -1, 1.5, 10**40, "", "x", "<redacted>", "coordinator",
+    "operation.succeeded", [], [1], ["human"], {}, {"kind": "human"}, {"value": "x"},
+)  # fmt: skip
+
+
+def one_line_per_type() -> list[str]:
+    replay = migrated()
+    lifecycle(replay)
+    by_type: dict[EventType, str] = {}
+    for stored_event in replay.events:
+        by_type.setdefault(stored_event.type, stored_event.to_json())
+    return list(by_type.values())
+
+
+def substitutions(text: str) -> list[tuple[str, str]]:
+    """``text`` with each top-level, actor and data field replaced by each wrong type,
+    canonically encoded so only the content can be what is refused."""
+    record: dict[str, Any] = json.loads(text)
+    out: list[tuple[str, str]] = []
+
+    def emit(path: str, changed: dict[str, Any]) -> None:
+        out.append((path, json.dumps(changed, sort_keys=True, separators=(",", ":"))))
+
+    for key in sorted(set(record) | {"type", "actor", "data", "seq", "reason"}):
+        for value in WRONG_TYPES:
+            emit(key, record | {key: value})
+    for key in ("kind", "ref"):
+        for value in WRONG_TYPES:
+            emit(f"actor.{key}", record | {"actor": record["actor"] | {key: value}})
+            emit(
+                f"actor.human.{key}",
+                record | {"actor": {"kind": "human", "ref": "ops"} | {key: value}},
+            )
+    for key in sorted(record.get("data", {})):
+        for value in WRONG_TYPES:
+            emit(f"data.{key}", record | {"data": record["data"] | {key: value}})
+    return out
+
+
+SWEEP = [
+    (text, path, changed) for text in one_line_per_type() for path, changed in substitutions(text)
+]
+
+
+def test_the_sweep_covers_every_enum_valued_field() -> None:
+    paths = {path for _, path, _ in SWEEP}
+    assert {"type", "actor.kind", "actor.human.ref", "reason", "data.kind", "data.status",
+            "data.state", "data.from", "data.to", "data.verdict"} <= paths  # fmt: skip
+    assert len({json.loads(text)["type"] for text, _, _ in SWEEP}) >= 11
+
+
+def test_every_wrong_json_type_is_corrupt_or_a_valid_event_never_a_crash() -> None:
+    """Any exception other than ``CorruptEventError`` escapes and fails the test."""
+    refused = 0
+    for _, path, changed in SWEEP:
+        try:
+            decoded = Event.from_json(changed)
+        except CorruptEventError:
+            refused += 1
+            continue
+        # Accepted only if the substitution happened to be a valid value; then it is
+        # exactly what is stored.
+        assert decoded.to_json() == changed, path
+    assert refused > 0.95 * len(SWEEP)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("type", 7), ("type", None), ("type", ["operation.succeeded"]), ("type", {}),
+        ("actor", "coordinator"), ("actor", ["coordinator"]),
+        ("actor.kind", 1), ("actor.kind", None), ("actor.kind", {"kind": "human"}),
+        ("actor.human.ref", 1), ("actor.human.ref", True), ("actor.human.ref", ["ops"]),
+        ("actor.human.ref", {}), ("actor.ref", 0), ("reason", 3),
+        ("data.kind", 1), ("data.status", ["intended"]), ("data.version", "2"),
+    ],
+)  # fmt: skip
+def test_verify_lines_reports_a_wrong_json_type_as_an_integrity_failure(
+    field: str, value: Any
+) -> None:
+    replay = migrated()
+    stored_lines = lines(replay)
+    target = next(i for i, text in enumerate(stored_lines) if '"status":"intended"' in text)
+    record: dict[str, Any] = json.loads(stored_lines[target])
+    match field.split("."):
+        case [key]:
+            record[key] = value
+        case ["actor", "human", "ref"]:
+            record["actor"] = {"kind": "human", "ref": value}
+        case [outer, key]:
+            record[outer] = record[outer] | {key: value}
+    stored_lines[target] = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    report = verify_lines(stored_lines, replay.stored())
+    assert report.exit_code == 1
+    detail = next(f.detail for f in report.failures if f.check == "corrupt-event")
+    assert detail.startswith(f"line {target + 1}:")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[" * 100_000 + "]" * 100_000,
+        '{"a":' * 100_000 + "1" + "}" * 100_000,
+        '{"seq":NaN}',
+        '{"seq":Infinity}',
+        "\ud800",
+        '"just a string"',
+    ],
+    ids=["deep array", "deep object", "NaN", "Infinity", "lone surrogate", "string"],
+)
+def test_verify_lines_survives_unparseable_lines(text: str) -> None:
+    replay = migrated()
+    stored_lines = lines(replay)
+    stored_lines[1] = text
+    report = verify_lines(stored_lines, replay.stored())
+    assert report.exit_code == 1
+    assert any(
+        f.check == "corrupt-event" and f.detail.startswith("line 2:") for f in report.failures
+    )
