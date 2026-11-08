@@ -636,3 +636,49 @@ rule of ADR-0022: no decision from persisted wall-clock time.
   section 3's envelope.
 - A second store adapter is added: it must implement the same baseline and
   the read-only open, or this ADR must say how its history starts.
+
+## Clarification (2026-11-08, PR #66 review)
+
+Section 2, layer 1 says that a failure transition without a reason code gets
+`unclassified`, "so the state change is never blocked by a missing code".
+From #17 part 3 (PR #66), the two layers that handle reason codes have
+**different defaults**. This clarifies section 2; the decision is unchanged.
+
+A *row that needs a reason* is one of:
+- a transition into `failed`, `cancelled` or `retry_wait`;
+- a `failed` or `ambiguous` operation;
+- a `quarantined` resource.
+
+- **The store fails open.**
+  - Event derivation, and so every store adapter, still writes `unclassified`
+    when a row that needs a reason has none, and the commit succeeds. Section
+    2's guarantee keeps holding for every caller of the port.
+  - History stays compatible. Stored `unclassified` events are read strictly by
+    `Event.from_json`, and `verify` treats them like any other event, so I11
+    and migrated stores are unaffected.
+  - What the store does refuse is `unclassified`, or any unregistered code,
+    given *explicitly* as an input. That raises `LedgerIntegrityError`, and the
+    rows and their events roll back together. `unclassified` is only ever the
+    fallback, never an input.
+- **The coordinator fails closed.**
+  - Every write the coordinator makes is checked before it reaches the store:
+    the journal's writes, transitions, quarantines and execution creation.
+  - Each code given must be registered and not `unclassified`, and each row
+    that needs a reason must have one.
+  - Otherwise `LedgerIntegrityError` is raised and nothing is written. The
+    explicit-input entry points (`Journal.reconcile`, coded errors, the event
+    context) refuse `unclassified` and unregistered codes the same way.
+  - On a supported path, a missing or invalid code is therefore a **blocked
+    execution reported for a human**, never a commit with an `unclassified`
+    event.
+- **Recovery semantics are unchanged.** The refusal is an ordinary
+  `LedgerIntegrityError`, handled as before:
+  - the execution is reported blocked and left for a human (ADR-0022);
+  - an effect that already happened keeps its result as an `ambiguous`
+    operation, which recovery reconciles (ADR-0020).
+
+  No state, retry rule or recovery decision is added.
+
+Section 2's sentence "Every test path asserts that `unclassified` never
+appears" stands. With the boundary in place, a missing code on a supported path
+shows up as a refused write in those tests.
