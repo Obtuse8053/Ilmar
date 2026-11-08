@@ -151,7 +151,14 @@ the previous one cannot.
 3. **The history is checked against current state.** Folding the events of
    an execution, in `seq` order, must reproduce its stored state, attempt
    and version, and the status and version of each of its operations and
-   resources.
+   resources. The fold starts from the entity's **first event**:
+   - its creation event (`execution.created`, `operation.intended`,
+     `resource.recorded`) for an entity created after the migration;
+   - its **baseline** event for an entity that existed when the events
+     table was added (section 8, "Migration baseline").
+
+     The baseline is a snapshot of the stored row at that moment. It is
+     not a history: what happened earlier is outside event coverage.
    - This is invariant **I11**. The crash-injection suite checks it after
      every crash point and every recovery (ADR-0022), and the store
      contract checks it after every commit it makes.
@@ -190,7 +197,7 @@ newline-terminated:
 | `instance` | yes | The Ilmar instance ID (ADR-0013). |
 | `epoch` | yes | The ownership epoch of the writing process, so events from before and after a takeover are distinguishable (ADR-0020). |
 | `pass` | yes for coordinator events | A random ID per `run_once` pass. It correlates everything one pass did, recovery included. |
-| `actor` | yes | `{"kind": "coordinator"}`, or `{"kind": "human", "ref": "…"}` for a human command. `ref` is validated as section 7 requires; #59 decides what a resolution records. |
+| `actor` | yes | `{"kind": "coordinator"}`; `{"kind": "migration"}` for the baseline (section 8); or `{"kind": "human", "ref": "…"}` for a human command. `ref` is validated as section 7 requires; #59 decides what a resolution records. |
 | `type` | yes | `noun.verb`, from the catalogue below. |
 | `execution`, `attempt` | when the event concerns an execution | |
 | `task` | when known | `provider:key`, never the task's title or body. |
@@ -242,6 +249,10 @@ The initial set:
 | `unexpected-error` | An exception caught at an execution's boundary (ADR-0022) |
 
 ### 5. Event catalogue (version 1)
+
+**Durable, written once by the migration (section 8):**
+- `events.coverage_started`;
+- `execution.baseline`, `operation.baseline` and `resource.baseline`.
 
 **Durable, from M2 behaviour:**
 - `execution.created`, and `execution.transitioned` (`data`: `from`, `to`);
@@ -408,10 +419,104 @@ defence, not the mechanism.
   - one migration adds the `events` table, append-only, with triggers that
     refuse `UPDATE` and `DELETE` as for `evidence`;
   - an index on `(execution_id, seq)`;
-  - a first `ownership.acquired` event.
-- **No backfill:** events start at the migration. Earlier history remains in
-  `transitions`, `operations` and `evidence`, and the exporter can label
-  that boundary.
+  - the migration baseline below, in the **same transaction**. A crash
+    during the migration leaves the store exactly as it was, and the next
+    open migrates again from the start.
+- **No backfill.** No past event is reconstructed or invented. Earlier
+  history stays where it is today, in `transitions`, `operations` and
+  `evidence`.
+
+#### Migration baseline
+
+Executions, operations and resources that exist when the events table is
+added have no creation event. Without a starting point, I11 could not be
+checked for them, and could not tell old history apart from a missing
+event. The migration therefore records **what exists now**, not what
+happened before:
+
+1. **`events.coverage_started`** is the first event (`seq` 1).
+   - Its `data` holds the schema version migrated from, and the number of
+     executions, operations and resources baselined.
+   - Every later event is "covered".
+2. **One baseline event per existing row**, all in `seq` order after the
+   marker:
+   - **`execution.baseline`:**
+     - the stored state, attempt and version;
+     - the number of `transitions` rows, and of `evidence` rows, the
+       execution has at that moment (`transitions_before`,
+       `evidence_before`).
+
+     These counts bound exactly what is historical.
+   - **`operation.baseline`:** key, kind, attempt, status and version. This
+     includes `intended` and `ambiguous` operations that a crashed
+     coordinator left unfinished.
+   - **`resource.baseline`:** key, kind, name, attempt, status and version.
+     This includes `quarantined` rows.
+
+   Terminal executions are baselined too: some still change later, for
+   example cleanup, a claim release after a merge, or #59.
+
+   The baseline does not go through `Commit`, so the migration makes its
+   own check before `COMMIT`: exactly one baseline event per existing
+   execution, operation and resource, and counts equal to the marker's.
+   Otherwise it rolls back.
+3. **Baseline events carry `actor` `{"kind": "migration"}`.** Their `epoch`
+   is the one in the store's owner row at that moment; a store never owned
+   has no executions and so no baseline. They carry no `pass` and no
+   `reason`. They are validated like every event (section 7). A baseline
+   holds no free text: the stored `last_error` and transition reasons are
+   not copied.
+4. **The migration runs only under the instance lock.**
+   - The store applies it only when opened for writing by a caller that
+     holds the lock: the coordinator, or a mutating command, after
+     `Ownership` has taken the lock. No coordinator can therefore write
+     between the snapshot and the first covered event.
+   - Today the store migrates every time it is opened. The implementation
+     separates the two: a **read-only open never migrates and never
+     writes**. `ilmar events` and `ilmar events verify` use it.
+   - On a store without the events table they report "no event coverage"
+     (exit 2) and change nothing.
+5. **After the baseline, everything is ordinary.**
+   - The next change to a baselined row is paired as in section 2: its
+     `from` is the stored status, which equals the baseline's.
+   - Recovery of a baselined, interrupted operation writes
+     `operation.reconciled` from the baseline's `intended` or `ambiguous`
+     status, exactly as for any other.
+
+#### What `ilmar events verify` reports
+
+`verify` is read-only. It folds every entity from its first event and
+compares the result with the stored rows. Each finding is in one of two
+classes, never mixed.
+
+- **Historical (information, exit 0).** These are data outside event
+  coverage by design, bounded by the baseline:
+  - `transitions` and `evidence` rows that the baseline counted;
+  - the creation and earlier status changes of a baselined operation or
+    resource.
+
+  They are reported per execution, for example "baselined at seq 17: 6
+  transitions and 2 evidence records before coverage".
+- **Integrity failure (exit 1).** Any of:
+  - a stored row whose fold disagrees with it (state, attempt, version or
+    status);
+  - an entity with **neither** a creation nor a baseline event. Under the
+    lock-held migration this cannot happen, so it is never classified as
+    historical;
+  - more `transitions` or `evidence` rows than the baseline count plus the
+    covered events account for, or fewer;
+  - an event whose entity does not exist;
+  - a second `events.coverage_started`, or a baseline event after covered
+    events of the same entity;
+  - a `seq` gap. Since append-only triggers refuse deletion, a gap means
+    the file was altered outside Ilmar.
+
+  Each failure names the entity and the check that failed.
+- **No coverage (exit 2):** the store has no events table yet.
+
+The classification never uses timestamps. Whether a row is historical is
+decided only by the baseline's explicit entities and counts. That keeps the
+rule of ADR-0022: no decision from persisted wall-clock time.
 - **Existing records keep their meaning:** `transitions`, `last_error` and
   `WorkerResult.detail` stay as they are. Events carry the reason code;
   human-readable text stays where it is.
@@ -442,6 +547,40 @@ defence, not the mechanism.
   - round-trip of every field;
   - I11 after every commit it makes.
 - **`ilmar events` and `ilmar events verify` (CLI),** both read-only.
+  They use the store's read-only open, which never migrates (section 8).
+- **`SQLiteExecutionStore`:** a read-only open, and a lock-held open that
+  applies the events migration with its baseline in one transaction.
+- **Migration baseline tests,** on a store built with today's schema
+  (version before the migration). The store holds:
+  - non-terminal executions in every non-terminal state;
+  - one with an `intended` and one with an `ambiguous` operation, left by a
+    crash;
+  - active, releasing and quarantined resources;
+  - a `SUCCEEDED` execution with its claim held, and a `FAILED` one.
+
+  The tests:
+  - **Migration under the lock** writes exactly one
+    `events.coverage_started` and one baseline per row, with matching
+    counts. I11 holds, and `verify` exits 0 with every pre-existing
+    execution reported as baselined, with its historical counts.
+  - **Recovery after the migration** runs on that store, with a crash
+    injected at every store write and before every effect, as in the crash
+    suite. After each crash and recovery, I11 holds and `verify` exits 0.
+    The baselined `intended` and `ambiguous` operations are reconciled from
+    their baseline status.
+  - **A crash inside the migration** leaves the store unchanged: no events
+    table and no partial baseline. The next open migrates once.
+  - **Opening without the lock, and read-only opens, never migrate.**
+    `ilmar events` and `verify` on an unmigrated store exit 2 and leave the
+    database file byte-for-byte unchanged.
+  - **`verify`'s classes:**
+    - pre-baseline `transitions` and `evidence` are historical (exit 0);
+    - each integrity failure listed in section 8 is detected (exit 1),
+      each by editing the database outside Ilmar: a row changed without an
+      event, an extra transition after the baseline, an execution inserted
+      with no events, a removed trigger and a deleted event (a `seq` gap);
+    - a historical finding is never reported as a failure, and no failure
+      as historical.
 - **Architecture tests:**
   - events are constructed only in `ilmar.core` and `ilmar.domain`;
   - no adapter imports the event types;
@@ -474,6 +613,16 @@ defence, not the mechanism.
   string edit. That is the point: nothing reaches an event unvalidated.
 - **Not solved here:** safe budget enforcement across crashes. Section 5
   reserves it for #18.
+- **Bad:** the migration writes one event per existing execution, operation
+  and resource in one transaction. Its size is bounded by the store, and it
+  runs once.
+- **Bad:** the store's open changes. Today every open migrates; afterwards a
+  read-only open never migrates, and the events migration needs the
+  instance lock. Callers that open the store before taking the lock must be
+  reordered.
+- **Good:** history before the migration is never mistaken for corruption,
+  and corruption is never excused as history. The baseline bounds the
+  historical part by explicit entities and counts, not by timestamps.
 
 ## Revisit when
 
@@ -485,3 +634,5 @@ defence, not the mechanism.
   over `events()`.
 - #14, #16, #12, #13, #18 or #59 needs a field that does not fit
   section 3's envelope.
+- A second store adapter is added: it must implement the same baseline and
+  the read-only open, or this ADR must say how its history starts.
