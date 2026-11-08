@@ -30,7 +30,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0021](0021-coordinator-execution.md) | One coordinator execution: steps, failure classes, claims and task completion | Accepted |
 | [0022](0022-crash-recovery.md) | Crash recovery: durable state is the only memory | Accepted |
 | [0023](0023-live-testing-and-in-memory-credentials.md) | Live end-to-end testing, and credentials that never touch disk | Accepted |
-| [0024](0024-structured-event-log.md) | A structured event log, written in the same commit as the change it describes | Proposed |
+| [0024](0024-structured-event-log.md) | A structured event log, written in the same commit as the change it describes | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
