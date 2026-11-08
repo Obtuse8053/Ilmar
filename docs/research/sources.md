@@ -54,6 +54,7 @@ Add a row whenever a source is consulted for a decision or a review.
 
 | Date | IDs | Purpose | Notes |
 | --- | --- | --- | --- |
+| 2026-11-08 | R13 | #44 real Claude Code smoke test | Live workflow run 42465684121 at `f9078dc`. Claude Code 2.1.318, image `sha256:5937feb7c037254ce619dc358947d8dcc8eca6110b84dfa00c728bde68557d5a` (built from `images/claude-code/Containerfile`, not published). Passed: completed, file written, no `DENY`, only `api.anthropic.com` contacted. Re-run when the pinned version changes. |
 | 2026-11-04 | R13, R15 | Claude Code `AgentRunner` (#8) | code.claude.com could not be fetched from the build environment this time (it was earlier). Flags (`-p`, `--output-format json`, `--permission-mode` values, `--max-turns`, `--model`, `--no-session-persistence`, `--strict-mcp-config`), the result fields (`type`, `subtype`, `is_error`, `result`) and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` were confirmed from search snippets of the official docs (docs.anthropic.com, docs.claude.com). The opt-in live test is the check against the current version. |
 | 2026-11-04 | R17, R22 | GitHub `SourceControlProvider` (#7) | git-scm.com is not reachable from the build environment. The documentation was read from git/git at v2.43.0. Behaviour was confirmed by the full contract against real git 2.43. |
 | 2026-11-04 | R21 | Egress allow-list (#40) | `podman-network-create` (`--internal`, `--disable-dns`), and the `network`, `ip`, `sysctl`, `add-host` and `dns` option pages, at the same two pinned commits. Behaviour confirmed by the CI §9 suite. |

@@ -1,6 +1,6 @@
 # ADR-0023: Live end-to-end testing, and credentials that never touch disk
 
-- Status: Proposed
+- Status: Accepted (2026-11-08, after the live tests passed; proposed 2026-11-05)
 - Date: 2026-11-05
 - Sources: [R13] · Findings: F-018, F-022
 - Implements: #11d (harness), #44 (record); amends ADR-0014 (environment
@@ -132,8 +132,10 @@ Podman. Hardened in the security review of PR #54:
     (`GITHUB_SHA` and `GITHUB_WORKFLOW_SHA`);
   - `main` still points at `expected_sha`, read from the API at that moment
     (`git/ref/heads/main`), not taken from the event;
-  - the `live` environment has required reviewers, no administrator bypass,
-    and deployment limited to exactly the branch `main`;
+  - the `live` environment has required reviewers with **Prevent
+    self-review** on (PR #55: whoever starts a run, a person or automation
+    acting as one, cannot approve it), no administrator bypass, and
+    deployment limited to exactly the branch `main`;
   - `main`'s rulesets require pull requests and block force pushes and
     deletion.
 
@@ -211,10 +213,17 @@ Podman. Hardened in the security review of PR #54:
     a pull request, and its workflow-file write is then refused. The refusal
     counts only after the control write succeeded, so too little Contents
     permission cannot pass for "no Workflows permission";
+  - it has Issues write (PR #56): it creates a probe issue first (Pull
+    requests write alone would allow the label calls), then a label, adds it
+    and checks GitHub kept it, and comments; the probe issue is closed and
+    the label deleted afterwards;
   - the repository's `full_name` is the configured one, so a renamed or
     transferred repository reached by redirect is refused.
 - **Isolation per run:** a new base branch `ilmar-live/<run>`, whose commit
-  has the default branch as its parent, plus its own label and issue.
+  has the default branch as its parent, plus its own label and issue. The
+  label is created and added through endpoints that fail loudly, and the
+  issue must appear in the coordinator's own listing before the run starts
+  (PR #56).
   Nothing existing is moved or force-pushed. Everything the run made is
   closed or deleted afterwards.
 - **Secrets:**
@@ -292,6 +301,31 @@ Podman. Hardened in the security review of PR #54:
   Ilmar repository is public.
 - #11 closes only after the live tests have passed and their records are on
   the issue.
+
+## Acceptance
+
+Accepted on 2026-11-08 after the live workflow passed in full: [run
+42465684121](https://github.com/Obtuse8053/Ilmar/actions/runs/42465684121) at
+`f9078dc`.
+- **Approval:** dispatched by the maintainer's account, and approved by a
+  separate reviewer account with self-review prevented.
+- **#44:** the smoke test passed with Claude Code 2.1.318, image
+  `sha256:5937feb7c037…`. It contacted only `api.anthropic.com`, and nothing
+  was denied.
+- **#11d:**
+  - the preflight passed all 12 checks;
+  - one task ran end to end in one attempt (34 s): published, verified and
+    merged as a pull request on the disposable repository, then completed;
+  - in the crash drill, the coordinator was killed after 2 s of agent work.
+    It recovered on attempt 2 with exactly one pull request.
+- **Records:** all five, with no credentials, are posted on #44 and #11.
+- **No leaks:** the job logs contain no credential-shaped strings, and no
+  debug logging was enabled.
+
+The two earlier runs failed on test defects, which were fixed and
+regression-tested in PRs #56 and #57. Unattended operation stays disabled:
+`ilmar run` still requires `--once`, and enabling it is #20, which revisits
+this ADR.
 
 ## Revisit when
 
