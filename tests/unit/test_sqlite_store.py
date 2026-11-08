@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from ilmar.adapters.sqlite import SCHEMA_V1, SCHEMA_VERSION, SQLiteExecutionStore
+from ilmar.adapters.sqlite import (
+    NEW_DATABASE_VERSION,
+    SCHEMA_V1,
+    SCHEMA_VERSION,
+    SQLiteExecutionStore,
+)
 from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.domain.errors import DuplicateExecutionError, EvidenceIntegrityError
 from ilmar.domain.execution import ExecutionState
@@ -49,11 +54,20 @@ def test_two_connections_cannot_both_hold_a_task(tmp_path: Path) -> None:
             second.create(other, other_transition)
 
 
+def user_version(path: Path) -> int:
+    with closing(sqlite3.connect(path)) as conn:
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+    return int(version)
+
+
 def test_schema_version_is_recorded(tmp_path: Path) -> None:
     path = tmp_path / "executions.sqlite3"
     SQLiteExecutionStore(path).close()
-    with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
+    # A new database starts before event coverage: its marker needs an owner.
+    assert user_version(path) == NEW_DATABASE_VERSION
+    with SQLiteExecutionStore(path) as store:
+        store.claim_instance("inst", now=at(0))
+    assert user_version(path) == SCHEMA_VERSION
 
 
 def test_newer_schema_is_refused(tmp_path: Path) -> None:
@@ -91,12 +105,14 @@ def test_version_1_databases_are_migrated_in_place(tmp_path: Path) -> None:
     path = tmp_path / "executions.sqlite3"
     make_v1(path)
     with SQLiteExecutionStore(path) as store:
+        assert user_version(path) == 1  # opening never migrates (ADR-0024 §8)
+        fence = store.claim_instance("inst", now=at(5))  # under the instance lock
         old = store.get("old")
         assert old is not None
         assert old.state is ExecutionState.CLAIMED
         assert (old.base_revision, old.candidate_revision) == (None, None)
         assert len(store.history("old")) == 1
-        store.append_evidence(evidence_record("old"))
+        store.append_evidence(evidence_record("old"), fence=fence)
         assert len(store.evidence("old")) == 1
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
@@ -108,10 +124,13 @@ def test_a_failed_migration_leaves_the_database_unchanged(tmp_path: Path) -> Non
     with closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE evidence (x INTEGER)")  # makes the migration fail
         conn.commit()
-    with pytest.raises(sqlite3.OperationalError):
-        SQLiteExecutionStore(path)
+    with SQLiteExecutionStore(path) as store, pytest.raises(sqlite3.OperationalError):
+        store.claim_instance("inst", now=at(5))  # the migration runs here, and fails
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+        assert (
+            conn.execute("SELECT name FROM sqlite_master WHERE name = 'owner'").fetchone() is None
+        )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
         assert "candidate_revision" not in columns
 
@@ -174,16 +193,20 @@ def make_v2(path: Path) -> None:
         conn.executescript(f"BEGIN;\n{MIGRATIONS[1]}\nPRAGMA user_version = 2;\nCOMMIT;")
 
 
-def test_version_2_migrates_to_3_keeping_everything(tmp_path: Path) -> None:
+def test_version_2_migrates_keeping_everything(tmp_path: Path) -> None:
     path = tmp_path / "executions.sqlite3"
     make_v2(path)
     with SQLiteExecutionStore(path) as store:
+        # Unclaimed: not migrated, and not usable until a coordinator claims it.
+        with pytest.raises(FencingError, match="claim it under the instance lock"):
+            store.fence()
+        assert user_version(path) == 2
+        fence = store.claim_instance("inst", now=at(5))
+        assert fence.epoch == 1  # the first owner
         assert store.get("old") is not None
-        assert store.fence() is None  # unclaimed until a coordinator takes it
         assert store.operations("old") == ()
         assert store.resources() == ()
-    with closing(sqlite3.connect(path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (3,)
+    assert user_version(path) == SCHEMA_VERSION
 
 
 def test_version_1_migrates_straight_to_3(tmp_path: Path) -> None:

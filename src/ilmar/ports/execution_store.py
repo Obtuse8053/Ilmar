@@ -13,6 +13,7 @@ from ilmar.domain.errors import (
     FencingError,
     LedgerIntegrityError,
 )
+from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.ledger import (
     Commit,
@@ -52,6 +53,20 @@ class ExecutionStore(Protocol):
     * :meth:`commit` writes executions, transitions, operations and resources
       in one transaction, all or nothing, under the rules of
       :func:`check_commit`.
+
+    The event log (ADR-0024):
+
+    * Event coverage starts when the store is first claimed. :meth:`claim_instance`
+      is called only under the instance lock, so it is where the migration
+      baseline is written, in the same transaction as the claim.
+    * From then on every write appends its events in the **same transaction**:
+      the mandatory events of a commit (one per changed row, paired with it,
+      see :mod:`ilmar.ports.event_log`), ``evidence.recorded`` and
+      ``ownership.acquired``. No event is written without its change, and no
+      change without its event. A refused write writes neither.
+    * Events are append-only and numbered by ``seq``, 1, 2, 3, … without gaps.
+    * Before coverage starts, only an unowned store accepts (unfenced) writes;
+      the baseline then records what they left.
 
     Inputs must satisfy :func:`check_create` / :func:`check_apply`.
     """
@@ -104,7 +119,9 @@ class ExecutionStore(Protocol):
         """Take ownership: return a fence whose epoch exceeds every earlier one.
 
         Call only while holding the instance lock. Every fence handed out
-        before is superseded at once.
+        before is superseded at once. The first claim also starts event
+        coverage (the migration baseline, ADR-0024 §8); every claim records
+        ``ownership.acquired``. All of it is one transaction.
         """
         ...
 
@@ -112,8 +129,17 @@ class ExecutionStore(Protocol):
         """The current owner's fence, or ``None`` if no coordinator ever claimed."""
         ...
 
-    def commit(self, fence: Fence, changes: Commit) -> None:
-        """Apply ``changes`` atomically if ``fence`` is current (see :func:`check_commit`)."""
+    def commit(self, fence: Fence, changes: Commit, *, context: EventContext | None = None) -> None:
+        """Apply ``changes`` atomically if ``fence`` is current (see :func:`check_commit`).
+
+        ``context`` supplies what the rows do not hold (pass, reasons,
+        durations); it must belong to ``fence``. Without one, the events carry
+        the fence's owner and the commit's own time.
+        """
+        ...
+
+    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
+        """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order."""
         ...
 
     def operation(self, key: str) -> Operation | None: ...

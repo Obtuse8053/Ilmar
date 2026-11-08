@@ -3,7 +3,9 @@
 
 It follows the same contract as the SQLite store, including fencing, the
 operation journal and the resource ledger (ADR-0020): every rule comes from
-the shared ``check_fence`` and ``check_commit``.
+the shared ``check_fence`` and ``check_commit``. Its event log (ADR-0024)
+follows the same rules as the SQLite store's, through ``ilmar.ports.event_log``:
+coverage starts at the first claim, with a baseline of what exists.
 """
 
 from __future__ import annotations
@@ -18,11 +20,17 @@ from ilmar.domain.errors import (
     ExecutionNotFoundError,
     FencingError,
 )
+from ilmar.domain.event_history import StoredState
+from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.ledger import Commit, Fence, Operation, OperationStatus, Resource, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
+from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+
+FROM_SCHEMA_VERSION = 0
+"""What the baseline records as the version migrated from: this store has no schema."""
 
 
 class InMemoryExecutionStore:
@@ -36,6 +44,7 @@ class InMemoryExecutionStore:
         self._owner: Fence | None = None
         self._operations: dict[str, Operation] = {}
         self._resources: dict[str, Resource] = {}
+        self._events: list[str] = []  # canonical lines, so stored events cannot change
 
     def create(
         self, execution: Execution, transition: Transition, *, fence: Fence | None = None
@@ -87,7 +96,9 @@ class InMemoryExecutionStore:
             check_fence(self._owner, fence)
             if record.execution_id not in self._executions:
                 raise ExecutionNotFoundError(record.execution_id)
+            events = () if fence is None else (event_log.evidence_event(record, fence),)
             self._evidence.setdefault(record.execution_id, []).append(record.to_json())
+            self._append(events)
 
     def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
         with self._lock:
@@ -106,19 +117,35 @@ class InMemoryExecutionStore:
                 raise FencingError(
                     f"this store belongs to instance {current.instance_id!r}, not {instance_id!r}"
                 )
-            self._owner = Fence(instance_id, 1 if current is None else current.epoch + 1)
-            return self._owner
+            new = Fence(instance_id, 1 if current is None else current.epoch + 1)
+            started: tuple[Event, ...] = ()
+            if not self._events:  # the first claim starts coverage (ADR-0024 §8)
+                started = event_log.baseline(now=now, owner=current, claimant=instance_id,
+                                             from_schema_version=FROM_SCHEMA_VERSION,
+                                             state=self._stored_state())  # fmt: skip
+            acquired = event_log.ownership_event(current, new, now=now)
+            self._owner = new
+            self._append((*started, acquired))
+            return new
 
     def fence(self) -> Fence | None:
         with self._lock:
             return self._owner
 
-    def commit(self, fence: Fence, changes: Commit) -> None:
+    def commit(self, fence: Fence, changes: Commit, *, context: EventContext | None = None) -> None:
         with self._lock:
             check_fence(self._owner, fence)
             check_commit(
                 fence,
                 changes,
+                execution=self._executions.get,
+                operation=self._operations.get,
+                resource=self._resources.get,
+            )
+            events = event_log.commit_events(
+                fence,
+                changes,
+                context,
                 execution=self._executions.get,
                 operation=self._operations.get,
                 resource=self._resources.get,
@@ -140,6 +167,14 @@ class InMemoryExecutionStore:
                 self._operations[operation.key] = operation
             for resource in changes.resources:
                 self._resources[resource.key] = resource
+            self._append(events)
+
+    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
+        with self._lock:
+            lines = self._events[max(after_seq, 0) :]
+        if limit is not None:
+            lines = lines[:limit]
+        return tuple(Event.from_json(line) for line in lines)
 
     def operation(self, key: str) -> Operation | None:
         with self._lock:
@@ -174,6 +209,20 @@ class InMemoryExecutionStore:
             )
 
     # -- internals ------------------------------------------------------------
+
+    def _append(self, events: Sequence[Event]) -> None:
+        """Called last, once every check passed: nothing can fail after it."""
+        numbered = event_log.with_seqs(events, len(self._events) + 1)
+        self._events.extend(event.to_json() for event in numbered)
+
+    def _stored_state(self) -> StoredState:
+        return event_log.stored_state(
+            executions=list(self._executions.values()),
+            operations=list(self._operations.values()),
+            resources=list(self._resources.values()),
+            transitions={k: len(v) for k, v in self._history.items()},
+            evidence={k: len(v) for k, v in self._evidence.items()},
+        )
 
     def _check_new(self, execution: Execution) -> None:
         if execution.id in self._executions:

@@ -99,9 +99,22 @@ reaches a path.
 
 Milestone scope and status are tracked in [`../roadmap.md`](../roadmap.md).
 
+## Event log
+
+ADR-0024. Every write to the execution store appends its events to an
+append-only `events` table **in the same transaction**: the mandatory events
+of a `Commit` (one per changed row, derived in `ilmar.domain.events` and
+paired with its row by `ilmar.ports.event_log` before `COMMIT`),
+`evidence.recorded` and `ownership.acquired`. Coverage starts at the first
+`claim_instance`, which runs only under the instance lock: it migrates the
+database and writes the baseline of what already exists, in one transaction.
+A read-only open (`SQLiteExecutionStore.open_read_only`) never migrates and
+never writes. `ilmar.domain.event_history` checks invariant I11: the events
+rebuild the stored rows.
+
 ## Not yet designed
 
-Structured event logging, a long-running scheduler loop, approval policies,
+A long-running scheduler loop, approval policies,
 and planning and review stages. Each will get an ADR when it is
 built.
 Open research findings that bear on these are listed in

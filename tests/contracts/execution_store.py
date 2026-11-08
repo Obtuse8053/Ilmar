@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +23,8 @@ from ilmar.domain.errors import (
     FencingError,
     LedgerIntegrityError,
 )
+from ilmar.domain.event_history import StoredState, verify
+from ilmar.domain.events import Event, EventContext, EventType, derive_events
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
@@ -44,6 +46,7 @@ from ilmar.domain.verification import (
     Independence,
     Verdict,
 )
+from ilmar.ports import event_log
 from ilmar.ports.execution_store import ExecutionStore
 
 from helpers import at
@@ -409,13 +412,207 @@ class FencingContract:
         assert sorted(results) == ["conflict"] * 7 + ["ok"]
 
 
-class ExecutionStoreContract(FencingContract):
+# -- the event log (ADR-0024) -------------------------------------------------------------
+
+
+def stored_state(store: ExecutionStore) -> StoredState:
+    """The rows I11 is checked against, read through the port only."""
+    executions = store.list_in_states(set(ExecutionState))
+    return StoredState(
+        executions=executions,
+        operations=[o for e in executions for o in store.operations(e.id)],
+        resources=store.resources(),
+        transitions={e.id: len(store.history(e.id)) for e in executions},
+        evidence={e.id: len(store.evidence(e.id)) for e in executions},
+    )
+
+
+def check_i11(store: ExecutionStore) -> None:
+    """Invariant I11: once coverage started, the events rebuild every stored row."""
+    events = store.events()
+    if events:
+        report = verify(events, stored_state(store))
+        assert report.failures == (), report.failures
+
+
+def types(events: Sequence[Event]) -> list[str]:
+    return [e.type.value for e in events]
+
+
+class EventLogContract:
+    """Mixed into :class:`ExecutionStoreContract`; see ADR-0024 §2, §6 and §8."""
+
+    def test_an_unclaimed_store_has_no_events(self, store: ExecutionStore) -> None:
+        _create(store, "e1", TASK_A, 0)
+        assert store.events() == ()
+
+    def test_the_first_claim_starts_coverage_with_a_baseline(self, store: ExecutionStore) -> None:
+        execution = _create(store, "e1", TASK_A, 0)
+        _advance(store, execution, S.CLAIMED, 1)
+        store.append_evidence(evidence_record("e1"))
+        fence = claimed(store)
+        marker, baseline, acquired = store.events()
+        assert marker.type is EventType.COVERAGE_STARTED
+        assert (marker.seq, marker.epoch, marker.actor.kind.value) == (1, 0, "migration")
+        assert {k: marker.data[k] for k in ("executions", "operations", "resources")} == {
+            "executions": 1, "operations": 0, "resources": 0}  # fmt: skip
+        assert baseline.type is EventType.EXECUTION_BASELINE
+        assert baseline.data == {"state": "claimed", "version": 2, "transitions_before": 2,
+                                 "evidence_before": 1}  # fmt: skip
+        assert acquired.type is EventType.OWNERSHIP_ACQUIRED
+        assert (acquired.seq, acquired.epoch, acquired.data) == (3, fence.epoch, {})
+        report = verify(store.events(), stored_state(store))
+        assert report.failures == ()
+        assert {f.subject for f in report.historical} == {"execution:e1"}
+
+    def test_a_later_claim_records_only_the_takeover(self, store: ExecutionStore) -> None:
+        first = claimed(store)
+        second = claimed(store)
+        events = store.events()
+        assert types(events) == ["events.coverage_started", "ownership.acquired",
+                                 "ownership.acquired"]  # fmt: skip
+        assert events[-1].epoch == second.epoch
+        assert events[-1].data == {"previous_instance": "inst", "previous_epoch": first.epoch}
+
+    def test_every_write_appends_exactly_its_paired_events(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        start = len(store.events())
+        execution = fenced_execution(store, fence)
+        claim = intent(K.CLAIM_TASK, fence)
+        box = Resource.intended(ResourceKind.CONTAINER, "e1", 1, "c1", owner_token="t", now=at(2))
+        store.commit(fence, Commit(operations=(claim,), resources=(box,)))
+        updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(3), reason="claimed")
+        done = claim.moved(ST.SUCCEEDED, fence=fence, now=at(3))
+        active = box.moved(R.ACTIVE, now=at(3), identity="c0ffee")
+        store.commit(fence, Commit(applied=((updated, step),), operations=(done,),
+                                   resources=(active,)))  # fmt: skip
+        store.append_evidence(evidence_record("e1", seconds=4), fence=fence)
+        new = store.events(after_seq=start)
+        assert types(new) == [
+            "execution.created",
+            "operation.intended", "resource.recorded",
+            "execution.transitioned", "operation.succeeded", "resource.changed",
+            "evidence.recorded",
+        ]  # fmt: skip
+        assert [e.seq for e in new] == list(range(start + 1, start + 1 + len(new)))
+        assert new[3].data == {"from": "queued", "to": "claimed", "version": 2}
+        assert new[4].data["from"] == "intended"  # the stored status, filled by the store
+        assert new[5].data["from"] == "intended"
+        assert all(e.execution == "e1" and e.epoch == fence.epoch for e in new)
+        assert all(not e.flags for e in store.events())
+
+    def test_events_read_back_exactly_as_derived(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        claim = intent(K.CLAIM_TASK, fence)
+        changes = Commit(created=((execution, transition),))
+        context = EventContext(at=at(1), instance="inst", epoch=fence.epoch,
+                               pass_id="p-0a1b2c", tasks={"e1": "fake:A"})  # fmt: skip
+        store.commit(fence, changes, context=context)
+        failed = claim.moved(ST.FAILED, fence=fence, now=at(3))
+        store.commit(fence, Commit(operations=(claim,)))
+        later = EventContext(at=at(3), instance="inst", epoch=fence.epoch, pass_id="p-0a1b2c",
+                             reasons={claim.key: "not-claimed-other"},
+                             durations_ms={claim.key: 412},
+                             error_classes={claim.key: "ProviderError"})  # fmt: skip
+        store.commit(fence, Commit(operations=(failed,)), context=later)
+        created, intended, outcome = store.events()[-3:]
+        (expected_created,) = derive_events(changes, context)
+        assert created.to_json() == expected_created.with_seq(created.seq or 0).to_json()
+        assert intended.type is EventType.OPERATION_INTENDED
+        assert outcome.to_json() == (
+            derive_events(Commit(operations=(failed,)), later)[0]
+            .with_previous("intended")
+            .with_seq(outcome.seq or 0)
+            .to_json()
+        )
+        assert (outcome.pass_id, outcome.reason) == ("p-0a1b2c", "not-claimed-other")
+        assert outcome.data["duration_ms"] == 412
+
+    def test_a_refused_write_appends_no_event(self, store: ExecutionStore) -> None:
+        old = claimed(store)
+        fenced_execution(store, old)
+        fence = claimed(store)
+        before = store.events()
+        stale = intent(K.CLAIM_TASK, old)
+        with pytest.raises(FencingError):
+            store.commit(old, Commit(operations=(stale,)))
+        with pytest.raises(FencingError):
+            store.append_evidence(evidence_record("e1"), fence=old)
+        bad = Resource.intended(ResourceKind.WORKSPACE, "e1", 2, "/w", owner_token="t", now=at(1))
+        with pytest.raises(LedgerIntegrityError):  # attempt 2 does not exist
+            store.commit(fence, Commit(operations=(intent(K.CLAIM_TASK, fence),),
+                                       resources=(bad,)))  # fmt: skip
+        with pytest.raises(ConcurrencyConflictError):
+            store.commit(fence, Commit(operations=(intent(K.CLAIM_TASK, fence),),
+                                       expected=(("e1", 9),)))  # fmt: skip
+        assert store.events() == before
+        assert store.operations("e1") == ()
+
+    def test_a_context_from_another_owner_is_refused(self, store: ExecutionStore) -> None:
+        old = claimed(store)
+        fence = claimed(store)
+        execution, transition = MACHINE.start(TASK_A, execution_id="e1", now=at(1))
+        before = store.events()
+        for context in (
+            EventContext(at=at(1), instance="inst", epoch=old.epoch),
+            EventContext(at=at(1), instance="other", epoch=fence.epoch),
+        ):
+            with pytest.raises(LedgerIntegrityError, match="another owner"):
+                store.commit(fence, Commit(created=((execution, transition),)), context=context)
+        assert store.get("e1") is None
+        assert store.events() == before
+
+    @pytest.mark.parametrize("break_it", ["drop", "duplicate", "foreign", "wrong-version"])
+    def test_an_unpaired_row_or_event_writes_nothing(
+        self, store: ExecutionStore, monkeypatch: pytest.MonkeyPatch, break_it: str
+    ) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        other = intent(K.START_CONTAINER, fence, step="c1")
+        real = derive_events  # what the store adapters call, through event_log
+
+        def broken(changes: Commit, context: EventContext) -> tuple[Event, ...]:
+            events = list(real(changes, context))
+            if break_it == "drop":
+                events.pop()
+            elif break_it == "duplicate":
+                events.append(events[0])
+            elif break_it == "foreign":
+                events += real(Commit(operations=(other,)), context)
+            else:
+                events[0] = real(Commit(operations=(other,)), context)[0]
+            return tuple(events)
+
+        monkeypatch.setattr(event_log, "derive_events", broken)
+        claim = intent(K.CLAIM_TASK, fence)
+        box = Resource.intended(ResourceKind.CONTAINER, "e1", 1, "c1", owner_token="t", now=at(2))
+        before = store.events()
+        with pytest.raises(LedgerIntegrityError):
+            store.commit(fence, Commit(operations=(claim,), resources=(box,)))
+        assert store.events() == before
+        assert store.operations("e1") == ()
+        assert store.resources() == ()
+
+    def test_events_are_read_after_a_seq_and_up_to_a_limit(self, store: ExecutionStore) -> None:
+        for _ in range(4):
+            claimed(store)
+        assert [e.seq for e in store.events()] == [1, 2, 3, 4, 5]
+        assert [e.seq for e in store.events(after_seq=2)] == [3, 4, 5]
+        assert [e.seq for e in store.events(after_seq=1, limit=2)] == [2, 3]
+        assert store.events(after_seq=5) == ()
+
+
+class ExecutionStoreContract(FencingContract, EventLogContract):
     def make_store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
         raise NotImplementedError
 
     @pytest.fixture
     def store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
-        yield from self.make_store(tmp_path)
+        # I11 is checked after every test, so after every commit the suite makes.
+        for store in self.make_store(tmp_path):
+            yield store
+            check_i11(store)
 
     # -- create / get ----------------------------------------------------
 

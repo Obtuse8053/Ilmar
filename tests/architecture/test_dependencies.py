@@ -78,3 +78,46 @@ def test_rule_detects_violations() -> None:
     assert not _is_allowed("ilmar.core", LAYER_RULES["domain"])
     assert _is_allowed("sqlite3", LAYER_RULES["domain"])
     assert _is_allowed("ilmar.domain.tasks", LAYER_RULES["ports"])
+
+
+# -- the event log (ADR-0024 §9) -------------------------------------------------------
+
+EVENT_MODULES = frozenset({"ilmar.domain.events", "ilmar.domain.event_history",
+                           "ilmar.ports.event_log"})  # fmt: skip
+STORE_ADAPTERS = frozenset({"sqlite.py", "memory.py"})
+"""The store adapters write events in the same transaction as their rows. No
+other adapter has store access, so no other adapter may touch events."""
+
+
+def _uses_events(path: Path) -> list[str]:
+    found = []
+    for module in _imports(path):
+        if module in EVENT_MODULES:
+            found.append(module)
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in ("ilmar.domain", "ilmar.ports"):
+            found += [f"{node.module}.{a.name}" for a in node.names
+                      if f"{node.module}.{a.name}" in EVENT_MODULES]  # fmt: skip
+    return found
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted((PACKAGE_ROOT / "adapters").rglob("*.py")),
+    ids=lambda p: str(p.relative_to(PACKAGE_ROOT / "adapters")),
+)
+def test_only_store_adapters_touch_events(path: Path) -> None:
+    if path.parent == PACKAGE_ROOT / "adapters" and path.name in STORE_ADAPTERS:
+        return
+    assert _uses_events(path) == [], (
+        f"{path.relative_to(PACKAGE_ROOT)} uses the event log; only the store adapters "
+        f"{sorted(STORE_ADAPTERS)} write events (ADR-0024 §2)"
+    )
+
+
+def test_the_event_rule_detects_violations(tmp_path: Path) -> None:
+    offender = tmp_path / "offender.py"
+    offender.write_text("from ilmar.domain import events\nfrom ilmar.ports.event_log import x\n")
+    assert _uses_events(offender) == ["ilmar.ports.event_log", "ilmar.domain.events"]
+    assert all((PACKAGE_ROOT / "adapters" / name).exists() for name in STORE_ADAPTERS)
