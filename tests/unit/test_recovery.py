@@ -50,7 +50,7 @@ from ilmar.domain.errors import (
     PolicyViolationError,
 )
 from ilmar.domain.execution import Execution, ExecutionState
-from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus
+from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
 from ilmar.domain.verification import VerificationCommand, VerificationPolicy
 from ilmar.domain.workspace import NetworkPolicy, ResourceOwner
 from recovery_support import Crash, Killable, KillableStore, Switch
@@ -83,6 +83,9 @@ class World:
     agent: ScriptedAgent = field(default_factory=ScriptedAgent)
     clock: Clock = field(default_factory=Clock)
     ids: Iterator[str] = field(default_factory=lambda: (f"e{n}" for n in range(1, 1000)))
+    # A new runtime for every process (a real restart: no in-memory state
+    # survives). ``None`` shares ``runtime`` across processes.
+    make_runtime: Callable[[WorkspaceLayout], Any] | None = None
 
     def __post_init__(self) -> None:
         if self.tasks_override:
@@ -103,7 +106,12 @@ class World:
             layout=self.layout,
             task_provider=Killable(self.tasks, PORT_EFFECTS["tasks"], switch, "tasks"),
             source_control=Killable(self.scm, PORT_EFFECTS["scm"], switch, "scm"),
-            container_runtime=Killable(self.runtime, PORT_EFFECTS["runtime"], switch, "runtime"),
+            container_runtime=Killable(
+                self.make_runtime(self.layout) if self.make_runtime else self.runtime,
+                PORT_EFFECTS["runtime"],
+                switch,
+                "runtime",
+            ),
             agent_runner=Killable(self.agent, PORT_EFFECTS["agent"], switch, "agent"),
             execution_store=store,
             agent_sandbox=AgentSandbox("localhost/agent:1", NetworkPolicy.ALLOWLIST, ("api.x",)),
@@ -860,3 +868,122 @@ def test_interrupted_provisioning_stays_transient_through_a_second_crash(tmp_pat
     execution = one_execution(world)
     assert execution.state is S.SUCCEEDED, execution.last_error
     assert check_retry(world) == []
+
+
+# -- containment across restarts (#15, ADR-0014, ADR-0015, ADR-0020) ----------------------
+
+
+def podman_world(root: Path, podman: Any) -> World:
+    """A world whose every process gets a *new* PodmanRuntime over one fake podman,
+    so the adapter's in-memory quarantine is gone after each restart: only the
+    ledger can keep the workspace blocked."""
+    from ilmar.adapters.podman import EgressSettings, PodmanRuntime
+
+    def make(layout: WorkspaceLayout) -> PodmanRuntime:
+        return PodmanRuntime(
+            layout=layout, environ={"PATH": "/usr/bin"}, executor=podman,
+            mount_probe=podman.mount_probe,
+            egress=EgressSettings(proxy_image="localhost/ilmar-proxy:1"),
+        )  # fmt: skip
+
+    world = World(root, make_runtime=make)
+    world.agent.plan = [(AgentOutcome.COMPLETED, {})]  # no edits: the fake podman runs nothing
+    return world
+
+
+@pytest.mark.parametrize("part", ["proxy", "network"])
+def test_a_failed_sidecar_removal_keeps_the_execution_blocked_across_restarts(
+    tmp_path: Path, part: str
+) -> None:
+    """A failed removal of the egress proxy or of the sandbox network quarantines the
+    sandbox in the ledger. Across restarts (each with a fresh runtime), the
+    workspace is never frozen, mounted or reused, no agent runs again, and the
+    claim is kept. Per ADR-0020 the quarantine is final for automation: even once
+    removal would now succeed, nothing retries or releases it (a human does, #59)."""
+    from fake_podman import FakePodman
+
+    podman = FakePodman()
+    sandbox = "ilmar-inst-e1-1"
+    if part == "proxy":
+        podman.fail_rm_names.add(sandbox + "-egress")
+    else:
+        podman.network_rm_fails = True
+    world = podman_world(tmp_path.resolve(), podman)
+
+    first = world.process()
+    report = first.run()
+    first.exit()
+    assert report is not None
+    assert report.code == 2, report.summary
+    assert report.results[0].detail == "a sandbox could not be removed"  # the containment itself
+    assert world.agent.runs == 1
+
+    for repaired in (False, True):  # a restart; then a restart after the cause is gone
+        if repaired:
+            podman.fail_rm_names.clear()
+            podman.network_rm_fails = False
+        calls_before = len(podman.calls)
+        process = world.process()
+        report = process.run()
+        execution = process.store.get("e1")
+        rows = process.store.resources(execution_id="e1")
+        frozen = process.store.operation(operation_key(K.FREEZE_CANDIDATE, "e1", 1))
+        process.exit()
+        assert report is not None
+        assert report.code == 2, report.summary
+        assert report.results[0].detail == "quarantined resources remain"
+        assert execution is not None
+        assert (execution.state, execution.attempt) == (S.FAILED, 1)
+        containers = [r for r in rows if r.kind is ResourceKind.CONTAINER]
+        assert [r.status for r in containers] == [R.QUARANTINED]
+        assert frozen is None  # never frozen
+        assert world.agent.runs == 1  # never run again
+        assert world.tasks.list_eligible() == ()  # the claim is kept for a human
+        assert world.layout.attempt_dir("e1", 1).exists()  # the workspace is kept
+        new_commands = [c.argv[1:3] for c in podman.calls[calls_before:]]
+        assert ["run"] not in [c[:1] for c in new_commands]  # no sandbox on that workspace
+        assert not [c for c in new_commands if c[0] == "rm" or c == ["network", "rm"]], (
+            "a quarantined sandbox is final for automation (ADR-0020)"
+        )
+
+
+# -- every non-terminal state is crashed in (#15) ------------------------------------------
+
+
+NON_TERMINAL = {state for state in ExecutionState if not state.is_terminal}
+
+
+def states_at_crash_points(root: Path, make: Callable[[Path], World]) -> set[ExecutionState]:
+    reference = root / "reference"
+    reference.mkdir()
+    world = make(reference)
+    process = world.process()
+    assert process.run() is not None
+    process.exit()
+    switches = [Switch(write_at=n) for n in range(1, process.switch.writes + 1)]
+    switches += [Switch(effect_at=k) for k in range(1, process.switch.effects + 1)]
+    states: set[ExecutionState] = set()
+    for number, switch in enumerate(switches):
+        point = root / f"p{number}"
+        point.mkdir()
+        world = make(point)
+        crashed = world.process(switch)
+        assert crashed.run() is None, "every point crashes"
+        crashed.exit()
+        with SQLiteExecutionStore(world.db) as store:
+            states.update(e.state for e in store.list_in_states(set(ExecutionState)))
+    return states
+
+
+def test_every_non_terminal_state_has_a_crash_point(tmp_path: Path) -> None:
+    """#15: the crash suite crashes in every non-terminal state, not just some.
+    The happy path and the retry path between them reach all seven."""
+    expected = {S.QUEUED, S.CLAIMED, S.PROVISIONING, S.RUNNING_AGENT, S.VERIFYING,
+                S.PUBLISHING, S.RETRY_WAIT}  # fmt: skip
+    assert expected == NON_TERMINAL  # a new state must be added here and crashed in
+    root = tmp_path.resolve()
+    (root / "happy").mkdir()
+    (root / "retry").mkdir()
+    seen = states_at_crash_points(root / "happy", World)
+    seen |= states_at_crash_points(root / "retry", retry_world)
+    assert NON_TERMINAL - seen == set()

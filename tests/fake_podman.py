@@ -82,6 +82,7 @@ class FakePodman:
     fail_rm_names: set[str] = field(default_factory=set)  # containers whose rm fails
     network_rm_fails: bool = False
     after_network_inspect: Callable[[str], None] | None = None  # to race a removal
+    after_container_inspect: Callable[[str], None] | None = None  # to race a removal
     networks: dict[str, FakeNetwork] = field(
         default_factory=lambda: {
             "podman": FakeNetwork("podman", {}, "10.88.0.0/16", internal=False, dns_enabled=False)
@@ -112,7 +113,10 @@ class FakePodman:
         if command == "ps":
             return self._ps(rest)
         if command == "container" and rest[0] == "inspect":
-            return self._inspect(rest[1])
+            inspected = self._inspect(rest[1])
+            if self.after_container_inspect is not None:  # its labels have now been read
+                self.after_container_inspect(rest[1])
+            return inspected
         if command == "run":
             return self._run(rest, call)
         if command == "exec":
