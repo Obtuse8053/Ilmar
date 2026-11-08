@@ -12,6 +12,10 @@ the rows do not hold comes from here:
   supported path maps to ``unclassified``: a failure the registry does not name
   is ``unexpected-error``, so a missing code shows up in tests as that, never
   as a silent gap.
+* :func:`require_failure_codes` is the boundary check: a coordinator commit
+  whose failure lacks a valid code is refused before it reaches the store, so
+  it never becomes a successful commit with an ``unclassified`` event. The
+  store's own fallback stays for other callers and for history (ADR-0024 §2).
 
 No event is built here, and nothing here runs inside an effect closure.
 """
@@ -22,15 +26,21 @@ import secrets
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
-from ilmar.domain.errors import ConcurrencyConflictError, IlmarError, ProviderError
+from ilmar.domain.errors import (
+    ConcurrencyConflictError,
+    IlmarError,
+    LedgerIntegrityError,
+    ProviderError,
+)
 from ilmar.domain.events import (
     DATA_SCHEMAS,
-    REASON_CODES,
     EventContext,
     EventType,
+    is_failure_code,
     reason_for_error,
+    rows_needing_a_reason,
 )
-from ilmar.domain.ledger import Fence
+from ilmar.domain.ledger import Commit, Fence
 
 
 class CodedError(IlmarError):
@@ -40,8 +50,8 @@ class CodedError(IlmarError):
 
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
-        code = code or self.default_code
-        if code not in REASON_CODES or code == "unclassified":
+        code = self.default_code if code is None else code
+        if not is_failure_code(code):
             raise ValueError(f"{code!r} is not a reason code a failure may carry")
         self.code = code
 
@@ -68,6 +78,22 @@ def error_class(error: BaseException) -> str | None:
     (an event field is omitted, never written invalid)."""
     name = type(error).__name__
     return name if _ERROR_CLASS(name) else None
+
+
+def require_failure_codes(changes: Commit, context: EventContext) -> None:
+    """Refuse a coordinator commit unless every failure in it has a valid code.
+
+    Every given code must be registered and not ``unclassified``, and every row
+    that needs a reason (:func:`~ilmar.domain.events.rows_needing_a_reason`)
+    must have one. Raises ``LedgerIntegrityError`` before anything is written:
+    the caller's change is refused, never committed with an ``unclassified``
+    event, and the execution is blocked for a human (ADR-0022).
+    """
+    given = {**changes.reasons, **context.reasons}
+    if invalid := sorted(k for k, code in given.items() if not is_failure_code(code)):
+        raise LedgerIntegrityError(f"invalid reason codes for {invalid}; nothing is written")
+    if missing := sorted(set(rows_needing_a_reason(changes)) - set(given)):
+        raise LedgerIntegrityError(f"no reason code for {missing}; nothing is written")
 
 
 def new_pass_id() -> str:
@@ -99,6 +125,8 @@ class PassEvents:
         reconciled: frozenset[str] = frozenset(),
         observations: Mapping[str, str] | None = None,
     ) -> EventContext:
+        if invalid := sorted(k for k, code in (reasons or {}).items() if not is_failure_code(code)):
+            raise ValueError(f"not a reason code a caller may give, for {invalid}")
         return EventContext(
             at=self._clock(),
             instance=fence.instance_id,

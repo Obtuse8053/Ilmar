@@ -131,6 +131,16 @@ _CLAIM_CODES: Mapping[ClaimOutcome, str] = MappingProxyType(
 )
 
 
+UNCLASSIFIED = "unclassified"
+"""The fallback the event derivation writes when no code was given. It is never a
+valid input: no caller may pass it as a code (ADR-0024 §2, layer 1)."""
+
+
+def is_failure_code(code: object) -> bool:
+    """Whether ``code`` is a registered reason code a caller may give."""
+    return isinstance(code, str) and code in REASON_CODES and code != UNCLASSIFIED
+
+
 def reason_for_error(error: type[BaseException] | BaseException) -> str:
     """The stable code of an error class, or ``unclassified``."""
     cls = error if isinstance(error, type) else type(error)
@@ -836,6 +846,17 @@ _OPERATION_EVENTS: Mapping[OperationStatus, EventType] = MappingProxyType(
 )
 
 
+def rows_needing_a_reason(commit: Commit) -> tuple[str, ...]:
+    """The keys of the rows whose events must carry a reason code: a transition into
+    failed, cancelled or retry_wait, a failed or ambiguous operation, and a
+    quarantined resource."""
+    keys = [e.id for e, t in commit.applied if t.to_state in _REASONED_STATES]
+    keys += [o.key for o in commit.operations
+             if o.status in (OperationStatus.FAILED, OperationStatus.AMBIGUOUS)]  # fmt: skip
+    keys += [r.key for r in commit.resources if r.status is ResourceStatus.QUARANTINED]
+    return tuple(keys)
+
+
 def _task(execution: Execution) -> str:
     return f"{execution.task.provider}:{execution.task.key}"
 
@@ -852,6 +873,9 @@ def derive_events(commit: Commit, context: EventContext) -> tuple[Event, ...]:
 
     if commit.reasons:  # the commit's own reasons; the context's, if any, take precedence
         context = replace(context, reasons={**commit.reasons, **context.reasons})
+    if given := sorted(k for k, code in context.reasons.items() if not is_failure_code(code)):
+        # ``unclassified`` is only ever the fallback below, never an input.
+        raise EventEnvelopeError(f"not a reason code a caller may give, for {given}")
     events: list[Event] = []
     for execution, _transition in commit.created:
         events.append(new(

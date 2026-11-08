@@ -36,7 +36,7 @@ from functools import partial
 from ilmar.core.clock import NonDecreasingClock
 from ilmar.core.components import Components
 from ilmar.core.effects import NEVER_TRANSIENT, Effects
-from ilmar.core.event_context import PassEvents, new_pass_id
+from ilmar.core.event_context import PassEvents, new_pass_id, require_failure_codes
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -188,11 +188,12 @@ class Coordinator:
                 task.ref, execution_id=self._new_id(), now=self._clock()
             )
             fence = self._effects.fence
-            self._store.commit(
-                fence,
+            created, context = (
                 Commit(created=((execution, transition),)),
-                context=self._events.context(fence),
+                self._events.context(fence),
             )
+            require_failure_codes(created, context)
+            self._store.commit(fence, created, context=context)
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)

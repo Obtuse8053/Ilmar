@@ -576,3 +576,18 @@ def test_the_pairing_check_runs_inside_the_transaction(
         with pytest.raises(LedgerIntegrityError, match="without an event"):
             store.commit(fence, Commit(applied=((updated, step),)))
     assert dump(covered) == before
+
+
+def test_an_unclassified_event_in_history_still_verifies(old_store: Path) -> None:
+    """History written before the boundary check (or by another caller through the
+    store's fallback) stays readable: ``unclassified`` is refused as an input, never
+    as a stored record."""
+    with SQLiteExecutionStore(old_store) as store:
+        fence = store.claim_instance("inst", now=at(10))
+        execution = store.get("q")
+        assert execution is not None
+        updated, step = MACHINE.advance(execution, S.FAILED, now=at(11), reason="r", error="x")
+        store.commit(fence, Commit(applied=((updated, step),)))  # no code: the fallback
+    with SQLiteExecutionStore.open_read_only(old_store) as store:
+        assert store.events()[-1].reason == "unclassified"
+    assert report(old_store).exit_code == 0

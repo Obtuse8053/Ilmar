@@ -22,7 +22,8 @@ import pytest
 
 from coordinator_support import Setup, make_setup
 from ilmar.adapters.sqlite import SQLiteExecutionStore
-from ilmar.core.event_context import PassEvents, error_class, failure_code
+from ilmar.core.effects import DeterministicError, TransientError
+from ilmar.core.event_context import CodedError, PassEvents, error_class, failure_code
 from ilmar.core.journal import Journal
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases, Ownership
@@ -36,8 +37,19 @@ from ilmar.domain.errors import (
     OwnershipConflictError,
     ProviderError,
 )
+from ilmar.domain.event_history import verify_lines
 from ilmar.domain.events import Event, EventType
-from ilmar.domain.ledger import Commit, Operation, OperationKind, OperationStatus
+from ilmar.domain.execution import ExecutionState
+from ilmar.domain.ledger import (
+    Commit,
+    Fence,
+    Operation,
+    OperationKind,
+    OperationStatus,
+    Resource,
+    ResourceKind,
+    ResourceStatus,
+)
 from ilmar.domain.tasks import ClaimOutcome, TaskRef
 from ilmar.domain.workspace import ResourceOwner
 
@@ -209,7 +221,8 @@ def test_an_intended_operation_is_first_marked_interrupted(harness: Harness) -> 
     ("status", "observed", "code", "message"),
     [
         (ST.FAILED, "outcome-unknown", None, "needs a reason code"),
-        (ST.FAILED, "outcome-unknown", "unclassified-ish", "needs a reason code"),
+        (ST.FAILED, "outcome-unknown", "unclassified-ish", "not a reason code"),
+        (ST.FAILED, "outcome-unknown", "unclassified", "not a reason code"),
         (ST.SUCCEEDED, "looked fine", None, "not a registered observation"),
     ],
 )
@@ -372,3 +385,125 @@ def test_a_clean_run_has_no_failure_codes_at_all(setup: Setup) -> None:
     assert report.code == 0
     assert {e.reason for e in events_of(setup)} == {None}
     assert all(not e.flags for e in events_of(setup))
+
+
+# -- the no-unclassified invariant at the API boundary ------------------------------------
+
+
+def snapshot(harness: Harness) -> tuple[object, ...]:
+    """Everything a refused write must leave as it was."""
+    store = harness.store
+    return (store.events(), store.get("e1"), store.history("e1"), store.operations("e1"),
+            store.resources())  # fmt: skip
+
+
+def check_i11(harness: Harness) -> None:
+    lines, stored = harness.store.history_snapshot()
+    assert verify_lines(lines, stored).failures == ()
+
+
+def failed_transition(harness: Harness, code: str | None) -> Commit:
+    execution = harness.store.get("e1")
+    assert execution is not None
+    updated, step = MACHINE.advance(execution, ExecutionState.FAILED, now=at(11), reason="r",
+                                    error="gave up")  # fmt: skip
+    return Commit(applied=((updated, step),), reasons={"e1": code} if code else {})
+
+
+@pytest.mark.parametrize("code", ["unclassified", "not-a-code", "", "RESOURCE-OWNERSHIP-CONFLICT"])
+def test_reconcile_refuses_an_invalid_code_and_writes_nothing(harness: Harness, code: str) -> None:
+    def interrupted() -> Mapping[str, str]:
+        raise ProviderError("lost")
+
+    with pytest.raises(ProviderError):
+        harness.perform(K.PUBLISH_REVISION, interrupted)
+    before = snapshot(harness)
+    for status in (ST.FAILED, ST.SUCCEEDED):
+        with pytest.raises(ValueError, match="not a reason code"):
+            harness.journal.reconcile("publish-revision:e1:1", status, reason="x",
+                                      observed="branch-unmoved", code=code,
+                                      lease=harness.lease())  # fmt: skip
+    assert snapshot(harness) == before
+    check_i11(harness)
+
+
+@pytest.mark.parametrize("code", ["unclassified", "not-a-code", ""])
+def test_explicit_code_inputs_refuse_unclassified_and_unknown_codes(code: str) -> None:
+    for error in (CodedError, TransientError, DeterministicError):
+        with pytest.raises(ValueError, match="not a reason code"):
+            error("x", code=code)
+    events = PassEvents(clock=lambda: at(1))
+    with pytest.raises(ValueError, match="not a reason code"):
+        events.context(Fence("inst", 1), reasons={"e1": code})
+
+
+@pytest.mark.parametrize("code", [None, "unclassified", "not-a-code"])
+def test_a_failure_without_a_valid_code_is_refused_and_rolled_back(
+    harness: Harness, code: str | None
+) -> None:
+    before = snapshot(harness)
+    with pytest.raises(LedgerIntegrityError, match="nothing is written"):
+        harness.journal.record(failed_transition(harness, code), lease=harness.lease(),
+                               execution_id="e1")  # fmt: skip
+    assert snapshot(harness) == before
+    stored = harness.store.get("e1")
+    assert stored is not None
+    assert stored.state is ExecutionState.QUEUED  # never silently failed
+    check_i11(harness)
+
+
+def test_a_quarantine_without_a_code_is_refused(harness: Harness) -> None:
+    fence = harness.ownership.fence
+    box = Resource.intended(ResourceKind.CONTAINER, "e1", 1, "c1", owner_token="t", now=at(10))
+    harness.journal.record(Commit(resources=(box,)), lease=harness.lease(), execution_id="e1")
+    before = snapshot(harness)
+    quarantined = box.moved(ResourceStatus.QUARANTINED, now=at(11))
+    with pytest.raises(LedgerIntegrityError, match="no reason code"):
+        harness.journal.record(Commit(resources=(quarantined,)), lease=harness.lease(),
+                               execution_id="e1")  # fmt: skip
+    assert snapshot(harness) == before
+    assert harness.store.resource(box.key) == box
+    del fence
+
+
+def test_a_follow_up_without_a_code_never_commits_as_a_success(harness: Harness) -> None:
+    """The effect happened, but its follow-up fails the execution without a code: the
+    outcome is kept as ambiguous with its result, the transition is not written."""
+    with pytest.raises(LedgerIntegrityError, match="follow-up changes were refused"):
+        harness.perform(K.PUBLISH_REVISION, lambda: {"head": "x"},
+                        after=lambda _r: failed_transition(harness, None))  # fmt: skip
+    (operation,) = harness.store.operations("e1")
+    assert operation.status is ST.AMBIGUOUS
+    assert operation.result == {"head": "x"}
+    assert harness.last("operation.ambiguous").reason == "ledger-integrity"
+    stored = harness.store.get("e1")
+    assert stored is not None
+    assert stored.state is ExecutionState.QUEUED
+    assert "execution.transitioned" not in [e.type.value for e in harness.store.events()]
+    assert all(e.reason != "unclassified" for e in harness.store.events())
+    check_i11(harness)
+
+
+def test_a_worker_ending_without_its_code_blocks_instead_of_failing(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug that drops a code is a refused write and a blocked execution, never a
+    failed execution with an ``unclassified`` event."""
+    from ilmar.core import worker
+
+    real = worker._Run.transition_to
+
+    def without_code(self: object, target: ExecutionState, reason: str, *, code: str | None = None,
+                     **values: str) -> Commit:  # fmt: skip
+        return real(self, target, reason, **values)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worker._Run, "transition_to", without_code)
+    setup.agent.plan = [(AgentOutcome.FAILED, {})]
+    report = setup.coordinator().run_once()
+    (result,) = report.results
+    assert result.outcome is Outcome.BLOCKED
+    assert "no reason code" in result.detail
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is ExecutionState.RUNNING_AGENT  # not silently failed
+    assert all(e.reason != "unclassified" for e in events_of(setup))

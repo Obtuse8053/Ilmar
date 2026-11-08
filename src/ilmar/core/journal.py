@@ -46,7 +46,12 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
-from ilmar.core.event_context import PassEvents, error_class, failure_code
+from ilmar.core.event_context import (
+    PassEvents,
+    error_class,
+    failure_code,
+    require_failure_codes,
+)
 from ilmar.core.ownership import ExecutionLease, Ownership
 from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.errors import (
@@ -55,7 +60,7 @@ from ilmar.domain.errors import (
     FencingError,
     LedgerIntegrityError,
 )
-from ilmar.domain.events import OBSERVATIONS, REASON_CODES, EventContext
+from ilmar.domain.events import OBSERVATIONS, EventContext, is_failure_code
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import (
     Commit,
@@ -160,7 +165,7 @@ class Journal:
                 intent=intent,
             )
         intent_commit = _with(before, operation)
-        self._store.commit(  # 1. intent, write-ahead, only on the version this worker saw
+        self._commit(  # 1. intent, write-ahead, only on the version this worker saw
             fence,
             Commit(
                 created=intent_commit.created,
@@ -198,7 +203,7 @@ class Journal:
         try:  # 4. the outcome, with its follow-up changes
             follow_up = after(result) if after is not None else Commit()
             _check_scope(follow_up, execution.id)
-            self._store.commit(
+            self._commit(
                 fence,
                 _with(follow_up, succeeded),
                 context=self._events.context(fence, durations_ms={key: duration}),
@@ -237,7 +242,9 @@ class Journal:
             raise ValueError("reconciliation settles an operation as succeeded or failed")
         if observed not in OBSERVATIONS:
             raise ValueError(f"{observed!r} is not a registered observation")
-        if status is OperationStatus.FAILED and (code is None or code not in REASON_CODES):
+        if code is not None and not is_failure_code(code):
+            raise ValueError(f"{code!r} is not a reason code a caller may give")
+        if status is OperationStatus.FAILED and code is None:
             raise ValueError("a failed reconciliation needs a reason code")
         operation = self._store.operation(key)
         if operation is None:
@@ -257,7 +264,7 @@ class Journal:
             operation = operation.moved(
                 OperationStatus.AMBIGUOUS, fence=fence, now=self._clock(), note="after a crash"
             )
-            self._store.commit(
+            self._commit(
                 fence,
                 Commit(operations=(operation,)),
                 context=self._events.context(fence, reasons={key: "interrupted"}),
@@ -265,7 +272,7 @@ class Journal:
         settled = operation.moved(
             status, fence=fence, now=self._clock(), result=result, note=reason[:_NOTE_LIMIT]
         )
-        self._store.commit(
+        self._commit(
             fence,
             _with(changes, settled),
             context=self._events.context(
@@ -283,7 +290,14 @@ class Journal:
         lease.check(execution_id)
         _check_scope(changes, execution_id)
         fence = self._ownership.fence
-        self._store.commit(fence, changes, context=self._events.context(fence))
+        self._commit(fence, changes, context=self._events.context(fence))
+
+    def _commit(self, fence: Fence, changes: Commit, *, context: EventContext) -> None:
+        """Every write the journal makes: refused before the store if a failure in it
+        lacks a valid code, so the change and its events are written together or
+        not at all."""
+        require_failure_codes(changes, context)
+        self._store.commit(fence, changes, context=context)
 
     def _elapsed(self, started: float) -> int:
         return max(0, round((self._monotonic() - started) * 1000))
@@ -300,7 +314,7 @@ class Journal:
                 result=result,
                 note=f"effect succeeded; follow-up refused: {type(error).__name__}",
             )
-            self._store.commit(
+            self._commit(
                 fence,
                 Commit(operations=(moved,)),
                 context=self._outcome(fence, moved, error, duration),
@@ -331,7 +345,7 @@ class Journal:
         try:
             fence = self._ownership.fence
             moved = operation.moved(status, fence=fence, now=self._clock(), note=_describe(error))
-            self._store.commit(
+            self._commit(
                 fence,
                 Commit(operations=(moved,)),
                 context=self._outcome(fence, moved, error, duration),
