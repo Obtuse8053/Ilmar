@@ -25,6 +25,11 @@ holding the execution's lease:
 A crash, or a lost fence, between steps leaves the operation ``INTENDED``,
 which recovery treats exactly like ``AMBIGUOUS``.
 
+Every commit carries its event context (ADR-0024): the pass, the effect's
+duration measured with the monotonic clock around the effect alone, the error
+class and stable reason code of a failed or ambiguous outcome, and for a
+reconciliation, what was observed.
+
 Replaying a step with the same idempotency key never acts twice blindly:
 
 * ``SUCCEEDED`` → the recorded result is returned and the effect is skipped;
@@ -37,9 +42,11 @@ Replaying a step with the same idempotency key never acts twice blindly:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
+from ilmar.core.event_context import PassEvents, error_class, failure_code
 from ilmar.core.ownership import ExecutionLease, Ownership
 from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.errors import (
@@ -48,6 +55,7 @@ from ilmar.domain.errors import (
     FencingError,
     LedgerIntegrityError,
 )
+from ilmar.domain.events import OBSERVATIONS, REASON_CODES, EventContext
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import (
     Commit,
@@ -71,6 +79,8 @@ class Journal:
         store: ExecutionStore,
         ownership: Ownership,
         clock: Callable[[], datetime],
+        events: PassEvents | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         always_definitive: tuple[type[BaseException], ...] = (),
     ) -> None:
         """``always_definitive`` errors are recorded as ``FAILED`` for every kind.
@@ -83,7 +93,13 @@ class Journal:
         self._store = store
         self._ownership = ownership
         self._clock = clock
+        self._events = events or PassEvents(clock=clock)
+        self._monotonic = monotonic
         self._always_definitive = always_definitive
+
+    @property
+    def events(self) -> PassEvents:
+        return self._events
 
     @property
     def fence(self) -> Fence:
@@ -152,7 +168,9 @@ class Journal:
                 operations=intent_commit.operations,
                 resources=intent_commit.resources,
                 expected=((execution.id, expected),),
+                reasons=intent_commit.reasons,
             ),
+            context=self._events.context(fence),
         )
 
         # 2. Right before acting: still the owner, still the lease holder, and
@@ -164,27 +182,33 @@ class Journal:
             raise ConcurrencyConflictError(
                 f"{execution.id} changed after {key} was recorded; no side effect"
             )
+        started = self._monotonic()
         try:
             result = dict(effect())  # 3. the effect
         except definitive as error:
-            self._settle(operation, OperationStatus.FAILED, error)
+            self._settle(operation, OperationStatus.FAILED, error, self._elapsed(started))
             raise
         except BaseException as error:
-            self._settle(operation, OperationStatus.AMBIGUOUS, error)
+            self._settle(operation, OperationStatus.AMBIGUOUS, error, self._elapsed(started))
             raise
+        duration = self._elapsed(started)
         succeeded = operation.moved(
             OperationStatus.SUCCEEDED, fence=fence, now=self._clock(), result=result
         )
         try:  # 4. the outcome, with its follow-up changes
             follow_up = after(result) if after is not None else Commit()
             _check_scope(follow_up, execution.id)
-            self._store.commit(fence, _with(follow_up, succeeded))
+            self._store.commit(
+                fence,
+                _with(follow_up, succeeded),
+                context=self._events.context(fence, durations_ms={key: duration}),
+            )
         except FencingError:
             raise  # ownership was lost: nothing more may be written or done
         except Exception as error:
             # The effect happened. Keep that knowledge (and its result) even
             # though the follow-up was refused: recovery reconciles it.
-            self._keep_result(operation, result, error)
+            self._keep_result(operation, result, error, duration)
             raise LedgerIntegrityError(
                 f"{key} succeeded but its follow-up changes were refused "
                 f"({type(error).__name__}); it is recorded as ambiguous with its result"
@@ -198,16 +222,23 @@ class Journal:
         *,
         lease: ExecutionLease,
         reason: str,
+        observed: str,
+        code: str | None = None,
         result: Mapping[str, str] | None = None,
         changes: Commit = Commit(),  # noqa: B008 - an immutable, empty value
     ) -> Operation:
         """Settle an unfinished operation from what the external system shows.
 
-        ``status`` must be final. ``reason`` records the observation, for
-        example "branch head equals the candidate".
+        ``status`` must be final. ``reason`` is the human-readable note,
+        ``observed`` what was seen (:data:`~ilmar.domain.events.OBSERVATIONS`),
+        and ``code`` the stable reason code, required when it failed.
         """
         if not status.is_final:
             raise ValueError("reconciliation settles an operation as succeeded or failed")
+        if observed not in OBSERVATIONS:
+            raise ValueError(f"{observed!r} is not a registered observation")
+        if status is OperationStatus.FAILED and (code is None or code not in REASON_CODES):
+            raise ValueError("a failed reconciliation needs a reason code")
         operation = self._store.operation(key)
         if operation is None:
             raise LedgerIntegrityError(f"no operation {key} to reconcile")
@@ -226,27 +257,71 @@ class Journal:
             operation = operation.moved(
                 OperationStatus.AMBIGUOUS, fence=fence, now=self._clock(), note="after a crash"
             )
-            self._store.commit(fence, Commit(operations=(operation,)))
+            self._store.commit(
+                fence,
+                Commit(operations=(operation,)),
+                context=self._events.context(fence, reasons={key: "interrupted"}),
+            )
         settled = operation.moved(
             status, fence=fence, now=self._clock(), result=result, note=reason[:_NOTE_LIMIT]
         )
-        self._store.commit(fence, _with(changes, settled))
+        self._store.commit(
+            fence,
+            _with(changes, settled),
+            context=self._events.context(
+                fence,
+                reasons={key: code} if code is not None else None,
+                reconciled=frozenset({key}),
+                observations={key: observed},
+            ),
+        )
         return settled
 
-    def _keep_result(self, operation: Operation, result: Result, error: Exception) -> None:
+    def record(self, changes: Commit, *, lease: ExecutionLease, execution_id: str) -> None:
+        """A state or ledger change with no external effect (a transition, a quarantine):
+        by the lease holder, under the fence, with this pass's event context."""
+        lease.check(execution_id)
+        _check_scope(changes, execution_id)
+        fence = self._ownership.fence
+        self._store.commit(fence, changes, context=self._events.context(fence))
+
+    def _elapsed(self, started: float) -> int:
+        return max(0, round((self._monotonic() - started) * 1000))
+
+    def _keep_result(
+        self, operation: Operation, result: Result, error: Exception, duration: int
+    ) -> None:
         try:
+            fence = self._ownership.fence
             moved = operation.moved(
                 OperationStatus.AMBIGUOUS,
-                fence=self._ownership.fence,
+                fence=fence,
                 now=self._clock(),
                 result=result,
                 note=f"effect succeeded; follow-up refused: {type(error).__name__}",
             )
-            self._store.commit(self._ownership.fence, Commit(operations=(moved,)))
+            self._store.commit(
+                fence,
+                Commit(operations=(moved,)),
+                context=self._outcome(fence, moved, error, duration),
+            )
         except Exception as failure:  # then it stays intended, which is also safe
             error.add_note(f"{operation.key}: could not keep the result ({type(failure).__name__})")
 
-    def _settle(self, operation: Operation, status: OperationStatus, error: BaseException) -> None:
+    def _outcome(
+        self, fence: Fence, operation: Operation, error: BaseException, duration: int
+    ) -> EventContext:
+        named = error_class(error)
+        return self._events.context(
+            fence,
+            reasons={operation.key: failure_code(error)},
+            durations_ms={operation.key: duration},
+            error_classes={operation.key: named} if named else None,
+        )
+
+    def _settle(
+        self, operation: Operation, status: OperationStatus, error: BaseException, duration: int
+    ) -> None:
         """Record a failed or ambiguous outcome.
 
         If that write fails too (the fence was lost, the store is gone), the
@@ -254,10 +329,13 @@ class Journal:
         effect's own error still propagates, with a note saying so.
         """
         try:
-            moved = operation.moved(
-                status, fence=self._ownership.fence, now=self._clock(), note=_describe(error)
+            fence = self._ownership.fence
+            moved = operation.moved(status, fence=fence, now=self._clock(), note=_describe(error))
+            self._store.commit(
+                fence,
+                Commit(operations=(moved,)),
+                context=self._outcome(fence, moved, error, duration),
             )
-            self._store.commit(self._ownership.fence, Commit(operations=(moved,)))
         except Exception as failure:  # the effect's error is the one to raise
             error.add_note(
                 f"{operation.key}: the outcome could not be recorded "
@@ -320,6 +398,7 @@ def _with(changes: Commit, operation: Operation) -> Commit:
         applied=changes.applied,
         operations=(operation, *changes.operations),
         resources=changes.resources,
+        reasons=changes.reasons,
     )
 
 

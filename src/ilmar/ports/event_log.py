@@ -90,10 +90,7 @@ def commit_events(
         return ()
     if context is None:
         context = default_context(fence, changes)
-    if (context.instance, context.epoch) != (fence.instance_id, fence.epoch):
-        raise LedgerIntegrityError("the event context belongs to another owner than the fence")
-    if context.actor.kind is ActorKind.MIGRATION:
-        raise LedgerIntegrityError("only the migration writes migration events")
+    _check_context(fence, context)
     try:
         derived = list(derive_events(changes, context))
         position = len(changes.created) + len(changes.applied)
@@ -112,6 +109,13 @@ def commit_events(
     events = tuple(derived)
     check_pairing(changes, events, execution=execution, operation=operation, resource=resource)
     return events
+
+
+def _check_context(fence: Fence, context: EventContext) -> None:
+    if (context.instance, context.epoch) != (fence.instance_id, fence.epoch):
+        raise LedgerIntegrityError("the event context belongs to another owner than the fence")
+    if context.actor.kind is ActorKind.MIGRATION:
+        raise LedgerIntegrityError("only the migration writes migration events")
 
 
 def check_pairing(
@@ -182,15 +186,22 @@ def _subject(event: Event) -> tuple[tuple[str, str], str]:
     return ("resource", str(data.get("ref"))), str(data.get("status"))
 
 
-def evidence_event(record: EvidenceRecord, fence: Fence) -> Event:
-    """``evidence.recorded`` for an appended evidence record."""
+def evidence_event(
+    record: EvidenceRecord, fence: Fence, context: EventContext | None = None
+) -> Event:
+    """``evidence.recorded`` for an appended evidence record. ``context`` supplies
+    the pass and the actor; its owner must be ``fence``'s."""
+    if context is not None:
+        _check_context(fence, context)
     data: dict[str, object] = {"digest": record.digest(), "verdict": record.verdict.value,
                                "policy_digest": record.policy_digest}  # fmt: skip
     if record.run is not None:
         data["run"] = record.run
     try:
         return Event.create(EventType.EVIDENCE_RECORDED, at=record.recorded_at,
-                            instance=fence.instance_id, epoch=fence.epoch, actor=COORDINATOR,
+                            instance=fence.instance_id, epoch=fence.epoch,
+                            actor=COORDINATOR if context is None else context.actor,
+                            pass_id=None if context is None else context.pass_id,
                             execution=record.execution_id, attempt=record.attempt,
                             run=record.run, data=data)  # fmt: skip
     except EventEnvelopeError as error:

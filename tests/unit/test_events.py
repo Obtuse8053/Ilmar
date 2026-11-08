@@ -264,8 +264,13 @@ ADR_CODES = {
 }  # fmt: skip
 
 
-def test_the_reason_codes_are_exactly_the_adr_table() -> None:
-    assert set(ev.REASON_CODES) == ADR_CODES
+ADDED_CODES = {"no-changes", "ci-config-changed", "checkout-failed"}  # #17 part 3
+
+
+def test_the_reason_codes_are_the_adr_table_and_the_deliberate_additions() -> None:
+    """ADR-0024 §4: the initial set stays; codes are only added, and each addition is
+    listed here so that it is deliberate."""
+    assert set(ev.REASON_CODES) == ADR_CODES | ADDED_CODES
     for code in ev.REASON_CODES:
         assert re.fullmatch(r"[a-z]+(-[a-z]+)*", code), code
 

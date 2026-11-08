@@ -63,6 +63,7 @@ from ilmar.domain.errors import (
     PolicyViolationError,
     ProviderError,
 )
+from ilmar.domain.events import reason_for_claim, reason_for_error
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
@@ -89,6 +90,7 @@ LATE_TRIES = 3
 """Verification runs, pushes or deletions of one frozen candidate within an attempt."""
 REVIEW_LABEL = "ilmar:needs-human-review"
 _NEVER_TRANSIENT_NAMES = frozenset(c.__name__ for c in NEVER_TRANSIENT)
+_NEVER_TRANSIENT_CODES = {c.__name__: reason_for_error(c) for c in NEVER_TRANSIENT}
 _DETERMINISTIC = (
     CandidateRejectedError,
     LeaseConflictError,
@@ -117,9 +119,10 @@ class WorkerResult:
 
 
 class _Deterministic(Exception):  # noqa: N818 - internal control flow, never escapes
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, code: str) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.code = code
 
 
 class _Blocked(Exception):  # noqa: N818 - internal control flow, never escapes
@@ -244,23 +247,26 @@ class _Run:
             raise _Blocked("the task no longer exists on the tracker")
         return self.task
 
-    def move(self, target: ExecutionState, reason: str, **values: str) -> Execution:
-        current = self.current()
-        updated, transition = self.w.machine.advance(
-            current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
-            **values,
-        )  # fmt: skip
-        self.lease.check(self.id)
-        self.store.apply(updated, transition, fence=self.w.effects.fence)
+    def move(
+        self, target: ExecutionState, reason: str, *, code: str | None = None, **values: str
+    ) -> Execution:
+        changes = self.transition_to(target, reason, code=code, **values)
+        self.w.effects.journal.record(changes, lease=self.lease, execution_id=self.id)
+        ((updated, _),) = changes.applied
         return updated
 
-    def transition_to(self, target: ExecutionState, reason: str, **values: str) -> Commit:
+    def transition_to(
+        self, target: ExecutionState, reason: str, *, code: str | None = None, **values: str
+    ) -> Commit:
+        """``code`` is the stable reason code of a failure, cancellation or retry."""
         current = self.current()
         updated, transition = self.w.machine.advance(
             current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
             **values,
         )  # fmt: skip
-        return Commit(applied=((updated, transition),))
+        return Commit(
+            applied=((updated, transition),), reasons={self.id: code} if code is not None else {}
+        )
 
     # -- the loop -------------------------------------------------------------------
 
@@ -272,18 +278,18 @@ class _Run:
                     return self.finish(execution)
                 self.step(execution)
             except TransientError as error:
-                blocked = self.retry_or_fail(str(error))
+                blocked = self.retry_or_fail(str(error), code=error.code)
                 if blocked is not None:
                     return blocked
             except (_Deterministic, DeterministicError) as failure:
-                self.fail(str(failure))
+                self.fail(str(failure), code=failure.code)
             except _Blocked as blocked:
                 return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
             except _DETERMINISTIC as error:
-                self.fail(f"{type(error).__name__}: {error}")
+                self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
             except ContainmentError as error:
                 if not self.current().state.is_terminal:
-                    self.fail(f"containment: {error}")
+                    self.fail(f"containment: {error}", code="containment-unconfirmed")
                 return WorkerResult(self.id, Outcome.BLOCKED, "a sandbox could not be removed")
             except (
                 AmbiguousOperationError,
@@ -318,7 +324,9 @@ class _Run:
             outcome = ClaimOutcome(result["outcome"])
             if outcome is ClaimOutcome.CLAIMED:
                 return self.transition_to(S.CLAIMED, "claimed")
-            return self.transition_to(S.CANCELLED, f"not claimed: {outcome.value}")
+            return self.transition_to(
+                S.CANCELLED, f"not claimed: {outcome.value}", code=reason_for_claim(outcome)
+            )
 
         self.w.effects.claim(execution, self.lease, then=then)  # repeatable
 
@@ -338,14 +346,17 @@ class _Run:
             if operation is not None and operation.status in _UNFINISHED:
                 effects.settle_directory_step(execution, self.lease, kind=kind, path=path)
                 if never:
-                    raise _Deterministic(f"{kind.value} failed: {never}")
-                raise TransientError("provisioning was interrupted")
+                    raise _never(f"{kind.value} failed", never)
+                raise TransientError("provisioning was interrupted", code="interrupted")
             if operation is not None and operation.status is ST.FAILED:
                 if never:
-                    raise _Deterministic(f"{kind.value} failed: {never}")
+                    raise _never(f"{kind.value} failed", never)
                 if operation.note == ABANDONED:  # a crash, then another before retrying
-                    raise TransientError("provisioning was interrupted")
-                raise _Deterministic(f"{kind.value} failed")
+                    raise TransientError("provisioning was interrupted", code="interrupted")
+                raise _Deterministic(
+                    f"{kind.value} failed",
+                    code="checkout-failed" if kind is K.CHECKOUT_BASE else "unexpected-error",
+                )
         if create is None:
             effects.create_attempt_directory(execution, self.lease, owner_token=self.w.new_token())
         branch = branch_name(execution.task)
@@ -374,7 +385,7 @@ class _Run:
         if never:  # recorded before the crash: fail, as the uninterrupted path does
             if sandbox is not None:
                 effects.remove_sandbox(execution, self.lease, resource=sandbox)
-            raise _Deterministic(f"the agent step failed: {never}")
+            raise _never("the agent step failed", never)
         if run is None:
             # A crash after the sandbox was created and before the agent ran: the
             # sandbox is never reused (ADR-0022). Remove it and start over.
@@ -382,25 +393,25 @@ class _Run:
                 effects.remove_sandbox(execution, self.lease, resource=sandbox)
             if start is not None and start.status in _UNFINISHED:
                 effects.settle_start(self.current(), self.lease, name=name)
-            raise TransientError("interrupted before the agent ran")
+            raise TransientError("interrupted before the agent ran", code="interrupted")
         if run.status in _UNFINISHED:
             effects.abandon_agent_run(execution, self.lease)
             if sandbox is not None:
                 effects.remove_sandbox(self.current(), self.lease, resource=sandbox)
-            raise TransientError("interrupted while the agent ran")
+            raise TransientError("interrupted while the agent ran", code="interrupted")
         if sandbox is not None:  # the sandbox must be confirmed gone before freezing
             effects.remove_sandbox(execution, self.lease, resource=sandbox)
         if run.status is ST.FAILED:
-            raise TransientError("the agent run was interrupted")
+            raise TransientError("the agent run was interrupted", code="interrupted")
         result = AgentResult(
             AgentOutcome(run.result["outcome"]),
             run.result.get("summary", ""),
             int(run.result["exit_code"]) if run.result.get("exit_code") else None,
         )
         if result.outcome is AgentOutcome.TIMED_OUT:
-            raise TransientError("the agent timed out")
+            raise TransientError("the agent timed out", code="agent-timed-out")
         if result.outcome is AgentOutcome.FAILED:
-            raise _Deterministic(f"the agent failed: {result.summary[:200]}")
+            raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.freeze(self.current(), name)
 
     def fresh_agent_run(self, execution: Execution, name: str) -> None:
@@ -444,13 +455,16 @@ class _Run:
             raise LedgerIntegrityError(f"{self.id}: the agent workspace is not the recorded one")
         prior = self.op(execution, K.FREEZE_CANDIDATE)
         if prior is not None and prior.status is ST.FAILED:
-            raise _Deterministic("the agent's output could not be frozen safely")
+            raise _Deterministic(
+                "the agent's output could not be frozen safely", code="candidate-rejected"
+            )
 
         def then(r: Mapping[str, str]) -> Commit:
             if r["changed_path_count"] == "0":
                 return self.transition_to(
-                    S.FAILED, "the agent changed nothing", error="the agent changed nothing"
-                )
+                    S.FAILED, "the agent changed nothing", code="no-changes",
+                    error="the agent changed nothing",
+                )  # fmt: skip
             return self.transition_to(
                 S.VERIFYING, "candidate frozen", candidate_revision=r["revision"]
             )
@@ -479,12 +493,14 @@ class _Run:
             verdict = Verdict(r["verdict"])
             if verdict.publishable:
                 return self.transition_to(S.PUBLISHING, f"verified: {verdict.value}")
+            ci = verdict is Verdict.REJECTED_CI_CONFIG
             reason = (
                 "CI configuration changed: a human must take over"
-                if verdict is Verdict.REJECTED_CI_CONFIG
+                if ci
                 else "verification checks failed"
             )
-            return self.transition_to(S.FAILED, reason, error=reason)
+            code = "ci-config-changed" if ci else "verification-failed"
+            return self.transition_to(S.FAILED, reason, code=code, error=reason)
 
         runs = sorted(self.ops(execution, K.VERIFY), key=lambda o: int(o.key.rsplit("run-", 1)[1]))
         never = next((n for o in runs if (n := recorded_never_transient(o))), None)
@@ -501,7 +517,7 @@ class _Run:
                         then=lambda _r: Commit(),
                     )  # fmt: skip
         if never is not None:
-            raise _Deterministic(f"verification failed: {never}")
+            raise _never("verification failed", never)
         tried = len(runs)
         if tried >= LATE_TRIES:
             raise _Blocked(
@@ -628,7 +644,7 @@ class _Run:
 
     # -- endings --------------------------------------------------------------------
 
-    def retry_or_fail(self, reason: str) -> WorkerResult | None:
+    def retry_or_fail(self, reason: str, *, code: str) -> WorkerResult | None:
         execution = self.current()
         if self.op(execution, K.FREEZE_CANDIDATE) is not None:
             # Never a new agent run once this attempt froze a candidate.
@@ -636,14 +652,14 @@ class _Run:
                 self.id, Outcome.BLOCKED, f"a transient failure after freezing: {reason}"
             )
         if self.w.machine.retries_remaining(execution) > 0 and execution.state is not S.QUEUED:
-            self.move(S.RETRY_WAIT, f"transient: {reason}", error=reason)
+            self.move(S.RETRY_WAIT, f"transient: {reason}", code=code, error=reason)
         else:
-            self.fail(f"attempts exhausted: {reason}")
+            self.fail(f"attempts exhausted: {reason}", code="attempts-exhausted")
         return None
 
-    def fail(self, reason: str) -> None:
+    def fail(self, reason: str, *, code: str) -> None:
         if not self.current().state.is_terminal:
-            self.move(S.FAILED, reason, error=reason)
+            self.move(S.FAILED, reason, code=code, error=reason)
 
     def finish(self, execution: Execution) -> WorkerResult:
         effects = self.w.effects
@@ -703,6 +719,11 @@ class _Run:
         return AgentRequest(
             task=task, instructions=instructions(task), timeout_seconds=self.w.agent_timeout
         )
+
+
+def _never(what: str, name: str) -> _Deterministic:
+    """A recorded never-transient failure: the execution ends with that class's code."""
+    return _Deterministic(f"{what}: {name}", code=_NEVER_TRANSIENT_CODES[name])
 
 
 def instructions(task: Task) -> str:

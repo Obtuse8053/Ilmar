@@ -99,8 +99,17 @@ class ExecutionStore(Protocol):
         """
         ...
 
-    def append_evidence(self, record: EvidenceRecord, *, fence: Fence | None = None) -> None:
+    def append_evidence(
+        self,
+        record: EvidenceRecord,
+        *,
+        fence: Fence | None = None,
+        context: EventContext | None = None,
+    ) -> None:
         """Append a verification evidence record (ADR-0010, ADR-0018).
+
+        ``context`` (pass and actor) is for its ``evidence.recorded`` event,
+        and must belong to ``fence``.
 
         Raises ``ExecutionNotFoundError`` if the execution does not exist.
         """

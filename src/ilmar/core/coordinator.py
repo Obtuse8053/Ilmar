@@ -36,6 +36,7 @@ from functools import partial
 from ilmar.core.clock import NonDecreasingClock
 from ilmar.core.components import Components
 from ilmar.core.effects import NEVER_TRANSIENT, Effects
+from ilmar.core.event_context import PassEvents, new_pass_id
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -51,6 +52,7 @@ from ilmar.domain.changes import ChangeRequest, ChangeRequestState
 from ilmar.domain.errors import ConflictError, FencingError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
+    Commit,
     OperationKind,
     Resource,
     ResourceKind,
@@ -101,9 +103,11 @@ class Coordinator:
         agent_timeout_seconds: float,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
+        events: PassEvents | None = None,
     ) -> None:
         self._c = components
         self._effects = effects
+        self._events = events or effects.events
         self._machine = machine
         self._clock = clock
         self._new_id = new_id
@@ -129,16 +133,19 @@ class Coordinator:
         clock: Callable[[], datetime],
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
+        new_pass_id: Callable[[], str] = new_pass_id,
     ) -> Coordinator:
         """Wire the journal, the fenced Verifier and the effects for ``components``.
 
         Every persisted timestamp comes from one non-decreasing clock (ADR-0022).
         """
         clock = NonDecreasingClock(clock)
+        events = PassEvents(clock=clock, new_id=new_pass_id)  # one per process, a pass id per pass
         journal = Journal(
             store=components.execution_store,
             ownership=ownership,
             clock=clock,
+            events=events,
             always_definitive=NEVER_TRANSIENT,
         )
         verifier = Verifier(
@@ -150,27 +157,29 @@ class Coordinator:
             instance_id=components.instance_id,
             clock=clock,
             fence=ownership.fence,
+            events=events,
         )
         effects = Effects(components=components, journal=journal, verifier=verifier, clock=clock)
-        extra: dict[str, Callable[[], str]] = {}
-        if new_id is not None:
-            extra["new_id"] = new_id
-        if new_token is not None:
-            extra["new_token"] = new_token
-        return cls(
+        coordinator = cls(
             components=components,
             effects=effects,
             machine=ExecutionStateMachine(max_attempts=min(max_attempts, MAX_ATTEMPTS)),
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
-            **extra,
+            events=events,
         )
+        if new_id is not None:
+            coordinator._new_id = new_id
+        if new_token is not None:
+            coordinator._worker.new_token = new_token
+        return coordinator
 
     @property
     def _store(self) -> ExecutionStore:
         return self._c.execution_store
 
     def run_once(self) -> PassReport:
+        self._events.begin_pass()  # every event this pass writes carries its id
         results = list(self.recover())
         completed = self.follow_up_change_requests(results)
         task = self._pick()
@@ -178,7 +187,12 @@ class Coordinator:
             execution, transition = self._machine.start(
                 task.ref, execution_id=self._new_id(), now=self._clock()
             )
-            self._store.create(execution, transition, fence=self._effects.fence)
+            fence = self._effects.fence
+            self._store.commit(
+                fence,
+                Commit(created=((execution, transition),)),
+                context=self._events.context(fence),
+            )
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)

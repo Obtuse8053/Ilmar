@@ -35,7 +35,7 @@ from ilmar.domain.ledger import ResourceKind, ResourceStatus
 from ilmar.domain.verification import VerificationCommand, VerificationPolicy
 from ilmar.domain.workspace import ContainerHandle, ContainerSpec, NetworkPolicy, ResourceOwner
 from ilmar.ports.container_runtime import ContainerRuntime
-from recovery_support import Crash, Killable, KillableStore, Switch
+from recovery_support import Crash, Killable, KillableStore, Switch, event_problems
 
 from fakes import FakeSourceControl, FakeTaskProvider
 from integration.podman_support import (
@@ -174,6 +174,8 @@ def test_a_coordinator_killed_mid_agent_run_recovers_on_real_podman(tmp_path: Pa
         coordinator.run_once()
     owner.release()  # the kernel drops the lock of a dead process
     store.close()
+    db = tmp / "executions.sqlite3"
+    assert event_problems(db) == []  # I11 after the crash point (ADR-0024)
     first = container_name(INSTANCE, "e1", 1)
     assert sandbox_parts(first) == {"container": True, "sidecar": True, "network": True}
 
@@ -202,9 +204,14 @@ def test_a_coordinator_killed_mid_agent_run_recovers_on_real_podman(tmp_path: Pa
         networks = podman("network", "ls", "--format", "{{.Name}}").stdout.split()
         assert not [n for n in networks if n.startswith(f"ilmar-{INSTANCE}-")]
         assert layout.attempt_dir("e1", 1).exists()  # the failed attempt's workspace is kept
+        abandoned = [e for e in store.events() if e.type.value == "operation.reconciled"
+                     and e.data["kind"] == "run-agent"]  # fmt: skip
+        assert [(e.reason, e.data["observed"]) for e in abandoned] == [
+            ("interrupted", "outcome-unknown")]  # fmt: skip
     finally:
         owner.release()
         store.close()
+    assert event_problems(db) == []  # I11 and stable codes after the real-Podman recovery
 
 
 # -- remove_owned on real resources ---------------------------------------------------------

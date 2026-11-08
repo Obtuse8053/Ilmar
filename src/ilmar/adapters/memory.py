@@ -91,12 +91,18 @@ class InMemoryExecutionStore:
                 raise ExecutionNotFoundError(execution_id)
             return tuple(self._history[execution_id])
 
-    def append_evidence(self, record: EvidenceRecord, *, fence: Fence | None = None) -> None:
+    def append_evidence(
+        self,
+        record: EvidenceRecord,
+        *,
+        fence: Fence | None = None,
+        context: EventContext | None = None,
+    ) -> None:
         with self._lock:
             check_fence(self._owner, fence)
             if record.execution_id not in self._executions:
                 raise ExecutionNotFoundError(record.execution_id)
-            events = () if fence is None else (event_log.evidence_event(record, fence),)
+            events = () if fence is None else (event_log.evidence_event(record, fence, context),)
             self._evidence.setdefault(record.execution_id, []).append(record.to_json())
             self._append(events)
 

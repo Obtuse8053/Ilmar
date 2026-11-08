@@ -8,6 +8,7 @@ external effect raises too: nothing after the crash point happens.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -102,10 +103,12 @@ PREVIOUS_SCHEMA = 3
 
 
 def event_problems(db: Path) -> list[str]:
-    """Invariant I11 and the flags that must never appear, read without writing.
+    """Read without writing, the event log's guarantees on a supported path (ADR-0024):
 
-    ``unclassified`` is not checked here yet: the coordinator supplies reason
-    codes in #17's core wiring (part 3 of 4).
+    * invariant I11: the events rebuild every stored row;
+    * no event is ``unclassified``, ``invalid``, ``redacted`` or ``truncated``;
+    * every failure, refusal, cancellation, retry and quarantine has a reason code;
+    * every coordinator event carries its pass.
     """
     with SQLiteExecutionStore.open_read_only(db) as store:
         lines, stored = store.history_snapshot()
@@ -114,9 +117,37 @@ def event_problems(db: Path) -> list[str]:
     report = verify_lines(lines, stored)
     problems = [f"I11 {f.check} {f.subject}: {f.detail}" for f in report.failures]
     for line in lines:
-        flags = {flag for flag in ("redacted", "invalid", "truncated") if f'"{flag}":true' in line}
-        if flags:
-            problems.append(f"an event was flagged {sorted(flags)}: {line[:120]}")
+        problems += [f"{problem}: {line[:160]}" for problem in line_problems(line)]
+    return problems
+
+
+_REASONED = {
+    "operation.failed", "operation.ambiguous", "resource.quarantined",
+}  # fmt: skip
+_WITHOUT_PASS = {"ownership.acquired"}  # recorded when the store is claimed, before a pass
+
+
+def line_problems(line: str) -> list[str]:
+    event = json.loads(line)
+    problems = [f"flagged {flag}" for flag in ("redacted", "invalid", "truncated") if flag in event]
+    if event.get("reason") == "unclassified":
+        problems.append("unclassified")
+    kind, data = event["type"], event.get("data", {})
+    needs_reason = kind in _REASONED or (
+        kind == "execution.transitioned" and data.get("to") in ("failed", "cancelled", "retry_wait")
+    )
+    if kind == "operation.reconciled" and data.get("status") == "failed":
+        needs_reason = True
+    if needs_reason and "reason" not in event:
+        problems.append("no reason code")
+    if kind == "operation.reconciled" and "observed" not in data:
+        problems.append("a reconciliation without its observation")
+    if (
+        event["actor"]["kind"] == "coordinator"
+        and kind not in _WITHOUT_PASS
+        and "pass" not in event
+    ):
+        problems.append("a coordinator event without its pass")
     return problems
 
 

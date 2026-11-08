@@ -374,6 +374,10 @@ class Commit:
       commit's own changes are applied. A worker uses it to write an intent
       only while the execution is still the version it last wrote (ADR-0012
       fencing level 2).
+    * ``reasons``: the stable reason code (ADR-0024 §4) of a changed row, keyed
+      by its execution id, operation key or resource key: why an execution
+      failed, was cancelled or waits to retry, why an operation failed, why a
+      resource was quarantined. It travels with the change it explains.
     """
 
     created: tuple[tuple[Execution, Transition], ...] = ()
@@ -381,12 +385,16 @@ class Commit:
     operations: tuple[Operation, ...] = ()
     resources: tuple[Resource, ...] = ()
     expected: tuple[tuple[str, int], ...] = ()
+    reasons: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         keys = [o.key for o in self.operations] + [r.key for r in self.resources]
         ids = [e.id for e, _ in (*self.created, *self.applied)]
         if len(set(keys)) != len(keys) or len(set(ids)) != len(ids):
             raise ValueError("a commit changes each record at most once")
+        if unknown := sorted(set(self.reasons) - set(keys) - set(ids)):
+            raise ValueError(f"reasons for records this commit does not change: {unknown}")
+        object.__setattr__(self, "reasons", MappingProxyType(dict(self.reasons)))
 
     @property
     def empty(self) -> bool:

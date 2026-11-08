@@ -29,7 +29,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, NoReturn
@@ -101,6 +101,11 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "change-request-merged": "The change request was merged.",
         "change-request-closed": "The change request was closed without merging.",
         "unexpected-error": "An exception was caught at an execution's boundary.",
+        # Added after the initial set (ADR-0024 §4: codes are added, never renamed).
+        "no-changes": "The agent finished without changing anything; there is no candidate.",
+        "ci-config-changed": "The candidate changes CI configuration, so a human must take over.",
+        "checkout-failed": "The base branch could not be checked out; repeating it would fail "
+        "the same way.",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
 )
@@ -254,6 +259,22 @@ _RES_KINDS = _one_of(k.value for k in ResourceKind)
 _RES_STATUSES = _one_of(s.value for s in ResourceStatus)
 _VERDICTS = _one_of(v.value for v in Verdict)
 _COUNT = _integer(0)
+
+OBSERVATIONS: Mapping[str, str] = MappingProxyType(
+    {  # what reconciliation saw when it settled an operation (ADR-0024 §1 and §5)
+        "outcome-unknown": "Nothing external shows whether the effect happened.",
+        "sandbox-absent": "No sandbox exists under the recorded name.",
+        "sandbox-removed": "The sandbox was removed before the operation was settled.",
+        "resource-quarantined": "The resource was quarantined instead of removed.",
+        "evidence-present": "The run's evidence record exists.",
+        "evidence-absent": "The run left no evidence record.",
+        "branch-at-candidate": "The branch head is the verified candidate.",
+        "branch-unmoved": "The branch head is still the expected head.",
+        "directory-absent": "The directory does not exist.",
+        "directory-unchanged": "The recorded directory is still there.",
+        "directory-replaced": "Another directory is at the recorded path.",
+    }
+)
 _POSITIVE = _integer(1)
 
 _MESSAGE_PARAM_VALUES: Mapping[str, frozenset[str]] = MappingProxyType(
@@ -339,6 +360,7 @@ _OPERATION: Schema = {
     "from": (_OP_STATUSES, False),
     "duration_ms": (_COUNT, False),
     "error_class": (_pattern(_ERROR_CLASS), False),
+    "observed": (_one_of(OBSERVATIONS), False),
 }
 _RESOURCE: Schema = {
     "ref": (_pattern(_REF), True),
@@ -796,6 +818,8 @@ class EventContext:
     reconciled: frozenset[str] = frozenset()
     tasks: Mapping[str, str] = field(default_factory=dict)
     """Execution id -> ``provider:key``, when the caller knows it."""
+    observations: Mapping[str, str] = field(default_factory=dict)
+    """Operation key -> what reconciliation observed (:data:`OBSERVATIONS`)."""
 
 
 # Transitions into these states record why.
@@ -826,6 +850,8 @@ def derive_events(commit: Commit, context: EventContext) -> tuple[Event, ...]:
                             epoch=context.epoch, actor=context.actor,
                             pass_id=context.pass_id, **values)  # fmt: skip
 
+    if commit.reasons:  # the commit's own reasons; the context's, if any, take precedence
+        context = replace(context, reasons={**commit.reasons, **context.reasons})
     events: list[Event] = []
     for execution, _transition in commit.created:
         events.append(new(
@@ -871,6 +897,8 @@ def _operation_event(
         data["duration_ms"] = duration
     if (error_class := context.error_classes.get(operation.key)) is not None:
         data["error_class"] = error_class
+    if (observed := context.observations.get(operation.key)) is not None:
+        data["observed"] = observed
     return new(kind, execution=operation.execution_id, attempt=operation.attempt,
                operation=operation.key, reason=reason, data=data)  # fmt: skip
 
