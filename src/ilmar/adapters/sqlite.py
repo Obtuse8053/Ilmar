@@ -18,6 +18,18 @@ Design notes (ADR-0005):
   Triggers keep the epoch monotonic, final operations and released or
   quarantined resources immutable, and identities unchangeable, even against
   writes that bypass this class.
+* Version 4 (#17, ADR-0024) adds the append-only ``events`` table. Every write
+  appends its events in its own transaction (``ilmar.ports.event_log``).
+
+Opening and migrating are separate (ADR-0024 §8):
+
+* Opening for writing creates a brand-new, empty database at version 3, but
+  never migrates an existing one.
+* Every migration of an existing database, the events table and its baseline
+  included, runs in :meth:`SQLiteExecutionStore.claim_instance`, which is
+  called only under the instance lock, in the same transaction as the claim.
+  A crash anywhere in it leaves the file as it was.
+* :meth:`SQLiteExecutionStore.open_read_only` never migrates and never writes.
 """
 
 from __future__ import annotations
@@ -39,6 +51,8 @@ from ilmar.domain.errors import (
     ExecutionNotFoundError,
     FencingError,
 )
+from ilmar.domain.event_history import StoredState
+from ilmar.domain.events import CorruptEventError, Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.ledger import (
     Commit,
@@ -52,9 +66,15 @@ from ilmar.domain.ledger import (
 )
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
+from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+"""The version this code writes. A database is at it once it has been claimed."""
+NEW_DATABASE_VERSION = 3
+"""A brand-new database is created at this version: no events yet, since the
+coverage marker needs its owner (ADR-0024 §8)."""
+COVERED_VERSION = 4
 
 SCHEMA_V1 = """
 CREATE TABLE executions (
@@ -218,6 +238,23 @@ WHEN NEW.key IS NOT OLD.key OR NEW.kind IS NOT OLD.kind OR NEW.name IS NOT OLD.n
   OR NEW.version <> OLD.version + 1
 BEGIN SELECT RAISE(ABORT, 'a resource keeps its owner and identity'); END;
 """,
+    # ADR-0024: the event log. The baseline is written by claim_instance in the
+    # same transaction as this script.
+    3: """
+CREATE TABLE events (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq >= 1),
+    execution_id TEXT,
+    type         TEXT NOT NULL,
+    line         TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX events_by_execution ON events (execution_id, seq);
+
+CREATE TRIGGER events_are_append_only_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER events_are_append_only_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+""",
 }
 
 _COLUMNS = (
@@ -231,27 +268,51 @@ class SQLiteExecutionStore:
 
     Use ``":memory:"`` as ``path`` for a throwaway database. The store is safe
     to share between threads; separate processes coordinate through SQLite's
-    own locking.
+    own locking. :meth:`open_read_only` opens a store that never writes.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
-            str(path), isolation_level=None, check_same_thread=False, timeout=5.0
-        )
+        self._read_only = read_only
+        if read_only:
+            # mode=ro: SQLite refuses every write, and a missing file is an error
+            # rather than a new database.
+            self._conn = sqlite3.connect(
+                f"file:{Path(path).resolve()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+        else:
+            self._conn = sqlite3.connect(
+                str(path), isolation_level=None, check_same_thread=False, timeout=5.0
+            )
         try:
             self._conn.execute("PRAGMA foreign_keys = ON")
-            if str(path) != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            # Every commit is on disk before it returns: an intent must be
-            # durable before its side effect starts (ADR-0020). Some builds
-            # default WAL databases to NORMAL, which can lose the last commits
-            # on power loss.
-            self._conn.execute("PRAGMA synchronous = FULL")
-            self._migrate()
+            if read_only:
+                _check_supported(_version(self._conn))
+            else:
+                if str(path) != ":memory:":
+                    self._conn.execute("PRAGMA journal_mode = WAL")
+                # Every commit is on disk before it returns: an intent must be
+                # durable before its side effect starts (ADR-0020). Some builds
+                # default WAL databases to NORMAL, which can lose the last
+                # commits on power loss.
+                self._conn.execute("PRAGMA synchronous = FULL")
+                self._create_if_new()
         except BaseException:
             self._conn.close()
             raise
+
+    @classmethod
+    def open_read_only(cls, path: Path | str) -> SQLiteExecutionStore:
+        """A store that never migrates and never writes (``ilmar events``, ``verify``).
+
+        The database file is left byte-for-byte unchanged. On a WAL database
+        SQLite may create its empty ``-shm`` and ``-wal`` side files.
+        """
+        return cls(path, read_only=True)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -280,20 +341,16 @@ class SQLiteExecutionStore:
             return
         check_create(execution, transition)
         with self._transaction() as conn:
-            check_fence(_owner(conn), None)
+            _check_unfenced(conn)
             _insert_execution(conn, execution, transition)
 
     def get(self, execution_id: str) -> Execution | None:
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT {_COLUMNS} FROM executions WHERE id = ?",  # noqa: S608
-                (execution_id,),
-            ).fetchone()
-        return None if row is None else _execution_from_row(row)
+        with self._reading() as conn:
+            return _get_execution(conn, execution_id)
 
     def active_for_task(self, task: TaskRef) -> Execution | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 f"SELECT {_COLUMNS} FROM executions "  # noqa: S608
                 "WHERE task_provider = ? AND task_key = ? AND is_terminal = 0",
                 (task.provider, task.key),
@@ -304,14 +361,8 @@ class SQLiteExecutionStore:
         values = sorted({state.value for state in states})
         if not values:
             return ()
-        placeholders = ", ".join("?" for _ in values)
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {_COLUMNS} FROM executions "  # noqa: S608
-                f"WHERE state IN ({placeholders}) ORDER BY created_at, id",
-                values,
-            ).fetchall()
-        return tuple(_execution_from_row(row) for row in rows)
+        with self._reading() as conn:
+            return _list_executions(conn, values)
 
     def apply(
         self, updated: Execution, transition: Transition, *, fence: Fence | None = None
@@ -321,17 +372,17 @@ class SQLiteExecutionStore:
             return
         check_apply(updated, transition)
         with self._transaction() as conn:
-            check_fence(_owner(conn), None)
+            _check_unfenced(conn)
             _update_execution(conn, updated, transition)
 
     def history(self, execution_id: str) -> Sequence[Transition]:
-        with self._lock:
-            exists = self._conn.execute(
+        with self._reading() as conn:
+            exists = conn.execute(
                 "SELECT 1 FROM executions WHERE id = ?", (execution_id,)
             ).fetchone()
             if exists is None:
                 raise ExecutionNotFoundError(execution_id)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT execution_id, from_state, to_state, at, reason FROM transitions "
                 "WHERE execution_id = ? ORDER BY seq",
                 (execution_id,),
@@ -349,7 +400,10 @@ class SQLiteExecutionStore:
 
     def append_evidence(self, record: EvidenceRecord, *, fence: Fence | None = None) -> None:
         with self._transaction() as conn:
-            check_fence(_owner(conn), fence)
+            if fence is None:
+                _check_unfenced(conn)
+            else:
+                _check_fenced(conn, fence)
             if (
                 conn.execute(
                     "SELECT 1 FROM executions WHERE id = ?", (record.execution_id,)
@@ -368,17 +422,17 @@ class SQLiteExecutionStore:
                     record.to_json(),
                 ),
             )
+            if fence is not None:
+                _append_events(conn, (event_log.evidence_event(record, fence),))
 
     def evidence(self, execution_id: str) -> Sequence[EvidenceRecord]:
-        with self._lock:
+        with self._reading() as conn:
             if (
-                self._conn.execute(
-                    "SELECT 1 FROM executions WHERE id = ?", (execution_id,)
-                ).fetchone()
+                conn.execute("SELECT 1 FROM executions WHERE id = ?", (execution_id,)).fetchone()
                 is None
             ):
                 raise ExecutionNotFoundError(execution_id)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT seq, digest, record FROM evidence WHERE execution_id = ? ORDER BY seq",
                 (execution_id,),
             ).fetchall()
@@ -394,12 +448,18 @@ class SQLiteExecutionStore:
 
     def claim_instance(self, instance_id: str, *, now: datetime) -> Fence:
         Fence(instance_id, 1)  # validates the identifier
-        with self._transaction() as conn:
-            current = _owner(conn)
+        with self._transaction(migrating=True) as conn:
+            version = _version(conn)
+            current = _owner(conn) if version >= NEW_DATABASE_VERSION else None
             if current is not None and current.instance_id != instance_id:
                 raise FencingError(
                     f"this store belongs to instance {current.instance_id!r}, not {instance_id!r}"
                 )
+            if version < COVERED_VERSION:
+                # The caller holds the instance lock (the port's rule), so no
+                # coordinator writes between this snapshot and the first
+                # covered event.
+                _migrate_under_lock(conn, version, current, instance_id, now=now)
             fence = Fence(instance_id, 1 if current is None else current.epoch + 1)
             claimed = _encode_time(now)
             conn.execute(
@@ -412,18 +472,28 @@ class SQLiteExecutionStore:
                 "INSERT INTO owner_history (instance_id, epoch, claimed_at) VALUES (?, ?, ?)",
                 (instance_id, fence.epoch, claimed),
             )
+            _append_events(conn, (event_log.ownership_event(current, fence, now=now),))
         return fence
 
     def fence(self) -> Fence | None:
-        with self._lock:
-            return _owner(self._conn)
+        with self._reading() as conn:
+            return _owner(conn)
 
-    def commit(self, fence: Fence, changes: Commit) -> None:
+    def commit(self, fence: Fence, changes: Commit, *, context: EventContext | None = None) -> None:
         with self._transaction() as conn:
-            check_fence(_owner(conn), fence)
+            _check_fenced(conn, fence)
             check_commit(
                 fence,
                 changes,
+                execution=lambda key: _get_execution(conn, key),
+                operation=lambda key: _get_operation(conn, key),
+                resource=lambda key: _get_resource(conn, key),
+            )
+            # Derived and paired against the stored rows, before any is written.
+            events = event_log.commit_events(
+                fence,
+                changes,
+                context,
                 execution=lambda key: _get_execution(conn, key),
                 operation=lambda key: _get_operation(conn, key),
                 resource=lambda key: _get_resource(conn, key),
@@ -436,14 +506,33 @@ class SQLiteExecutionStore:
                 _write_operation(conn, operation)
             for resource in changes.resources:
                 _write_resource(conn, resource, fence)
+            _append_events(conn, events)
+
+    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
+        with self._reading(any_version=True) as conn:
+            return tuple(Event.from_json(line) for line in _event_lines(conn, after_seq, limit))
+
+    def history_snapshot(self) -> tuple[tuple[str, ...], StoredState]:
+        """Every stored event line and the rows I11 is checked against, read in one
+        transaction (ADR-0024 §8, ``ilmar events verify``). No lines: no coverage."""
+        with self._reading(any_version=True) as conn:
+            conn.execute("BEGIN")
+            try:
+                if not _has_events(conn):
+                    return (), event_log.stored_state(executions=(), operations=(),
+                                                      resources=(), transitions={},
+                                                      evidence={})  # fmt: skip
+                return _raw_event_lines(conn), _stored_state(conn)
+            finally:
+                conn.execute("COMMIT")
 
     def operation(self, key: str) -> Operation | None:
-        with self._lock:
-            return _get_operation(self._conn, key)
+        with self._reading() as conn:
+            return _get_operation(conn, key)
 
     def operations(self, execution_id: str) -> Sequence[Operation]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 f"SELECT {_OPERATION_COLUMNS} FROM operations "  # noqa: S608
                 "WHERE execution_id = ? ORDER BY created_at, rowid",
                 (execution_id,),
@@ -451,16 +540,16 @@ class SQLiteExecutionStore:
         return tuple(_operation_from_row(row) for row in rows)
 
     def unfinished_operations(self) -> Sequence[Operation]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 f"SELECT {_OPERATION_COLUMNS} FROM operations "  # noqa: S608
                 "WHERE status IN ('intended', 'ambiguous') ORDER BY created_at, rowid"
             ).fetchall()
         return tuple(_operation_from_row(row) for row in rows)
 
     def resource(self, key: str) -> Resource | None:
-        with self._lock:
-            return _get_resource(self._conn, key)
+        with self._reading() as conn:
+            return _get_resource(conn, key)
 
     def resources(
         self,
@@ -479,8 +568,8 @@ class SQLiteExecutionStore:
             clauses.append(f"status IN ({', '.join('?' for _ in wanted)})")
             values += wanted
         where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 f"SELECT {_RESOURCE_COLUMNS} FROM resources {where}"  # noqa: S608
                 "ORDER BY created_at, rowid",
                 values,
@@ -490,40 +579,201 @@ class SQLiteExecutionStore:
     # -- internals -------------------------------------------------------
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _reading(self, *, any_version: bool = False) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            if not any_version:
+                _check_current(_version(self._conn))
+            yield self._conn
+
+    @contextmanager
+    def _transaction(self, *, migrating: bool = False) -> Iterator[sqlite3.Connection]:
+        if self._read_only:
+            raise FencingError("this store was opened read-only; it never writes")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                version = _version(self._conn)
+                _check_supported(version)
+                if not migrating:
+                    _check_current(version)
                 yield self._conn
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
 
-    def _migrate(self) -> None:
+    def _create_if_new(self) -> None:
+        """Give a brand-new, empty database its schema. An existing one is never
+        migrated here: that happens under the instance lock (claim_instance)."""
         with self._lock:
-            (version,) = self._conn.execute("PRAGMA user_version").fetchone()
-            if version == SCHEMA_VERSION:
+            if _version(self._conn) != 0:
+                _check_supported(_version(self._conn))
                 return
-            if version > SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema version {version} is newer than supported "
-                    f"version {SCHEMA_VERSION}; upgrade Ilmar"
-                )
-            # Brand-new database: create version 1, then apply every migration.
-            # Everything happens in one transaction, so a failure leaves the
-            # file exactly as it was.
-            script = [] if version else [SCHEMA_V1]
-            script += [MIGRATIONS[v] for v in range(max(version, 1), SCHEMA_VERSION)]
-            body = "\n".join(script)
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.executescript(
-                    f"BEGIN;\n{body}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
-                )
-            except sqlite3.Error:
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
+                version = _version(self._conn)  # another process may have created it
+                if version == 0:
+                    if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone():
+                        raise RuntimeError("the database has tables but no Ilmar schema version")
+                    script = [SCHEMA_V1] + [MIGRATIONS[v] for v in range(1, NEW_DATABASE_VERSION)]
+                    _run_script(self._conn, "\n".join(script))
+                    self._conn.execute(f"PRAGMA user_version = {NEW_DATABASE_VERSION}")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
                 raise
+            self._conn.execute("COMMIT")
+
+
+def _version(conn: sqlite3.Connection) -> int:
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    return _integer(version)
+
+
+def _check_supported(version: int) -> None:
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {version} is newer than supported "
+            f"version {SCHEMA_VERSION}; upgrade Ilmar"
+        )
+
+
+def _check_current(version: int) -> None:
+    if version < NEW_DATABASE_VERSION:
+        raise FencingError(
+            f"the store is at schema version {version}; claim it under the instance lock "
+            "to migrate it before use"
+        )
+
+
+def _check_unfenced(conn: sqlite3.Connection) -> None:
+    """An unfenced write: only on a store never owned, which has no events yet."""
+    check_fence(_owner(conn), None)
+    if _version(conn) >= COVERED_VERSION:  # pragma: no cover - a covered store is owned
+        raise FencingError("a store with event coverage takes only fenced writes")
+
+
+def _check_fenced(conn: sqlite3.Connection, fence: Fence) -> None:
+    check_fence(_owner(conn), fence)
+    if _version(conn) < COVERED_VERSION:
+        raise FencingError(
+            "this store has no event coverage yet; only claim_instance, under the "
+            "instance lock, may start it"
+        )
+
+
+def _run_script(conn: sqlite3.Connection, script: str) -> None:
+    """Run ``script`` statement by statement inside the caller's transaction
+    (``executescript`` would commit it)."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("the schema script ends inside a statement")
+
+
+def _migrate_under_lock(
+    conn: sqlite3.Connection, version: int, owner: Fence | None, claimant: str, *, now: datetime
+) -> None:
+    """Every migration of an existing database, then the event baseline, in the
+    caller's transaction (ADR-0024 §8). Raises, and so rolls everything back, if
+    the baseline does not match the stored rows exactly."""
+    script = [MIGRATIONS[v] for v in range(max(version, 1), SCHEMA_VERSION)]
+    if version == 0:  # pragma: no cover - a new database is created when opened
+        script.insert(0, SCHEMA_V1)
+    _run_script(conn, "\n".join(script))
+    events = event_log.baseline(now=now, owner=owner, claimant=claimant,
+                                from_schema_version=version, state=_stored_state(conn))  # fmt: skip
+    _append_events(conn, events)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _has_events(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _next_seq(conn: sqlite3.Connection) -> int:
+    (highest,) = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()
+    row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
+    issued = 0 if row is None else _integer(row[0])
+    return max(_integer(highest), issued) + 1  # a seq is never reused, even after tampering
+
+
+def _append_events(conn: sqlite3.Connection, events: Sequence[Event]) -> None:
+    for event in event_log.with_seqs(events, _next_seq(conn)):
+        conn.execute(
+            "INSERT INTO events (seq, execution_id, type, line) VALUES (?, ?, ?, ?)",
+            (event.seq, event.execution, event.type.value, event.to_json()),
+        )
+
+
+def _raw_event_lines(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """The stored lines in row order. A line is the record of its event, its own
+    ``seq`` included: a reordered or renumbered row shows as a ``seq`` gap."""
+    return tuple(_text(line) for (line,) in conn.execute("SELECT line FROM events ORDER BY seq"))
+
+
+def _event_lines(conn: sqlite3.Connection, after_seq: int, limit: int | None) -> list[str]:
+    if not _has_events(conn):
+        return []
+    query = "SELECT seq, line FROM events WHERE seq > ? ORDER BY seq"
+    values: list[object] = [after_seq]
+    if limit is not None:
+        query += " LIMIT ?"
+        values.append(limit)
+    lines = []
+    for seq, line in conn.execute(query, values).fetchall():
+        event = Event.from_json(_text(line))
+        if event.seq != seq:
+            raise CorruptEventError(f"event row {seq} holds seq {event.seq}")
+        lines.append(_text(line))
+    return lines
+
+
+def _list_executions(conn: sqlite3.Connection, states: Sequence[str]) -> tuple[Execution, ...]:
+    placeholders = ", ".join("?" for _ in states)
+    rows = conn.execute(
+        f"SELECT {_COLUMNS} FROM executions "  # noqa: S608
+        f"WHERE state IN ({placeholders}) ORDER BY created_at, id",
+        list(states),
+    ).fetchall()
+    return tuple(_execution_from_row(row) for row in rows)
+
+
+def _stored_state(conn: sqlite3.Connection) -> StoredState:
+    """Every row I11 covers, oldest first (the baseline's order)."""
+    executions = _list_executions(conn, sorted(s.value for s in ExecutionState))
+    operations = [
+        _operation_from_row(row)
+        for row in conn.execute(
+            f"SELECT {_OPERATION_COLUMNS} FROM operations ORDER BY created_at, rowid"  # noqa: S608
+        ).fetchall()
+    ]
+    resources = [
+        _resource_from_row(row)
+        for row in conn.execute(
+            f"SELECT {_RESOURCE_COLUMNS} FROM resources ORDER BY created_at, rowid"  # noqa: S608
+        ).fetchall()
+    ]
+
+    def counts(table: str) -> dict[str, int]:
+        return {
+            _text(execution_id): _integer(n)
+            for execution_id, n in conn.execute(
+                f"SELECT execution_id, COUNT(*) FROM {table} GROUP BY execution_id"  # noqa: S608
+            ).fetchall()
+        }
+
+    return event_log.stored_state(executions=executions, operations=operations,
+                                  resources=resources, transitions=counts("transitions"),
+                                  evidence=counts("evidence"))  # fmt: skip
 
 
 _OPERATION_COLUMNS = (

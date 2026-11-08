@@ -33,6 +33,7 @@ from ilmar.domain.errors import (
     LedgerIntegrityError,
     ProviderError,
 )
+from ilmar.domain.events import EventContext
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import Commit, Fence, OperationKind, OperationStatus
 from ilmar.domain.tasks import TaskRef
@@ -60,12 +61,12 @@ class CrashingStore:
         self.crashed = False
         self.after_commit: Callable[[], None] | None = None
 
-    def commit(self, fence: Fence, changes: Commit) -> None:
+    def commit(self, fence: Fence, changes: Commit, *, context: EventContext | None = None) -> None:
         self.commits += 1
         if self.crashed or (self.crash_at is not None and self.commits >= self.crash_at):
             self.crashed = True
             raise Crash(f"crash at commit {self.commits}")
-        self.inner.commit(fence, changes)
+        self.inner.commit(fence, changes, context=context)
         if self.after_commit is not None:
             hook, self.after_commit = self.after_commit, None
             hook()

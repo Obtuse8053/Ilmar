@@ -53,7 +53,14 @@ from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
 from ilmar.domain.verification import VerificationCommand, VerificationPolicy
 from ilmar.domain.workspace import NetworkPolicy, ResourceOwner
-from recovery_support import Crash, Killable, KillableStore, Switch
+from recovery_support import (
+    Crash,
+    Killable,
+    KillableStore,
+    Switch,
+    event_problems,
+    to_previous_schema,
+)
 
 from fakes import FakeSourceControl, FakeTaskProvider
 
@@ -130,7 +137,7 @@ class World:
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),
         )
-        return Process(inner, ownership, coordinator, switch)
+        return Process(inner, ownership, coordinator, switch, self.db)
 
 
 @dataclass
@@ -139,6 +146,7 @@ class Process:
     ownership: Ownership
     coordinator: Coordinator
     switch: Switch
+    db: Path
 
     def run(self) -> PassReport | None:
         try:
@@ -147,9 +155,16 @@ class Process:
             return None
 
     def exit(self) -> None:
-        """The kernel releases the lock; the connection goes away."""
+        """The kernel releases the lock; the connection goes away.
+
+        Whatever the process did, crash or not, the event log must rebuild what
+        it left (I11, ADR-0024): every crash point and every recovery pass of
+        the suite is checked here.
+        """
         self.ownership.release()
         self.store.close()
+        problems = event_problems(self.db)
+        assert problems == [], problems
 
 
 def recover(world: World, *, passes: int = 6) -> list[PassReport]:
@@ -313,6 +328,58 @@ def test_recovery_survives_crashing_again(tmp_path: Path, first: int, second: in
 
 
 # -- one test per reconciliation rule that must stop for a human -------------
+
+
+def baselined_unfinished(db: Path) -> dict[str, str]:
+    """Operation key -> status, for every operation the baseline found unfinished."""
+    with SQLiteExecutionStore.open_read_only(db) as store:
+        return {
+            str(e.operation): str(e.data["status"])
+            for e in store.events()
+            if e.type.value == "operation.baseline"
+            and e.data["status"] in ("intended", "ambiguous")
+        }
+
+
+def recovered_from_previous_schema(root: Path, switch: Switch) -> list[str]:
+    """Crash, leave the store as the previous schema would have, then recover with the
+    events migration: the store must be recovered exactly as before, I11 must hold
+    (checked at every process exit) and every unfinished operation the baseline
+    found must be settled from its baseline status."""
+    world = World(root.resolve())
+    crashed = world.process(switch)
+    assert crashed.run() is None, "no crash"
+    crashed.exit()
+    to_previous_schema(world.db)
+    recover(world)
+    problems = check_invariants(world)
+    unfinished = baselined_unfinished(world.db)
+    with SQLiteExecutionStore.open_read_only(world.db) as store:
+        events = store.events()
+    for key, status in unfinished.items():
+        settled = [e for e in events if e.operation == key and e.data.get("from") == status]
+        if not settled:
+            problems.append(f"{key} was not settled from its baseline status {status}")
+    return problems
+
+
+def test_a_store_left_by_the_previous_schema_is_recovered_at_every_crash_point(
+    tmp_path: Path,
+) -> None:
+    writes, effects = totals(tmp_path)
+    failures = {}
+    unfinished_seen = 0
+    points = [(f"w{n}", Switch(write_at=n)) for n in range(1, writes + 1)]
+    points += [(f"k{k}", Switch(effect_at=k)) for k in range(1, effects + 1)]
+    for label, switch in points:
+        root = tmp_path / label
+        root.mkdir()
+        problems = recovered_from_previous_schema(root, switch)
+        if problems:
+            failures[label] = problems
+        unfinished_seen += len(baselined_unfinished(root / "executions.sqlite3"))
+    assert failures == {}
+    assert unfinished_seen > 0  # some crash points left intended or ambiguous operations
 
 
 def crash_before(world: World, effect: str) -> None:

@@ -57,12 +57,15 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#17 (plan step 2): structured event logging. It starts with an ADR for the
-event schema:
-- JSON lines, each carrying the execution ID;
-- an event for every state transition and provider call;
-- stable reason codes, among them `resource-ownership-conflict` (moved from
-  #15).
+#17 (plan step 2): structured event logging, under ADR-0024, in four
+reviewable pull requests:
+1. the domain: schema, reason codes, derivation, the I11 fold;
+2. the store: the `events` table, events in the same transaction as every
+   write, the lock-held migration with its baseline, the read-only open;
+3. the core: the coordinator supplies each commit's context (pass, reason
+   codes, durations), and the crash suite checks that `unclassified` never
+   appears;
+4. the `ilmar events` and `ilmar events verify` commands.
 
 Cancellation (#16), stall detection (#13) and budgets (#18) build on it.
 

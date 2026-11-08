@@ -8,10 +8,15 @@ external effect raises too: nothing after the crash point happens.
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ilmar.adapters.sqlite import SQLiteExecutionStore
+from ilmar.domain.event_history import verify_lines
+from ilmar.domain.events import EventContext
 from ilmar.domain.ledger import Commit, Fence
 
 
@@ -60,9 +65,9 @@ class KillableStore:
         self.switch.on_write()
         self.inner.apply(*args, **kwargs)
 
-    def commit(self, fence: Fence, changes: Commit) -> None:
+    def commit(self, fence: Fence, changes: Commit, *, context: EventContext | None = None) -> None:
         self.switch.on_write()
-        self.inner.commit(fence, changes)
+        self.inner.commit(fence, changes, context=context)
 
     def append_evidence(self, *args: Any, **kwargs: Any) -> None:
         self.switch.on_write()
@@ -88,3 +93,41 @@ class Killable:
             return attribute(*args, **kwargs)
 
         return guarded
+
+
+# -- the event log (ADR-0024) ------------------------------------------------------------
+
+PREVIOUS_SCHEMA = 3
+"""The schema before the events migration."""
+
+
+def event_problems(db: Path) -> list[str]:
+    """Invariant I11 and the flags that must never appear, read without writing.
+
+    ``unclassified`` is not checked here yet: the coordinator supplies reason
+    codes in #17's core wiring (part 3 of 4).
+    """
+    with SQLiteExecutionStore.open_read_only(db) as store:
+        lines, stored = store.history_snapshot()
+    if not lines:
+        return []  # no coverage yet: nothing was ever claimed
+    report = verify_lines(lines, stored)
+    problems = [f"I11 {f.check} {f.subject}: {f.detail}" for f in report.failures]
+    for line in lines:
+        flags = {flag for flag in ("redacted", "invalid", "truncated") if f'"{flag}":true' in line}
+        if flags:
+            problems.append(f"an event was flagged {sorted(flags)}: {line[:120]}")
+    return problems
+
+
+def to_previous_schema(db: Path) -> None:
+    """The store exactly as schema 3 would have left it: every row, no events.
+
+    The events migration only adds the ``events`` table (its index and triggers
+    go with it), so removing it and the version leaves the previous layout.
+    """
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("DROP TABLE events")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'events'")
+        conn.execute(f"PRAGMA user_version = {PREVIOUS_SCHEMA}")
+        conn.commit()
