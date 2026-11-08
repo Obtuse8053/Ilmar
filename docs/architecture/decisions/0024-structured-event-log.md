@@ -1,6 +1,6 @@
 # ADR-0024: A structured event log, written in the same commit as the change it describes
 
-- Status: Proposed
+- Status: Accepted (2026-11-08, maintainer approval on PR #62)
 - Date: 2026-11-08
 - Sources: none external · Findings: F-009
 - Implements: #17 (schema only; implementation follows approval). Prepares
