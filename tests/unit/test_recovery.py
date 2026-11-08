@@ -18,6 +18,8 @@ every invariant of ADR-0022 is checked.
 
 from __future__ import annotations
 
+import io
+import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -36,7 +38,9 @@ from coordinator_support import (
     policy,
     task,
 )
+from ilmar import cli_events
 from ilmar.adapters.sqlite import SQLiteExecutionStore
+from ilmar.cli import _build_parser
 from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import Coordinator, PassReport
 from ilmar.core.layout import WorkspaceLayout
@@ -1054,3 +1058,31 @@ def test_every_non_terminal_state_has_a_crash_point(tmp_path: Path) -> None:
     seen = states_at_crash_points(root / "happy", World)
     seen |= states_at_crash_points(root / "retry", retry_world)
     assert NON_TERMINAL - seen == set()
+
+
+def test_ilmar_events_reads_and_verifies_a_recovered_crash(tmp_path: Path) -> None:
+    """``ilmar events`` over normal recovery history (#17 part 4)."""
+    world = World(tmp_path.resolve())
+    crashed = world.process(Switch(effect_at=4))
+    assert crashed.run() is None, "no crash"
+    crashed.exit()
+    recover(world)
+
+    def ilmar(*argv: str) -> tuple[int, str]:
+        out = io.StringIO()
+        code = cli_events.run(_build_parser().parse_args(list(argv)), out=out, err=io.StringIO())
+        return code, out.getvalue()
+
+    db = str(world.db)
+    code, out = ilmar("events", "verify", "--db", db)
+    assert code == 0, out
+    assert "historical findings (information): 0" in out  # covered from the start
+    assert "integrity failures: 0" in out
+    code, out = ilmar("events", "--db", db, "--type", "operation.reconciled")
+    assert code == 0
+    settled = [json.loads(line) for line in out.splitlines()]
+    assert settled
+    assert all("observed" in e["data"] for e in settled)
+    every = [json.loads(line) for line in ilmar("events", "--db", db)[1].splitlines()]
+    passes = {e.get("pass") for e in every if e["actor"]["kind"] == "coordinator"}
+    assert len(passes - {None}) >= 2  # the crashed pass and the recovering one

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ilmar import __version__
+from ilmar import __version__, cli_events
 from ilmar.adapters.registry import build, plan
 from ilmar.config import load_config
 from ilmar.core.coordinator import Coordinator, ExitCode
@@ -27,7 +27,16 @@ UNATTENDED_DISABLED = (
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    words = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parser.parse_args(words)
+    except SystemExit as stop:
+        # `ilmar events` uses exit 2 for "no event coverage": a usage error there is 3.
+        if words[:1] == ["events"] and stop.code == 2:
+            return cli_events.CONFIGURATION
+        raise
+    if args.command == "events":
+        return cli_events.run(args)
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
@@ -60,6 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="the configuration file; required, never taken from the working directory",
     )
+    cli_events.add_parser(commands)
     validate.add_argument(
         "--check-environment",
         action="store_true",
