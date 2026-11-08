@@ -74,40 +74,97 @@ Chosen option: 4. Events are part of the durable state. They are committed
 atomically with the change they record, are never written by a separate
 path, and are exported as JSON lines by a read-only command.
 
-### 1. Two classes of event
+### 1. Two classes of event, and which provider calls are durable
 
 | | Durable events | Diagnostic events |
 | --- | --- | --- |
-| What | Everything that changes state or touches the outside world: execution transitions, every journaled operation and its outcome, ledger status changes, evidence, ownership, and the M3 events below | High-volume, read-only observations: provider read calls (`list_eligible`, `get`, `find`, `load_candidate`, branch heads), pass start and end, agent heartbeats |
+| What | Everything that changes Ilmar's state or the outside world (rules below) | High-volume, read-only observations that change nothing |
 | Where | The store's `events` table, in the **same transaction** as the change | The process's log stream (stderr), as JSON lines when enabled. Never persisted by Ilmar |
-| Guarantee | Exactly the committed changes: no event without its change, and no change without its event | Best effort; lost on a crash |
-| May drive decisions | Yes (budgets, reconciliation, audit) | **Never** |
+| Guarantee | Exactly the committed changes (section 2) | Best effort; lost on a crash |
+| May drive decisions | Yes (reconciliation, audit; budgets only as section 5 allows) | **Never** |
 
-### 2. Where durable events come from
+Provider calls are classified by the port method called, not case by case:
 
-- **`Commit` gains `events: tuple[Event, ...]`.** `ExecutionStore.commit`
-  appends them in the same transaction, under the same fence. A fenced-out
-  process therefore cannot write events either (I7).
-- **The core builds events when it builds a commit,** from data it already
-  has:
-  - the transition: from, to, reason code;
-  - the operation: kind, step, status, duration;
-  - the resource: kind, name, from, to.
+- **Every mutating port method is durable.** These are the methods the
+  architecture test already derives from `ilmar.ports`, such as
+  `claim`, `release`, `post_update`, `checkout`, `freeze_candidate`,
+  `publish_revision`, `upsert_change_request`, `start`, `run`, `stop`,
+  `remove_owned` and `AgentRunner.run`. Each is called only inside a journal
+  effect (ADR-0020), so each produces exactly the journal's
+  `operation.*` events: one call, one operation, its intent and its outcome.
+  A new mutating method cannot be added without a journal operation, so it
+  cannot be added without events.
+- **A read-only port method is diagnostic** (`provider.read`), with one
+  exception: **an observation that decides a durable change is recorded in
+  the event of that change, inside the same commit.** Examples:
+  - the claim outcome;
+  - the remote head seen when settling an interrupted push;
+  - the sandbox state `remove_owned` reports;
+  - the tracker state a reconciliation acts on (#12).
 
-  No event needs an extra read, write or commit. No event is ever written
-  inside an effect closure. **No adapter writes events:** adapters have no
-  store access. They report outcomes, and the core records them.
-- **The journal emits events from its existing commits:**
-  - `operation.intended` with the intent commit;
-  - `operation.succeeded`, `operation.failed` or `operation.ambiguous` with
-    the outcome commit;
-  - `operation.reconciled` when recovery settles one (ADR-0022).
+  So a durable decision is always explained by durable data. A read that
+  decides nothing leaves no durable trace.
+- **Not a provider call, but durable:** execution transitions, ledger
+  changes, evidence, ownership, and the M3 events in section 5.
 
-  So an effect's events bracket it exactly, across crashes.
-- **Ledger and transition events** are written by the commit that changes
-  the row. A test enforces this: every commit that changes an execution,
-  operation or resource also carries the matching events, so none can be
-  forgotten.
+### 2. Atomicity, and how a missing event is prevented
+
+The rule is **one fenced transaction**: `ExecutionStore.commit(fence,
+Commit)` writes the state rows and their events together, or writes nothing.
+Missing events are prevented by construction, checked inside the
+transaction, and checked again against the history. Each layer covers what
+the previous one cannot.
+
+1. **The core cannot omit a mandatory event; it does not write them.**
+   `Commit` derives the mandatory events from its own contents, with a pure
+   function in `ilmar.domain`:
+   - each created execution → `execution.created`;
+   - each applied transition → `execution.transitioned`;
+   - each operation row → the `operation.*` event for its new status;
+   - each resource row → `resource.recorded`, `resource.changed` or
+     `resource.quarantined`.
+
+   The caller supplies only the context the rows do not hold, in a typed
+   `EventContext`:
+   - the pass and the actor;
+   - durations;
+   - the observations of section 1;
+   - the reason code of a failure or refusal.
+
+   The caller may add **extra** events, such as `evidence.recorded` or the
+   M3 events, but cannot remove or replace a derived one. A failure
+   transition without a reason code gets `unclassified`, so the state change
+   is never blocked by a missing code. Every test path asserts that
+   `unclassified` never appears, so a missing code is a test failure rather
+   than lost history.
+2. **The store checks the pairing inside the transaction, before
+   `COMMIT`.** It has the previous version of every changed row, so it fills
+   each event's `from` status from the stored row. It then verifies:
+   - exactly one derived event per changed row, matching that row's key,
+     new version and new status;
+   - no derived event without a changed row.
+
+   On any mismatch it rolls back and raises `LedgerIntegrityError`. Under
+   ADR-0022 that blocks only the execution concerned, and no effect follows.
+   This guards against a bug in the derivation, and against a store adapter
+   that writes rows some other way.
+3. **The history is checked against current state.** Folding the events of
+   an execution, in `seq` order, must reproduce its stored state, attempt
+   and version, and the status and version of each of its operations and
+   resources.
+   - This is invariant **I11**. The crash-injection suite checks it after
+     every crash point and every recovery (ADR-0022), and the store
+     contract checks it after every commit it makes.
+   - `ilmar events verify`, a read-only command, runs the same fold for an
+     operator.
+   - A row changed outside Ilmar, for example by hand in SQLite, shows up
+     here as a mismatch. Section 8's triggers additionally refuse any edit
+     to the events themselves.
+
+Effects themselves happen between two commits, the intent and the outcome,
+exactly as today. Events never decide whether an effect runs. No event is
+built or written inside an effect closure. No adapter has store access, so
+no adapter writes events.
 
 ### 3. The envelope (format `ilmar.event/1`)
 
@@ -133,14 +190,14 @@ newline-terminated:
 | `instance` | yes | The Ilmar instance ID (ADR-0013). |
 | `epoch` | yes | The ownership epoch of the writing process, so events from before and after a takeover are distinguishable (ADR-0020). |
 | `pass` | yes for coordinator events | A random ID per `run_once` pass. It correlates everything one pass did, recovery included. |
-| `actor` | yes | `{"kind": "coordinator"}`, or `{"kind": "human", "ref": "…"}` for a human command. `ref` is a label the human supplies, never an account credential. #59 decides what a resolution records. |
+| `actor` | yes | `{"kind": "coordinator"}`, or `{"kind": "human", "ref": "…"}` for a human command. `ref` is validated as section 7 requires; #59 decides what a resolution records. |
 | `type` | yes | `noun.verb`, from the catalogue below. |
 | `execution`, `attempt` | when the event concerns an execution | |
 | `task` | when known | `provider:key`, never the task's title or body. |
 | `operation` | for operation events | The journal key: correlates intent, outcome and reconciliation. |
 | `run` | for verification events | The verification run number (ADR-0022, evidence format 2). |
 | `reason` | for failures, refusals and decisions | A **stable reason code** (section 4). |
-| `message` | optional | One sentence written by Ilmar, at most 300 characters (see 7). |
+| `message` | optional | Rendered from a registered message template (section 7); never free text. |
 | `data` | optional | A type-specific object, at most 4 KiB serialised. |
 
 **Durations** (`duration_ms`) are measured with `time.monotonic` around the
@@ -214,13 +271,26 @@ envelope.
     current time;
   - `agent.stalled` (reason `agent-stalled`, `data`: the silence
     measured with the monotonic clock).
-- **#18:**
-  - `budget.charged` (`data`: `kind`: `agent_seconds`,
-    `verification_seconds` or later `cost`, and its `amount`);
-  - `budget.exceeded` (reason `budget-exceeded`).
+- **#18:** `budget.reserved`, `budget.charged`, `budget.released` and
+  `budget.exceeded` (reason `budget-exceeded`) are reserved names only.
+  **Summing events does not, on its own, enforce a budget safely across
+  crashes:**
+  - A crash during an effect leaves `operation.intended` with no outcome.
+    The work it did, such as model calls during an agent run, may have been
+    paid for but has no recorded amount.
+  - Usage is often known only to the provider (the model API), not to
+    Ilmar. `AgentResult` reports no usage today.
+  - A check made before an effect races with usage accrued during it.
 
-  Charges are summed from durable events, so a budget survives restarts and
-  counts every attempt.
+  #18 must therefore decide the accounting model, and ADR-0024 does not:
+  - reserving before an effect, in the intent commit;
+  - settling after it;
+  - charging the full reservation for interrupted or ambiguous operations;
+  - reconciling with provider-side usage where it is available;
+  - keeping a provider-side hard cap as the backstop: the spending-capped key
+    (ADR-0023), or a gateway (F-019).
+
+  The events give it durable order and correlation, nothing more.
 - **#59:** `quarantine.resolved` (actor `human`, `data`: what was observed).
   It is a new append-only record. ADR-0020's rule that quarantined rows never
   change stays intact.
@@ -254,35 +324,73 @@ decides stalls in process, and records only the decision, durably.
   - The exporter changes nothing, so a crashed export is simply re-run.
   - No push sink or network exporter is in the core.
 
-### 7. Redaction and untrusted text
+### 7. Validation first, then redaction
 
-- **Excluded from events:**
-  - credentials (ADR-0006, ADR-0023);
-  - environment values;
-  - command arguments carrying values;
-  - task titles and bodies;
-  - agent output and summaries, which are untrusted (ADR-0010);
-  - workspace file contents;
-  - raw tool stderr.
-- **Agent summaries:** the agent's summary stays in the attempt and evidence
-  records, for #14. The event carries `agent-failed` and the evidence digest.
-  Implementing this ADR therefore removes the agent summary quote from the
-  failure reason it puts into events. `last_error` keeps its current text
-  until #14 decides.
-- **`message`** is written by Ilmar from fixed text and identifiers only: no
-  interpolated provider stderr or agent text.
-- **Defence in depth:** before a commit, every string field is checked
-  against credential shapes, the same patterns the live harness uses
-  (`github_pat_`, `gh?_`, `sk-ant-`, `x-access-token:`, and their URL and
-  base64 forms).
-  - A match replaces the field with `"<redacted>"`, and sets
-    `"redacted": true` on the event.
-  - It never fails the commit, because events must not block state changes.
-  - A test asserts the replacement, and a live-run check asserts that no
-    event was ever redacted.
-- **Size limits:** `message` is capped at 300 characters and `data` at
-  4 KiB. Anything longer is truncated and marked with `"truncated": true`,
-  never dropped.
+Events are protected in three layers, in this order. Redaction is the last
+defence, not the mechanism.
+
+1. **Schema-level allowlisting, at construction.** Every event type
+   declares its `data` keys, and every field has a type with a validator.
+   - **Envelope identifiers** (execution, attempt, task, operation, run,
+     instance, pass) come from the domain's typed values, and are checked
+     against the same patterns those values already obey (ADR-0012 naming,
+     the journal key format).
+   - **`data` values** must be one of:
+     - an integer, or a bounded enum member;
+     - a reason code from the registry;
+     - an identifier matching a declared pattern: a resource name, a branch
+       name, a 40-hex or 64-hex digest, or a change-request URL that is
+       `https`, on the configured provider host, without user info, query
+       or fragment.
+
+     There are **no free-form strings in `data`.** An unknown key, a wrong
+     type or a value outside its pattern is refused.
+   - **`message`** is a template ID from a registry of fixed sentences,
+     rendered with typed parameters from the same validated set. No string
+     reaches an event from a provider's stderr, an exception message, the
+     agent, the tracker or a workspace.
+   - **Excluded entirely:** credentials (ADR-0006, ADR-0023), environment
+     values, command arguments, task titles and bodies, agent output and
+     summaries (ADR-0010), file contents and paths inside workspaces.
+     The agent's summary stays in the attempt and evidence records, for
+     #14. Implementing this ADR removes the summary quote from the event
+     form of the failure reason; `last_error` keeps its text until #14
+     decides.
+2. **Human-supplied values are the strictest case:** `actor.ref`, and any
+   reason a human types for #59.
+   - `actor.ref` must match `^[a-z][a-z0-9-]{0,31}$`: a short lower-case
+     label such as `maintainer` or `ops-1`. It is not an email address, a
+     login or a token. It rejects `@`, `:`, `/`, `_`, upper case and
+     anything longer, which excludes every credential shape listed below.
+   - A human's free-text reason, if #59 keeps one, is stored in #59's own
+     resolution record, not in the event. The event carries the record's
+     digest.
+   - A human command whose value fails validation is **refused** with a
+     message. It is never redacted and written: a person is there to
+     correct it.
+3. **Credential-shape scan, as defence in depth.** After validation, every
+   string in the serialised event is checked against credential shapes, the
+   patterns the live harness uses (`github_pat_`, `gh?_`, `sk-ant-`,
+   `x-access-token:`, and their URL-encoded and base64 forms). Validation
+   should make a match impossible, so a match is a bug:
+   - in a coordinator commit, the field is replaced by `"<redacted>"` and
+     the event flagged `"redacted": true`. The commit is not blocked;
+   - tests assert that the flag never appears on any test path, and the
+     live run asserts that no event was ever redacted.
+
+**Failure handling:**
+- An invalid optional field, or invalid `data`, in a coordinator event:
+  - the field is dropped and the event flagged `"invalid": true`;
+  - the state change still commits;
+  - tests assert that the flag never appears.
+- An invalid **envelope identifier** can only come from a broken invariant,
+  since those come from validated domain types. The commit is refused
+  (`LedgerIntegrityError`) and blocks that execution alone (ADR-0022),
+  rather than writing an event that cannot be attributed.
+- **Size limits:** a rendered `message` is at most 300 characters, and
+  `data` at most 4 KiB serialised. The templates and validators make longer
+  values impossible; a test checks every template at its maximum
+  parameters.
 
 ### 8. Compatibility and versioning
 
@@ -312,25 +420,36 @@ decides stalls in process, and records only the decision, durably.
 
 ### 9. Port and contract changes (for the implementation PR)
 
-- `ilmar.domain`:
-  - `Event` (frozen dataclass), `EventType`;
-  - the reason-code registry;
-  - `Commit.events`.
-- `ExecutionStore`:
-  - `commit` appends `Commit.events` in the same transaction;
+- **`ilmar.domain`:**
+  - `Event`, `EventType`, the per-type `data` schemas and validators;
+  - `EventContext`;
+  - the reason-code registry and the message-template registry;
+  - the pure derivation of mandatory events from a `Commit`;
+  - `Commit.extra_events`;
+  - the I11 fold.
+- **`ExecutionStore`:**
+  - `commit` derives, pairs (section 2, step 2) and appends events in the
+    same transaction;
   - a new read method, `events(*, after_seq=0, limit=…) -> Sequence[Event]`.
 
   The contract suite covers:
   - atomicity with the rest of the commit;
+  - the pairing check: an unpaired row and an unpaired event are each
+    refused;
   - refusal under a stale fence;
   - append-only behaviour;
   - `seq` order;
-  - round-trip of every field.
-- `ilmar events` (CLI), read-only.
+  - round-trip of every field;
+  - I11 after every commit it makes.
+- **`ilmar events` and `ilmar events verify` (CLI),** both read-only.
 - **Architecture tests:**
   - events are constructed only in `ilmar.core` and `ilmar.domain`;
-  - no adapter imports the event types for writing;
-  - no effect closure builds or writes an event.
+  - no adapter imports the event types;
+  - no effect closure builds or writes an event;
+  - every mutating port method maps to a journal operation kind, and so to
+    its events.
+- **Tests that `unclassified`, `"redacted"` and `"invalid"` never occur,**
+  across the unit, crash-injection and Podman suites.
 
 ## Consequences
 
@@ -348,9 +467,13 @@ decides stalls in process, and records only the decision, durably.
 - **Bad:** some data exists twice. A transition is in `transitions` and in
   its event; an operation's final status is in `operations` and in its last
   event. The tables stay authoritative for current state, and events for
-  history. A test checks that they agree.
-- **Bad:** reason codes add a mapping to maintain. Tests catch an error class
-  with no code.
+  history. The pairing check and I11 (section 2) make them agree.
+- **Bad:** reason codes and message templates add registries to maintain.
+  Tests catch an error class with no code, and a failure with no template.
+- **Bad:** typed `data` schemas make adding a field a code change, not a
+  string edit. That is the point: nothing reaches an event unvalidated.
+- **Not solved here:** safe budget enforcement across crashes. Section 5
+  reserves it for #18.
 
 ## Revisit when
 
