@@ -93,11 +93,11 @@ No implementation starts without approval.
   - **Final acceptance audit:** every criterion passes; the evidence matrix
     is
     [on #16](https://github.com/Obtuse8053/Ilmar/issues/16#issuecomment-6748276550).
-    It is closed when #79 is merged and green.
-  - **Verified:**
-    - CI green on `373f345`, with real Podman: 106 passed, 1 skipped by
-      design;
-    - #79 green at `fff4f8d`;
+    #16 was closed after #79 merged
+    ([closing comment](https://github.com/Obtuse8053/Ilmar/issues/16#issuecomment-6749515510)).
+  - **Verified on `82c7f67`** (the merge of #79, so the whole of #16 is on
+    `main`):
+    - CI green, including real Podman: 106 passed, 1 skipped by design;
     - 2385 tests pass on Python 3.11, 3.12 and 3.13.
   - **Use:** `ilmar cancel` (`docs/operations/cancel.md`). Unattended
     operation stays disabled.
