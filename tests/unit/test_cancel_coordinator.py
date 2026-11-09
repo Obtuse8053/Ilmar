@@ -120,7 +120,10 @@ def check_i11(setup: Setup) -> None:
 
     stored = StoredState(
         executions=executions,
-        operations=[o for e in executions for o in setup.store.operations(e.id)],
+        operations=[
+            *(o for e in executions for o in setup.store.operations(e.id)),
+            *setup.store.instance_operations(),
+        ],
         resources=setup.store.resources(),
         transitions={e.id: len(setup.store.history(e.id)) for e in executions},
         evidence={e.id: len(setup.store.evidence(e.id)) for e in executions},

@@ -36,7 +36,17 @@ from ilmar.domain.errors import (
     PolicyViolationError,
     ProviderError,
 )
-from ilmar.domain.tasks import ClaimOutcome, Task, TaskRef
+from ilmar.domain.tasks import (
+    Claim,
+    ClaimOutcome,
+    HeldClaim,
+    ReleaseResult,
+    RestoreResult,
+    Standing,
+    Task,
+    TaskRef,
+    TaskStanding,
+)
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
@@ -51,20 +61,57 @@ from ilmar.ports.container_runtime import ContainerRuntime
 
 
 @dataclass
+class FakeClaim:
+    """One claim object on the fake tracker: what a GitHub claim comment holds."""
+
+    object_id: str
+    instance: str
+    token: str
+    author: str
+
+
+@dataclass
 class _TrackedTask:
     task: Task
-    holder: str | None = None
     open: bool = True
+    eligible: bool = True  # the eligible label is present
+    excluded: bool = False
+    human: bool = False  # a human claim label or an assignee
+    label: bool = False  # the claim label Ilmar owns
+    gone: bool = False
+    claims: list[FakeClaim] = field(default_factory=list)
     updates: list[str] = field(default_factory=list)
 
 
 class FakeTaskProvider:
-    """A task tracker held in memory. ``worker`` identifies this factory."""
+    """A task tracker held in memory. ``worker`` identifies this factory's instance,
+    ``identity`` the account it writes as (ADR-0026 §6).
 
-    def __init__(self, tasks: Iterable[Task] = (), *, name: str = "fake", worker: str = "ilmar"):
+    Claims are objects with an immutable id, an instance, a token and an author,
+    as on GitHub; only an object written by ``identity`` that names ``worker`` is
+    this instance's own. ``writes`` records every write this provider made, and
+    ``hooks`` run at the named points of the targeted writes (adversarial tests).
+    """
+
+    def __init__(
+        self,
+        tasks: Iterable[Task] = (),
+        *,
+        name: str = "fake",
+        worker: str = "ilmar",
+        identity: str = "ilmar-bot",
+    ):
         self._name = name
         self._worker = worker
+        self._identity = identity
         self._tasks: dict[TaskRef, _TrackedTask] = {}
+        self._ids = itertools.count(1)
+        self._tokens = itertools.count(1)
+        self.writes: list[tuple[str, str]] = []
+        self.standing_reads: list[TaskRef] = []
+        self.unreadable: set[TaskRef] = set()  # standing raises: an uncertain read
+        self.lagging: dict[TaskRef, int] = {}  # reads that do not see our claims yet
+        self.hooks: dict[str, list[Callable[[HeldClaim], None]]] = {}
         for task in tasks:
             self.add(task)
 
@@ -79,8 +126,28 @@ class FakeTaskProvider:
             raise ValueError("task belongs to a different provider")
         self._tasks[task.ref] = _TrackedTask(task)
 
-    def claim_as(self, ref: TaskRef, worker: str) -> None:
-        self._tasks[ref].holder = worker
+    def tracked(self, ref: TaskRef) -> _TrackedTask:
+        return self._tasks[ref]
+
+    def refs(self) -> tuple[TaskRef, ...]:
+        return tuple(self._tasks)
+
+    def claim_as(self, ref: TaskRef, worker: str, *, author: str | None = None) -> FakeClaim:
+        """A claim object written by someone else (``author``, by default ``worker``)."""
+        claim = FakeClaim(self._object_id(), worker, self._token(), author or worker)
+        self._tasks[ref].claims.append(claim)
+        self._tasks[ref].label = True
+        return claim
+
+    def forge(self, ref: TaskRef, *, token: str | None = None, author: str = "mallory") -> None:
+        """A copy of this instance's marker, written by another account."""
+        tracked = self._tasks[ref]
+        tracked.claims.append(
+            FakeClaim(self._object_id(), self._worker, token or self._token(), author)
+        )
+
+    def own_claims(self, ref: TaskRef) -> list[FakeClaim]:
+        return [c for c in self._tasks[ref].claims if self._authentic(c)]
 
     def close(self, ref: TaskRef) -> None:
         self._tasks[ref].open = False
@@ -88,34 +155,163 @@ class FakeTaskProvider:
     def updates(self, ref: TaskRef) -> Sequence[str]:
         return tuple(self._tasks[ref].updates)
 
+    def _object_id(self) -> str:
+        return f"o-{next(self._ids)}"
+
+    def _token(self) -> str:
+        return f"t{next(self._tokens):031x}"
+
+    def _authentic(self, claim: FakeClaim) -> bool:
+        return claim.instance == self._worker and claim.author == self._identity
+
+    def _hook(self, point: str, claim: HeldClaim) -> None:
+        for hook in list(self.hooks.get(point, ())):
+            hook(claim)
+
     # -- TaskProvider ----------------------------------------------------
 
     def list_eligible(self) -> Sequence[Task]:
-        return tuple(t.task for t in self._tasks.values() if t.open and t.holder is None)
+        return tuple(
+            t.task
+            for t in self._tasks.values()
+            if t.open and not t.gone and t.eligible and not t.excluded and not t.human
+            and not t.label and not t.claims
+        )  # fmt: skip
 
     def get(self, ref: TaskRef) -> Task | None:
         tracked = self._tasks.get(ref)
-        return None if tracked is None else tracked.task
+        return None if tracked is None or tracked.gone else tracked.task
 
-    def claim(self, ref: TaskRef) -> ClaimOutcome:
+    def claim(self, ref: TaskRef) -> Claim:
         tracked = self._tasks.get(ref)
-        if tracked is None or not tracked.open:
-            return ClaimOutcome.NOT_ELIGIBLE
-        if tracked.holder not in (None, self._worker):
-            return ClaimOutcome.CLAIMED_BY_OTHER
-        tracked.holder = self._worker
-        return ClaimOutcome.CLAIMED
+        if tracked is None or tracked.gone or not tracked.open:
+            return Claim(ClaimOutcome.NOT_ELIGIBLE)
+        own = [c for c in tracked.claims if self._authentic(c)]
+        if tracked.human or len(own) != len(tracked.claims):
+            return Claim(ClaimOutcome.CLAIMED_BY_OTHER)
+        if own:
+            self._write("label", ref)
+            tracked.label = True
+            return Claim(ClaimOutcome.CLAIMED, own[0].token)
+        if tracked.label:
+            return Claim(ClaimOutcome.CLAIMED_BY_OTHER)
+        if not tracked.eligible or tracked.excluded:
+            return Claim(ClaimOutcome.NOT_ELIGIBLE)
+        claim = FakeClaim(self._object_id(), self._worker, self._token(), self._identity)
+        self._write("post-claim", ref)
+        tracked.claims.append(claim)
+        tracked.label = True
+        return Claim(ClaimOutcome.CLAIMED, claim.token)
 
     def release(self, ref: TaskRef) -> None:
         tracked = self._tasks.get(ref)
-        if tracked is not None and tracked.holder == self._worker:
-            tracked.holder = None
+        if tracked is None or tracked.gone:
+            return
+        own = [c for c in tracked.claims if self._authentic(c)]
+        for claim in own:
+            self._write("delete-claim", ref)
+            tracked.claims.remove(claim)
+        if own and not tracked.claims:
+            self._write("unlabel", ref)
+            tracked.label = False
 
     def post_update(self, ref: TaskRef, message: str) -> None:
         tracked = self._tasks.get(ref)
-        if tracked is None:
+        if tracked is None or tracked.gone:
             raise ProviderError(f"unknown task {ref}")
+        self._write("note", ref)
         tracked.updates.append(message)
+
+    def standing(self, ref: TaskRef) -> TaskStanding:
+        self.standing_reads.append(ref)
+        if ref in self.unreadable:
+            raise ProviderError(f"cannot read {ref}")
+        tracked = self._tasks.get(ref)
+        if tracked is None or tracked.gone:
+            return TaskStanding(Standing.GONE, "task-gone")
+        lagging = self.lagging.get(ref, 0) > 0
+        if lagging:
+            self.lagging[ref] -= 1
+        own = [] if lagging else [c for c in tracked.claims if self._authentic(c)]
+        others = [c for c in tracked.claims if not self._authentic(c)]
+        reasons = set()
+        if not tracked.open:
+            reasons.add("task-closed")
+        if not tracked.eligible:
+            reasons.add("task-unlabelled")
+        if tracked.excluded:
+            reasons.add("task-excluded")
+        if tracked.human:
+            reasons.add("task-claimed-by-human")
+        if others:
+            reasons.add("task-claimed-by-other-instance")
+        if not own:
+            reasons.add("task-claim-lost")
+        if reasons:
+            return TaskStanding.decisive(reasons)
+        first = own[0]
+        return TaskStanding(
+            Standing.HELD,
+            claim=HeldClaim(ref, first.token, first.object_id),
+            label_missing=not tracked.label,
+        )
+
+    def held_claims(self) -> Sequence[HeldClaim]:
+        return tuple(
+            HeldClaim(ref, c.token, c.object_id)
+            for ref, t in self._tasks.items()
+            if t.label and not t.gone
+            for c in t.claims
+            if self._authentic(c)
+        )
+
+    def release_claim(self, claim: HeldClaim) -> ReleaseResult:
+        self._hook("reread", claim)
+        tracked, found = self._object(claim)
+        if found is None:
+            result = ReleaseResult.ABSENT
+        elif not self._still_ours(found, claim):
+            return ReleaseResult.CHANGED
+        else:
+            self._hook("delete", claim)
+            assert tracked is not None
+            if found in tracked.claims:
+                self._write("delete-claim", claim.ref)
+                tracked.claims.remove(found)
+            result = ReleaseResult.RELEASED
+        self._hook("label", claim)
+        tracked = self._tasks.get(claim.ref)
+        remains = tracked is None or tracked.gone or bool(tracked.claims) or tracked.human
+        if tracked is not None and tracked.label and not remains:
+            self._write("unlabel", claim.ref)
+            tracked.label = False
+        return result
+
+    def restore_label(self, claim: HeldClaim) -> RestoreResult:
+        self._hook("reread", claim)
+        tracked, found = self._object(claim)
+        if found is None:
+            return RestoreResult.ABSENT
+        if not self._still_ours(found, claim):
+            return RestoreResult.CHANGED
+        self._hook("label", claim)
+        assert tracked is not None
+        self._write("label", claim.ref)
+        tracked.label = True
+        return RestoreResult.RESTORED
+
+    def _object(self, claim: HeldClaim) -> tuple[_TrackedTask | None, FakeClaim | None]:
+        tracked = self._tasks.get(claim.ref)
+        if tracked is None or tracked.gone:
+            return None, None
+        found = next((c for c in tracked.claims if c.object_id == claim.object_id), None)
+        return tracked, found
+
+    def _still_ours(self, found: FakeClaim, claim: HeldClaim) -> bool:
+        return self._authentic(found) and found.token == claim.claim_id
+
+    def _write(self, what: str, ref: TaskRef) -> None:
+        self.writes.append((what, str(ref)))
 
 
 ProgramHandler = Callable[[Sequence[str], float, Mapping[str, str]], CommandResult]

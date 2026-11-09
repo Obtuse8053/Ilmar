@@ -31,6 +31,9 @@ class HttpRequest:
     url: str
     headers: Mapping[str, str]
     body: bytes | None = None
+    follow_redirects: bool = True
+    """``False``: a redirect comes back as the 3xx response, never followed
+    (ADR-0026 §1: a transferred issue is never read in another repository)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +83,26 @@ class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the 3xx is returned to the caller as it is."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
 def urllib_transport(request: HttpRequest, *, timeout: float = 30.0) -> HttpResponse:
-    """Real transport. Honours ``HTTPS_PROXY``. Follows same-origin redirects only."""
-    opener = urllib.request.build_opener(_SameOriginRedirects())
+    """Real transport. Honours ``HTTPS_PROXY``. Follows same-origin redirects only,
+    and none at all when the request says so."""
+    handler = _SameOriginRedirects() if request.follow_redirects else _NoRedirects()
+    opener = urllib.request.build_opener(handler)
     raw = urllib.request.Request(  # noqa: S310 - the scheme is checked by GitHubClient
         request.url, data=request.body, headers=dict(request.headers), method=request.method
     )
@@ -96,7 +116,11 @@ def urllib_transport(request: HttpRequest, *, timeout: float = 30.0) -> HttpResp
 
 
 class GitHubNotFoundError(ProviderError):
-    """The resource does not exist (HTTP 404)."""
+    """The resource does not exist (HTTP 404, or 410 for a deleted one)."""
+
+
+class GitHubMovedError(ProviderError):
+    """The resource answered with a redirect that was not followed (HTTP 3xx)."""
 
 
 class GitHubClient:
@@ -124,11 +148,12 @@ class GitHubClient:
         *,
         query: Mapping[str, str] | None = None,
         body: Any = None,
+        follow_redirects: bool = True,
     ) -> Any:
         url = self._base + path
         if query:
             url += "?" + urllib.parse.urlencode(query)
-        response = self._send(method, url, body)
+        response = self._send(method, url, body, follow_redirects=follow_redirects)
         return json.loads(response.body) if response.body else None
 
     def paginate(self, path: str, *, query: Mapping[str, str] | None = None) -> Iterator[Any]:
@@ -144,7 +169,9 @@ class GitHubClient:
             if url is not None and urllib.parse.urlsplit(url).hostname != self._host:
                 raise ProviderError("GitHub pagination pointed to another host; refusing")
 
-    def _send(self, method: str, url: str, body: Any) -> HttpResponse:
+    def _send(
+        self, method: str, url: str, body: Any, *, follow_redirects: bool = True
+    ) -> HttpResponse:
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self._token}",
@@ -155,9 +182,11 @@ class GitHubClient:
         if body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        response = self._transport(HttpRequest(method, url, headers, data))
-        if response.status == 404:
+        response = self._transport(HttpRequest(method, url, headers, data, follow_redirects))
+        if response.status in (404, 410):
             raise GitHubNotFoundError(f"GitHub {method} {_path_of(url)}: not found")
+        if 300 <= response.status < 400:
+            raise GitHubMovedError(f"GitHub {method} {_path_of(url)}: moved (not followed)")
         if not 200 <= response.status < 300:
             raise ProviderError(
                 f"GitHub {method} {_path_of(url)}: HTTP {response.status} {_message(response)}"

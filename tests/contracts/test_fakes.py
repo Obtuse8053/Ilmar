@@ -8,7 +8,7 @@ adapters are also required to have.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -55,6 +55,40 @@ class TestFakeTaskProvider(TaskProviderContract):
     def claim_as_other(self, provider: TaskProvider, task: Task) -> None:
         assert isinstance(provider, FakeTaskProvider)
         provider.claim_as(task.ref, "someone-else")
+
+    def change(self, provider: TaskProvider, task: Task, what: str) -> None:
+        assert isinstance(provider, FakeTaskProvider)
+        tracked = provider.tracked(task.ref)
+        if what == "close":
+            tracked.open = False
+        elif what == "unlabel":
+            tracked.eligible = False
+        elif what == "exclude":
+            tracked.excluded = True
+        elif what in ("assign", "human-label"):
+            tracked.human = True
+        elif what == "other-instance":
+            provider.claim_as(task.ref, "someone-else")
+        elif what == "forge-own-marker":
+            provider.forge(task.ref)
+        elif what == "gone":
+            tracked.gone = True
+        elif what == "drop-own-claim":
+            tracked.claims = [c for c in tracked.claims if c not in provider.own_claims(task.ref)]
+        elif what == "drop-label":
+            tracked.label = False
+        elif what == "add-label":
+            tracked.label = True
+        else:
+            raise AssertionError(what)
+
+    def make_unreadable(self, provider: TaskProvider, task: Task) -> None:
+        assert isinstance(provider, FakeTaskProvider)
+        provider.unreadable.add(task.ref)
+
+    def snapshot(self, provider: TaskProvider) -> Hashable:
+        assert isinstance(provider, FakeTaskProvider)
+        return repr(sorted((str(r), repr(provider.tracked(r))) for r in provider.refs()))
 
 
 class TestFakeContainerRuntime(ContainerRuntimeContract):

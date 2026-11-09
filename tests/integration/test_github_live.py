@@ -52,10 +52,10 @@ def test_claim_lifecycle_on_real_github() -> None:
     )
     try:
         (task,) = a.list_eligible()
-        assert a.claim(task.ref) is ClaimOutcome.CLAIMED
-        assert b.claim(task.ref) is ClaimOutcome.CLAIMED_BY_OTHER
+        assert a.claim(task.ref).outcome is ClaimOutcome.CLAIMED
+        assert b.claim(task.ref).outcome is ClaimOutcome.CLAIMED_BY_OTHER
         a.release(task.ref)
-        assert b.claim(task.ref) is ClaimOutcome.CLAIMED
+        assert b.claim(task.ref).outcome is ClaimOutcome.CLAIMED
         b.release(task.ref)
         assert [t.ref for t in a.list_eligible()] == [task.ref]
     finally:

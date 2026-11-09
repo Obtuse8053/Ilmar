@@ -69,6 +69,7 @@ from ilmar.domain.ledger import (
     OperationKind,
     OperationStatus,
     changed_paths_digest,
+    instance_operation_key,
     operation_key,
 )
 from ilmar.ports.execution_store import ExecutionStore
@@ -123,6 +124,7 @@ class Journal:
         after: Callable[[Result], Commit] | None = None,
         definitive: tuple[type[BaseException], ...] = (),
         observed: str | None = None,
+        outcome_observed: Callable[[Result], str | None] | None = None,
     ) -> Result:
         """Perform one side effect with write-ahead intent; see the module docstring.
 
@@ -131,10 +133,14 @@ class Journal:
         atomically with the success. ``observed`` is the read that decided to
         perform it (:data:`~ilmar.domain.events.OBSERVATIONS`, ADR-0024 §1): it
         is recorded on the operation's intent and outcome events, in the same
-        commits as ``before`` and ``after``.
+        commits as ``before`` and ``after``. ``outcome_observed(result)``, if
+        given, names what the effect itself found instead, for the success
+        event (ADR-0026 §5: ``claim-absent``).
         """
         if observed is not None and observed not in OBSERVATIONS:
             raise ValueError(f"{observed!r} is not a registered observation")
+        if kind.instance_scoped:
+            raise LedgerIntegrityError(f"{kind.value} is instance-scoped; use perform_instance")
         lease.check(execution.id)
         _check_scope(before, execution.id)
         definitive = (*definitive, *self._always_definitive)
@@ -208,6 +214,7 @@ class Journal:
         succeeded = operation.moved(
             OperationStatus.SUCCEEDED, fence=fence, now=self._clock(), result=result
         )
+        found = _found(outcome_observed, result, seen, key)
         try:  # 4. the outcome, with its follow-up changes
             follow_up = after(result) if after is not None else Commit()
             _check_scope(follow_up, execution.id)
@@ -215,7 +222,7 @@ class Journal:
                 fence,
                 _with(follow_up, succeeded),
                 context=self._events.context(
-                    fence, durations_ms={key: duration}, observations=seen
+                    fence, durations_ms={key: duration}, observations=found
                 ),
             )
         except FencingError:
@@ -261,6 +268,8 @@ class Journal:
             raise LedgerIntegrityError(f"no operation {key} to reconcile")
         # Like perform: only the lease holder settles an execution's operations,
         # and only while this coordinator still owns the instance (ADR-0020).
+        if operation.execution_id is None:
+            raise LedgerIntegrityError(f"{key} is instance-scoped; no lease settles it")
         lease.check(operation.execution_id)
         self._ownership.check()
         if operation.status.is_final:
@@ -293,6 +302,88 @@ class Journal:
             ),
         )
         return settled
+
+    def perform_instance(
+        self,
+        kind: OperationKind,
+        effect: Callable[[], Result],
+        *,
+        step: str,
+        intent: Mapping[str, str],
+        reason: str,
+        revalidate: Callable[[], None],
+        definitive: tuple[type[BaseException], ...] = (),
+        outcome_observed: Callable[[Result], str | None] | None = None,
+    ) -> Result:
+        """Perform an instance-scoped side effect (ADR-0026 §5, the ADR-0020 amendment).
+
+        It names no execution, so no lease guards it: the instance lock and the
+        fence do, checked again right before the effect, as in :meth:`perform`.
+        ``revalidate`` runs after the intent commit and that check; if it raises,
+        the effect never happens and the operation is recorded as failed.
+        ``reason`` is the reason code on the operation's events.
+
+        A repeated call for an unfinished operation repeats it from the intent
+        **stored** with it, never from the caller's: the stored intent names the
+        object to act on.
+        """
+        if not kind.instance_scoped:
+            raise LedgerIntegrityError(f"{kind.value} names an execution; use perform")
+        self._ownership.check()
+        fence = self._ownership.fence
+        definitive = (*definitive, *self._always_definitive)
+        key = instance_operation_key(kind, fence.instance_id, step)
+        reasons = {key: reason}
+        existing = self._store.operation(key)
+        if existing is not None:
+            if existing.status is OperationStatus.SUCCEEDED:
+                return existing.result
+            if existing.status is OperationStatus.FAILED:
+                raise LedgerIntegrityError(f"{key} already failed definitively")
+            if dict(existing.intent) != dict(intent):
+                raise LedgerIntegrityError(f"{key}: the intent differs from the recorded one")
+            operation = existing.moved(
+                OperationStatus.INTENDED, fence=fence, now=self._clock(), note="repeated"
+            )
+        else:
+            operation = Operation.intended_for_instance(
+                kind, fence.instance_id, fence=fence, now=self._clock(), step=step, intent=intent
+            )
+        self._commit(  # 1. intent, write-ahead
+            fence,
+            Commit(operations=(operation,)),
+            context=self._events.context(fence, reasons=reasons),
+        )
+        self._ownership.check()  # 2. still the owner, right before acting
+        try:
+            revalidate()
+        except BaseException as error:
+            self._settle(operation, OperationStatus.FAILED, error, 0)
+            raise
+        started = self._monotonic()
+        try:
+            result = dict(effect())  # 3. the effect
+        except definitive as error:
+            self._settle(operation, OperationStatus.FAILED, error, self._elapsed(started))
+            raise
+        except BaseException as error:
+            self._settle(operation, OperationStatus.AMBIGUOUS, error, self._elapsed(started))
+            raise
+        duration = self._elapsed(started)
+        succeeded = operation.moved(
+            OperationStatus.SUCCEEDED, fence=fence, now=self._clock(), result=result
+        )
+        self._commit(  # 4. the outcome
+            fence,
+            Commit(operations=(succeeded,)),
+            context=self._events.context(
+                fence,
+                reasons=reasons,
+                durations_ms={key: duration},
+                observations=_found(outcome_observed, result, None, key),
+            ),
+        )
+        return result
 
     def record(self, changes: Commit, *, lease: ExecutionLease, execution_id: str) -> None:
         """A state or ledger change with no external effect (a transition, a quarantine):
@@ -422,7 +513,7 @@ def _check_scope(changes: Commit, execution_id: str) -> None:
     execution's state, journal or resources (ADR-0020).
     """
     owners = {e.id for e, _ in (*changes.created, *changes.applied)}
-    owners |= {o.execution_id for o in changes.operations}
+    owners |= {o.execution_id or "(the instance)" for o in changes.operations}
     owners |= {r.execution_id for r in changes.resources}
     owners |= {execution for execution, _ in changes.expected}
     owners |= {str(event.execution) for event in changes.extra_events}
@@ -431,6 +522,23 @@ def _check_scope(changes: Commit, execution_id: str) -> None:
         raise LedgerIntegrityError(
             f"a worker for {execution_id} cannot change records of {', '.join(foreign)}"
         )
+
+
+def _found(
+    outcome_observed: Callable[[Result], str | None] | None,
+    result: Result,
+    seen: Mapping[str, str] | None,
+    key: str,
+) -> Mapping[str, str] | None:
+    """The observation recorded with a success: what the effect found, if it says."""
+    if outcome_observed is None:
+        return seen
+    found = outcome_observed(result)
+    if found is None:
+        return seen
+    if found not in OBSERVATIONS:
+        raise ValueError(f"{found!r} is not a registered observation")
+    return {key: found}
 
 
 def _with(changes: Commit, operation: Operation) -> Commit:

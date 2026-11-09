@@ -52,7 +52,7 @@ from ilmar.domain.ledger import (
     ResourceKind,
     ResourceStatus,
 )
-from ilmar.domain.tasks import ClaimOutcome, TaskRef
+from ilmar.domain.tasks import Claim, ClaimOutcome, TaskRef
 from ilmar.domain.workspace import ResourceOwner
 
 from helpers import at
@@ -275,7 +275,7 @@ def test_every_event_of_a_pass_carries_that_pass(setup: Setup) -> None:
 def test_a_claim_that_did_not_succeed_cancels_with_its_code(
     setup: Setup, monkeypatch: pytest.MonkeyPatch, outcome: ClaimOutcome, code: str
 ) -> None:
-    monkeypatch.setattr(setup.tasks, "claim", lambda ref: outcome)
+    monkeypatch.setattr(setup.tasks, "claim", lambda ref: Claim(outcome))
     setup.coordinator().run_once()
     assert transition_to(setup, "cancelled").reason == code
 
@@ -670,7 +670,7 @@ def test_the_run_summary_shows_each_code_beside_the_readable_detail(
     if arrange == "agent-failed":
         setup.agent.plan = [(AgentOutcome.FAILED, {})]
     elif arrange == "not-claimed":
-        monkeypatch.setattr(setup.tasks, "claim", lambda ref: ClaimOutcome.CLAIMED_BY_OTHER)
+        monkeypatch.setattr(setup.tasks, "claim", lambda ref: Claim(ClaimOutcome.CLAIMED_BY_OTHER))
     elif arrange == "ownership":
 
         def foreign(name: str, *, owner: ResourceOwner) -> bool:

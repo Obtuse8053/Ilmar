@@ -36,7 +36,7 @@ from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import Commit, OperationStatus, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.ports import event_log
-from recovery_support import PREVIOUS_SCHEMA, to_previous_schema
+from recovery_support import PREVIOUS_SCHEMA, to_previous_schema, to_schema_4
 
 from contracts.execution_store import evidence_record
 from helpers import at
@@ -494,3 +494,100 @@ def test_an_unclassified_event_in_history_still_verifies(old_store: Path) -> Non
     with SQLiteExecutionStore.open_read_only(old_store) as store:
         assert store.events()[-1].reason == "unclassified"
     assert report(old_store).exit_code == 0
+
+
+# -- schema 5: instance-scoped operations (ADR-0026 §5) -------------------------------------
+
+
+@pytest.fixture
+def schema_4(tmp_path: Path) -> Path:
+    """A covered store as schema 4 left it: every row and event."""
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_4(path)
+    return path
+
+
+def operation_rows(path: Path) -> list[tuple[object, ...]]:
+    with closing(sqlite3.connect(path)) as conn:
+        return conn.execute("SELECT * FROM operations ORDER BY rowid").fetchall()
+
+
+def event_rows(path: Path) -> list[tuple[object, ...]]:
+    with closing(sqlite3.connect(path)) as conn:
+        return conn.execute("SELECT * FROM events ORDER BY seq").fetchall()
+
+
+def test_the_schema_4_fixture_requires_an_execution(schema_4: Path) -> None:
+    assert version(schema_4) == 4
+    with closing(sqlite3.connect(schema_4)) as conn:
+        (sql,) = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+        ).fetchone()
+    assert "execution_id TEXT NOT NULL REFERENCES" in sql
+    assert "release-orphan-claim" not in sql
+
+
+def test_a_covered_store_migrates_to_5_without_a_new_baseline(schema_4: Path) -> None:
+    rows, events = operation_rows(schema_4), event_rows(schema_4)
+    with SQLiteExecutionStore(schema_4) as store:
+        assert store.instance_operations() == ()  # readable before the migration
+        fence = store.claim_instance("inst", now=at(10))
+        added = store.events(after_seq=len(events))
+    assert version(schema_4) == SCHEMA_VERSION == 5
+    assert operation_rows(schema_4) == rows  # every row, byte for byte, in order
+    assert event_rows(schema_4)[: len(events)] == events
+    assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]  # no baseline
+    assert fence.epoch == 3
+    assert report(schema_4).exit_code == 0  # I11 holds over the rebuilt table
+
+
+def test_the_migrated_table_keeps_its_triggers_and_indexes(schema_4: Path) -> None:
+    with SQLiteExecutionStore(schema_4) as store:
+        store.claim_instance("inst", now=at(10))
+    names = {name for _, name, _ in schema(schema_4)}
+    assert {
+        "operations_by_execution",
+        "operations_unfinished",
+        "operations_cannot_be_removed",
+        "operations_final_are_immutable",
+        "operations_identity_is_immutable",
+    } <= names
+    assert "operations_before" not in names
+    with closing(sqlite3.connect(schema_4)) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM operations")
+
+
+@pytest.mark.parametrize(("kind", "attempt"), [("claim-task", 1), ("release-orphan-claim", 2)])
+def test_the_database_refuses_an_unscoped_row_of_another_kind(
+    schema_4: Path, kind: str, attempt: int
+) -> None:
+    with SQLiteExecutionStore(schema_4) as store:
+        store.claim_instance("inst", now=at(10))
+    with closing(sqlite3.connect(schema_4)) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO operations VALUES (?, NULL, ?, ?, 'intended', 3, 1, 'x', 'x', '{}', "
+            "'{}', '')",
+            (f"{kind}:inst:{attempt}:s", attempt, kind),
+        )
+
+
+def test_a_failed_migration_to_5_changes_nothing(
+    schema_4: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = dump(schema_4)
+    monkeypatch.setitem(MIGRATIONS, 4, MIGRATIONS[4] + "\nSELECT no_such_function();\n")
+    with SQLiteExecutionStore(schema_4) as store, pytest.raises(sqlite3.OperationalError):
+        store.claim_instance("inst", now=at(10))
+    assert dump(schema_4) == before
+    assert version(schema_4) == 4
+
+
+def test_a_schema_4_store_refuses_fenced_writes_until_claimed(schema_4: Path) -> None:
+    with SQLiteExecutionStore(schema_4) as store:
+        fence = store.fence()
+        assert fence is not None
+        with pytest.raises(FencingError, match="not migrated"):
+            store.commit(fence, Commit())
+    assert version(schema_4) == 4

@@ -199,6 +199,10 @@ class InMemoryExecutionStore:
         with self._lock:
             return tuple(o for o in self._operations.values() if o.status in unfinished)
 
+    def instance_operations(self) -> Sequence[Operation]:
+        with self._lock:
+            return tuple(o for o in self._operations.values() if o.execution_id is None)
+
     def resource(self, key: str) -> Resource | None:
         with self._lock:
             return self._resources.get(key)

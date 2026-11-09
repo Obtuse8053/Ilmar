@@ -133,6 +133,17 @@ def intent(
     )
 
 
+def orphan_intent(fence: Fence) -> Operation:
+    return Operation.intended_for_instance(
+        K.RELEASE_ORPHAN_CLAIM,
+        fence.instance_id,
+        fence=fence,
+        now=at(2),
+        step="github.0123456789abcdef",
+        intent={"task": "fake:A", "claim": "c1", "object": "o1"},
+    )
+
+
 def freeze_op(fence: Fence, *, revision: str = CANDIDATE) -> tuple[Operation, Operation]:
     first = intent(K.FREEZE_CANDIDATE, fence)
     done = first.moved(
@@ -289,6 +300,56 @@ class FencingContract:
         with pytest.raises(LedgerIntegrityError, match="attempt"):
             store.commit(fence, Commit(operations=(later,)))
 
+    # -- instance-scoped operations (ADR-0026 §5, the ADR-0020 amendment) ---------------
+
+    def test_an_instance_scoped_operation_names_no_execution_and_keeps_i11(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        fenced_execution(store, fence)
+        first = orphan_intent(fence)
+        context = EventContext(at=at(2), instance="inst", epoch=fence.epoch,
+                               reasons={first.key: "orphaned-claim"})  # fmt: skip
+        store.commit(fence, Commit(operations=(first,)), context=context)
+        assert store.operation(first.key) == first
+        assert store.unfinished_operations() == (first,)
+        assert store.operations("e1") == ()
+        assert store.instance_operations() == (first,)
+        done = first.moved(ST.SUCCEEDED, fence=fence, now=at(3), result={"result": "released"})
+        store.commit(fence, Commit(operations=(done,)), context=context)
+        assert store.operation(first.key) == done
+        assert store.unfinished_operations() == ()
+        written = [e for e in store.events() if e.operation == first.key]
+        assert types(written) == ["operation.intended", "operation.succeeded"]
+        assert all(e.execution is None and e.reason == "orphaned-claim" for e in written)
+        check_i11(store)
+
+    def test_only_instance_scoped_kinds_may_omit_the_execution(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        with pytest.raises(ValueError, match="execution"):
+            dataclasses.replace(intent(K.CLAIM_TASK, fence), execution_id=None)
+        with pytest.raises(ValueError, match="instance-scoped"):
+            Operation.intended(K.RELEASE_ORPHAN_CLAIM, "e1", 1, fence=fence, now=at(2))
+        assert {k for k in K if k.instance_scoped} == {K.RELEASE_ORPHAN_CLAIM}
+
+    def test_an_instance_scoped_operation_is_this_instances(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        foreign = Operation.intended_for_instance(
+            K.RELEASE_ORPHAN_CLAIM, "other", fence=fence, now=at(2), step="github.x"
+        )
+        with pytest.raises(LedgerIntegrityError, match="names no execution"):
+            store.commit(fence, Commit(operations=(foreign,)))
+        assert store.operation(foreign.key) is None
+
+    def test_an_instance_scoped_operation_is_fenced(self, store: ExecutionStore) -> None:
+        old = claimed(store)
+        claimed(store)
+        before = store.events()
+        with pytest.raises(FencingError):
+            store.commit(old, Commit(operations=(orphan_intent(old),)))
+        assert store.events() == before
+        assert store.operation(orphan_intent(old).key) is None
+
     def test_resources_follow_their_lifecycle(self, store: ExecutionStore) -> None:
         fence = claimed(store)
         fenced_execution(store, fence)
@@ -420,7 +481,10 @@ def stored_state(store: ExecutionStore) -> StoredState:
     executions = store.list_in_states(set(ExecutionState))
     return StoredState(
         executions=executions,
-        operations=[o for e in executions for o in store.operations(e.id)],
+        operations=[
+            *(o for e in executions for o in store.operations(e.id)),
+            *store.instance_operations(),
+        ],
         resources=store.resources(),
         transitions={e.id: len(store.history(e.id)) for e in executions},
         evidence={e.id: len(store.evidence(e.id)) for e in executions},

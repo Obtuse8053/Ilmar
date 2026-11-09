@@ -161,7 +161,11 @@ class Effects:
 
     def claim(self, execution: Execution, lease: ExecutionLease, *, then: Then) -> ClaimOutcome:
         def effect() -> Mapping[str, str]:
-            return {"outcome": self._c.task_provider.claim(execution.task).value}
+            claim = self._c.task_provider.claim(execution.task)
+            result = {"outcome": claim.outcome.value}
+            if claim.claim_id is not None:  # the claim this execution holds (ADR-0026 §3a)
+                result["claim_id"] = claim.claim_id
+            return result
 
         result = self._journal.perform(K.CLAIM_TASK, execution, effect, lease=lease, after=then)
         return ClaimOutcome(result["outcome"])

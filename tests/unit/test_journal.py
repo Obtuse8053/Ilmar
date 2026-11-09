@@ -692,3 +692,150 @@ def test_only_the_lease_holder_reconciles_and_only_while_owning(
     operation = coordinator.store.inner.operation(key)
     assert operation is not None
     assert operation.status is ST.AMBIGUOUS
+
+
+# -- instance-scoped operations (ADR-0026 §5, the ADR-0020 amendment) ----------------------
+
+ORPHAN_INTENT = {"task": "fake:1", "claim": "tok", "object": "o-1"}
+
+
+def perform_orphan(
+    c: Coordinator,
+    effect: Callable[[], Mapping[str, str]],
+    *,
+    intent: Mapping[str, str] = ORPHAN_INTENT,
+    revalidate: Callable[[], None] = lambda: None,
+    **options: Any,
+) -> Mapping[str, str]:
+    return c.journal.perform_instance(
+        K.RELEASE_ORPHAN_CLAIM, effect, step="fake.0123abcd", intent=intent,
+        reason="orphaned-claim", revalidate=revalidate, **options,
+    )  # fmt: skip
+
+
+ORPHAN_KEY = "release-orphan-claim:inst:1:fake.0123abcd"
+
+
+def test_an_instance_operation_is_written_ahead_with_no_execution(
+    coordinator: Coordinator,
+) -> None:
+    seen: list[Any] = []
+
+    def effect() -> Mapping[str, str]:
+        seen.append(coordinator.store.inner.operation(ORPHAN_KEY))
+        return {"result": "released"}
+
+    assert perform_orphan(coordinator, effect) == {"result": "released"}
+    assert seen[0].status is ST.INTENDED
+    assert seen[0].execution_id is None
+    assert dict(seen[0].intent) == ORPHAN_INTENT
+    done = coordinator.store.inner.operation(ORPHAN_KEY)
+    assert done is not None
+    assert done.status is ST.SUCCEEDED
+    events = [e for e in coordinator.store.inner.events() if e.operation == ORPHAN_KEY]
+    assert [(e.type.value, e.execution, e.reason) for e in events] == [
+        ("operation.intended", None, "orphaned-claim"),
+        ("operation.succeeded", None, "orphaned-claim"),
+    ]
+    assert all(e.pass_id is not None for e in events)
+
+
+def test_an_instance_operation_records_what_the_effect_found(coordinator: Coordinator) -> None:
+    def found(result: Mapping[str, str]) -> str | None:
+        return "claim-absent" if result["result"] == "absent" else None
+
+    perform_orphan(coordinator, lambda: {"result": "absent"}, outcome_observed=found)
+    (outcome,) = [
+        e
+        for e in coordinator.store.inner.events()
+        if e.operation == ORPHAN_KEY and e.type.value == "operation.succeeded"
+    ]
+    assert outcome.data["observed"] == "claim-absent"
+
+
+def test_a_failed_revalidation_never_acts_and_settles_failed(coordinator: Coordinator) -> None:
+    world = World()
+
+    def revalidate() -> None:
+        raise LedgerIntegrityError("the task is backed again")
+
+    with pytest.raises(LedgerIntegrityError, match="backed"):
+        perform_orphan(coordinator, world.claim, revalidate=revalidate)
+    assert world.effects == []
+    operation = coordinator.store.inner.operation(ORPHAN_KEY)
+    assert operation is not None
+    assert operation.status is ST.FAILED
+    with pytest.raises(LedgerIntegrityError, match="already failed"):
+        perform_orphan(coordinator, world.claim)
+    assert world.effects == []
+
+
+def test_an_unfinished_instance_operation_repeats_only_its_recorded_intent(
+    coordinator: Coordinator,
+) -> None:
+    def unclear() -> Mapping[str, str]:
+        raise ProviderError("timeout")
+
+    with pytest.raises(ProviderError):
+        perform_orphan(coordinator, unclear)
+    assert coordinator.store.inner.operation(ORPHAN_KEY).status is ST.AMBIGUOUS  # type: ignore[union-attr]
+    with pytest.raises(LedgerIntegrityError, match="intent differs"):
+        perform_orphan(coordinator, World().claim, intent={**ORPHAN_INTENT, "object": "o-2"})
+    assert perform_orphan(coordinator, lambda: {"result": "absent"}) == {"result": "absent"}
+    assert perform_orphan(coordinator, World().claim) == {"result": "absent"}  # never again
+
+
+def test_a_superseded_coordinator_neither_records_nor_acts_for_the_instance(
+    layout: WorkspaceLayout, path: Path, coordinator: Coordinator
+) -> None:
+    coordinator.ownership.release()
+    other = start(layout, path)
+    world = World()
+    with pytest.raises(FencingError):
+        perform_orphan(coordinator, world.claim)
+    assert world.effects == []
+    assert other.store.inner.operation(ORPHAN_KEY) is None
+    stop(other)
+
+
+def test_losing_ownership_after_the_instance_intent_stops_the_effect(
+    coordinator: Coordinator,
+) -> None:
+    world = World()
+    coordinator.store.after_commit = coordinator.ownership.release
+    with pytest.raises(FencingError):
+        perform_orphan(coordinator, world.claim)
+    assert world.effects == []
+
+
+def test_the_two_scopes_never_mix(coordinator: Coordinator) -> None:
+    with pytest.raises(LedgerIntegrityError, match="use perform_instance"):
+        coordinator.perform(K.RELEASE_ORPHAN_CLAIM, World().claim)
+    with pytest.raises(LedgerIntegrityError, match="use perform"):
+        coordinator.journal.perform_instance(
+            K.RELEASE_TASK, World().claim, step="s", intent={}, reason="orphaned-claim",
+            revalidate=lambda: None,
+        )  # fmt: skip
+    perform_orphan(coordinator, lambda: {"result": "absent"})
+    with pytest.raises(LedgerIntegrityError, match="no lease settles"):
+        coordinator.journal.reconcile(ORPHAN_KEY, ST.SUCCEEDED, lease=coordinator.lease(),
+                                      reason="r", observed="claim-absent")  # fmt: skip
+
+
+@pytest.mark.parametrize("crash_at", [1, 2])
+def test_a_crash_in_an_instance_operation_is_repeated_from_its_intent(
+    layout: WorkspaceLayout, path: Path, crash_at: int
+) -> None:
+    c = start(layout, path, crash_at=crash_at)
+    world = World()
+    with pytest.raises(Crash):
+        perform_orphan(c, world.claim)
+    assert world.effects == ([] if crash_at == 1 else ["claim"])
+    stop(c)
+    again = start(layout, path)
+    assert perform_orphan(again, world.claim) == {"task": "task-1"}
+    operation = again.store.inner.operation(ORPHAN_KEY)
+    assert operation is not None
+    assert operation.status is ST.SUCCEEDED
+    assert dict(operation.intent) == ORPHAN_INTENT
+    stop(again)

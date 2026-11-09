@@ -89,8 +89,8 @@ def test_get_handles_foreign_refs_missing_issues_and_pull_requests(api: FakeGitH
 
 def test_claim_posts_one_marker_and_label_and_is_idempotent(api: FakeGitHub) -> None:
     p = provider(api)
-    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED
-    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
     assert len(claims(api, 1)) == 1
     assert CLAIMED in api.issues[1].labels
 
@@ -119,7 +119,7 @@ def test_human_claim_label_is_respected(api: FakeGitHub) -> None:
     api.issues[1].labels.add(HUMAN)
     p = human_aware(api)
     assert p.list_eligible() == ()
-    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
     p.release(ref(1))
     assert HUMAN in api.issues[1].labels
     assert label_writes(api) == []
@@ -128,9 +128,9 @@ def test_human_claim_label_is_respected(api: FakeGitHub) -> None:
 def test_human_label_added_during_our_claim_survives_release(api: FakeGitHub) -> None:
     """Regression (PR #38 review): releasing must not erase a human's label-only claim."""
     p = human_aware(api)
-    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
     api.issues[1].labels.add(HUMAN)  # a human starts on it while Ilmar holds it
-    assert p.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER  # we notice; no side effects
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER  # we notice; no side effects
     p.release(ref(1))
     assert HUMAN in api.issues[1].labels
     assert CLAIMED not in api.issues[1].labels
@@ -150,7 +150,7 @@ def test_human_label_added_during_back_off_survives_withdrawal(api: FakeGitHub) 
             api.comment(1, claim_comment("b"))
 
     api.before.append(human_and_b_act_during_a_post)
-    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert a.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
     assert HUMAN in api.issues[1].labels
     assert set(label_writes(api)) == {CLAIMED}
 
@@ -176,13 +176,14 @@ def test_the_claim_label_is_owned_by_ilmar(api: FakeGitHub) -> None:
 def test_claim_outcomes(api: FakeGitHub, change: dict[str, object], expected: ClaimOutcome) -> None:
     for key, value in change.items():
         setattr(api.issues[1], key, value)
-    assert provider(api).claim(ref(1)) is expected
+    assert provider(api).claim(ref(1)).outcome is expected
     assert claims(api, 1) == []
 
 
 def test_claim_of_unknown_or_foreign_task_is_not_eligible(api: FakeGitHub) -> None:
-    assert provider(api).claim(ref(42)) is ClaimOutcome.NOT_ELIGIBLE
-    assert provider(api).claim(TaskRef("github", "other/repo#1")) is ClaimOutcome.NOT_ELIGIBLE
+    assert provider(api).claim(ref(42)).outcome is ClaimOutcome.NOT_ELIGIBLE
+    foreign = TaskRef("github", "other/repo#1")
+    assert provider(api).claim(foreign).outcome is ClaimOutcome.NOT_ELIGIBLE
 
 
 def test_claim_marker_carries_a_unique_token(api: FakeGitHub) -> None:
@@ -206,7 +207,7 @@ def test_claim_appearing_mid_claim_makes_us_back_off(api: FakeGitHub) -> None:
             api.comment(1, claim_comment("b"))
 
     api.before.append(b_claims_during_a_post)
-    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert a.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
     assert claims(api, 1) == [claim_comment("b")]  # a withdrew; b's claim untouched
     assert CLAIMED in api.issues[1].labels  # still visibly taken (by b)
 
@@ -224,7 +225,7 @@ def test_overlapping_claims_on_a_controlled_schedule_never_both_succeed(api: Fak
     results: dict[str, ClaimOutcome] = {}
 
     def run(instance: str) -> None:
-        results[instance] = provider(api, instance).claim(ref(1))
+        results[instance] = provider(api, instance).claim(ref(1)).outcome
 
     threads = [threading.Thread(target=run, args=(i,), name=i) for i in ("a", "b")]
     for thread in threads:
@@ -256,8 +257,8 @@ def test_overlapping_claims_on_a_controlled_schedule_never_both_succeed(api: Fak
 
 def test_sequential_second_instance_sees_the_first(api: FakeGitHub) -> None:
     a, b = provider(api, "a"), provider(api, "b")
-    assert a.claim(ref(1)) is ClaimOutcome.CLAIMED
-    assert b.claim(ref(1)) is ClaimOutcome.CLAIMED_BY_OTHER
+    assert a.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
+    assert b.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
     assert len(claims(api, 1)) == 1
 
 
@@ -266,7 +267,7 @@ def test_ownership_is_per_instance_across_restarts(api: FakeGitHub) -> None:
     an execution still backs it is decided by the durable store (#12, #15)."""
     provider(api, "a").claim(ref(1))
     restarted = provider(api, "a")
-    assert restarted.claim(ref(1)) is ClaimOutcome.CLAIMED
+    assert restarted.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
     assert len(claims(api, 1)) == 1
     restarted.release(ref(1))
     assert claims(api, 1) == []
@@ -336,6 +337,8 @@ class Schedule:
         self.followed = True
 
     def gate(self, request: HttpRequest) -> None:
+        if urllib.parse.urlsplit(request.url).path == "/user":
+            return  # the identity lookup (ADR-0026 §6) is not part of the race
         actor = threading.current_thread().name
         with self._condition:
             if not self._order:
