@@ -11,12 +11,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import itertools
+import json
+import multiprocessing
 import os
+import stat
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -421,3 +426,253 @@ def test_a_cancel_event_for_another_execution_is_refused_by_the_journal(world: W
     with pytest.raises(LedgerIntegrityError, match="cannot change records of e2"):
         world.journal.record(Commit(extra_events=(event,)), lease=world.lease, execution_id="e1")
     assert world.store.events() == before
+
+
+# -- ADR-0025 acceptance (audit of #16) ---------------------------------------------------
+
+_FORK = multiprocessing.get_context("fork")
+PROTOCOL_STEPS = ["created", "written", "synced", "linked", "unlinked"]
+
+
+def _crash_submitting(root: str, step: str) -> None:
+    def crash(name: str) -> None:
+        if name == step:
+            os._exit(9)
+
+    fs._step = crash
+    fd = fs.open_inbox(Path(root), create=True)
+    fs.submit(fd, "e1", "alice", now=at(5))
+    os._exit(0)
+
+
+@pytest.mark.parametrize("step", PROTOCOL_STEPS)
+def test_a_submitter_killed_at_any_step_then_the_worker_applies_at_most_one(
+    world: World, step: str
+) -> None:
+    os.close(world.inbox())
+    child = _FORK.Process(target=_crash_submitting, args=(str(world.layout.coordinator_root), step))
+    child.start()
+    child.join(30)
+    assert child.exitcode == 9
+    published = PROTOCOL_STEPS.index(step) >= PROTOCOL_STEPS.index("linked")
+    names = world.names()
+    assert ("e1.json" in names) == published  # nothing, an inert temporary file, or one request
+    cancellations = world.cancellations()
+    applied = cancellations.apply(world.execution(), world.lease)
+    assert len(world.requests()) == int(published)
+    assert applied.reports == ()
+    if published:  # applied; its companion temporary name (same inode) is removed too
+        assert world.names() == []
+    else:  # an inert temporary file may be a live submitter's: kept until a request is applied
+        assert [n for n in world.names() if not n.startswith(".tmp-")] == []
+        world.submit("bob")  # a later submission behaves as specified
+        cancellations.apply(world.execution(), world.lease)
+        assert [e.actor.ref for e in world.requests()] == ["bob"]
+        cancellations.apply(world.execution(), world.lease)  # the next safe point
+        assert world.names() == []  # the inert leftover goes once a request was applied
+    world.check_i11()
+
+
+class Crash(BaseException):
+    """A worker death: no handler below the test catches it."""
+
+
+def test_a_worker_killed_between_the_two_removals_records_once_and_cleans_up(
+    world: World,
+) -> None:
+    """The submitter's crash leftover (final and temporary name, one inode): the
+    worker removes the private name, dies before the companion; the next apply
+    records nothing more and removes the companion."""
+    os.close(world.inbox())
+    request_id = "q-" + "e" * 32
+    temporary = world.box / fs.temporary_name("e1", request_id)
+    _valid_file(world, temporary, request_id, actor="alice")
+    os.link(temporary, world.box / FINAL)
+    cancellations = world.cancellations()
+    original = cancellations._remove_companion
+
+    def die(fd: int, execution: Any, request: Any) -> None:
+        raise Crash
+
+    cancellations._remove_companion = die  # type: ignore[method-assign]
+    with pytest.raises(Crash):
+        cancellations.apply(world.execution(), world.lease)
+    assert len(world.requests()) == 1
+    assert world.names() == [temporary.name]  # the private name is gone, the companion stays
+    cancellations._remove_companion = original  # type: ignore[method-assign]
+    applied = cancellations.apply(world.execution(), world.lease)
+    assert applied.reports == ()
+    assert len(world.requests()) == 1  # recorded once
+    assert world.names() == []
+    world.check_i11()
+
+
+# The check-then-unlink race: every window, every concurrent change (ADR-0025 §1a).
+
+WINDOWS = ["validated", "recorded", "taken", "verified"]
+
+
+@dataclass
+class Made:
+    """What a concurrent change put in the inbox, to find it again afterwards."""
+
+    kind: str
+    fingerprint: object = None
+
+
+def _replace_with(world: World, kind: str, tmp: Path) -> Made:
+    staged = world.box / ".staged"
+    if kind == "valid":
+        _valid_file(world, staged, "q-" + "b" * 32, actor="mallory")
+        made = Made(kind, staged.read_bytes())
+    elif kind == "invalid":
+        staged.write_text('{"not":"a request"}')
+        staged.chmod(0o600)
+        made = Made(kind, staged.read_bytes())
+    elif kind == "symlink":
+        target = tmp / "valid-elsewhere.json"
+        _valid_file(world, target, "q-" + "c" * 32)
+        staged.symlink_to(target)
+        made = Made(kind, str(target))
+    else:
+        os.mkfifo(staged, 0o600)
+        made = Made(kind)
+    os.replace(staged, world.box / FINAL)  # the concurrent writer's own rename
+    return made
+
+
+def _found(world: World, made: Made) -> list[str]:
+    """Where an entry that change made is now: the final name or under rejected/."""
+    places = [world.box / FINAL] + [world.box / fs.REJECTED / n for n in world.rejected()]
+    return [str(path) for path in places if os.path.lexists(path) and _is(path, made)]
+
+
+def _is(path: Path, made: Made) -> bool:
+    if made.kind == "symlink":
+        return path.is_symlink() and os.readlink(path) == made.fingerprint
+    if made.kind == "fifo":
+        return stat.S_ISFIFO(path.lstat().st_mode)
+    regular = path.is_file() and not path.is_symlink()
+    return regular and path.read_bytes() == made.fingerprint
+
+
+CHANGES = ["valid", "invalid", "symlink", "fifo", "delete", "remove-companion"]
+
+
+@pytest.mark.parametrize("change", CHANGES)
+@pytest.mark.parametrize("window", WINDOWS)
+def test_every_window_and_concurrent_change(
+    world: World, tmp_path: Path, window: str, change: str
+) -> None:
+    os.close(world.inbox())
+    # The validated request is a submitter's crash leftover, so a companion exists.
+    request_id = "q-" + "a" * 32
+    temporary = world.box / fs.temporary_name("e1", request_id)
+    _valid_file(world, temporary, request_id, actor="alice")
+    os.link(temporary, world.box / FINAL)
+    target = tmp_path / "valid-elsewhere.json"
+    made: list[Made] = []
+
+    def act() -> None:
+        if change == "delete":
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(world.box / FINAL)
+        elif change == "remove-companion":  # as its own CLI would
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+        else:
+            made.append(_replace_with(world, change, tmp_path))
+
+    world.windows[window] = act
+    events_before = len(world.store.events(execution_id="e1"))
+    applied = world.cancellations().apply(world.execution(), world.lease)
+    # The validated request is recorded exactly once, and no other event.
+    (event,) = world.requests()
+    assert (event.data["request"], event.actor.ref) == (request_id, "alice")
+    assert len(world.store.events(execution_id="e1")) == events_before + 1
+    # Every entry that was not verified survives, at the final name or under rejected/.
+    for entry in made:
+        assert len(_found(world, entry)) == 1, (entry, world.names(), world.rejected())
+        moved_aside = any(fs.REJECTED in place for place in _found(world, entry))
+        if moved_aside:
+            assert any("rejected/" in report for report in applied.reports)
+    if target.exists():  # no symlink target is touched
+        assert fs.SCHEMA in target.read_text()
+    assert not os.path.lexists(temporary)  # the verified request's companion is gone
+    world.check_i11()
+
+
+def test_a_tight_loop_of_mixed_entries_loses_nothing(world: World, tmp_path: Path) -> None:
+    """A writer creates entries of every kind at the final name as fast as it can
+    while the worker applies and cleans up. Every entry is accounted for: valid
+    requests recorded once (and only then deleted), everything else preserved;
+    nothing unvalidated is recorded, no symlink target is touched."""
+    os.close(world.inbox())
+    created: list[Made] = []
+    valid_ids: list[str] = []
+    stop = threading.Event()
+    counter = itertools.count()
+
+    def writer() -> None:
+        while not stop.is_set():
+            n = next(counter)
+            kind = ("valid", "invalid", "symlink", "fifo")[n % 4]
+            staged = world.box / f".staged-{n}"
+            if kind == "valid":
+                request_id = f"q-{n:032x}"
+                _valid_file(world, staged, request_id)
+                entry = Made(kind, staged.read_bytes())
+            elif kind == "invalid":
+                staged.write_text(f'{{"n":{n}}}')
+                staged.chmod(0o600)
+                entry = Made(kind, staged.read_bytes())
+            elif kind == "symlink":
+                target = tmp_path / f"target-{n}.json"
+                _valid_file(world, target, f"q-{n:032x}")
+                staged.symlink_to(target)
+                entry = Made(kind, str(target))
+            else:
+                os.mkfifo(staged, 0o600)
+                entry = Made(kind, n)
+            try:
+                os.link(staged, world.box / FINAL, follow_symlinks=False)
+            except FileExistsError:
+                os.unlink(staged)
+                continue
+            os.unlink(staged)
+            created.append(entry)
+            if kind == "valid":
+                valid_ids.append(f"q-{n:032x}")
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    cancellations = world.cancellations()
+    try:
+        for _ in range(300):
+            cancellations.apply(world.execution(), world.lease)
+    finally:
+        stop.set()
+        thread.join()
+    cancellations.apply(world.execution(), world.lease)  # settle the last entry
+    recorded = [str(e.data["request"]) for e in world.requests()]
+    assert len(recorded) == len(set(recorded))  # never twice
+    assert set(recorded) <= set(valid_ids)  # nothing unvalidated
+    assert len(created) > 20
+    rejected = world.box / fs.REJECTED
+    kept = sorted(os.listdir(rejected)) if rejected.exists() else []
+    fifos = sum(1 for n in kept if stat.S_ISFIFO((rejected / n).lstat().st_mode))
+    links = {os.readlink(rejected / n) for n in kept if (rejected / n).is_symlink()}
+    contents = {(rejected / n).read_bytes() for n in kept if (rejected / n).is_file()
+                and not (rejected / n).is_symlink()}  # fmt: skip
+    for entry in created:
+        if entry.kind == "valid":
+            request_id = json.loads(entry.fingerprint)["request"]  # type: ignore[arg-type]
+            assert request_id in recorded or entry.fingerprint in contents, request_id
+        elif entry.kind == "invalid":
+            assert entry.fingerprint in contents
+        elif entry.kind == "symlink":
+            assert entry.fingerprint in links
+            assert fs.SCHEMA in Path(str(entry.fingerprint)).read_text()  # untouched
+    assert fifos == sum(1 for e in created if e.kind == "fifo")
+    assert [n for n in world.names() if n != fs.REJECTED] == []
+    world.check_i11()

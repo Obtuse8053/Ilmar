@@ -929,6 +929,11 @@ def check_cancelled(world: World) -> list[str]:
             problems.append("the claim was not released")
         if any(o.kind is K.FREEZE_CANDIDATE for o in store.operations(execution.id)):
             problems.append("a cancelled run was frozen")
+        runs = [o for o in store.operations(execution.id) if o.kind is K.RUN_AGENT]
+        if len({o.attempt for o in runs}) != len(runs):
+            problems.append("an attempt ran the agent twice")
+        if execution.attempt > 3:
+            problems.append(f"{execution.attempt} attempts")
         if world.agent.runs > execution.attempt:
             problems.append(f"{world.agent.runs} agent runs in {execution.attempt} attempts")
     if world.scm.pushes or world.scm._change_requests:
