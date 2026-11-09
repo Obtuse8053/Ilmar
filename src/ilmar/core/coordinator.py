@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 
+from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS
+from ilmar.core.cancellation import cancellation_accepted
 from ilmar.core.clock import NonDecreasingClock
 from ilmar.core.components import Components
 from ilmar.core.effects import NEVER_TRANSIENT, Effects
@@ -104,6 +106,7 @@ class Coordinator:
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
+        watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
         self._c = components
         self._effects = effects
@@ -120,6 +123,7 @@ class Coordinator:
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
             new_token=new_token,
+            watch_interval_seconds=watch_interval_seconds,
         )
 
     @classmethod
@@ -134,6 +138,7 @@ class Coordinator:
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
         new_pass_id: Callable[[], str] = new_pass_id,
+        watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> Coordinator:
         """Wire the journal, the fenced Verifier and the effects for ``components``.
 
@@ -167,6 +172,7 @@ class Coordinator:
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
             events=events,
+            watch_interval_seconds=watch_interval_seconds,
         )
         if new_id is not None:
             coordinator._new_id = new_id
@@ -330,12 +336,18 @@ class Coordinator:
 
         Never started again automatically: a task with an active execution;
         one with a published (SUCCEEDED) execution, whose change request
-        exists, open or merged; and one whose execution FAILED. Releasing a
-        failed task's claim makes it eligible on the tracker, but running it
-        again would be an automatic retry of a failure that was classified
-        as not retryable (ADR-0021). A human decides.
+        exists, open or merged; one whose execution FAILED; and one whose
+        execution was CANCELLED on request (ADR-0025 §3). Releasing such a
+        task's claim makes it eligible on the tracker, but running it again
+        would undo a decision: a failure classified as not retryable
+        (ADR-0021), or a person's cancellation. A human decides (#12).
         """
         finished = {e.task for e in self._store.list_in_states({S.SUCCEEDED, S.FAILED})}
+        finished |= {
+            e.task
+            for e in self._store.list_in_states({S.CANCELLED})
+            if cancellation_accepted(self._store, e.id)
+        }
         for task in sorted(self._c.task_provider.list_eligible(), key=lambda t: t.ref.key):
             if task.ref in finished or self._store.active_for_task(task.ref) is not None:
                 continue

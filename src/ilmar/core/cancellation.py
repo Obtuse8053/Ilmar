@@ -52,6 +52,18 @@ class Applied:
     reports: tuple[str, ...] = field(default_factory=tuple)
 
 
+def cancellation_accepted(store: ExecutionStore, execution_id: str) -> bool:
+    """Whether an ``accepted`` ``execution.cancel_requested`` is recorded for it.
+
+    On an execution that is not terminal yet, that is a pending cancellation:
+    every decision point reads it from the store (ADR-0025 §1).
+    """
+    return any(
+        e.type is EventType.EXECUTION_CANCEL_REQUESTED and e.data.get("decision") == "accepted"
+        for e in store.events(execution_id=execution_id)
+    )
+
+
 class Cancellations:
     """The coordinator's side of the request inbox, used by the lease holder."""
 
@@ -89,7 +101,7 @@ class Cancellations:
 
     def accepted(self, execution_id: str) -> bool:
         """Whether a cancellation of this execution was accepted (durable state)."""
-        return any(e.data.get("decision") == "accepted" for e in self._requests(execution_id))
+        return cancellation_accepted(self._store, execution_id)
 
     def decide(self, execution: Execution) -> str:
         if execution.state.is_terminal:

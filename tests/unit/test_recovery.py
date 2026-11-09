@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -850,6 +851,106 @@ def check_merged(world: World, *, merged: bool = True) -> list[str]:
     return problems + notes_posted_once(world)
 
 
+def submit_cancel(world: World, once: list[bool]) -> None:
+    """A person runs ``ilmar cancel`` once, for the execution that is running: a
+    file in the private inbox, which survives every crash (ADR-0025 §1a)."""
+    from ilmar.core import cancel_inbox
+
+    if once:
+        return
+    with SQLiteExecutionStore.open_read_only(world.db) as store:
+        active = store.list_in_states({s for s in ExecutionState if not s.is_terminal})
+    fd = cancel_inbox.open_inbox(world.layout.coordinator_root, create=True)
+    try:
+        for execution in active:
+            cancel_inbox.submit(fd, execution.id, "alice", now=world.clock())
+            once.append(True)
+    finally:
+        os.close(fd)
+
+
+def cancelled_during_run_world(root: Path) -> World:
+    world = World(root)
+    once: list[bool] = []
+    world.agent.during = lambda: submit_cancel(world, once)
+    return world
+
+
+def cancelled_after_claim_world(root: Path) -> World:
+    world = World(root)
+    original = world.tasks.claim
+    once: list[bool] = []
+
+    def claim(ref: Any) -> Any:
+        outcome = original(ref)
+        submit_cancel(world, once)
+        return outcome
+
+    world.tasks.claim = claim  # type: ignore[method-assign]
+    return world
+
+
+def check_cancelled(world: World) -> list[str]:
+    """ADR-0025 after recovery: I12, the claim released once, the request recorded
+    once, nothing left in the inbox, the task never picked again (and I11, checked
+    by every ``Process.exit``)."""
+    from ilmar.core import cancel_inbox
+    from ilmar.domain.events import EventType
+
+    problems = notes_posted_once(world)
+    with SQLiteExecutionStore(world.db) as store:
+        executions = store.list_in_states(set(ExecutionState))
+        if [e.state for e in executions] != [S.CANCELLED]:
+            return [f"expected one cancelled execution: {[e.state.value for e in executions]}"]
+        (execution,) = executions
+        events = store.events(execution_id=execution.id)
+        recorded = [e for e in events if e.type is EventType.EXECUTION_CANCEL_REQUESTED]
+        if [e.data.get("decision") for e in recorded] != ["accepted"]:
+            problems.append(f"recorded: {[e.data for e in recorded]}")
+        accepted = min((e.seq or 0) for e in recorded) if recorded else 0
+        forbidden = ("run-agent:", "freeze-candidate:", "verify:", "publish-revision:")
+        late = [e.operation for e in events if e.type is EventType.OPERATION_INTENDED
+                and (e.seq or 0) > accepted and str(e.operation).startswith(forbidden)]  # fmt: skip
+        if late:
+            problems.append(f"I12: started after the cancellation was accepted: {late}")
+        into = [e.reason for e in events if e.type is EventType.EXECUTION_TRANSITIONED
+                and e.data.get("to") == "cancelled"]  # fmt: skip
+        if into != ["cancel-requested"]:
+            problems.append(f"transition reasons: {into}")
+        if store.unfinished_operations():
+            problems.append(f"unfinished: {[o.key for o in store.unfinished_operations()]}")
+        rows = store.resources(execution_id=execution.id)
+        if any(r.kind is ResourceKind.CONTAINER and r.status is not R.RELEASED for r in rows):
+            problems.append("a sandbox row is not released")
+        if any(r.status is R.QUARANTINED for r in rows):
+            problems.append("a resource was quarantined")
+        release = store.operation(f"release-task:{execution.id}:{execution.attempt}:cancelled")
+        if release is None or release.status.value != "succeeded":
+            problems.append("the claim was not released")
+        if any(o.kind is K.FREEZE_CANDIDATE for o in store.operations(execution.id)):
+            problems.append("a cancelled run was frozen")
+        if world.agent.runs > execution.attempt:
+            problems.append(f"{world.agent.runs} agent runs in {execution.attempt} attempts")
+    if world.scm.pushes or world.scm._change_requests:
+        problems.append("a cancelled execution published something")
+    if world.runtime._containers:
+        problems.append("live sandboxes remain")
+    if world.tasks.list_eligible() != (task("1"),):
+        problems.append("the cancelled task's claim is still held")
+    box = world.layout.coordinator_root.joinpath(*cancel_inbox.INBOX_PARTS)
+    left = [n for n in os.listdir(box) if n != cancel_inbox.REJECTED] if box.exists() else []
+    if left:
+        problems.append(f"inbox leftovers: {left}")
+    if box.joinpath(cancel_inbox.REJECTED).exists():
+        problems.append("a valid request was set aside")
+    again = world.process()
+    report = again.run()
+    again.exit()
+    if report is None or report.summary != "no eligible task":
+        problems.append(f"picked again: {report.summary if report else 'crash'}")
+    return problems
+
+
 Scenario = tuple[
     Callable[[Path], World], Callable[[World], None] | None, Callable[[World], list[str]]
 ]
@@ -860,6 +961,8 @@ SCENARIOS: dict[str, Scenario] = {
     "security": (security_world, None, partial(check_failed, verified=False)),
     "merged": (World, merge, check_merged),
     "closed": (World, close, partial(check_merged, merged=False)),
+    "cancelled-during-run": (cancelled_during_run_world, None, check_cancelled),
+    "cancelled-after-claim": (cancelled_after_claim_world, None, check_cancelled),
 }
 
 
