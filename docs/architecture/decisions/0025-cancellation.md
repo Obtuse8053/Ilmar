@@ -629,3 +629,23 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
 - Verification runs become long enough that waiting for them is a problem.
   The stop signal could then reach the verifier too.
 - Podman gains a way to bound an exec session's lifetime (F-024).
+
+## Clarification (2026-11-09, #16 part 1 review)
+
+Section 1a lets the worker remove an execution's temporary files once the
+execution is terminal or a request for it was applied. A submitter can still
+be running at that moment: the worker may then remove its temporary file
+before the submitter's `linkat`. Section 1a does not say what the CLI does
+then. This clarifies section 1a; the decision is unchanged.
+
+- **Nothing is published.** `linkat` fails with `ENOENT` because the source is
+  gone. The final name is untouched and no request is lost or overwritten.
+- **The CLI retries with bounded attempts.** It starts again from step 1
+  with a new request id, at most three attempts in all. The same applies
+  when step 5 finds the final name gone, which happens when the worker took
+  the standing request between the `EEXIST` and the read.
+- **After the last attempt, it fails closed.** The CLI reports that the inbox
+  kept changing and exits 3. It never falls back to `rename` or to
+  overwriting, and it never reports a request it did not see.
+
+The worker's cleanup rules are unchanged.
