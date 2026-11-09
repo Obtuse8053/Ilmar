@@ -57,21 +57,47 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#17 (plan step 2): structured event logging, under ADR-0024, in four
-reviewable pull requests:
-1. the domain: schema, reason codes, derivation, the I11 fold;
-2. the store: the `events` table, events in the same transaction as every
-   write, the lock-held migration with its baseline, the read-only open;
-3. the core: the coordinator supplies each commit's context (pass, reason
-   codes, durations), and the crash suite checks that `unclassified` never
-   appears;
-4. the `ilmar events` and `ilmar events verify` commands.
+Finish #17 (plan step 2). Its four implementation parts are merged (PRs #64,
+#65, #66 and #68; ADR-0024 with its clarification, #67). The close-out audit
+([comment on #17](https://github.com/Obtuse8053/Ilmar/issues/17#issuecomment-6734099160))
+found three small gaps, for one more pull request:
+1. record the change-request state (merged or closed) as the observation on
+   the events of the claim release it decides;
+2. show the stable reason code in the `ilmar run --once` output, keeping the
+   human-readable text;
+3. decide on ADR-0024's diagnostic stream (`provider.read`, `pass.started`,
+   `pass.finished`): implement it, or defer it explicitly. It needs a
+   maintainer decision.
 
-Cancellation (#16), stall detection (#13) and budgets (#18) build on it.
+After that, #16 (cancellation), as the planned order says.
 
 **Waiting for the maintainer's explicit go-ahead.**
 
 ## Change log
+
+- 2026-11-09: **#17 implementation merged; close-out found three gaps,** so
+  #17 stays open.
+  - **The four parts:**
+    - #64: the domain, with the schema, reason codes, derivation and the I11
+      fold;
+    - #65: the SQLite event store, with events in the same fenced
+      transaction as every write, the lock-held migration with its baseline,
+      and the read-only open;
+    - #66: the coordinator's event context (pass, durations, error classes,
+      codes, reconciliation observations), with a fail-closed reason-code
+      boundary (ADR-0024 clarification, #67);
+    - #68: `ilmar events` and `ilmar events verify`
+      (`docs/operations/events.md`).
+  - **Evidence:**
+    - on `053da9d`, CI is green, including real Podman;
+    - pytest passes on Python 3.11, 3.12 and 3.13: 2048 tests;
+    - I11 is checked after every coordinator pass in every test and at
+      every crash point, including recovery of stores from the previous
+      schema.
+  - **Gaps, in the [audit](https://github.com/Obtuse8053/Ilmar/issues/17#issuecomment-6734099160):**
+    - the change-request observation is not in the events;
+    - the reason code is not in the `run` output;
+    - the diagnostic stream needs a decision.
 
 - 2026-11-08: **#15 finished** (restart recovery): audited against ADR-0012,
   ADR-0020, ADR-0022, the code and the tests. The evidence matrix is on #15.
