@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import timedelta
 from pathlib import Path
 
@@ -59,6 +59,21 @@ LOST = "task-claim-lost"
 @pytest.fixture
 def setup(tmp_path: Path) -> Setup:
     return make_setup(tmp_path)
+
+
+@pytest.fixture
+def sqlite() -> Iterator[Callable[[Path], SQLiteExecutionStore]]:
+    """Open SQLite stores that are all closed at the end of the test."""
+    opened: list[SQLiteExecutionStore] = []
+
+    def open_store(path: Path) -> SQLiteExecutionStore:
+        store = SQLiteExecutionStore(path)
+        opened.append(store)
+        return store
+
+    yield open_store
+    for store in opened:
+        store.close()
 
 
 def run(setup: Setup) -> PassReport:
@@ -793,10 +808,12 @@ def test_the_wall_clock_never_changes_a_decision(tmp_path: Path, clock: str) -> 
     assert into(setup, S.CANCELLED) == [LOST]
 
 
-def test_a_restored_snapshot_does_not_change_the_outcome(tmp_path: Path) -> None:
+def test_a_restored_snapshot_does_not_change_the_outcome(
+    tmp_path: Path, sqlite: Callable[[Path], SQLiteExecutionStore]
+) -> None:
     (tmp_path / "a").mkdir()
     db = tmp_path / "executions.sqlite3"
-    setup = make_setup(tmp_path / "a", store=SQLiteExecutionStore(db))
+    setup = make_setup(tmp_path / "a", store=sqlite(db))
     setup.agent.during = lose(setup, {1, 3, 5, 7})
     run(setup)  # P0
     run(setup)  # P1: observed
@@ -813,7 +830,7 @@ def test_a_restored_snapshot_does_not_change_the_outcome(tmp_path: Path) -> None
         Path(str(db) + side).unlink(missing_ok=True)
         if Path(str(snapshot) + side).exists():
             shutil.copy(Path(str(snapshot) + side), Path(str(db) + side))
-    restored = SQLiteExecutionStore(db)
+    restored = sqlite(db)
     setup.store = restored
     setup.components.execution_store = restored
     setup.ownership = Ownership.take(layout=setup.layout, store=restored, instance_id="inst",
@@ -970,11 +987,11 @@ class Died(BaseException):
 @pytest.mark.parametrize("point", ["intent", "effect", "after-effect", "outcome"])
 @pytest.mark.parametrize("second", [False, True])
 def test_an_orphan_release_survives_crashes_and_never_touches_a_newer_claim(
-    tmp_path: Path, point: str, second: bool
+    tmp_path: Path, point: str, second: bool, sqlite: Callable[[Path], SQLiteExecutionStore]
 ) -> None:
     db = tmp_path / "executions.sqlite3"
     (tmp_path / "s").mkdir()
-    setup = make_setup(tmp_path / "s", store=SQLiteExecutionStore(db), tasks=(task("1"),))
+    setup = make_setup(tmp_path / "s", store=sqlite(db), tasks=(task("1"),))
     old = orphan(setup)
     setup.tasks.tracked(REF).eligible = False  # keep the task out of the queue
     original_commit = setup.store.commit
