@@ -99,6 +99,16 @@ human cancellation, and how all of it survives a crash.
    rechecks the token, marker and author right before deleting. A newer
    claim is always a **different object**, so it can never be selected.
 
+**How a missing label is restored:**
+1. *Through `claim`* (the previous draft). Rejected (final review). If the
+   claim object vanished meanwhile, `claim` either posts a new claim,
+   undoing a human's revocation, or reports `CLAIMED_BY_OTHER` because of
+   Ilmar's own label. That turned into a cancellation on one read, with a
+   false reason.
+2. **A targeted `restore_label` on the exact object the `HELD` read
+   returned.** Chosen. It only adds the label, and its result never decides
+   anything (§5).
+
 **Debouncing ineligibility:**
 1. *Require every ineligibility to be seen on two passes.* Rejected. It adds
    latency to deliberate human acts, and the risk it guards against is only
@@ -135,7 +145,7 @@ writes. The result is one of:
 
 | Standing | Meaning | Reason code |
 | --- | --- | --- |
-| `HELD` | Open, still eligible-labelled, not excluded, no other claim, and **this instance's own claim is present**. `label_missing=True` when the claim comment is there but `claimed_label` is not. | — |
+| `HELD` | Open, still eligible-labelled, not excluded, no other claim, and **this instance's own claim is present**. It carries that claim as a `HeldClaim` (§5): the task, the token and the object id. `label_missing=True` when the claim comment is there but `claimed_label` is not. | — |
 | `CLAIM_LOST` | Open and still wanted, but this instance's claim is gone, for example its comment was deleted. | `task-claim-lost` |
 | `CLAIMED_BY_OTHER` | An assignee, a human claim label, or another instance's claim is present (ADR-0013). | `task-claimed-by-human`, `task-claimed-by-other-instance` |
 | `INELIGIBLE` | Closed, the eligible label removed, or an excluded label added. | `task-closed`, `task-unlabelled`, `task-excluded` |
@@ -145,6 +155,13 @@ writes. The result is one of:
 - **Precedence of reasons.** When several apply, the most decisive one is
   reported, in this order: `GONE`, then `task-closed`, then
   `CLAIMED_BY_OTHER`, then the label reasons, then `CLAIM_LOST`.
+- **Every read is fresh.** Each call issues its own requests to the
+  tracker, in the current pass.
+  - **No cache:** no client-side cache, memo or reuse of a response
+    across calls or passes.
+  - **Allowed:** conditional requests (ETags), because the tracker itself
+    validates them.
+  - **Why:** §3a's two observations are independent only because of this.
 - **Fail closed on uncertainty.** A failed read, a rate limit, a 5xx, or a
   403 (which can mean the token lost access) raises `ProviderError`. Any
   other unexpected response does the same. **Uncertainty never cancels
@@ -233,7 +250,7 @@ sign of the claim between them, in **three distinct passes**:
 
 | Pass | What happens there |
 | --- | --- |
-| `P0` | This execution's own latest claim write: its `claim` or `restore-claim` succeeded. |
+| `P0` | This execution's own latest claim write: the pass of the **latest commit of its `claim` operation**, whether that is its intent, a repeated intent or its outcome. A label restore (§5) is not a claim write: it never posts or removes a claim. |
 | `P1` | The first observation, a fresh `CLAIM_LOST` read, is recorded. `P1` differs from `P0` and follows it. |
 | `P2` | The confirming observation, a fresh `CLAIM_LOST` read. `P2` differs from `P1` and follows it. |
 
@@ -272,9 +289,8 @@ store's checks on extra events). Its fields:
 - `reason`: `task-claim-lost`;
 - the envelope's `pass` (ADR-0024) and `epoch`;
 - `data.state`: `observed` or `cleared`;
-- `data.claim`: the id of the claim the execution last held. It is the
-  opaque `claim_id` from the execution's latest successful `claim` or
-  `restore-claim`, recorded in that operation's result.
+- `data.claim`: the id of the claim the execution holds. It is the opaque
+  `claim_id` that the `claim` operation recorded in its result.
 
 **The open observation.** It is the latest `execution.claim_lost` event of
 the execution, if its state is `observed`. At most one is open at a time.
@@ -284,9 +300,11 @@ The predicate is read from the durable events, never from memory.
 continues when **all** of the following hold:
 - the standing is `CLAIM_LOST`;
 - no observation is open;
-- **the current pass is not the pass of this execution's latest successful
-  `claim` or `restore-claim`.** That pass is the one whose events carry the
-  operation's success.
+- **the current pass is not `P0`.** `P0` is the pass of the latest
+  `operation.*` event of this execution's `claim` operation;
+- **that `claim` operation has succeeded.** While it is absent or
+  unfinished, the execution has no claim to lose, so `CLAIM_LOST` is
+  ignored.
 
 Nothing else changes: no transition, no release, no effect. A `CLAIM_LOST`
 read in the claim's own pass is ignored. It is neither recorded nor
@@ -300,11 +318,10 @@ when **all** of the following hold:
 3. it was recorded in **another pass**: its pass id differs from the
    current one, and its `seq` is lower than any event of the current pass;
 4. it **follows this execution's latest claim write:**
-   - its `seq` is greater than that of the latest successful `claim` or
-     `restore-claim`;
-   - its pass differs from that operation's pass;
-5. its `data.claim` equals the execution's current claim id, so no `claim`
-   or `restore-claim` of this execution has succeeded since;
+   - its `seq` is greater than that of every `operation.*` event of the
+     `claim` operation;
+   - its pass differs from the pass of the latest one;
+5. its `data.claim` equals the claim id in the `claim` operation's result;
 6. the execution is not past a `publish-revision` intent (§2).
 
 Rules 3 to 5 read only event order and identities from the store. No
@@ -329,8 +346,12 @@ The confirmation and the decision are one fenced commit:
 same commit as what caused the reset, when any of these happen:
 - a fresh read shows `HELD`, with or without `label_missing`: the claim
   reappeared;
-- this execution's `claim` or `restore-claim` succeeds: Ilmar's own write,
-  so a later "lost" is a new observation;
+- any commit of this execution's `claim` operation (an intent, a repeated
+  intent, or an outcome): Ilmar's own claim write, so a later "lost" is a
+  new observation. If the commit cannot carry the `cleared` event (a
+  repeated intent takes no extra changes, see the journal), `cleared` is
+  committed on its own just before it. A crash in between only clears,
+  which is the safe direction;
 - any other standing decides the execution: it is `INELIGIBLE`,
   `CLAIMED_BY_OTHER` or `GONE`, which by §1's precedence outranks the lost
   claim and decides at once;
@@ -364,14 +385,44 @@ recording after a crash cannot open a second observation.
 
 ### 5. Claims: labels, and orphaned claims
 
-**Restoring a missing label.**
-- `HELD` with `label_missing`: the worker calls the existing `claim`, which
-  in the "only our claim present" path re-applies `claimed_label` and
-  returns `CLAIMED` (ADR-0013).
-- It is journaled as a new repeatable operation `restore-claim`, keyed
-  `restore-claim:<execution>:<attempt>:<n>`.
-- Any other result of that `claim` is treated as the corresponding standing
-  in §3.
+**Restoring a missing label: targeted, and never a claim.**
+- **When:** the standing is `HELD` with `label_missing`.
+- **How:** the worker calls the new
+  `TaskProvider.restore_label(claim) -> RESTORED | ABSENT | CHANGED`, with
+  the `HeldClaim` that this `HELD` read returned.
+- **The journal:** the new repeatable operation `restore-claim-label`,
+  keyed `restore-claim-label:<execution>:<attempt>:<n>`. It records the
+  claim's object id and token in its intent.
+- **The effect** mirrors `release_claim`:
+  1. Re-read **that object** by its id.
+  2. If it is absent, the result is `ABSENT`.
+  3. If it is no longer this adapter's authentic claim with that token, the
+     result is `CHANGED`.
+  4. Otherwise add `claimed_label`, and only that label. The result is
+     `RESTORED`.
+
+  It **never posts a claim, never deletes anything, and never removes a
+  label.**
+- **The result is never a standing decision:**
+  - `RESTORED` and `ABSENT` settle the operation as succeeded. `ABSENT` is
+    recorded with the observation `claim-absent`.
+  - `CHANGED` settles it as failed (`claim-changed`).
+
+  What happens to the execution is decided only by the next fresh
+  `standing` read, under §3 and §3a. An `ABSENT` here is **not** a
+  `CLAIM_LOST` observation.
+- **Interrupted, it is simply performed again from its recorded intent.**
+  That is safe: it can only re-add a label beside the one authentic claim
+  object it names.
+- **Why not reuse `claim`** (the previous draft):
+  - **A false reason on one read:** if the claim comment vanished between
+    the read and the effect, while Ilmar's own label was present (for
+    example after an interrupted restore that had already re-added it),
+    `claim` returns `CLAIMED_BY_OTHER`. The draft mapped that to an
+    immediate cancellation, with a wrong reason and on a single read,
+    bypassing §3a.
+  - **Undoing a human's revocation:** without the label, `claim` posts a
+    **new** claim, silently undoing a human's deletion of Ilmar's claim.
 
 **Orphaned claims.**
 
@@ -475,12 +526,15 @@ because the record is written first (ADR-0021). A test keeps that order.
 
 **The port gains:**
 - two read-only methods, `standing(ref)` and `held_claims()`;
-- one targeted write, `release_claim(claim) -> RELEASED | ABSENT | CHANGED`
-  (§5). It is used only by `release-orphan-claim`, and it deletes at most
-  the one object it names.
+- two targeted writes, each acting on exactly one named claim object (§5):
+  - `release_claim(claim) -> RELEASED | ABSENT | CHANGED`: used only by
+    `release-orphan-claim`; it deletes at most that object;
+  - `restore_label(claim) -> RESTORED | ABSENT | CHANGED`: used only by
+    `restore-claim-label`; it only adds `claimed_label` beside that object.
 
 `claim` returns the new claim's `claim_id` alongside its outcome, so that
-the execution's `claim` and `restore-claim` results can record it (§3a).
+the execution's `claim` result can record it (§3a). `claim` is called only
+to claim a task (ADR-0021), never to repair one.
 `release`, `get`, `list_eligible` and `post_update` keep their signatures.
 `claim` and `release` gain the authenticity rule below.
 
@@ -546,13 +600,13 @@ That rule applies to `claim`, `release`, `standing` and `held_claims`.
 | --- | --- |
 | Before a decision is recorded | Nothing durable happened. The next pass reads the standing again and decides from the tracker as it is then. |
 | After the decision, before the ending completes | It is a pending cancellation: ADR-0025 §5 applies unchanged. |
-| During `restore-claim` | It is repeatable: performed again. An unclear outcome is settled by the next standing read. |
+| During `restore-claim-label` | Performed again from its recorded intent: the same object id and token. It can only add the label beside that authentic object, and otherwise settles as `ABSENT` or `CHANGED`. It is never a standing decision; the next fresh `standing` read decides (§5). |
 | `release-orphan-claim` intent recorded, effect not done | Performed again **from the recorded intent**: the same object id and token, never re-selected by task. If the object is gone, the result is `ABSENT`. A newer claim posted meanwhile is a different object and is untouched. |
 | After the delete, before the label step or the record | Performed again: the object is `ABSENT`, the label step reruns its "no claim remains" check, and the operation settles as succeeded (`claim-absent`). |
 | After the effect, before the outcome commit | It is ambiguous. Settled by observation: re-read the recorded object. If it is absent, succeeded. If it is present and unchanged, delete again. If it changed, failed (`claim-changed`). |
 | Before recording a first `CLAIM_LOST` observation | Nothing is durable. The next pass reads again and records the first observation then. |
 | After the first observation is recorded | It is open, and durable across the crash. Confirmation needs a fresh `CLAIM_LOST` read in a **later** pass, ordered by `seq` (§3a). The restarted coordinator's passes always follow it. |
-| After a claim or `restore-claim` succeeded, before any later read | The write's pass is durable on its success events. Reads in that pass are never recorded, so no observation can come from the write's lag window, even across a crash. |
+| During `claim`, or after it, before any later read | Every commit of the `claim` operation carries its pass. `P0` is the pass of the latest one, so an interrupted claim's pass counts as a write pass too. An unfinished `claim` makes `CLAIM_LOST` ignored altogether. No observation can come from a claim write's lag window, even across a crash. |
 | Between the confirming read and its commit | Nothing is durable. The next pass rereads and decides then, or resets if the claim is back. |
 | After the confirming commit | The decision is a pending cancellation: ADR-0025 §5 applies. |
 
@@ -562,6 +616,7 @@ point in the crash suite:
   backed (§5);
 - an orphan release deletes only the object recorded in its intent, after
   revalidation;
+- a label restore never posts a claim and never decides a cancellation;
 - no `task-claim-lost` cancellation exists without an earlier, uncleared
   `observed` event. That event must come from a pass that differs from the
   decision's pass and from the pass of the latest claim write before it,
@@ -634,6 +689,9 @@ but it must precede #20** (unattended operation, which already depends on
 ### Tests the implementation must add
 
 - **Contract (`TaskProviderContract`; the fake and the GitHub adapter):**
+  - **Freshness:** each `standing` call issues its own tracker requests. A
+    change made between two calls, including between two passes, is always
+    seen by the second. No response is reused.
   - each standing and each reason: a task becomes closed, unlabelled,
     excluded, assigned, human-claimed, claimed by another instance, gone, or
     loses our claim;
@@ -663,7 +721,8 @@ but it must precede #20** (unattended operation, which already depends on
     - terminal executions are not read.
   - `CLAIM_LOST` decides only on a second pass; a single observation only
     records.
-  - the label is restored through `restore-claim`.
+  - the label is restored through `restore-claim-label`, and only beside
+    the authentic claim object that the `HELD` read returned.
   - human and tracker precedence, in both orders:
     - the first accepted cancellation wins;
     - a failure first stays a failure.
@@ -734,8 +793,9 @@ but it must precede #20** (unattended operation, which already depends on
   - **Reset:**
     - the claim reappears (`HELD`) between the observations: `cleared`
       with `claim-present`, and a later loss needs two observations again;
-    - this execution's own `claim` or `restore-claim` succeeds after the
-      observation: `cleared`, and the old observation can never confirm;
+    - any commit of this execution's `claim` operation after the
+      observation (intent, repeated intent, outcome): `cleared`, and the old
+      observation can never confirm;
     - an observation whose `data.claim` differs from the current claim id
       never confirms.
   - **Read-after-write lag:**
@@ -743,7 +803,23 @@ but it must precede #20** (unattended operation, which already depends on
       own pass never cancels;
     - one that is invisible for that pass plus one more pass, then seen,
       resets and never cancels;
-    - after a `restore-claim`, the same holds from that write's pass.
+    - while the `claim` operation is unfinished, `CLAIM_LOST` is ignored;
+    - the pass of an **interrupted** `claim` counts as `P0`.
+  - **Label restore is never a decision (regressions for the review of
+    `cc295d7`):**
+    - an interrupted label restore that had already re-added the label,
+      then the claim comment deleted by a human, then the restore performed
+      again: the restore settles `ABSENT`. There is **no** cancellation in
+      that pass, **no** `CLAIMED_BY_OTHER`, and nothing is posted. The lost
+      claim is then confirmed only under §3a: two later fresh reads in two
+      passes, with reason `task-claim-lost`.
+    - the claim comment deleted between the `HELD` read and the restore's
+      effect, with the label missing: `ABSENT`. No new claim is ever posted,
+      and the human's deletion stands.
+    - the claim comment edited (token, marker or instance), or replaced by
+      a forged copy, before the effect: `CHANGED`. No label is added.
+    - `restore_label` performs no write other than adding `claimed_label`
+      to that one task.
   - **Precedence:** an `INELIGIBLE`, `CLAIMED_BY_OTHER` or `GONE` read
     while an observation is open decides at once with that reason, and
     clears the observation.
