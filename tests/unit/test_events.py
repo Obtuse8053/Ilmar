@@ -264,7 +264,12 @@ ADR_CODES = {
 }  # fmt: skip
 
 
-ADDED_CODES = {"no-changes", "ci-config-changed", "checkout-failed"}  # #17 part 3
+ADDED_CODES = {
+    "no-changes",
+    "ci-config-changed",
+    "checkout-failed",  # #17 part 3
+    "cancel-requested",
+}  # ADR-0025 (#16)
 
 
 def test_the_reason_codes_are_the_adr_table_and_the_deliberate_additions() -> None:

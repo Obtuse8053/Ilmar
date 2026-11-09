@@ -181,6 +181,7 @@ class Journal:
                 resources=intent_commit.resources,
                 expected=((execution.id, expected),),
                 reasons=intent_commit.reasons,
+                extra_events=intent_commit.extra_events,
             ),
             context=self._events.context(fence, observations=seen),
         )
@@ -424,6 +425,7 @@ def _check_scope(changes: Commit, execution_id: str) -> None:
     owners |= {o.execution_id for o in changes.operations}
     owners |= {r.execution_id for r in changes.resources}
     owners |= {execution for execution, _ in changes.expected}
+    owners |= {str(event.execution) for event in changes.extra_events}
     foreign = sorted(owners - {execution_id})
     if foreign:
         raise LedgerIntegrityError(
@@ -438,6 +440,7 @@ def _with(changes: Commit, operation: Operation) -> Commit:
         operations=(operation, *changes.operations),
         resources=changes.resources,
         reasons=changes.reasons,
+        extra_events=changes.extra_events,
     )
 
 

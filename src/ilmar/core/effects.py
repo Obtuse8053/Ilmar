@@ -1150,4 +1150,5 @@ def _merge(first: Commit, second: Commit) -> Commit:
         resources=first.resources + second.resources,
         expected=first.expected + second.expected,
         reasons={**first.reasons, **second.reasons},
+        extra_events=first.extra_events + second.extra_events,
     )

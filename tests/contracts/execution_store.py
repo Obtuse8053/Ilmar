@@ -24,7 +24,7 @@ from ilmar.domain.errors import (
     LedgerIntegrityError,
 )
 from ilmar.domain.event_history import StoredState, verify
-from ilmar.domain.events import Event, EventContext, EventType, derive_events
+from ilmar.domain.events import Actor, ActorKind, Event, EventContext, EventType, derive_events
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
@@ -636,6 +636,94 @@ class EventLogContract:
         assert [e.seq for e in store.events(after_seq=2)] == [3, 4, 5]
         assert [e.seq for e in store.events(after_seq=1, limit=2)] == [2, 3]
         assert store.events(after_seq=5) == ()
+
+    # -- extra events (ADR-0025 §4: execution.cancel_requested) ---------------------------
+
+    def test_an_extra_event_is_written_in_its_commit_and_keeps_i11(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        before = len(store.events())
+        updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="r")
+        extra = cancel_event(fence)
+        context = EventContext(at=at(2), instance="inst", epoch=fence.epoch)
+        store.commit(fence, Commit(applied=((updated, step),), extra_events=(extra,)),
+                     context=context)  # fmt: skip
+        new = store.events(after_seq=before)
+        assert types(new) == ["execution.transitioned", "execution.cancel_requested"]
+        stored = new[-1]
+        assert stored.seq == before + 2
+        assert dataclasses.replace(stored, seq=None) == extra
+        assert store.get("e1") == updated
+        check_i11(store)
+
+    def test_an_extra_event_alone_changes_no_row(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        store.commit(fence, Commit(extra_events=(cancel_event(fence),)))
+        assert store.events()[-1].type is EventType.EXECUTION_CANCEL_REQUESTED
+        assert store.get("e1") == execution
+        check_i11(store)
+
+    @pytest.mark.parametrize(
+        "spoil",
+        ["type", "epoch", "instance", "seq", "unknown-execution", "migration", "object", "flagged"],
+    )
+    def test_an_invalid_extra_event_rolls_back_the_whole_commit(
+        self, store: ExecutionStore, spoil: str
+    ) -> None:
+        fence = claimed(store)
+        execution = fenced_execution(store, fence)
+        good = cancel_event(fence)
+        bad: object
+        if spoil == "type":
+            bad = Event.create(EventType.EXECUTION_TRANSITIONED, at=at(2), instance="inst",
+                               epoch=fence.epoch, actor=good.actor, execution="e1",
+                               data={"from": "queued", "to": "claimed", "version": 2})  # fmt: skip
+        elif spoil == "epoch":
+            bad = dataclasses.replace(good, epoch=fence.epoch + 1)
+        elif spoil == "instance":
+            bad = dataclasses.replace(good, instance="other")
+        elif spoil == "seq":
+            bad = dataclasses.replace(good, seq=99)
+        elif spoil == "unknown-execution":
+            bad = cancel_event(fence, execution="nobody")
+        elif spoil == "flagged":
+            bad = dataclasses.replace(good, flags=frozenset({"redacted"}))
+        elif spoil == "migration":
+            bad = dataclasses.replace(good, actor=Actor(ActorKind.MIGRATION))
+        else:
+            bad = {"type": "execution.cancel_requested"}
+        before = (store.events(), store.history("e1"))
+        updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="r")
+        with pytest.raises((LedgerIntegrityError, ValueError)):
+            store.commit(fence, Commit(applied=((updated, step),),
+                                       extra_events=(bad,)))  # type: ignore[arg-type]  # fmt: skip
+        assert (store.events(), store.history("e1")) == before
+        assert store.get("e1") == execution
+
+    def test_a_stale_fence_writes_no_extra_event(self, store: ExecutionStore) -> None:
+        old = claimed(store)
+        fenced_execution(store, old)
+        claimed(store)
+        before = store.events()
+        with pytest.raises(FencingError):
+            store.commit(old, Commit(extra_events=(cancel_event(old),)))
+        assert store.events() == before
+
+
+def cancel_event(fence: Fence, *, execution: str = "e1", request: str = "q-" + "a" * 32) -> Event:
+    return Event.create(
+        EventType.EXECUTION_CANCEL_REQUESTED,
+        at=at(2),
+        instance=fence.instance_id,
+        epoch=fence.epoch,
+        actor=Actor(ActorKind.HUMAN, "alice"),
+        execution=execution,
+        reason="cancel-requested",
+        data={"request": request, "decision": "accepted"},
+    )
 
 
 class ExecutionStoreContract(FencingContract, EventLogContract):

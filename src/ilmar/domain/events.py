@@ -106,6 +106,7 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "ci-config-changed": "The candidate changes CI configuration, so a human must take over.",
         "checkout-failed": "The base branch could not be checked out; repeating it would fail "
         "the same way.",
+        "cancel-requested": "A person asked to cancel the execution (ADR-0025).",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
 )
@@ -236,6 +237,8 @@ Check = Callable[[Any], bool]
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _PASS = re.compile(r"^p-[0-9a-f]{6,32}$")
+_REQUEST_ID = re.compile(r"^q-[0-9a-f]{32}$")  # a cancellation request (ADR-0025)
+CANCEL_DECISIONS = frozenset({"accepted", "too-late", "already-terminal", "duplicate"})
 _OPERATION_KEY = re.compile(r"^[a-z-]+:[A-Za-z0-9][A-Za-z0-9_-]{0,63}:[1-9][0-9]{0,5}"
                             r"(:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127})?$")  # fmt: skip
 _TASK = re.compile(r"^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._/#-]{1,200}$")
@@ -343,12 +346,12 @@ class EventType(enum.Enum):
     RESOURCE_QUARANTINED = "resource.quarantined"
     EVIDENCE_RECORDED = "evidence.recorded"
     OWNERSHIP_ACQUIRED = "ownership.acquired"
+    EXECUTION_CANCEL_REQUESTED = "execution.cancel_requested"
 
 
 RESERVED_TYPES: Mapping[str, int] = MappingProxyType(
     {  # name -> the issue that defines its data (ADR-0024 §5); not constructible yet
-        "execution.cancel_requested": 16,
-        "execution.cancelled": 16,
+        "execution.cancelled": 16,  # ADR-0025: unused; the transition is the record
         "task.reconciled": 12,
         "claim.released": 12,
         "claim.relabelled": 12,
@@ -431,11 +434,18 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
             "previous_instance": (_pattern(_IDENTIFIER), False),
             "previous_epoch": (_POSITIVE, False),
         },
+        EventType.EXECUTION_CANCEL_REQUESTED: {  # ADR-0025
+            "request": (_pattern(_REQUEST_ID), True),
+            "decision": (_one_of(CANCEL_DECISIONS), True),
+        },
     }
 )
 
 # Event types that need a reason code (a failure, a refusal, a quarantine).
 _NEEDS_REASON = frozenset({EventType.RESOURCE_QUARANTINED})
+# Event types no row derives (ADR-0024 §9, ``Commit.extra_events``): given by the
+# core, with an explicit reason and an execution, never an ``unclassified`` fallback.
+EXTRA_TYPES = frozenset({EventType.EXECUTION_CANCEL_REQUESTED})
 
 
 # -- credential shapes (ADR-0024 §7, layer 3) ------------------------------------------
@@ -788,6 +798,8 @@ def _check_envelope(
         raise error("operation is not a journal key")
     if reason is not None and reason not in REASON_CODES:
         raise error(f"unknown reason code {reason!r}")
+    if kind in EXTRA_TYPES and (execution is None or reason is None):
+        raise error(f"{kind.value} names its execution and its reason")
 
 
 def _replace(event: Event, **changes: Any) -> Event:
