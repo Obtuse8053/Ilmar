@@ -57,20 +57,51 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#16 (plan step 3): cancellation. **ADR-0025 is proposed for review.** It
-covers:
-- requests, submitted by `ilmar cancel` into a private inbox and applied by
-  the lease holder;
-- a stop signal that ends a running agent like a timeout;
-- per-state rules, fencing, crash recovery and the new invariant I12.
+#12 (plan step 4): reconcile executions against the tracker every pass.
+**Start with its ADR (design only).** It must decide:
+- **Ineligible task:** how a task that becomes ineligible while running ends
+  CANCELLED. The natural route is ADR-0025's ending (safe points, I12, the
+  claim and quarantine rules) with a non-human actor and its own reason
+  code. That would add a second source of cancellation besides the human
+  inbox, without changing the inbox rules.
+- **Port change:** the `TaskProvider` extension that lists this instance's
+  claims, with its contract tests and the GitHub adapter.
+- **Orphaned claims:** the release rule for orphaned claims (ADR-0013,
+  ADR-0021), applied before new work is picked.
 
-It includes a narrow addition to ADR-0012 level 1 and port changes in the
-sensitive `ContainerRuntime`, both needing explicit approval.
+Then the implementation, against the fakes and the contract tests.
 
-**Waiting for the maintainer's review.** No #16 implementation before
-ADR-0025 is accepted.
+**Alternatives:**
+- **#51** first, which the plan prefers before #12 "if possible". It is
+  large and sensitive (the `ca_bundle` ADR). It can follow #12's ADR, and
+  then cover #12's GitHub behaviour with a stateful emulator before #12's
+  live tests.
+- **#13** first, if you'd rather defer tracker work. It has the longest
+  remaining chain: #13, then #18 and #14.
+
+No implementation starts without approval.
 
 ## Change log
+
+- 2026-11-09: **#16 finished** (cancellation, ADR-0025 with the #76
+  clarification).
+  - **Implementation:** #74 (inbox, CLI, durable events), #75 (inbox read
+    race), #77 (stop signal in `ContainerRuntime` and `AgentRunner`), #78
+    (watcher, coordinator integration, crash recovery, I12, stranded
+    requests, the full ending on every exception path). #79 completed the
+    tests ADR-0025 requires.
+  - **Final acceptance audit:** every criterion passes; the evidence matrix
+    is
+    [on #16](https://github.com/Obtuse8053/Ilmar/issues/16#issuecomment-6748276550).
+    It is closed when #79 is merged and green.
+  - **Verified:**
+    - CI green on `373f345`, with real Podman: 106 passed, 1 skipped by
+      design;
+    - #79 green at `fff4f8d`;
+    - 2385 tests pass on Python 3.11, 3.12 and 3.13.
+  - **Use:** `ilmar cancel` (`docs/operations/cancel.md`). Unattended
+    operation stays disabled.
+  - **Next:** #12, starting with its ADR.
 
 - 2026-11-09: **#17 finished** (structured event logging):
   - **Implementation:** PRs #64, #65, #66, #68 and #71, plus the ADR-0024
