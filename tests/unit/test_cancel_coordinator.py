@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -289,6 +290,8 @@ class WaitingAgent:
         self.runs = 0
         self.before: Callable[[], None] | None = None
         self.patience = 5.0  # seconds to wait for the stop signal
+        self.submitted_at = 0.0
+        self.stopped_at = 0.0
 
     @property
     def name(self) -> str:
@@ -308,8 +311,10 @@ class WaitingAgent:
             self.before()
         if self.submit_for is not None:
             submit(self.setup, self.submit_for)
+        self.submitted_at = time.monotonic()
         assert isinstance(stop, threading.Event)
         stopped = stop.wait(self.patience)  # real time: the watcher looks every 0.05 s
+        self.stopped_at = time.monotonic()
         if not stopped:
             runtime.run(container, ["write", "src/app.py", FIXED["src/app.py"]],
                         timeout_seconds=10)  # fmt: skip
@@ -335,6 +340,8 @@ def test_running_agent_in_progress_is_stopped_by_the_watcher(
     assert report.results[0].outcome is Outcome.CANCELLED
     assert waiting.stops[0] is not None
     assert waiting.stops[0].is_set()
+    # Positive control: stopped within the watcher interval (plus scheduling slack).
+    assert waiting.stopped_at - waiting.submitted_at < 0.05 + 1.0
     run = setup.store.operation(operation_key(K.RUN_AGENT, "e1", 1))
     assert run is not None
     assert (run.status, run.result["outcome"]) == (ST.SUCCEEDED, "cancelled")
@@ -483,12 +490,50 @@ def _another_executions_request(setup: Setup, tmp: Path) -> None:
     submit(setup, "e2")
 
 
-BAD = {
+VALID_FIELDS = {"schema": fs.SCHEMA, "request": "q-" + "a" * 32, "execution": "e1",
+                "actor": "alice", "written_at": "2026-11-09T10:00:00Z"}  # fmt: skip
+
+
+def _raw(content: bytes) -> Callable[[Setup, Path], None]:
+    def place(setup: Setup, tmp: Path) -> None:
+        path = inbox(setup) / "e1.json"
+        path.write_bytes(content)
+        path.chmod(0o600)
+
+    return place
+
+
+def _directory(setup: Setup, tmp: Path) -> None:
+    (inbox(setup) / "e1.json").mkdir(mode=0o700)
+
+
+def _hard_link_without_temporary(setup: Setup, tmp: Path) -> None:
+    elsewhere = setup.layout.coordinator_root / "kept-elsewhere.json"
+    elsewhere.write_text(fs.encode(VALID_FIELDS))
+    elsewhere.chmod(0o600)
+    os.link(elsewhere, inbox(setup) / "e1.json")
+
+
+CANONICAL = fs.encode(VALID_FIELDS).encode()
+BAD: dict[str, Callable[[Setup, Path], None]] = {
     "symlink-to-a-valid-request": _symlink_to_valid,
     "fifo": _fifo,
-    "wrong-execution-inside": _wrong_execution_inside,
+    "directory": _directory,
+    "hard-link-without-temporary": _hard_link_without_temporary,
     "mode-0644": _open_mode,
+    "oversized": _raw(fs.encode({**VALID_FIELDS, "actor": "a" * 2000}).encode()),
+    "truncated": _raw(CANONICAL[: len(CANONICAL) // 2]),
+    "non-utf8": _raw(b"\xff\xfe" + CANONICAL),
     "non-canonical": _non_canonical,
+    "duplicate-key": _raw(CANONICAL[:-1] + b',"actor":"mallory"}'),
+    "extra-key": _raw(fs.encode({**VALID_FIELDS, "force": "yes"}).encode()),
+    "wrong-schema": _raw(fs.encode({**VALID_FIELDS, "schema": "ilmar.cancel-request/9"}).encode()),
+    "malformed-request-id": _raw(fs.encode({**VALID_FIELDS, "request": "q-xyz"}).encode()),
+    "invalid-actor": _raw(fs.encode({**VALID_FIELDS, "actor": "Mallory <m@x>"}).encode()),
+    "deep-nesting": _raw(b"[" * 500 + b"]" * 500),
+    "huge-number": _raw(CANONICAL[:-1] + b',"n":' + b"9" * 900 + b"}"),
+    "nan": _raw(CANONICAL[:-1] + b',"n":NaN}'),
+    "wrong-execution-inside": _wrong_execution_inside,
     "another-executions-request": _another_executions_request,
 }
 
@@ -498,7 +543,7 @@ def test_the_watcher_never_interrupts_on_a_bad_entry(
     setup: Setup, waiting: WaitingAgent, tmp_path: Path, case: str
 ) -> None:
     waiting.submit_for = None
-    waiting.patience = 1.0  # 20 looks by the watcher
+    waiting.patience = 0.6  # a dozen looks by the watcher
     os.close(fs.open_inbox(setup.layout.coordinator_root, create=True))
     waiting.before = lambda: BAD[case](setup, tmp_path)
     report = setup.coordinator(watch_interval_seconds=0.05).run_once()
@@ -508,13 +553,93 @@ def test_the_watcher_never_interrupts_on_a_bad_entry(
     assert requests(setup) == []  # nothing recorded for e1
     assert report.results[0].outcome is Outcome.PUBLISHED
     if case == "symlink-to-a-valid-request":
-        assert (tmp_path / "elsewhere.json").exists()  # its target is never touched
+        assert fs.SCHEMA in (tmp_path / "elsewhere.json").read_text()  # target untouched
+    if case == "hard-link-without-temporary":
+        kept = setup.layout.coordinator_root / "kept-elsewhere.json"
+        assert kept.read_text() == fs.encode(VALID_FIELDS)  # the other link is untouched
     if case != "another-executions-request":
         assert "inbox:" in report.results[0].detail  # moved aside and reported
         assert os.listdir(inbox(setup) / fs.REJECTED)
+        assert not os.path.lexists(inbox(setup) / "e1.json")
     else:
         assert (inbox(setup) / "e2.json").exists()  # not this execution's to touch
     check_i11(setup)
+
+
+def test_the_watcher_never_interrupts_through_a_symlinked_inbox(
+    setup: Setup, waiting: WaitingAgent, tmp_path: Path
+) -> None:
+    """``requests/cancel`` replaced by a symlink to a directory holding a valid
+    request: never followed, nothing recorded, the target untouched, reported."""
+    waiting.submit_for = None
+    waiting.patience = 0.6
+    os.close(fs.open_inbox(setup.layout.coordinator_root, create=True))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    planted = elsewhere / "e1.json"
+    planted.write_text(fs.encode(VALID_FIELDS))
+    planted.chmod(0o600)
+
+    def swap_directory() -> None:
+        os.rmdir(inbox(setup))
+        inbox(setup).symlink_to(elsewhere)
+
+    waiting.before = swap_directory
+    report = setup.coordinator(watch_interval_seconds=0.05).run_once()
+    stop = waiting.stops[0]
+    assert stop is not None
+    assert not stop.is_set()
+    assert requests(setup) == []
+    assert report.results[0].outcome is Outcome.PUBLISHED
+    assert "unsafe" in report.results[0].detail
+    assert planted.read_text() == fs.encode(VALID_FIELDS)
+    assert sorted(os.listdir(elsewhere)) == ["e1.json"]
+    check_i11(setup)
+
+
+def test_the_watcher_never_interrupts_on_a_foreign_owner(
+    setup: Setup, waiting: WaitingAgent
+) -> None:
+    """Simulated by the injected owner check: the inbox belongs to someone else."""
+    waiting.submit_for = None
+    waiting.patience = 0.6
+
+    def plant() -> None:
+        submit(setup)  # a valid request, but in an inbox that is not ours to trust
+
+    waiting.before = plant
+    coordinator = setup.coordinator(watch_interval_seconds=0.05)
+    coordinator._worker.cancellations._uid = os.geteuid() + 1
+    report = coordinator.run_once()
+    stop = waiting.stops[0]
+    assert stop is not None
+    assert not stop.is_set()
+    assert requests(setup) == []
+    assert report.results[0].outcome is Outcome.PUBLISHED
+    assert "unsafe" in report.results[0].detail
+    assert (inbox(setup) / "e1.json").exists()  # nothing touched in a foreign inbox
+    check_i11(setup)
+
+
+def test_queued_with_a_recorded_claim_intent_settles_the_claim_then_releases(
+    setup: Setup,
+) -> None:
+    """ADR-0025 §3, QUEUED: a claim intent recorded (a crash before its effect) is
+    settled first, since claiming is repeatable, and then the claim is released."""
+    on_commit(setup, operation(K.CLAIM_TASK, ST.INTENDED),
+              lambda: (_ for _ in ()).throw(Crash()))  # fmt: skip
+    with pytest.raises(Crash):
+        setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is S.QUEUED
+    submit(setup)
+    report = setup.coordinator().run_once()
+    assert report.results[0].outcome is Outcome.CANCELLED
+    claims = [o for o in setup.store.operations("e1") if o.kind is K.CLAIM_TASK]
+    assert [o.status for o in claims] == [ST.SUCCEEDED]  # settled
+    assert states(setup) == [S.QUEUED, S.CANCELLED]  # never CLAIMED, no other step
+    cancelled_cleanly(setup)  # and released, with one note
 
 
 def test_a_request_swapped_after_the_watcher_validated_it(
