@@ -57,32 +57,28 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#12 (plan step 4): tracker reconciliation. **ADR-0026 is proposed for
-review.** It covers:
-- **Task standing:** a new read-only `TaskProvider.standing`, read at the
-  start of each pass and at the worker's costly or irreversible safe points.
-- **Tracker-driven cancellation:** decided through ADR-0025's machinery,
-  with the coordinator as actor and its own reason codes.
-- **Precedence:** the first accepted cancellation and the first committed
-  transition win, and nothing is decided after a publish intent.
-- **Claims:** restoring a missing label, and releasing orphaned claims
-  through a new read-only `held_claims` and one instance-scoped journaled
-  operation.
-- **Security:** own claims count only when authentic, meaning written by
-  Ilmar's own identity.
-- **Crash recovery:** the rules, and the new invariant I13.
+#12 (plan step 4): tracker reconciliation, **implementing the accepted
+ADR-0026.** The maintainer approved:
+- the `TaskProvider` additions (`standing`, `held_claims`, `release_claim`,
+  `restore_label`, `claim` returning its claim id, authentic own claims);
+- the ADR-0020 amendment for one instance-scoped operation, with its store
+  migration;
+- the ADR-0024 registry additions;
+- tracker-driven cancellation through ADR-0025's machinery;
+- the two reads added to the side-effect architecture test.
 
-It also assesses #51: not a prerequisite for #12, but needed before #20.
-
-**Changes that need explicit approval:**
-- `TaskProvider` port changes;
-- an ADR-0020 amendment and a store migration;
-- two read methods added to the side-effect architecture test.
-
-**Waiting for the maintainer's review.** No #12 implementation before
-ADR-0026 is accepted.
+The implementation PR includes every mandatory test in the ADR.
 
 ## Change log
+
+- 2026-11-09: **ADR-0026 accepted** (tracker reconciliation, for #12),
+  merged in #81 after three review rounds:
+  - **Orphan release:** acts on exactly the observed claim object.
+  - **Lost-claim confirmation:** durable, fenced, and decided in three
+    ordered passes with no time-based rule (ADR-0022 §Time).
+  - **Label repair:** a targeted restore that never claims and never decides.
+
+  #12 implementation started.
 
 - 2026-11-09: **#16 finished** (cancellation, ADR-0025 with the #76
   clarification).
