@@ -57,29 +57,30 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#12 (plan step 4): reconcile executions against the tracker every pass.
-**Start with its ADR (design only).** It must decide:
-- **Ineligible task:** how a task that becomes ineligible while running ends
-  CANCELLED. The natural route is ADR-0025's ending (safe points, I12, the
-  claim and quarantine rules) with a non-human actor and its own reason
-  code. That would add a second source of cancellation besides the human
-  inbox, without changing the inbox rules.
-- **Port change:** the `TaskProvider` extension that lists this instance's
-  claims, with its contract tests and the GitHub adapter.
-- **Orphaned claims:** the release rule for orphaned claims (ADR-0013,
-  ADR-0021), applied before new work is picked.
+#12 (plan step 4): tracker reconciliation. **ADR-0026 is proposed for
+review.** It covers:
+- **Task standing:** a new read-only `TaskProvider.standing`, read at the
+  start of each pass and at the worker's costly or irreversible safe points.
+- **Tracker-driven cancellation:** decided through ADR-0025's machinery,
+  with the coordinator as actor and its own reason codes.
+- **Precedence:** the first accepted cancellation and the first committed
+  transition win, and nothing is decided after a publish intent.
+- **Claims:** restoring a missing label, and releasing orphaned claims
+  through a new read-only `held_claims` and one instance-scoped journaled
+  operation.
+- **Security:** own claims count only when authentic, meaning written by
+  Ilmar's own identity.
+- **Crash recovery:** the rules, and the new invariant I13.
 
-Then the implementation, against the fakes and the contract tests.
+It also assesses #51: not a prerequisite for #12, but needed before #20.
 
-**Alternatives:**
-- **#51** first, which the plan prefers before #12 "if possible". It is
-  large and sensitive (the `ca_bundle` ADR). It can follow #12's ADR, and
-  then cover #12's GitHub behaviour with a stateful emulator before #12's
-  live tests.
-- **#13** first, if you'd rather defer tracker work. It has the longest
-  remaining chain: #13, then #18 and #14.
+**Changes that need explicit approval:**
+- `TaskProvider` port changes;
+- an ADR-0020 amendment and a store migration;
+- two read methods added to the side-effect architecture test.
 
-No implementation starts without approval.
+**Waiting for the maintainer's review.** No #12 implementation before
+ADR-0026 is accepted.
 
 ## Change log
 

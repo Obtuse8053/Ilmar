@@ -32,6 +32,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0023](0023-live-testing-and-in-memory-credentials.md) | Live end-to-end testing, and credentials that never touch disk | Accepted |
 | [0024](0024-structured-event-log.md) | A structured event log, written in the same commit as the change it describes | Accepted |
 | [0025](0025-cancellation.md) | Cancellation through a request inbox, applied by the lease holder at safe points | Accepted |
+| [0026](0026-tracker-reconciliation.md) | Tracker reconciliation: task standing, orphaned claims and tracker-driven cancellation | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
