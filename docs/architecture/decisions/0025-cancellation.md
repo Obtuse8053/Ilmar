@@ -104,16 +104,15 @@ Chosen options: request option 4, stop option 4, record option 2.
   1. It opens the store read-only (ADR-0024 §8).
   2. It checks that the execution exists and is not terminal. If it is
      terminal, it exits 3 and changes nothing.
-  3. It writes one request file:
-     `<coordinator_root>/requests/cancel/<execution-id>.json`.
-     - The file is written atomically: a temporary file opened with
-       `O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600, then renamed into place.
-     - It holds a schema tag, a random request id, the execution id, the
-       actor label, and when it was written. The time is for people only and
-       never decides anything (ADR-0022, "Time").
-     - A request already pending for that execution is left as it is, with
-       exit 0.
-  4. It reports when the request takes effect: in the running pass, or at
+  3. It checks that no cancellation was already accepted for it (an
+     `accepted` `execution.cancel_requested` event). If one was, it reports
+     that request and exits 0 without writing.
+  4. It publishes one request file,
+     `<coordinator_root>/requests/cancel/<execution-id>.json`, by the
+     protocol in section 1a. **The first request wins:** an existing request
+     is never overwritten. A later submitter reports the request that stands
+     (its id and actor) and exits 0.
+  5. It reports when the request takes effect: in the running pass, or at
      the next `ilmar run --once`.
 - **This is an explicit, narrow addition to ADR-0012 level 1.**
   - Submitting a request changes nothing that Ilmar reads without
@@ -128,16 +127,22 @@ Chosen options: request option 4, stop option 4, record option 2.
   - Tracker users cannot cancel through this path.
   - Remote or multi-user cancellation needs its own ADR (see "Revisit when").
 - **The coordinator applies a request** at each safe point (section 3).
-  - The worker reads the file, validates it (schema, a known and matching
-    execution id, the actor label) and records `execution.cancel_requested`
-    in one fenced commit, under the execution's lease:
+  **The worker holding the execution's lease is the only component that
+  applies a request durably.**
+  - It reads the request through the validation routine of section 1b. A
+    request that does not pass is never applied.
+  - It records `execution.cancel_requested` in one fenced commit, under the
+    lease:
     - `actor` is human, with the label as `ref`;
     - the reason is `cancel-requested`;
-    - `data` holds `request` (the request id) and `decision` (`accepted`,
-      `too-late` or `already-terminal`).
-  - Only after that commit does it delete the file.
-  - An invalid file is moved aside to `rejected/` and reported. It is never
-    acted on.
+    - `data` holds `request` (the request id) and `decision`: `accepted`,
+      `too-late`, `already-terminal`, or `duplicate` (a cancellation of this
+      execution was already accepted).
+  - Only after that commit does it remove the file, by the cleanup rules of
+    section 1a.
+  - An entry that fails validation is moved aside by the worker, at a safe
+    point and never by the watcher, and reported. It is never acted on
+    (section 1b).
 - **A pending cancellation** is an `accepted` `execution.cancel_requested`
   event on an execution that is not terminal yet. Every decision point reads
   it from the store. The inbox file is only the way in.
@@ -149,6 +154,138 @@ Chosen options: request option 4, stop option 4, record option 2.
   - `execution.cancel_requested` becomes constructible, and the registry
     gains the code `cancel-requested`. #12 adds `task-ineligible` with the
     coordinator as actor.
+
+### 1a. The request file protocol: first request wins, never overwritten
+
+**The inbox:** `<coordinator_root>/requests/cancel/`.
+- The CLI creates `requests/` and `requests/cancel/` with mode 0700 if they
+  are missing. It walks to them from `coordinator_root` with
+  `openat(…, O_DIRECTORY | O_NOFOLLOW)` at every level.
+- If any level is a symlink, not a directory, not owned by the effective user,
+  or open to group or others, it is refused. The CLI exits 3 and the
+  coordinator ignores the whole inbox, reporting why. Nothing is repaired
+  automatically.
+
+**Names:**
+- **The final name** is derived only from the execution id, which is already
+  restricted to `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`:
+  `<execution-id>.json`. No name is ever taken from a directory listing to
+  decide which execution a request is for.
+- **A temporary name** has the form `.tmp-<execution-id>.<request-id>`. The
+  request id is `q-` followed by 32 random hex digits, from `secrets`.
+
+**Publishing a request, by the CLI:**
+1. Create the temporary file with
+   `openat(inbox, tmp, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC,
+   0o600)`. `O_EXCL` means a stray entry with that name is never reused or
+   followed.
+2. Write the canonical JSON request:
+   - a schema tag, `ilmar.cancel-request/1`;
+   - the request id;
+   - the execution id;
+   - the actor label;
+   - when it was written, for people only (ADR-0022, "Time").
+
+   At most 1 KiB. Then `fsync` the file.
+3. **Publish it with `linkat(inbox, tmp, inbox, final, 0)`**: a hard link,
+   without following symlinks.
+   - The link is created atomically, and it **fails with `EEXIST` if the final
+     name exists**, whatever is there: a request, a symlink or anything else.
+   - Unlike `rename`, it can never replace an existing entry. Of any number of
+     concurrent submitters, exactly one link succeeds, so **the first request
+     wins**.
+4. Remove the temporary name (`unlinkat`), then `fsync` the inbox directory.
+5. **On `EEXIST`,** the CLI removes its own temporary file, then reads the
+   existing entry through the validation routine (section 1b).
+   - A valid request: it reports that request (id, actor) and exits 0.
+   - Anything else: it reports that the inbox holds an invalid entry for this
+     execution, which the coordinator will move aside, and exits 3. It never
+     replaces or removes that entry itself.
+
+**Crash cleanup.** Every intermediate state is either inert or a complete,
+valid request. Nothing relies on timestamps.
+
+| Crash point | What remains | Effect and cleanup |
+| --- | --- | --- |
+| CLI, before or while writing the temporary file | `.tmp-<execution>.<request>`, perhaps partial | Inert: nothing ever reads a temporary name as a request. A later submission uses a new request id, so no name collides. The worker removes the execution's temporary files once the execution is terminal, or when it applies a request for it (below). |
+| CLI, after `linkat`, before removing the temporary name | the final name and the temporary name, one inode (`st_nlink == 2`), a complete, `fsync`ed request | A valid request (section 1b accepts exactly this second link). When the worker removes the request, it also removes the companion temporary name. |
+| Worker, after recording, before removing the file | the request file | At the next safe point, its request id is already recorded, so it is removed and nothing is recorded twice. |
+| Worker, between removing the final name and the temporary name | the temporary name | Inert; removed as in the first row. |
+
+**Removal by the worker:**
+- The worker removes a request only if the entry is still exactly the one it
+  validated: the same `st_dev` and `st_ino`, and the same content digest,
+  checked again on the opened file.
+- It then removes the companion temporary name only if that name has the same
+  inode.
+- If the entry changed in between, it removes nothing and validates again at
+  the next safe point. Recording is idempotent by request id.
+- A temporary file that is still being written by a concurrent CLI could be
+  removed under it only when the execution is already terminal or a request
+  is already applied. That CLI's `linkat` then fails, and it reports an error
+  (exit 3). It never publishes a half-written request.
+
+### 1b. Validation, shared by the watcher and the worker
+
+One read-only routine, `read_cancel_request(inbox_fd, execution_id)`, decides
+whether a valid request exists **for that execution**. It never writes. Both
+the watcher and the worker call it, and nothing else reads the inbox.
+
+1. **The path is safe:** `inbox_fd` was opened as section 1a describes, with
+   no symlinks, the right owner and mode 0700.
+2. **The entry is opened safely:**
+   - `openat(inbox_fd, "<execution-id>.json", O_RDONLY | O_NOFOLLOW |
+     O_NONBLOCK | O_CLOEXEC)`;
+   - a symlink at the final name fails to open (`ELOOP`), and a FIFO or device
+     does not block the reader.
+3. **The opened file passes `fstat`:**
+   - a regular file;
+   - owned by the effective user, with no group or other permission bits;
+   - at most 1 KiB;
+   - `st_nlink == 1`, or `2` only when the second link is the matching
+     `.tmp-<execution-id>.<request-id>` with the same `st_dev` and `st_ino`. A
+     foreign hard link is refused.
+4. **The content is read once,** at most 1 KiB plus one byte, from the opened
+   descriptor. Every later check uses these bytes; the name is never read a
+   second time.
+5. **The content is strict:**
+   - UTF-8 JSON with no duplicate keys;
+   - exactly the expected keys, the right schema tag and canonical form;
+   - a well-formed request id;
+   - **an execution id equal to the one the caller asked for** (the file
+     name alone is not enough);
+   - an actor label that passes ADR-0024's `actor.ref` rule.
+
+   Nesting deeper than the format has, oversized numbers and NaN are refused.
+6. **The result** is either "no request" or an immutable `CancelRequest`:
+   request id, actor, execution id, content digest, `st_dev` and `st_ino`.
+   **Anything that fails a check is "no request"**, together with a reason
+   for the report. It is never an error that stops a pass.
+
+**The watcher:**
+- It signals only when this routine returns a `CancelRequest` for **the
+  execution whose agent is running**. Any invalid, malformed, oversized,
+  symlinked, hard-linked, foreign-owned or mismatched entry, or an unsafe
+  inbox, **never interrupts the agent**. The run continues as if nothing were
+  there.
+- It hands the validated `CancelRequest` to the worker through a
+  single-assignment slot together with the stop signal. It never writes,
+  never moves or removes an entry, and calls no port method.
+- It reports invalid entries at most once per run, on the process's log
+  stream, and nothing durable.
+
+**The worker** calls the same routine at each safe point, and after a
+stopped run:
+- It records the request the watcher validated, which is what stopped the
+  run. It then removes the file only if it is still that entry (section 1a).
+- If the routine finds an invalid entry at a safe point, the worker moves it
+  aside, which is the only place an invalid entry is touched:
+  - it renames the entry itself, never a symlink's target, within the inbox
+    to `rejected/<execution-id>.<random>`, with
+    `renameat(inbox, name, rejected, unique_name)`;
+  - the destination name is new and random, so nothing is replaced.
+
+  It reports it and records nothing durable.
 
 ### 2. Stopping a running agent: a stop signal on the running call
 
@@ -169,13 +306,14 @@ Chosen options: request option 4, stop option 4, record option 2.
   `AgentOutcome.CANCELLED` is new. The run's journaled operation then ends
   `SUCCEEDED`, with the outcome `cancelled`: the run ended, and how it ended
   is known.
-- **A watcher thread** runs only while the agent runs. It reads the inbox
-  every 2 seconds and sets the signal when a request for this execution
-  appears.
-  - It writes nothing and calls no port method.
+- **A watcher thread** runs only while the agent runs. Every 2 seconds it
+  calls the validation routine (section 1b) for this execution, and sets the
+  signal **only for a valid request for this execution**.
+  - It writes nothing, removes nothing and calls no port method.
   - The stop itself happens inside the journaled `run-agent` effect the
     worker started, so the watcher adds no new, unjournaled effect.
-  - The request is recorded by the worker right after the run returns.
+  - The request is recorded by the worker right after the run returns. That
+    is the request the watcher validated, handed over with the signal.
 - **After the run,** the worker performs its normal journaled sandbox stop,
   `remove_owned` with ownership verification (ADR-0022). That stop finishes
   any leftover, or finds nothing.
@@ -240,6 +378,7 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
 
 | Crash | Recovery |
 | --- | --- |
+| CLI, while publishing a request | See section 1a: an inert temporary file, or a complete request. |
 | Before the request is recorded | The file is still there. It is applied at the next safe point. |
 | After it is recorded, before the file is deleted | The request id is already recorded, so the file is deleted and nothing is recorded twice. |
 | During the stop of a running agent | `run-agent` is `INTENDED`: the existing rule abandons it ("interrupted") and removes the sandbox with `remove_owned`. The pending cancellation then ends the execution, **instead of** starting a new attempt. |
@@ -277,16 +416,67 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
 - **CLI:**
   - a request is refused for a terminal or unknown execution, or an invalid
     `--as`;
-  - a second request is idempotent;
-  - the file is written atomically, with mode 0600, and never follows a
-    symlink;
-  - an invalid request file is moved aside, never acted on;
   - submitting needs no lock and changes nothing else (the store is
     byte-for-byte unchanged).
+- **Acceptance, first request wins (section 1a), adversarial:**
+  - **Concurrent submissions:** at least 16 processes start together, each
+    `ilmar cancel` for the same execution with a different `--as`.
+    - Exactly one final file exists, byte for byte one submitter's request.
+    - Every process exits 0 and reports that same request id and actor.
+    - No temporary file is left behind.
+    - The worker then records exactly one `execution.cancel_requested`.
+
+    It is repeated many times to exercise the race.
+  - **No overwrite:** with any entry at the final name (a valid request, an
+    invalid file, a symlink to a valid request elsewhere, a directory or a
+    FIFO), a submission leaves that entry byte-for-byte and inode-for-inode
+    unchanged. It exits 0 for a valid request, otherwise 3.
+  - **Crash at each step of the protocol:** a real process is killed with
+    `os._exit` after creating, after writing, after `fsync`, after `linkat`,
+    and after removing the temporary name. Each time:
+    - the inbox holds nothing, an inert temporary file, or one valid request;
+    - a later submission behaves as specified;
+    - the worker applies at most one request and removes the leftovers by
+      the cleanup rules.
+  - **Worker crashes:** after recording and before removal, and between the
+    two removals, the request is recorded once and the leftovers are
+    cleaned.
+  - **An unsafe inbox:** `requests/` or `requests/cancel/` as a symlink, open
+    to group or others, or owned by another user (simulated by an injected
+    owner check). The CLI refuses with exit 3 and writes nothing.
+- **Acceptance, the watcher never interrupts on a bad entry (section 1b),
+  adversarial.** For each entry below, placed while a scripted agent runs, the
+  agent runs to completion, no stop signal is set, no event is recorded, and
+  the worker later moves the entry aside without touching any symlink's
+  target:
+  - a symlink at the final name, pointing at a valid request elsewhere;
+  - a symlinked inbox directory;
+  - a FIFO, which must not block the watcher, and a directory;
+  - a hard link to a valid request with no matching temporary name;
+  - mode 0644, and a foreign owner (by the injected check);
+  - an oversized file;
+  - truncated or non-UTF-8 content, and non-canonical JSON;
+  - duplicate or extra keys, a wrong schema tag, a malformed request id;
+  - an invalid actor label;
+  - deep nesting, huge numbers and NaN;
+  - **a valid request whose execution id names a different execution**
+    than its file name, and a valid request for another execution, which
+    must not stop this one.
+
+  Also:
+  - **Swapped after validation:** a valid request is replaced by another
+    entry between the watcher's validation and the worker's removal. The
+    worker records the request that stopped the run, removes nothing it did
+    not validate, and validates the new entry at the next safe point.
+  - **Positive control:** a valid request stops the run within the watcher
+    interval and the stop's own bound. Exactly that request is recorded,
+    with its actor, and the file and its companion are removed.
 - **Architecture:**
   - the request inbox is inside `coordinator_root`;
-  - no code path other than the worker records `execution.cancel_requested`;
-  - the watcher calls no port method.
+  - no code path other than the worker records `execution.cancel_requested`
+    or moves or removes inbox entries;
+  - the watcher calls no port method and no writing filesystem call;
+  - `read_cancel_request` is the only code that reads the inbox.
 
 ## Consequences
 
@@ -310,6 +500,14 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
   It is recorded as `too-late`, and the human closes the change request.
 - **Bad:** a verification run in progress is not interrupted. It finishes
   within its own timeout.
+- **Bad:** the protocol depends on POSIX `linkat`, `openat`, `O_NOFOLLOW` and
+  per-file ownership. These hold on the local filesystems ADR-0005 already
+  requires; a filesystem without hard links is refused at submission (exit
+  3).
+- **Residual risk:** the operator account can always rewrite its own
+  inbox. Validation protects the coordinator against malformed or unsafe
+  entries and against entries it did not validate. It does not protect
+  against that account, which can already stop Ilmar.
 
 ## Revisit when
 
