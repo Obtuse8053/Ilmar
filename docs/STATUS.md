@@ -57,21 +57,30 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#16 (plan step 3): cancellation of running executions, **starting with an ADR
-for review**. It decides:
-- how a human requests cancellation while a coordinator owns the instance;
-- what happens to an agent that is mid-run;
-- how the ownership-verified stop and removal (ADR-0012 rule 3) and the
-  reserved `execution.cancel_requested` and `execution.cancelled` events
-  (ADR-0024 §5) are used.
+#16 (plan step 3): cancellation. **ADR-0025 is proposed for review.** It
+covers:
+- requests, submitted by `ilmar cancel` into a private inbox and applied by
+  the lease holder;
+- a stop signal that ends a running agent like a timeout;
+- per-state rules, fencing, crash recovery and the new invariant I12.
 
-It comes after #17 closes. #17's last gaps are fixed in its completion PR,
-and its diagnostic stream is deferred to #70.
+It includes a narrow addition to ADR-0012 level 1 and port changes in the
+sensitive `ContainerRuntime`, both needing explicit approval.
 
-**Waiting for the maintainer's explicit go-ahead.** No #16 implementation
-before the ADR is reviewed.
+**Waiting for the maintainer's review.** No #16 implementation before
+ADR-0025 is accepted.
 
 ## Change log
+
+- 2026-11-09: **#17 finished** (structured event logging):
+  - **Implementation:** PRs #64, #65, #66, #68 and #71, plus the ADR-0024
+    clarification, #67.
+  - **Final acceptance audit:** all 12 criteria pass; the evidence is
+    [on #17](https://github.com/Obtuse8053/Ilmar/issues/17#issuecomment-6735109957).
+    Verified on `09fe56d`: CI green, including real Podman; 2063 tests on
+    Python 3.11, 3.12 and 3.13.
+  - **Deferred:** the optional diagnostic stream, to #70.
+  - **Next:** #16, starting with ADR-0025, now proposed.
 
 - 2026-11-09: #17 completion PR, for the close-out audit's three gaps:
   - a merged or closed change request is recorded as the observation on the
