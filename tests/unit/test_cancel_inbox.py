@@ -230,6 +230,38 @@ def test_the_crash_leftover_of_a_submitter_is_valid(root: Path, inbox: int) -> N
     assert reading.request.request_id == REQUEST_ID
 
 
+def test_a_temporary_name_unlinked_during_the_read_is_still_valid(
+    root: Path, inbox: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (CI on the #74 merge): a loser read the winner's request with two
+    links, and the winner unlinked its temporary name before the companion check."""
+    temporary = place(root, fs.encode(fields()), name=fs.temporary_name(EXECUTION, REQUEST_ID))
+    os.link(temporary, box(root) / FINAL)
+    real = os.stat
+
+    def winner_unlinks_first(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if path == temporary.name:
+            os.unlink(temporary)  # the winning submitter's last step, at the worst moment
+        return real(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", winner_unlinks_first)
+    reading = fs.read_cancel_request(inbox, EXECUTION)
+    assert reading.problem is None
+    assert reading.request is not None
+    assert reading.request.request_id == REQUEST_ID
+
+
+def test_a_second_link_that_stays_is_refused_even_if_the_temporary_name_is_gone(
+    root: Path, inbox: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    temporary = place(root, fs.encode(fields()), name=fs.temporary_name(EXECUTION, REQUEST_ID))
+    os.link(temporary, box(root) / FINAL)
+    os.link(temporary, root / "kept-by-someone-else")
+    os.unlink(temporary)
+    assert fs.read_cancel_request(inbox, EXECUTION).problem == (
+        "a hard link to the request from elsewhere")  # fmt: skip
+
+
 def test_a_file_that_grows_while_read_is_refused(
     root: Path, inbox: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
