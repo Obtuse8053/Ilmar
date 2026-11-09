@@ -106,6 +106,17 @@ human cancellation, and how all of it survives a crash.
 2. **One observation decides, except for a lost claim.** Chosen. A lost
    claim can be read-after-write lag on Ilmar's own write.
 
+**How a lost claim is confirmed:**
+1. *A minimum persisted wall-clock age* (the second draft: 300 s).
+   Rejected. ADR-0022 §Time forbids comparing a persisted timestamp with the
+   current time to make a decision, so that a clock stepping back, or a
+   restored snapshot, can never change an outcome.
+2. **Independent observations, ordered by the store, in separate passes.**
+   Chosen. Each is a fresh read. Each comes from a pass that **follows**
+   Ilmar's own last claim write, and the first and the confirming
+   observation come from different passes. Order comes from the store's
+   event sequence and the pass identity (ADR-0024), never from a clock.
+
 **Where the first lost-claim observation lives:**
 1. *In memory.* Rejected. A crash or restart forgets it, so a lost claim
    would either never be confirmed or be confirmed by a single read.
@@ -217,13 +228,41 @@ inbox request (ADR-0025 §1, §4). The fields:
 
 ### 3a. Confirming a lost claim: durable, fenced, revalidated
 
-A lost claim cancels only after **two independent observations**:
-- they are made in **two different passes**;
-- they are at least **`CLAIM_LOST_CONFIRM_SECONDS` = 300** apart, on the
-  coordinator's persisted, non-decreasing clock (I10);
-- **no sign of the claim** appears between them.
+A lost claim cancels only after **two independent observations**, with no
+sign of the claim between them, in **three distinct passes**:
 
-That makes a single stale read, including lag on Ilmar's own write, harmless.
+| Pass | What happens there |
+| --- | --- |
+| `P0` | This execution's own latest claim write: its `claim` or `restore-claim` succeeded. |
+| `P1` | The first observation, a fresh `CLAIM_LOST` read, is recorded. `P1` differs from `P0` and follows it. |
+| `P2` | The confirming observation, a fresh `CLAIM_LOST` read. `P2` differs from `P1` and follows it. |
+
+**Time is never consulted** (ADR-0022 §Time). Order comes from durable
+facts only:
+- **Event sequence.** The store assigns every event a `seq` that increases
+  with every commit (ADR-0024). "Follows" means a greater `seq`.
+- **Pass identity.** Every event carries the id of the pass that wrote it
+  (ADR-0024). Passes of one instance never overlap, because they run under
+  the instance lock (ADR-0012).
+
+So a wall clock that steps back or forward, or a restored snapshot, can
+neither shorten nor lengthen the confirmation, and cannot change its
+outcome.
+
+**Why this protects against read-after-write lag:**
+- **No observation in the writing pass.** A read in `P0`, the pass that
+  wrote the claim, is never recorded and never counts. That is the window
+  where Ilmar's own write may not be visible yet.
+- **Two later observations must agree.** The first comes from a later pass
+  and the confirmation from another later pass, each a fresh read. Between
+  them lie a full commit cycle, the end of one pass, and the start of the
+  next, with their own tracker reads.
+- **A disagreeing read resets.** Any read in between that sees the claim
+  resets everything (see "Reset").
+
+A stale view would have to persist across two whole passes after Ilmar's
+own write to cancel anything. If that is ever observed in practice, the
+answer is more passes, never a timer (Revisit when).
 
 **The record.** A new registered extra event, `execution.claim_lost`, is
 written by the worker that holds the lease. It goes in a fenced commit,
@@ -241,22 +280,35 @@ store's checks on extra events). Its fields:
 the execution, if its state is `observed`. At most one is open at a time.
 The predicate is read from the durable events, never from memory.
 
-**Recording the first observation.** When the standing is `CLAIM_LOST` and
-no observation is open, the worker records `observed` and continues. Nothing
-else changes: no transition, no release, no effect.
+**Recording the first observation.** The worker records `observed` and
+continues when **all** of the following hold:
+- the standing is `CLAIM_LOST`;
+- no observation is open;
+- **the current pass is not the pass of this execution's latest successful
+  `claim` or `restore-claim`.** That pass is the one whose events carry the
+  operation's success.
+
+Nothing else changes: no transition, no release, no effect. A `CLAIM_LOST`
+read in the claim's own pass is ignored. It is neither recorded nor
+counted.
 
 **Confirming.** At a later safe point, the worker reads the standing
 **afresh in this pass**. It decides a `task-claim-lost` cancellation only
 when **all** of the following hold:
 1. the fresh read is again `CLAIM_LOST`;
 2. an observation is open;
-3. it was recorded in **another pass**: a different pass id than the
-   current one;
-4. it was recorded at least `CLAIM_LOST_CONFIRM_SECONDS` before now,
-   measured on the persisted, non-decreasing clock;
-5. its `data.claim` equals the execution's current claim id. No `claim` or
-   `restore-claim` of this execution has succeeded since the observation.
+3. it was recorded in **another pass**: its pass id differs from the
+   current one, and its `seq` is lower than any event of the current pass;
+4. it **follows this execution's latest claim write:**
+   - its `seq` is greater than that of the latest successful `claim` or
+     `restore-claim`;
+   - its pass differs from that operation's pass;
+5. its `data.claim` equals the execution's current claim id, so no `claim`
+   or `restore-claim` of this execution has succeeded since;
 6. the execution is not past a `publish-revision` intent (§2).
+
+Rules 3 to 5 read only event order and identities from the store. No
+timestamp takes part.
 
 The confirmation and the decision are one fenced commit:
 - a `cleared` event closing the observation;
@@ -269,6 +321,9 @@ The confirmation and the decision are one fenced commit:
   case it exists for: the claim stayed lost across it. But it is
   **revalidated** by the fresh read and by rules 3 to 5. An old record is
   never enough on its own.
+- **Epochs need no ordering of their own.** Every pass of a later epoch
+  follows every pass of an earlier one in `seq`, because the store numbers
+  events in commit order across epochs.
 
 **Reset.** The open observation is closed with a `cleared` event, in the
 same commit as what caused the reset, when any of these happen:
@@ -496,7 +551,8 @@ That rule applies to `claim`, `release`, `standing` and `held_claims`.
 | After the delete, before the label step or the record | Performed again: the object is `ABSENT`, the label step reruns its "no claim remains" check, and the operation settles as succeeded (`claim-absent`). |
 | After the effect, before the outcome commit | It is ambiguous. Settled by observation: re-read the recorded object. If it is absent, succeeded. If it is present and unchanged, delete again. If it changed, failed (`claim-changed`). |
 | Before recording a first `CLAIM_LOST` observation | Nothing is durable. The next pass reads again and records the first observation then. |
-| After the first observation is recorded | It is open, and durable across the crash. Confirmation needs a later pass, the elapsed time, and a fresh `CLAIM_LOST` read (§3a). |
+| After the first observation is recorded | It is open, and durable across the crash. Confirmation needs a fresh `CLAIM_LOST` read in a **later** pass, ordered by `seq` (§3a). The restarted coordinator's passes always follow it. |
+| After a claim or `restore-claim` succeeded, before any later read | The write's pass is durable on its success events. Reads in that pass are never recorded, so no observation can come from the write's lag window, even across a crash. |
 | Between the confirming read and its commit | Nothing is durable. The next pass rereads and decides then, or resets if the claim is back. |
 | After the confirming commit | The decision is a pending cancellation: ADR-0025 §5 applies. |
 
@@ -506,9 +562,10 @@ point in the crash suite:
   backed (§5);
 - an orphan release deletes only the object recorded in its intent, after
   revalidation;
-- no `task-claim-lost` cancellation exists without an earlier `observed`
-  event from another pass, at least `CLAIM_LOST_CONFIRM_SECONDS` before it,
-  and not cleared in between;
+- no `task-claim-lost` cancellation exists without an earlier, uncleared
+  `observed` event. That event must come from a pass that differs from the
+  decision's pass and from the pass of the latest claim write before it,
+  and must follow that write in `seq`;
 - a claim is removed only by this instance releasing **its own** claims;
 - human claim labels, assignees and other instances' claims are never
   changed.
@@ -665,11 +722,14 @@ but it must precede #20** (unattended operation, which already depends on
     - one `CLAIM_LOST` read records `observed` only;
     - a second read **in the same pass** decides nothing and records
       nothing;
-    - a second read in a later pass **before** `CLAIM_LOST_CONFIRM_SECONDS`
-      decides nothing.
+    - a `CLAIM_LOST` read in the **pass of the claim write itself** is
+      neither recorded nor counted, including in a pass that both claims
+      and reaches later safe points;
+    - an observation and a confirmation in the same pass never decide.
   - **Confirmation:**
-    - in a later pass, after the interval, with a fresh `CLAIM_LOST` read,
-      it decides exactly once;
+    - it decides exactly once, with a fresh `CLAIM_LOST` read, in a pass
+      after the observation's pass, which itself followed the claim write's
+      pass (three distinct passes, ordered by `seq`);
     - the `cleared` event and the decision are one commit.
   - **Reset:**
     - the claim reappears (`HELD`) between the observations: `cleared`
@@ -678,8 +738,12 @@ but it must precede #20** (unattended operation, which already depends on
       observation: `cleared`, and the old observation can never confirm;
     - an observation whose `data.claim` differs from the current claim id
       never confirms.
-  - **Read-after-write lag:** a just-posted own claim, invisible for
-    several reads within the interval, never cancels.
+  - **Read-after-write lag:**
+    - a just-posted own claim that stays invisible for every read of its
+      own pass never cancels;
+    - one that is invisible for that pass plus one more pass, then seen,
+      resets and never cancels;
+    - after a `restore-claim`, the same holds from that write's pass.
   - **Precedence:** an `INELIGIBLE`, `CLAIMED_BY_OTHER` or `GONE` read
     while an observation is open decides at once with that reason, and
     clears the observation.
@@ -689,19 +753,30 @@ but it must precede #20** (unattended operation, which already depends on
       clearing, nor a decision;
     - an observation from an earlier epoch still needs the fresh read and
       rules 3 to 5.
-  - **The clock:** confirmation uses the persisted, non-decreasing clock.
-    A clock set back never shortens the interval.
+  - **Time is never consulted (ADR-0022 §Time):**
+    - with the wall clock frozen, stepped back by hours, or stepped forward
+      by days between and within passes, every decision is identical to a
+      run with a steady clock;
+    - a restored store snapshot does not change the outcome of rules 3
+      to 5;
+    - a test asserts that the confirmation code reads no timestamp.
 - **Lost-claim confirmation, crash recovery (mandatory):** a crash at every
   write and every effect point, and a second crash during recovery, around:
+  - the claim write itself;
   - recording the first observation;
   - the confirming read;
   - the confirming commit;
   - a reset.
 
+  Also with a coordinator restart (a new epoch) between `P0`, `P1` and
+  `P2`.
+
   In each case:
   - at most one open observation;
   - at most one decision;
-  - never a decision from one observation;
+  - never a decision from one observation, or from observations whose
+    passes are not distinct and ordered after the claim write as §3a
+    requires;
   - I11, I12 and I13 hold.
 - **Crash suite:** new scenarios run at every write and every effect crash
   point, and again with a second crash during recovery. They check I11, I12
@@ -751,11 +826,12 @@ but it must precede #20** (unattended operation, which already depends on
   removing Ilmar's label is overriding ADR-0013's ownership rule. Such a
   claim still never blocks this instance, because an own claim reads as
   "ours" and is re-claimed.
-- **A lost claim cancels slowly:** at least `CLAIM_LOST_CONFIRM_SECONDS`
-  after the first observation, and only in a later pass. Until then, the
-  execution continues without a visible claim. That is accepted, because a
-  lost claim is rare (a human deleted Ilmar's own comment), and acting on
-  one stale read would be worse.
+- **A lost claim cancels slowly:** only in the second pass after the one
+  that wrote the claim. How long that takes depends on how often passes
+  run, not on a timer. Until then, the execution continues without a
+  visible claim. That is accepted, because a lost claim is rare (a human
+  deleted Ilmar's own comment), and acting on one stale read would be
+  worse.
 - **A schema migration and an ADR-0020 amendment,** for one instance-scoped
   operation kind.
 - **A new configuration need:** `bot_login` is required where the adapter
@@ -767,6 +843,10 @@ but it must precede #20** (unattended operation, which already depends on
   significant model spend. Then consider letting the watcher also poll
   `standing` through a pre-bound, read-only callable. That needs an
   ADR-0025 amendment and a change to its architecture test.
+- **Tracker reads are observed to stay stale across two whole passes.**
+  Then require more independent observations, or a read-your-writes check
+  that the adapter can prove (for example, the claim object read directly
+  by its id). Never a wall-clock threshold (ADR-0022 §Time).
 - **Rate limits are hit in practice.** Consider conditional requests
   (ETags) for the standing reads, or webhooks feeding a durable queue.
 - **Several instances per repository become a requirement** (ADR-0013's
