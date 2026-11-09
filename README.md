@@ -39,6 +39,8 @@ ilmar config validate ilmar.example.toml
   research review process.
 - [`docs/operations/events.md`](docs/operations/events.md): reading and verifying the
   event log (`ilmar events`).
+- [`docs/operations/cancel.md`](docs/operations/cancel.md): asking the coordinator to
+  cancel an execution (`ilmar cancel`).
 - [`docs/STATUS.md`](docs/STATUS.md): where development stands and what is next.
 - [`docs/workflow.md`](docs/workflow.md): how work is planned, claimed and reviewed.
 - [`docs/roadmap.md`](docs/roadmap.md): milestone status and approved improvements.

@@ -20,12 +20,13 @@ the same transaction as the rows.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ilmar.domain.errors import LedgerIntegrityError
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import (
     COORDINATOR,
+    EXTRA_TYPES,
     ActorKind,
     BaselineExecution,
     Event,
@@ -66,6 +67,11 @@ def default_context(fence: Fence, changes: Commit) -> EventContext:
     times = [e.updated_at for e, _ in (*changes.created, *changes.applied)]
     times += [o.updated_at for o in changes.operations]
     times += [r.updated_at for r in changes.resources]
+    # A commit of extra events only derives nothing: its context's time is their own.
+    times += [
+        datetime.strptime(e.at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+        for e in changes.extra_events
+    ]
     if not times:
         raise ValueError("an empty commit has no events")
     return EventContext(at=max(times), instance=fence.instance_id, epoch=fence.epoch)
@@ -88,6 +94,7 @@ def commit_events(
     """
     if changes.empty:
         return ()
+    extras = check_extra_events(fence, changes, execution=execution)  # before reading them
     if context is None:
         context = default_context(fence, changes)
     _check_context(fence, context)
@@ -108,7 +115,34 @@ def commit_events(
         raise LedgerIntegrityError(f"an event of this commit is invalid: {error}") from None
     events = tuple(derived)
     check_pairing(changes, events, execution=execution, operation=operation, resource=resource)
-    return events
+    return events + extras
+
+
+def check_extra_events(
+    fence: Fence, changes: Commit, *, execution: Callable[[str], Execution | None]
+) -> tuple[Event, ...]:
+    """The commit's events that no row derives (ADR-0024 §9), refused unless each is a
+    registered extra type, belongs to the fence's owner, is not yet numbered, and
+    names an execution this commit creates or the store holds. Raises
+    ``LedgerIntegrityError``: the whole commit is refused."""
+    created = {e.id for e, _ in changes.created}
+    for event in changes.extra_events:
+        if not isinstance(event, Event) or event.type not in EXTRA_TYPES:
+            raise LedgerIntegrityError("only registered extra events may be given")
+        if (event.instance, event.epoch) != (fence.instance_id, fence.epoch):
+            raise LedgerIntegrityError("an extra event belongs to another owner than the fence")
+        if event.seq is not None:
+            raise LedgerIntegrityError("the store numbers events; an extra event has no seq")
+        if event.flags:
+            raise LedgerIntegrityError(
+                f"an extra event must be valid as given; it is {', '.join(sorted(event.flags))}"
+            )
+        if event.actor.kind is ActorKind.MIGRATION:
+            raise LedgerIntegrityError("only the migration writes migration events")
+        subject = str(event.execution)
+        if subject not in created and execution(subject) is None:
+            raise LedgerIntegrityError(f"an extra event names an unknown execution {subject}")
+    return tuple(changes.extra_events)
 
 
 def _check_context(fence: Fence, context: EventContext) -> None:

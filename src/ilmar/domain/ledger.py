@@ -23,8 +23,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from ilmar.domain.execution import Execution, Transition
+
+if TYPE_CHECKING:  # events imports this module; the store validates extra events
+    from ilmar.domain.events import Event
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _DISCRIMINATOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -378,6 +382,10 @@ class Commit:
       by its execution id, operation key or resource key: why an execution
       failed, was cancelled or waits to retry, why an operation failed, why a
       resource was quarantined. It travels with the change it explains.
+    * ``extra_events``: events no row derives (ADR-0024 §9), such as
+      ``execution.cancel_requested`` (ADR-0025). The store validates them and
+      appends them after the commit's mandatory events, in the same
+      transaction; they change no row.
     """
 
     created: tuple[tuple[Execution, Transition], ...] = ()
@@ -386,6 +394,7 @@ class Commit:
     resources: tuple[Resource, ...] = ()
     expected: tuple[tuple[str, int], ...] = ()
     reasons: Mapping[str, str] = field(default_factory=dict)
+    extra_events: tuple[Event, ...] = ()
 
     def __post_init__(self) -> None:
         keys = [o.key for o in self.operations] + [r.key for r in self.resources]
@@ -398,7 +407,9 @@ class Commit:
 
     @property
     def empty(self) -> bool:
-        return not (self.created or self.applied or self.operations or self.resources)
+        return not (
+            self.created or self.applied or self.operations or self.resources or self.extra_events
+        )
 
 
 # -- candidate integrity ---------------------------------------------------------------

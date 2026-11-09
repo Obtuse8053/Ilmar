@@ -232,6 +232,11 @@ def _apply(fold: _Fold, event: Event) -> None:
             return
         state.evidence_seen += 1
         return
+    if event.type is EventType.EXECUTION_CANCEL_REQUESTED:
+        # Changes no row (ADR-0025), but must be about an execution the log knows.
+        if str(event.execution) not in fold.executions:
+            fold.fail("event-before-creation", f"execution:{event.execution}", f"seq {event.seq}")
+        return
     if event.type in _OPERATION_CHANGES or event.type is EventType.OPERATION_BASELINE:
         _apply_row(fold, fold.operations, f"operation:{event.operation}", str(event.operation),
                    event)  # fmt: skip

@@ -26,6 +26,8 @@ from ilmar.domain.event_history import (
     verify_lines,
 )
 from ilmar.domain.events import (
+    Actor,
+    ActorKind,
     BaselineExecution,
     CorruptEventError,
     Event,
@@ -672,3 +674,61 @@ def test_verify_lines_survives_unparseable_lines(text: str) -> None:
     assert any(
         f.check == "corrupt-event" and f.detail.startswith("line 2:") for f in report.failures
     )
+
+
+# -- execution.cancel_requested (ADR-0025 §4) ---------------------------------------------
+
+
+def cancel_requested(execution_id: str = "e1", decision: str = "accepted") -> Event:
+    return Event.create(
+        EventType.EXECUTION_CANCEL_REQUESTED, at=NOW, instance="inst", epoch=FENCE.epoch,
+        actor=Actor(ActorKind.HUMAN, "alice"), execution=execution_id,
+        reason="cancel-requested", data={"request": "q-" + "a" * 32, "decision": decision},
+    )  # fmt: skip
+
+
+def test_a_cancel_request_event_changes_no_row_and_keeps_i11() -> None:
+    replay = Replay()
+    replay.migrate()
+    lifecycle(replay)
+    replay.append(cancel_requested())
+    assert replay.verify().findings == ()
+
+
+def test_a_cancel_request_for_an_unknown_execution_is_an_integrity_failure() -> None:
+    replay = Replay()
+    replay.migrate()
+    lifecycle(replay)
+    replay.append(cancel_requested("e2"))
+    assert [f.subject for f in replay.verify().failures] == ["execution:e2"]
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        {"execution": None},
+        {"reason": None},
+        {"data": {"request": "q-" + "a" * 32}},
+        {"data": {"request": "not-an-id", "decision": "accepted"}},
+        {"data": {"request": "q-" + "a" * 32, "decision": "forced"}},
+    ],
+)
+def test_a_malformed_cancel_request_event_is_refused_or_flagged(spoil: dict[str, Any]) -> None:
+    fields: dict[str, Any] = {
+        "at": NOW, "instance": "inst", "epoch": FENCE.epoch,
+        "actor": Actor(ActorKind.HUMAN, "alice"), "execution": "e1",
+        "reason": "cancel-requested",
+        "data": {"request": "q-" + "a" * 32, "decision": "accepted"},
+    }  # fmt: skip
+    fields.update(spoil)
+    try:
+        event = Event.create(EventType.EXECUTION_CANCEL_REQUESTED, **fields)
+    except ValueError:
+        return  # a broken envelope is refused
+    assert "invalid" in event.flags  # bad data is flagged, never silently accepted
+
+
+def test_every_cancel_decision_reads_back() -> None:
+    for decision in ("accepted", "too-late", "already-terminal", "duplicate"):
+        event = cancel_requested(decision=decision)
+        assert Event.from_json(event.with_seq(7).to_json()).data["decision"] == decision
