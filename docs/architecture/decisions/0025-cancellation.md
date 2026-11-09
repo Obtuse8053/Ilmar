@@ -209,21 +209,93 @@ valid request. Nothing relies on timestamps.
 | --- | --- | --- |
 | CLI, before or while writing the temporary file | `.tmp-<execution>.<request>`, perhaps partial | Inert: nothing ever reads a temporary name as a request. A later submission uses a new request id, so no name collides. The worker removes the execution's temporary files once the execution is terminal, or when it applies a request for it (below). |
 | CLI, after `linkat`, before removing the temporary name | the final name and the temporary name, one inode (`st_nlink == 2`), a complete, `fsync`ed request | A valid request (section 1b accepts exactly this second link). When the worker removes the request, it also removes the companion temporary name. |
-| Worker, after recording, before removing the file | the request file | At the next safe point, its request id is already recorded, so it is removed and nothing is recorded twice. |
-| Worker, between removing the final name and the temporary name | the temporary name | Inert; removed as in the first row. |
+| Worker, after recording, before renaming the file | the request file | At the next safe point, its request id is already recorded, so it is cleaned up (below) and nothing is recorded twice. |
+| Worker, after renaming to `.applying-…`, before unlinking it | `.applying-<execution>.<random>` | Inert. At the next safe point it is verified: a recorded request id is unlinked; anything else is moved to `rejected/` (below). |
+| Worker, between the two unlinks | the temporary name | Inert; removed as in the first row. |
 
-**Removal by the worker:**
-- The worker removes a request only if the entry is still exactly the one it
-  validated: the same `st_dev` and `st_ino`, and the same content digest,
-  checked again on the opened file.
-- It then removes the companion temporary name only if that name has the same
-  inode.
-- If the entry changed in between, it removes nothing and validates again at
-  the next safe point. Recording is idempotent by request id.
-- A temporary file that is still being written by a concurrent CLI could be
-  removed under it only when the execution is already terminal or a request
-  is already applied. That CLI's `linkat` then fails, and it reports an error
-  (exit 3). It never publishes a half-written request.
+**Removal by the worker: the check-then-unlink race.**
+
+POSIX gives **no atomic compare-and-delete**:
+- `unlinkat` and `renameat` act on whatever entry has the name at the moment
+  of the call. Neither can be made conditional on the inode or the content
+  seen by an earlier `fstat` or read.
+- Checking an entry and then unlinking its name therefore always leaves a
+  window in which the name can be pointed at something else.
+- Linux's `renameat2(RENAME_NOREPLACE)` is not in Python's standard library
+  (ADR-0003), and it would not close this window either.
+
+This ADR does not claim such a guarantee. It states who can write the inbox,
+and it makes every removal safe under that assumption.
+
+*Trust assumptions for writers to the inbox*, enforced as far as the
+operating system allows (section 1b, step 1):
+
+| Writer | May do | Never does |
+| --- | --- | --- |
+| `ilmar cancel` (any number at once) | create its own `.tmp-<execution>.<request>` name with `O_EXCL`; publish it with `linkat`, which never replaces; unlink its own temporary name | rename, replace or unlink a final name, or anyone else's temporary name |
+| The worker (one per instance: it holds the instance lock, and the execution's lease) | everything below, and only under the lock | delete an entry it has not verified at a private name it chose |
+| The operator account, by hand | anything; it owns the directory | — (outside the protocol, trusted) |
+| Agents and sandboxes | nothing: `coordinator_root` is never mountable | — |
+
+Under these assumptions:
+- only the worker moves or deletes a **final name**;
+- the only way a final name can change between the worker's check and its
+  action is a **manual change by the operator** (or by an `ilmar cancel` that
+  was modified to break the protocol, which is the same account).
+
+The design does not try to win that race. It makes sure that losing it
+**never destroys an entry the worker did not verify**, and never records
+anything it did not validate.
+
+*Cleanup is rename first, verify after*, so that what is deleted is exactly
+what was verified:
+1. **Validate** the request (section 1b) and **record** it durably (one
+   fenced commit; idempotent by request id).
+2. **Take the entry out of the shared name:**
+   `renameat(inbox, "<execution-id>.json", inbox,
+   ".applying-<execution-id>.<random>")`.
+   - The rename moves whatever is at the final name at that instant to a name
+     only the worker uses, chosen with 128 random bits.
+   - `ENOENT` means there is nothing to clean.
+   - The name's uniqueness rests on its randomness, not on an atomic
+     no-replace, and the ADR says so.
+3. **Verify the moved entry:**
+   - open `.applying-…` with `O_NOFOLLOW | O_NONBLOCK`;
+   - `fstat` it, and read and digest it;
+   - compare it with what was validated in step 1: `st_dev`, `st_ino` and the
+     content digest.
+4. **If it matches,** unlink `.applying-…`. Nobody else uses that name, so
+   this unlink removes exactly what was verified. Then, if the companion
+   `.tmp-<execution>.<request>` still exists with the same inode, unlink it;
+   `ENOENT` is fine, because its own CLI may have removed it first.
+5. **If it does not match** (the operator swapped the entry in the window):
+   - The worker **does not delete it.** It renames it to
+     `rejected/<execution-id>.<random>` and reports it:
+     - as invalid, if it fails validation;
+     - or as "a different request, not applied: resubmit", if it passes.
+   - A symlink is moved as a symlink; its target is never touched.
+   - The recorded request stays recorded, because it is what was validated
+     (and, during a run, what stopped the agent).
+
+*Moving an invalid entry aside* uses the same rename-first rule:
+- the final name is renamed to `rejected/<execution-id>.<random>`, and the
+  moved entry is then validated again;
+- if, because of the same race, the moved entry turns out to be a **valid**
+  request, it is kept in `rejected/` and reported as "a valid request moved
+  aside by a concurrent change: resubmit". It is not restored automatically,
+  because a restore would be another unconditional rename.
+
+*Crash cleanup for these steps:*
+- A crash leaves at most an `.applying-<execution>.<random>` name, which is
+  inert: section 1b never reads it as a request.
+- At the next safe point, the worker verifies each such name for that
+  execution:
+  - an entry whose request id is already recorded is unlinked;
+  - anything else is moved to `rejected/` and reported.
+- A temporary file that a concurrent CLI is still writing is removed only
+  when the execution is already terminal or a request was already applied,
+  by the same rename-first rule. That CLI's `linkat` then fails, and it exits
+  3. It never publishes a half-written request.
 
 ### 1b. Validation, shared by the watcher and the worker
 
@@ -277,13 +349,14 @@ the watcher and the worker call it, and nothing else reads the inbox.
 **The worker** calls the same routine at each safe point, and after a
 stopped run:
 - It records the request the watcher validated, which is what stopped the
-  run. It then removes the file only if it is still that entry (section 1a).
+  run. It then cleans up by the rename-first rule of section 1a, which never
+  deletes an entry it has not verified at its private name.
 - If the routine finds an invalid entry at a safe point, the worker moves it
   aside, which is the only place an invalid entry is touched:
   - it renames the entry itself, never a symlink's target, within the inbox
-    to `rejected/<execution-id>.<random>`, with
-    `renameat(inbox, name, rejected, unique_name)`;
-  - the destination name is new and random, so nothing is replaced.
+    to `rejected/<execution-id>.<random>`;
+  - it then validates the moved entry again (section 1a, "Moving an invalid
+    entry aside").
 
   It reports it and records nothing durable.
 
@@ -465,9 +538,37 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
 
   Also:
   - **Swapped after validation:** a valid request is replaced by another
-    entry between the watcher's validation and the worker's removal. The
-    worker records the request that stopped the run, removes nothing it did
-    not validate, and validates the new entry at the next safe point.
+    entry between the watcher's validation and the worker's cleanup. The
+    worker records the request that stopped the run and deletes nothing it
+    did not verify at its private name (see the race tests below).
+- **Acceptance, the check-then-unlink race (section 1a), adversarial.** A test
+  hook runs a concurrent change **exactly in each window**:
+  - between validation and recording;
+  - between recording and the rename to `.applying-…`;
+  - between that rename and the verification;
+  - between the verification and the unlink.
+
+  The concurrent changes are:
+  - replace the final entry with a different valid request, an invalid file,
+    a symlink to a valid request, or a FIFO;
+  - delete it;
+  - remove the companion temporary name (as its own CLI would).
+
+  For every window and change:
+  - the validated request is recorded **exactly once**;
+  - **every entry that was not verified survives** byte for byte, either at
+    the final name or under `rejected/`, with a report saying why;
+  - no symlink target is touched;
+  - `ENOENT` on the companion or the entry is tolerated;
+  - I11 holds, and no other event is recorded.
+- **A race stress test:** a thread swaps entries at the final name in a tight
+  loop while the worker applies and cleans up, over many iterations. Every
+  entry the swapper created is accounted for at the end: the one verified
+  request is deleted and everything else is preserved. A request is never
+  recorded twice, and nothing unvalidated is ever recorded.
+- **Crash during cleanup:** a killed worker after the rename to `.applying-…`
+  leaves an inert entry. The next safe point unlinks it if its request is
+  recorded, and otherwise moves it to `rejected/`.
   - **Positive control:** a valid request stops the run within the watcher
     interval and the stop's own bound. Exactly that request is recorded,
     with its actor, and the file and its companion are removed.
@@ -504,10 +605,19 @@ recorded as `already-terminal`. A cancellation never turns into a failure.
   per-file ownership. These hold on the local filesystems ADR-0005 already
   requires; a filesystem without hard links is refused at submission (exit
   3).
-- **Residual risk:** the operator account can always rewrite its own
-  inbox. Validation protects the coordinator against malformed or unsafe
-  entries and against entries it did not validate. It does not protect
-  against that account, which can already stop Ilmar.
+- **Residual risk:** there is no atomic compare-and-delete in POSIX, so a
+  check and a later removal by name can always be raced. The design narrows
+  who can race it, and keeps the race harmless:
+  - Only the worker removes final names. CLIs never replace or unlink them,
+    and agents cannot reach the inbox, so only a manual change by the
+    operator account can race the worker.
+  - Rename-first cleanup then deletes only what it verified at a private
+    name. A swapped-in entry is preserved and reported, never lost. A valid
+    request swapped in that way is not applied and must be resubmitted.
+
+  The operator account can always rewrite its own inbox, and can already
+  stop Ilmar. Validation protects the coordinator from malformed or unsafe
+  entries and from anything it did not validate, not from that account.
 
 ## Revisit when
 
