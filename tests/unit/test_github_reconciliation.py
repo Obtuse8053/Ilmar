@@ -320,7 +320,7 @@ def _forge(api: FakeGitHub, object_id: int) -> None:
     api.comment(1, claim_comment("a", "0" * 32), user="mallory")
 
 
-Adversary = Callable[[FakeGitHub, int], None]
+Adversary = Callable[[FakeGitHub, int], object]
 ADVERSARIES: dict[str, Adversary] = {
     "newer-own-claim": lambda api, o: api.comment(1, claim_comment("a", "e" * 32), user=ME),
     "other-instance": lambda api, o: api.comment(1, claim_comment("b"), user=ME),
@@ -400,3 +400,15 @@ def test_an_orphan_release_deletes_only_the_observed_object(
         claims_left = [c for c in api.comments[1] if "ilmar:claim" in str(c["body"])]
         # A transferred issue is no longer this repository's: nothing more is done.
         assert claims_left or human or adversary == "transfer"
+
+
+@pytest.mark.parametrize("how", ["deleted", "transferred"])
+def test_releasing_a_vanished_task_is_done(api: FakeGitHub, how: str) -> None:
+    held(api)
+    if how == "deleted":
+        api.deleted.add(1)
+    else:
+        api.transferred[1] = "elsewhere/repo"
+    p = provider(api)
+    p.release(ref(1))  # "not found" counts as done (ADR-0026 §3)
+    p.release(ref(1))

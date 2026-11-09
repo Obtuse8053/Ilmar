@@ -36,6 +36,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from ilmar.core import tracker
 from ilmar.core.cancel_inbox import CancelRequest
 from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS, Watcher
 from ilmar.core.cancellation import Cancellations, cancellation_accepted
@@ -44,9 +45,11 @@ from ilmar.core.components import Components
 from ilmar.core.effects import (
     ABANDONED,
     NEVER_TRANSIENT,
+    ClaimChangedError,
     DeterministicError,
     Effects,
     TransientError,
+    claim_from_intent,
     parse_identity,
 )
 from ilmar.core.event_context import failure_code
@@ -68,7 +71,7 @@ from ilmar.domain.errors import (
     PolicyViolationError,
     ProviderError,
 )
-from ilmar.domain.events import EventType, reason_for_claim, reason_for_error
+from ilmar.domain.events import Event, EventContext, EventType, reason_for_claim, reason_for_error
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
@@ -81,7 +84,7 @@ from ilmar.domain.ledger import (
     operation_key,
     resource_key,
 )
-from ilmar.domain.tasks import ClaimOutcome, Task
+from ilmar.domain.tasks import ClaimOutcome, HeldClaim, Standing, Task
 from ilmar.domain.verification import EvidenceRecord, Verdict
 from ilmar.domain.workspace import ResourceOwner
 from ilmar.ports.execution_store import ExecutionStore
@@ -267,6 +270,7 @@ class _Run:
         self.id = execution_id
         self.task = task
         self.cancel_failures = 0
+        self.read_at_pass_start = False
         self.notices: list[str] = []
         """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
 
@@ -330,8 +334,13 @@ class _Run:
             current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
             **values,
         )  # fmt: skip
+        cleared: tuple[Event, ...] = ()
+        if target.is_terminal:  # a terminal execution closes its open observation (§3a)
+            cleared = self.clearing(observed=None)
         return Commit(
-            applied=((updated, transition),), reasons={self.id: code} if code is not None else {}
+            applied=((updated, transition),),
+            reasons={self.id: code} if code is not None else {},
+            extra_events=cleared,
         )
 
     # -- the loop -------------------------------------------------------------------
@@ -394,7 +403,11 @@ class _Run:
             self.apply_inbox()  # a request that arrived too late: already-terminal
             return self.finish(self.current())
         try:
-            self.cancel_point()
+            if not self.read_at_pass_start:  # the start of this pass (ADR-0026 §2)
+                self.read_at_pass_start = True
+                self.cancel_point(tracker=True)
+            else:
+                self.cancel_point()
             self.step(execution)
         except _Cancelled:
             self.end_cancelled()
@@ -405,6 +418,7 @@ class _Run:
         if state is S.QUEUED:
             self.claim(execution)
         elif state in (S.CLAIMED, S.RETRY_WAIT):
+            self.cancel_point(tracker=True)  # before a new attempt (ADR-0026 §2)
             self.move(S.PROVISIONING, "provisioning a new attempt")
         elif state is S.PROVISIONING:
             self.provision(execution)
@@ -428,6 +442,7 @@ class _Run:
                 S.CANCELLED, f"not claimed: {outcome.value}", code=reason_for_claim(outcome)
             )
 
+        self.clear_before_claim_write(execution)
         self.w.effects.claim(execution, self.lease, then=then)  # repeatable
 
     # -- PROVISIONING ---------------------------------------------------------------
@@ -479,7 +494,8 @@ class _Run:
         start = self.op(execution, K.START_CONTAINER, name)
         run = self.op(execution, K.RUN_AGENT)
         if self.op(execution, K.FREEZE_CANDIDATE) is None and start is None:
-            self.fresh_agent_run(execution, name)
+            self.cancel_point(tracker=True)  # before the agent run (ADR-0026 §2)
+            self.fresh_agent_run(self.current(), name)
             return
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)
         never = recorded_never_transient(start) or recorded_never_transient(run)
@@ -513,7 +529,7 @@ class _Run:
             raise TransientError("the agent timed out", code="agent-timed-out")
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
-        self.cancel_point()  # never frozen once a cancellation is accepted
+        self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted
         if result.outcome is not AgentOutcome.COMPLETED:
             # A cancelled run's output never becomes a candidate (ADR-0025 §2). A
             # stopped run whose request was not recorded fails closed.
@@ -639,7 +655,7 @@ class _Run:
                 f"verification infrastructure failed {LATE_TRIES} times; the frozen candidate "
                 "is kept"
             )
-        self.cancel_point()  # no verification run starts once a cancellation is accepted
+        self.cancel_point(tracker=True)  # no verification run starts once one is accepted
         try:
             effects.verify(
                 self.current(),
@@ -688,7 +704,7 @@ class _Run:
                     or pushed
                 )
         if not pushes:
-            self.cancel_point()  # before the first push; after it, a request is too late
+            self.cancel_point(tracker=True)  # before the first push; after it, too late
         if not pushed:
             failed = sum(
                 1 for o in self.ops(self.current(), K.PUBLISH_REVISION) if o.status is ST.FAILED
@@ -810,11 +826,135 @@ class _Run:
     def cancel_pending(self) -> bool:
         return not self.current().state.is_terminal and cancellation_accepted(self.store, self.id)
 
-    def cancel_point(self) -> None:
-        """A safe point: apply a request from the inbox, then stop if one is accepted."""
+    def cancel_point(self, *, tracker: bool = False) -> None:
+        """A safe point: apply a request from the inbox, then, where ADR-0026 §2 says
+        so, read the task's standing and act on it; stop if a cancellation is
+        accepted."""
         self.apply_inbox()
+        if tracker and not self.cancel_pending():
+            self.tracker_point()
         if self.cancel_pending():
             raise _Cancelled
+
+    # -- tracker reconciliation (ADR-0026) ------------------------------------------
+
+    def tracker_point(self) -> None:
+        """Read the task's standing afresh and act on it (ADR-0026 §3, §3a).
+
+        Never for a terminal execution, and never once a publish intent exists:
+        from then on the change-request follow-up decides the claim. A read that
+        fails raises ``ProviderError``: nothing is decided, and the execution is
+        blocked for this pass.
+        """
+        execution = self.current()
+        if execution.state.is_terminal or self.publish_intended():
+            return
+        self.settle_restores()
+        standing = self.w.components.task_provider.standing(execution.task)  # read only
+        if standing.standing is Standing.HELD:
+            self.record(self.clearing(observed="claim-present"))  # the claim reappeared
+            if standing.label_missing and standing.claim is not None:
+                self.restore(standing.claim)
+            return
+        if standing.standing is Standing.CLAIM_LOST:
+            self.lost_claim()
+            return
+        reason = standing.reason or ""  # INELIGIBLE, CLAIMED_BY_OTHER, GONE: at once
+        self.decide(reason, cleared=self.clearing(observed=reason))
+
+    def publish_intended(self) -> bool:
+        return any(o.kind is K.PUBLISH_REVISION for o in self.store.operations(self.id))
+
+    def lost_claim(self) -> None:
+        """§3a: record a first observation, or confirm one recorded in an earlier pass."""
+        events = self.store.events(execution_id=self.id)
+        write = tracker.claim_write(events, self.store.operations(self.id))
+        current = self.w.effects.events.pass_id
+        observation = tracker.open_observation(events)
+        if observation is not None and tracker.confirms(observation, write, events, current):
+            self.decide(tracker.LOST, cleared=self.clearing(observed=tracker.LOST))
+            return
+        changes: list[Event] = []
+        if observation is not None:
+            if not tracker.stale(observation, write):
+                return  # recorded in this pass: it waits for a later one
+            changes += self.clearing(observed=None)  # it can never confirm: closed
+        if (
+            write is not None
+            and write.claim_id is not None
+            and tracker.may_observe(write, current)
+            and not tracker.observed_in_pass(events, current)
+        ):
+            changes.append(
+                tracker.claim_lost(
+                    self.context(),
+                    self.id,
+                    state="observed",
+                    claim=write.claim_id,
+                    observed=tracker.LOST,
+                )
+            )
+        self.record(tuple(changes))
+
+    def decide(self, reason: str, *, cleared: tuple[Event, ...]) -> None:
+        """Record the tracker's cancellation decision, with any clearing, in one commit."""
+        current = self.w.effects.events.pass_id
+        if any(
+            e.type is EventType.EXECUTION_CANCEL_REQUESTED
+            and e.actor.kind is tracker.COORDINATOR.kind
+            and e.reason == reason
+            and e.pass_id == current
+            for e in self.store.events(execution_id=self.id)
+        ):
+            return  # one recording per pass and decision
+        decided = self.w.cancellations.decide(self.current())
+        event = tracker.decision(self.context(), self.id, reason=reason, decided=decided)
+        self.record((*cleared, event))
+
+    def clearing(self, *, observed: str | None) -> tuple[Event, ...]:
+        """The ``cleared`` event that closes the open observation, if there is one."""
+        observation = tracker.open_observation(self.store.events(execution_id=self.id))
+        if observation is None:
+            return ()
+        claim = str(observation.data.get("claim"))
+        return (
+            tracker.claim_lost(self.context(), self.id, state="cleared", claim=claim,
+                               observed=observed),
+        )  # fmt: skip
+
+    def clear_before_claim_write(self, execution: Execution) -> None:
+        """Any commit of the claim operation resets an open observation (§3a). A
+        repeated intent takes no extra changes, so the clearing is committed on its
+        own just before; a crash in between only clears."""
+        claim = self.op(execution, K.CLAIM_TASK)
+        if claim is None or claim.status in _UNFINISHED:
+            self.record(self.clearing(observed=None))
+
+    def settle_restores(self) -> None:
+        """Perform an interrupted label restore again, from its recorded intent."""
+        for operation in self.ops(self.current(), K.RESTORE_CLAIM_LABEL):
+            if operation.status in _UNFINISHED:
+                step = operation.key.split(":", 3)[3]
+                self.restore(claim_from_intent(operation.intent), step=step)
+
+    def restore(self, claim: HeldClaim, *, step: str | None = None) -> None:
+        """``restore-claim-label``: never a claim and never a decision (§5)."""
+        execution = self.current()
+        if step is None:
+            step = str(len(self.ops(execution, K.RESTORE_CLAIM_LABEL)) + 1)
+        try:
+            self.w.effects.restore_label(execution, self.lease, claim=claim, step=step)
+        except ClaimChangedError:
+            _LOG.warning("%s: the claim changed; its label was not restored", self.id)
+
+    def record(self, events: tuple[Event, ...]) -> None:
+        if events:
+            self.w.effects.journal.record(
+                Commit(extra_events=events), lease=self.lease, execution_id=self.id
+            )
+
+    def context(self) -> EventContext:
+        return self.w.effects.events.context(self.w.effects.fence)
 
     def end_cancelled(self) -> None:
         """Undo what the current state started (ADR-0025 §3), then CANCELLED."""
@@ -858,16 +998,30 @@ class _Run:
             run = self.op(execution, K.RUN_AGENT)
             if run is not None and run.status in _UNFINISHED:
                 effects.abandon_agent_run(self.current(), self.lease)
-        self.end_cancelled_now("cancelled on request")
+        self.end_cancelled_now()
 
-    def end_cancelled_now(self, reason: str) -> None:
+    def end_cancelled_now(self) -> None:
         """The transition itself, only ever after the ending above; ``finish`` then
-        posts the note and releases the claim, or keeps it (quarantine)."""
+        posts the note and releases the claim, or keeps it (quarantine). It carries
+        the accepted decision's reason code (ADR-0026 §3)."""
         if not self.current().state.is_terminal:
-            self.move(S.CANCELLED, reason, code="cancel-requested")
+            code = self.cancel_reason()
+            reason = (
+                "cancelled on request"
+                if code == "cancel-requested"
+                else f"cancelled: {tracker.EXPLANATIONS[code]}"
+            )
+            self.move(S.CANCELLED, reason, code=code)
+
+    def cancel_reason(self) -> str:
+        return tracker.accepted_reason(self.store.events(execution_id=self.id)) or (
+            "cancel-requested"
+        )
 
     def finish(self, execution: Execution) -> WorkerResult:
         effects = self.w.effects
+        self.settle_restores()  # an interrupted label restore is finished, never left open
+        execution = self.current()
         for operation in self.store.operations(self.id):  # informational notes are not repeated
             if operation.kind is K.POST_UPDATE and operation.status in _UNFINISHED:
                 step = operation.key.split(":", 3)[3]
@@ -896,8 +1050,10 @@ class _Run:
             if quarantined:  # a human must look: the claim stays
                 return self.quarantine_remains()
             if held_claim(self.store, self.id):  # never claimed: nothing to tell or release
-                message = "Ilmar stopped working on this task: its cancellation was requested."
-                self.note(execution, CANCEL_STEP, message)
+                why = self.cancel_reason()
+                if why != "task-gone":  # nothing to post on a task that no longer exists
+                    message = f"Ilmar stopped working on this task: {tracker.EXPLANATIONS[why]}."
+                    self.note(execution, CANCEL_STEP, message)
                 effects.release(self.current(), self.lease, step=CANCEL_STEP)  # repeatable
         code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.CANCELLED)
         detail = self.recorded_reason(S.CANCELLED) or execution.last_error or ""

@@ -202,7 +202,11 @@ class GitHubTaskProvider:
         number = self._number(ref)
         if number is None:
             return
-        mine = [c.comment_id for c in self._claims(number) if self._authentic(c)]
+        try:
+            claims = self._claims(number)
+        except (GitHubNotFoundError, GitHubMovedError):
+            return  # the task is gone: nothing to release, and that counts as done
+        mine = [c.comment_id for c in claims if self._authentic(c)]
         if mine:  # never ours: leave other claims, forged copies and labels alone
             self._withdraw(number, mine)
 

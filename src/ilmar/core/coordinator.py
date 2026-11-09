@@ -8,10 +8,12 @@ per execution. A pass:
    with unsettled operations or live sandboxes (ADR-0022): each is driven
    from its durable state by a worker under its own lease. Executions that
    cannot be reconciled stay blocked on their own; nothing else waits;
-2. follows up published executions: a change request that was **merged**
+2. releases **orphaned claims**: this instance's authentic claims that no
+   execution backs, exactly the observed claim object each (ADR-0026 §5);
+3. follows up published executions: a change request that was **merged**
    completes the task, one **closed** without merging abandons it. Either
    way Ilmar's claim is released. While it is open the task stays claimed;
-3. picks at most one eligible task and drives it with a worker.
+4. picks at most one eligible task and drives it with a worker.
 
 Execution completion and task completion differ (ADR-0021). An execution is
 SUCCEEDED when its verified candidate is published as a change request. The
@@ -33,12 +35,24 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 
+from ilmar.core import tracker
 from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS
 from ilmar.core.cancellation import cancellation_accepted
 from ilmar.core.clock import NonDecreasingClock
 from ilmar.core.components import Components
-from ilmar.core.effects import NEVER_TRANSIENT, Effects
-from ilmar.core.event_context import PassEvents, new_pass_id, require_failure_codes
+from ilmar.core.effects import (
+    NEVER_TRANSIENT,
+    ClaimChangedError,
+    Effects,
+    claim_from_intent,
+    orphan_step,
+)
+from ilmar.core.event_context import (
+    PassEvents,
+    failure_code,
+    new_pass_id,
+    require_failure_codes,
+)
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -51,17 +65,24 @@ from ilmar.core.worker import (
     needs_attention,
 )
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
-from ilmar.domain.errors import ConflictError, FencingError, ProviderError
+from ilmar.domain.errors import (
+    ConflictError,
+    FencingError,
+    LedgerIntegrityError,
+    ProviderError,
+)
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
     OperationKind,
+    OperationStatus,
     Resource,
     ResourceKind,
     ResourceStatus,
+    instance_operation_key,
     operation_key,
 )
-from ilmar.domain.tasks import Task
+from ilmar.domain.tasks import HeldClaim, ReleaseResult, Task, TaskRef
 from ilmar.ports.execution_store import ExecutionStore
 
 _LOG = logging.getLogger(__name__)
@@ -187,6 +208,7 @@ class Coordinator:
     def run_once(self) -> PassReport:
         self._events.begin_pass()  # every event this pass writes carries its id
         results = list(self.recover())
+        released = self.release_orphaned_claims(results)
         completed = self.follow_up_change_requests(results)
         task = self._pick()
         if task is not None:
@@ -203,10 +225,12 @@ class Coordinator:
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)
+        orphans = f"released {released} orphaned claim(s)" if released else ""
         if not results:
-            return PassReport(ExitCode.SUCCESS, "no eligible task", completed_tasks=completed)
+            summary = orphans or "no eligible task"
+            return PassReport(ExitCode.SUCCESS, summary, completed_tasks=completed)
         code = max(_CODES[r.outcome] for r in results)
-        summary = "; ".join(r.line() for r in results)
+        summary = "; ".join([*(r.line() for r in results), *([orphans] if orphans else [])])
         return PassReport(code, summary, tuple(results), completed)
 
     def recover(self) -> tuple[WorkerResult, ...]:
@@ -280,6 +304,85 @@ class Coordinator:
     def dispatch(self, execution_id: str, task: Task | None) -> WorkerResult:
         """Run one execution's worker. Safe to call concurrently for different executions."""
         return self._worker.run(execution_id, task)
+
+    # -- orphaned claims (ADR-0026 §5) -----------------------------------------------
+
+    def release_orphaned_claims(self, problems: list[WorkerResult]) -> int:
+        """Release this instance's authentic claims that nothing in the store backs.
+
+        After recovery, before the change-request follow-up and before picking
+        new work. An interrupted release is performed again from its recorded
+        intent first. Each release acts on exactly the observed claim object,
+        revalidated against the store right before its effect. Returns how many
+        were released; problems are reported, never silenced.
+        """
+        released = 0
+        pending: list[HeldClaim] = [
+            claim_from_intent(o.intent)
+            for o in self._store.instance_operations()
+            if o.kind is OperationKind.RELEASE_ORPHAN_CLAIM
+            and o.status in (OperationStatus.INTENDED, OperationStatus.AMBIGUOUS)
+        ]
+        try:
+            listed = list(self._c.task_provider.held_claims())  # read only
+        except ProviderError as error:
+            listed = []
+            problems.append(WorkerResult("claims", Outcome.BLOCKED,
+                                         f"held claims could not be read: {error}",
+                                         code="transient-provider-error"))  # fmt: skip
+        settled = {self._orphan_key(c) for c in pending}
+        orphans = pending + [
+            c for c in listed if not self._backed(c.ref) and self._orphan_key(c) not in settled
+        ]
+        for claim in orphans:
+            existing = self._store.operation(self._orphan_key(claim))
+            if existing is not None and existing.status.is_final:
+                continue  # released, or changed: never retried as a delete
+            known = {e.id for e in self._executions_of(claim.ref)}
+
+            def revalidate(ref: TaskRef = claim.ref, known: set[str] = known) -> None:
+                now = {e.id for e in self._executions_of(ref)}
+                if now - known or self._backed(ref):
+                    raise LedgerIntegrityError(f"{ref} is backed again; its claim is kept")
+
+            try:
+                result = self._effects.release_orphan_claim(claim, revalidate=revalidate)
+            except FencingError:
+                raise
+            except (ClaimChangedError, LedgerIntegrityError, ProviderError) as error:
+                problems.append(WorkerResult("claims", Outcome.BLOCKED,
+                                             f"orphaned claim on {claim.ref}: {error}",
+                                             code=failure_code(error)))  # fmt: skip
+                continue
+            if result is ReleaseResult.RELEASED:
+                released += 1
+        return released
+
+    def _orphan_key(self, claim: HeldClaim) -> str:
+        return instance_operation_key(
+            OperationKind.RELEASE_ORPHAN_CLAIM, self._effects.fence.instance_id, orphan_step(claim)
+        )
+
+    def _executions_of(self, ref: TaskRef) -> list[Execution]:
+        return [e for e in self._store.list_in_states(set(ExecutionState)) if e.task == ref]
+
+    def _backed(self, ref: TaskRef) -> bool:
+        """ADR-0026 §5, rule 3: a claim is backed while any execution of its task is
+        non-terminal, SUCCEEDED with its change request still tracked, terminal with
+        quarantined resources, or still needs attention (its own worker releases it)."""
+        for execution in self._executions_of(ref):
+            if not execution.state.is_terminal or needs_attention(self._store, execution):
+                return True
+            rows = self._store.resources(execution_id=execution.id)
+            if any(r.status is ResourceStatus.QUARANTINED for r in rows):
+                return True
+            if execution.state is S.SUCCEEDED and any(
+                r.kind is ResourceKind.CHANGE_REQUEST
+                and r.status in (ResourceStatus.ACTIVE, ResourceStatus.RELEASING)
+                for r in rows
+            ):
+                return True
+        return False
 
     # -- task completion --------------------------------------------------------------
 
@@ -358,17 +461,26 @@ class Coordinator:
         Never started again automatically: a task with an active execution;
         one with a published (SUCCEEDED) execution, whose change request
         exists, open or merged; one whose execution FAILED; and one whose
-        execution was CANCELLED on request (ADR-0025 §3). Releasing such a
-        task's claim makes it eligible on the tracker, but running it again
-        would undo a decision: a failure classified as not retryable
-        (ADR-0021), or a person's cancellation. A human decides (#12).
+        execution was CANCELLED on request (ADR-0025 §3), or because its claim
+        was lost or the task vanished (ADR-0026 §3). Releasing such a task's
+        claim makes it eligible on the tracker, but running it again would undo
+        a decision: a failure classified as not retryable (ADR-0021), or a
+        person's cancellation. A human decides.
+
+        A task cancelled because the tracker made it ineligible or claimed by
+        someone else may be picked again, as a new execution, once the tracker
+        lists it as eligible again; but never while an earlier execution of it
+        still needs attention, such as an unfinished claim release (ADR-0026 §5).
         """
         finished = {e.task for e in self._store.list_in_states({S.SUCCEEDED, S.FAILED})}
-        finished |= {
-            e.task
-            for e in self._store.list_in_states({S.CANCELLED})
-            if cancellation_accepted(self._store, e.id)
-        }
+        terminal = self._store.list_in_states({s for s in ExecutionState if s.is_terminal})
+        finished |= {e.task for e in terminal if needs_attention(self._store, e)}
+        for execution in self._store.list_in_states({S.CANCELLED}):
+            if not cancellation_accepted(self._store, execution.id):
+                continue  # not claimed in the first place: eligible again
+            reason = tracker.accepted_reason(self._store.events(execution_id=execution.id))
+            if reason not in tracker.REPICKABLE:
+                finished.add(execution.task)
         for task in sorted(self._c.task_provider.list_eligible(), key=lambda t: t.ref.key):
             if task.ref in finished or self._store.active_for_task(task.ref) is not None:
                 continue

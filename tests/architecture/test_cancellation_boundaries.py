@@ -4,8 +4,10 @@
 * The request inbox is reached only through ``open_inbox``, always under the
   layout's ``coordinator_root`` (never mountable into a sandbox).
 * Only the worker's applier (``core/cancellation.py``) records
-  ``execution.cancel_requested`` or moves or removes inbox entries, and only
-  the worker calls it; the CLI only submits.
+  ``execution.cancel_requested`` for a person, or moves or removes inbox
+  entries, and only the worker calls it; the CLI only submits. The tracker's
+  decisions (ADR-0026 §3) are built only in ``core/tracker.py`` and recorded
+  only by the worker (``tests/architecture/test_tracker_boundaries.py``).
 * The watcher calls no port method and no filesystem function: it reads
   through the validation routine it is given, and sets an event.
 * Only ``cancel_inbox`` opens, lists or reads inbox entries: every other
@@ -86,7 +88,7 @@ def test_only_the_applier_records_a_cancel_request() -> None:
                 for a in call.args
             ):
                 writers.append(path.name)
-    assert writers == ["cancellation.py"]
+    assert writers == ["cancellation.py", "tracker.py"]  # a person; the tracker (ADR-0026)
 
 
 def test_only_the_applier_moves_or_removes_inbox_entries() -> None:
