@@ -31,6 +31,7 @@ class AgentOutcome(enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"  # stopped by a stop signal (ADR-0025 §2); never frozen
 
 
 @dataclass(frozen=True, slots=True)

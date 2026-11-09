@@ -23,6 +23,7 @@ probe tool itself works inside the sandbox.
 from __future__ import annotations
 
 import secrets
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -47,7 +48,7 @@ from ilmar.domain.workspace import (
 )
 from ilmar.ports.container_runtime import ContainerRuntime
 
-from contracts.container_runtime import NAME, OWNER, ContainerRuntimeContract
+from contracts.container_runtime import NAME, OWNER, ContainerRuntimeContract, SetAfter
 from integration.podman_support import (
     IMAGE,
     PODMAN,
@@ -69,7 +70,7 @@ from integration.podman_support import (
 
 pytestmark = pytest.mark.integration
 
-NAMES = (NAME, "ilmar-it-profile", "ilmar-it-open")
+NAMES = (NAME, NAME + "-other", "ilmar-it-profile", "ilmar-it-open")
 SENTINEL = "ilmar-sentinel-must-not-leak"
 
 
@@ -107,6 +108,9 @@ class TestContractOnRealPodman(ContainerRuntimeContract):
 
     def make_workspace(self, tmp_path: Path) -> Path:
         return make_workspace(self._layout)
+
+    def make_workspace_named(self, tmp_path: Path, name: str) -> Path:
+        return make_workspace(self._layout, execution=name)
 
     def make_spec(
         self, workspace: Path, name: str, owner: ResourceOwner, identity: DirectoryIdentity
@@ -342,3 +346,30 @@ def test_the_same_probe_reaches_the_target_without_isolation(layout: WorkspaceLa
     finally:
         server.close()
         runtime.stop(handle, owner=OWNER)
+
+
+# -- the stop signal on real Podman (ADR-0025 §2, #16 part 2) ------------------------
+
+
+def test_a_stop_kills_every_process_in_the_sandbox_and_nothing_writes_afterwards(
+    layout: WorkspaceLayout,
+) -> None:
+    """The exec client is killed and the whole container removed: a process the
+    command left in the background cannot write to the workspace afterwards."""
+    runtime = PodmanRuntime(layout=layout)
+    workspace = make_workspace(layout)
+    spec = ContainerSpec(image=IMAGE, host_workspace=workspace, name=NAME, owner=OWNER,
+                         workspace_identity=identity_of(workspace))  # fmt: skip
+    handle = runtime.start(spec)
+    began = time.monotonic()
+    result = runtime.run(
+        handle, sh("(sleep 4; printf late > late.txt) & sleep 120"), timeout_seconds=300,
+        stop=SetAfter(4),  # about one second in
+    )  # fmt: skip
+    assert result.cancelled
+    assert not result.timed_out
+    assert time.monotonic() - began < 30
+    assert podman("container", "exists", NAME, check=False).returncode != 0
+    time.sleep(6)
+    assert not (workspace / "late.txt").exists()
+    assert runtime.find(NAME) is None

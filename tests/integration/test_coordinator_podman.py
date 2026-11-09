@@ -32,7 +32,7 @@ from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import ResourceKind, ResourceStatus
 from ilmar.domain.verification import Verdict, VerificationCommand, VerificationPolicy
-from ilmar.domain.workspace import ContainerHandle, NetworkPolicy
+from ilmar.domain.workspace import ContainerHandle, NetworkPolicy, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
 
 from fakes import FakeSourceControl, FakeTaskProvider
@@ -64,7 +64,12 @@ class ShellAgent:
         return "shell"
 
     def run(
-        self, runtime: ContainerRuntime, container: ContainerHandle, request: AgentRequest
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
         done = runtime.run(container, ["sh", "-c", self.script], timeout_seconds=60)
         if done.exit_code != 0:

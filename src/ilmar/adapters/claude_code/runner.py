@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
-from ilmar.domain.workspace import ContainerHandle
+from ilmar.domain.workspace import ContainerHandle, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
 
 _PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "dontAsk"})
@@ -89,7 +89,12 @@ class ClaudeCodeRunner:
         return self._name
 
     def run(
-        self, runtime: ContainerRuntime, container: ContainerHandle, request: AgentRequest
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
         settings = self._settings
         if settings.expected_version is not None:
@@ -102,7 +107,10 @@ class ClaudeCodeRunner:
             self.command(request),
             timeout_seconds=request.timeout_seconds,
             env=self._environment(),
+            stop=stop,
         )
+        if result.cancelled:  # the runtime removed the sandbox, as on a timeout
+            return AgentResult(AgentOutcome.CANCELLED, "Claude Code was stopped on request", None)
         if result.timed_out:
             return AgentResult(AgentOutcome.TIMED_OUT, "Claude Code timed out", result.exit_code)
         parsed = parse_result(result.stdout)

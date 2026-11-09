@@ -58,6 +58,14 @@ class TestFakeTaskProvider(TaskProviderContract):
 
 
 class TestFakeContainerRuntime(ContainerRuntimeContract):
+    def break_removal(self, runtime: ContainerRuntime) -> None:
+        assert isinstance(runtime, FakeContainerRuntime)
+        runtime.fail_removal = True
+
+    def repair_removal(self, runtime: ContainerRuntime) -> None:
+        assert isinstance(runtime, FakeContainerRuntime)
+        runtime.fail_removal = False
+
     def make_runtime(self) -> ContainerRuntime:
         return FakeContainerRuntime()
 

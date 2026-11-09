@@ -11,11 +11,20 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import threading
+from collections.abc import Mapping, Sequence
 
 import pytest
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
-from ilmar.domain.workspace import ContainerHandle
+from ilmar.domain.workspace import (
+    CommandResult,
+    ContainerHandle,
+    ContainerInfo,
+    ContainerSpec,
+    ResourceOwner,
+    StopSignal,
+)
 from ilmar.ports.agent_runner import AgentRunner
 from ilmar.ports.container_runtime import ContainerRuntime
 
@@ -47,6 +56,48 @@ EXPECTED = {
 }
 
 REQUEST = AgentRequest(task=task("42"), instructions="Fix the bug.", timeout_seconds=60)
+
+
+class StopObservingRuntime:
+    """Wraps the arranged runtime: records the ``stop`` each command was given and
+    behaves like a runtime that honours it (a set signal cancels the command)."""
+
+    def __init__(self, inner: ContainerRuntime) -> None:
+        self.inner = inner
+        self.stops: list[StopSignal | None] = []
+
+    @property
+    def name(self) -> str:
+        return self.inner.name
+
+    def start(self, spec: ContainerSpec) -> ContainerHandle:
+        return self.inner.start(spec)
+
+    def find(self, name: str) -> ContainerInfo | None:
+        return self.inner.find(name)
+
+    def run(
+        self,
+        handle: ContainerHandle,
+        argv: Sequence[str],
+        *,
+        timeout_seconds: float,
+        env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
+    ) -> CommandResult:
+        self.stops.append(stop)
+        if stop is not None and stop.is_set():
+            return CommandResult(-9, "", "", 0.0, cancelled=True)
+        return self.inner.run(handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop)
+
+    def is_running(self, handle: ContainerHandle) -> bool:
+        return self.inner.is_running(handle)
+
+    def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
+        return self.inner.remove_owned(name, owner=owner)
+
+    def stop(self, handle: ContainerHandle, *, owner: ResourceOwner) -> None:
+        self.inner.stop(handle, owner=owner)
 
 
 class AgentRunnerContract:
@@ -98,3 +149,32 @@ class AgentRunnerContract:
         assert type(result) is AgentResult
         fields = {f.name for f in dataclasses.fields(AgentResult)}
         assert fields == {"outcome", "summary", "exit_code"}
+
+    # -- the stop signal (ADR-0025 §2) ------------------------------------
+
+    def test_a_set_stop_signal_is_passed_through_and_yields_cancelled(
+        self, runner: AgentRunner
+    ) -> None:
+        runtime, container = self.arrange(AgentScenario.COMPLETES)
+        observing = StopObservingRuntime(runtime)
+        stop = threading.Event()
+        stop.set()
+        result = runner.run(observing, container, REQUEST, stop=stop)
+        assert result.outcome is AgentOutcome.CANCELLED
+        assert result.exit_code is None
+        assert stop in observing.stops  # the very signal, unchanged, reached the runtime
+
+    def test_an_unset_stop_signal_changes_nothing(self, runner: AgentRunner) -> None:
+        runtime, container = self.arrange(AgentScenario.COMPLETES)
+        observing = StopObservingRuntime(runtime)
+        stop = threading.Event()
+        result = runner.run(observing, container, REQUEST, stop=stop)
+        assert result.outcome is AgentOutcome.COMPLETED
+        assert stop in observing.stops
+        assert not stop.is_set()  # a runner only reads the signal
+
+    def test_without_a_stop_signal_nothing_is_passed(self, runner: AgentRunner) -> None:
+        runtime, container = self.arrange(AgentScenario.COMPLETES)
+        observing = StopObservingRuntime(runtime)
+        assert runner.run(observing, container, REQUEST).outcome is AgentOutcome.COMPLETED
+        assert set(observing.stops) == {None}

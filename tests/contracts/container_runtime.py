@@ -10,12 +10,19 @@ remove a container, and operations act on the immutable id.
 from __future__ import annotations
 
 import dataclasses
+import threading
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
-from ilmar.domain.errors import OwnershipConflictError, PolicyViolationError, ProviderError
+from ilmar.domain.errors import (
+    ContainmentError,
+    OwnershipConflictError,
+    PolicyViolationError,
+    ProviderError,
+)
 from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
@@ -38,8 +45,37 @@ def identity_of(path: Path) -> DirectoryIdentity:
     return DirectoryIdentity(info.st_dev, info.st_ino)
 
 
+class SetAfter:
+    """A stop signal that becomes set on its ``checks + 1``-th look.
+
+    Deterministic for every runtime: a real one looks every 0.25 s, a fake once
+    per simulated second. It also counts how often it was looked at.
+    """
+
+    def __init__(self, checks: int) -> None:
+        self._checks = checks
+        self.looks = 0
+        self._lock = threading.Lock()
+
+    def is_set(self) -> bool:
+        with self._lock:
+            self.looks += 1
+            return self.looks > self._checks
+
+
+STOP_BOUND_SECONDS = 30.0
+"""How long a real runtime may take to kill, remove and confirm after a stop."""
+
+
 class ContainerRuntimeContract:
     def make_runtime(self) -> ContainerRuntime:
+        raise NotImplementedError
+
+    def break_removal(self, runtime: ContainerRuntime) -> None:
+        """Make the next sandbox removal unconfirmable (provider-specific)."""
+        pytest.skip("this runtime cannot simulate an unconfirmed removal")
+
+    def repair_removal(self, runtime: ContainerRuntime) -> None:
         raise NotImplementedError
 
     def make_workspace(self, tmp_path: Path) -> Path:
@@ -274,3 +310,93 @@ class ContainerRuntimeContract:
         assert info.handle == foreign
         assert info.owner == foreign_owner
         assert runtime.is_running(foreign)
+
+    # -- the stop signal (ADR-0025 §2): exactly like a timeout ----------------
+
+    def test_a_stop_signal_cancels_the_command_and_removes_the_sandbox(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        stop = SetAfter(2)
+        began = time.monotonic()
+        result = runtime.run(container, self.sleep(120), timeout_seconds=300, stop=stop)
+        assert time.monotonic() - began < STOP_BOUND_SECONDS
+        assert result.cancelled
+        assert not result.timed_out
+        assert not result.succeeded
+        assert stop.looks >= 3
+        assert not runtime.is_running(container)
+        assert runtime.find(NAME) is None
+        with pytest.raises(ProviderError):
+            runtime.run(container, self.echo("stale"), timeout_seconds=30)
+
+    def test_a_signal_set_before_the_command_runs_nothing(
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        workspace: Path,
+    ) -> None:
+        stop = threading.Event()
+        stop.set()
+        result = runtime.run(container, self.write_file("ran.txt", "x"), timeout_seconds=30,
+                             stop=stop)  # fmt: skip
+        assert result.cancelled
+        assert not (workspace / "ran.txt").exists()
+        assert runtime.find(NAME) is None
+
+    def test_an_unset_stop_signal_changes_nothing(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        stop = threading.Event()
+        result = runtime.run(container, self.echo("still here"), timeout_seconds=30, stop=stop)
+        assert result.succeeded
+        assert not result.cancelled
+        assert result.stdout.strip() == "still here"
+        assert runtime.is_running(container)
+        assert not stop.is_set()  # a runtime only reads the signal
+
+    def test_a_timeout_with_an_unset_signal_is_still_a_timeout(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(container, self.sleep(30), timeout_seconds=1,
+                             stop=threading.Event())  # fmt: skip
+        assert result.timed_out
+        assert not result.cancelled
+        assert runtime.find(NAME) is None
+
+    def test_a_stop_leaves_other_sandboxes_alone(
+        self, runtime: ContainerRuntime, container: ContainerHandle, tmp_path: Path
+    ) -> None:
+        other_workspace = self.make_workspace_named(tmp_path, "other")
+        other_spec = self.make_spec(other_workspace, NAME + "-other", OTHER_ATTEMPT,
+                                    identity_of(other_workspace))  # fmt: skip
+        other = runtime.start(other_spec)
+        try:
+            result = runtime.run(container, self.sleep(120), timeout_seconds=300,
+                                 stop=SetAfter(1))  # fmt: skip
+            assert result.cancelled
+            assert runtime.is_running(other)
+            assert runtime.run(other, self.echo("alive"), timeout_seconds=30).succeeded
+        finally:
+            runtime.stop(other, owner=OTHER_ATTEMPT)
+
+    def test_an_unconfirmed_removal_after_a_stop_fails_closed_and_quarantines(
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        spec: ContainerSpec,
+    ) -> None:
+        self.break_removal(runtime)
+        with pytest.raises(ContainmentError):
+            runtime.run(container, self.sleep(120), timeout_seconds=300, stop=SetAfter(1))
+        with pytest.raises(ContainmentError):  # the workspace is quarantined
+            runtime.start(spec)
+        self.repair_removal(runtime)
+        replacement = runtime.start(spec)  # removal now confirmed: released
+        assert replacement.id != container.id
+        runtime.stop(replacement, owner=OWNER)
+
+    def make_workspace_named(self, tmp_path: Path, name: str) -> Path:
+        """A second workspace the runtime may mount (override to fit a layout)."""
+        path = tmp_path / name
+        path.mkdir()
+        return path

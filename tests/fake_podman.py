@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ilmar.adapters.podman.runtime import TIMED_OUT_EXIT_CODE, Completed
-from ilmar.domain.workspace import DirectoryIdentity
+from ilmar.domain.workspace import DirectoryIdentity, StopSignal
 
 PODMAN = "podman"
 
@@ -57,6 +57,8 @@ class Call:
     stdin: bytes | None = None
     command_env: dict[str, str] | None = None
     """What the in-container loader exported from stdin (``podman exec`` only)."""
+    stopped_by: StopSignal | None = None
+    """The stop signal the executor was given (``podman exec`` of ``sleep`` only)."""
 
 
 @dataclass
@@ -102,6 +104,7 @@ class FakePodman:
         *,
         pass_fds: Sequence[int] = (),
         stdin: bytes | None = None,
+        stop: StopSignal | None = None,
     ) -> Completed:
         args = list(argv)
         assert args[0] == PODMAN, args
@@ -120,7 +123,7 @@ class FakePodman:
         if command == "run":
             return self._run(rest, call)
         if command == "exec":
-            return self._exec(rest, call, timeout)
+            return self._exec(rest, call, timeout, stop)
         if command == "network":
             return self._network(rest)
         if command == "logs":
@@ -278,7 +281,9 @@ class FakePodman:
             return Completed(0, name + "\n", "")
         return Completed(125, "", f"Error: unsupported network action {action}\n")
 
-    def _exec(self, rest: list[str], call: Call, timeout: float) -> Completed:
+    def _exec(
+        self, rest: list[str], call: Call, timeout: float, stop: StopSignal | None = None
+    ) -> Completed:
         recorded = "podman records exec environments on disk: values must go through stdin"
         assert "--env-file" not in rest, recorded
         assert "--env" not in rest, recorded
@@ -300,6 +305,11 @@ class FakePodman:
             case ["exit", code]:
                 return Completed(int(code), "", "")
             case ["sleep", seconds]:
+                call.stopped_by = stop
+                # Simulated time: the executor looks at the stop signal once per poll.
+                for _ in range(int(min(float(seconds), timeout)) + 1):
+                    if stop is not None and stop.is_set():
+                        return Completed(TIMED_OUT_EXIT_CODE, "", "", cancelled=True)
                 if float(seconds) > timeout:
                     return Completed(TIMED_OUT_EXIT_CODE, "", "", timed_out=True)
                 return Completed(0, "", "")

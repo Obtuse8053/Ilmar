@@ -12,6 +12,7 @@ from ilmar.domain.workspace import (
     ContainerInfo,
     ContainerSpec,
     ResourceOwner,
+    StopSignal,
 )
 
 
@@ -37,6 +38,13 @@ class ContainerRuntime(Protocol):
       refuses to mount that workspace again, under any container name, until a
       later ``stop`` or ``start`` confirms every one of them is gone. ``stop``
       reports a partial teardown the same way.
+    * A ``stop`` signal that is set before or while a command runs (checked at
+      least once a second) is handled **exactly like a timeout**: only the
+      runtime's own client process group is killed, the whole sandbox with its
+      companion resources is removed by the id the handle holds, and the result
+      has ``cancelled=True``. An unconfirmed removal raises ``ContainmentError``
+      and quarantines the workspace, as on a timeout. A signal set before the
+      command starts runs nothing. A signal that is never set changes nothing.
     * ``NetworkPolicy.UNRESTRICTED`` is refused with ``PolicyViolationError``
       unless the runtime was explicitly configured to permit it (a trusted or
       development deployment). A ``ContainerSpec`` alone never grants it.
@@ -70,8 +78,11 @@ class ContainerRuntime(Protocol):
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         """Run ``argv`` in the container with ``env`` added for this command only.
+
+        ``stop``: see the contract above.
 
         ``env`` is where a credential goes (the model key: ADR-0006). An adapter
         must keep it out of anything the runtime persists or shows: not the

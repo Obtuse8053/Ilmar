@@ -33,6 +33,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
+    StopSignal,
 )
 
 from fakes import FakeContainerRuntime, FakeSourceControl
@@ -65,6 +66,7 @@ class RecordingRuntime(FakeContainerRuntime):
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         if argv and argv[0] == "kill-sandbox":  # the candidate ends its own sandbox
             self._containers[handle.id].running = False
@@ -82,7 +84,7 @@ class RecordingRuntime(FakeContainerRuntime):
                 return CommandResult(0, "", "", 0.1)
             dirty = (workspace / "tests" / "test_app.py").read_text() != "ok\n" or strays
             return CommandResult(1 if dirty else 0, "", "", 0.1)
-        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env)
+        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop)
 
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         self.started.append(spec)

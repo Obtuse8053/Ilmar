@@ -22,6 +22,7 @@ from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
     NetworkPolicy,
+    StopSignal,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
 from ilmar.ports.execution_store import ExecutionStore
@@ -68,6 +69,7 @@ class WorkspaceRuntime(FakeContainerRuntime):
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         if argv and argv[0] == "check":
             container = self._containers[handle.id]
@@ -75,7 +77,7 @@ class WorkspaceRuntime(FakeContainerRuntime):
             ok = target.is_file() and argv[2] in target.read_text()
             self.commands.append((handle.id, tuple(argv)))
             return CommandResult(0 if ok else 1, "", "" if ok else "not fixed\n", 0.1)
-        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env)
+        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop)
 
     def stop(self, handle: ContainerHandle, *, owner: Any) -> None:
         if self.stop_hook is not None:
@@ -109,7 +111,12 @@ class ScriptedAgent:
         return "scripted"
 
     def run(
-        self, runtime: ContainerRuntime, container: ContainerHandle, request: AgentRequest
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
         outcome, edits = self.plan[min(self.runs, len(self.plan) - 1)]
         self.runs += 1

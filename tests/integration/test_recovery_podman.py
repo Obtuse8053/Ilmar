@@ -33,7 +33,13 @@ from ilmar.domain.errors import OwnershipConflictError
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import ResourceKind, ResourceStatus
 from ilmar.domain.verification import VerificationCommand, VerificationPolicy
-from ilmar.domain.workspace import ContainerHandle, ContainerSpec, NetworkPolicy, ResourceOwner
+from ilmar.domain.workspace import (
+    ContainerHandle,
+    ContainerSpec,
+    NetworkPolicy,
+    ResourceOwner,
+    StopSignal,
+)
 from ilmar.ports.container_runtime import ContainerRuntime
 from recovery_support import Crash, Killable, KillableStore, Switch, event_problems
 
@@ -97,7 +103,12 @@ class ShellAgent:
         return "shell"
 
     def run(
-        self, runtime: ContainerRuntime, container: ContainerHandle, request: AgentRequest
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
         self.containers.append(container.name)
         if self.switch is not None:

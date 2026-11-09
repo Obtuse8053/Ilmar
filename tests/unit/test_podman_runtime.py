@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
@@ -15,6 +18,7 @@ from ilmar.adapters.podman import EgressSettings, PodmanRuntime, SandboxProfile
 from ilmar.adapters.podman.runtime import (
     LABEL_MANAGED,
     PODMAN_ENVIRONMENT,
+    TIMED_OUT_EXIT_CODE,
     proc_root_identity,
     subprocess_executor,
 )
@@ -35,6 +39,7 @@ from ilmar.domain.workspace import (
     ResourceOwner,
 )
 
+from contracts.container_runtime import SetAfter
 from fake_podman import FakeNetwork, FakePodman
 
 OWNER = ResourceOwner(instance_id="inst-a", execution_id="exec-1", attempt=1, token="tok-1")
@@ -773,7 +778,7 @@ def runs_of(podman: FakePodman, name: str) -> int:
 
 
 @pytest.mark.parametrize("part", ["proxy", "network"])
-@pytest.mark.parametrize("how", ["stop", "timeout"])
+@pytest.mark.parametrize("how", ["stop", "timeout", "stop-signal"])
 def test_failed_sidecar_teardown_quarantines_the_workspace(
     layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, part: str, how: str
 ) -> None:
@@ -785,6 +790,8 @@ def test_failed_sidecar_teardown_quarantines_the_workspace(
         if how == "stop":
             rt.stop(handle, owner=OWNER)
             return None
+        if how == "stop-signal":  # ADR-0025 §2: exactly what a timeout does
+            return rt.run(handle, ["sleep", "60"], timeout_seconds=300, stop=SetAfter(1))
         return rt.run(handle, ["sleep", "60"], timeout_seconds=1)  # containment, not a result
 
     with pytest.raises(ContainmentError, match="ilmar-exec-1-1"):
@@ -952,3 +959,184 @@ def test_a_coordinator_killed_mid_command_leaves_no_credential_on_disk(tmp_path:
     leftovers = [p for p in spool.rglob("*") if b"must-not-persist" in p.read_bytes()]
     assert leftovers == []
     assert list(spool.iterdir()) == []
+
+
+# -- the stop signal (ADR-0025 §2, #16 part 2) ---------------------------------------
+
+
+def test_a_stop_signal_reaches_the_executor_and_removes_the_container(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    stop = SetAfter(2)
+    result = rt.run(handle, ["sleep", "60"], timeout_seconds=300, stop=stop)
+    assert (result.cancelled, result.timed_out) == (True, False)
+    (exec_call,) = [c for c in podman.calls if c.argv[1] == "exec"]
+    assert exec_call.stopped_by is stop
+    assert ["rm", "--force", "--time", "0", handle.id] in [c.argv[1:] for c in podman.calls]
+    assert podman.containers == {}
+
+
+def test_a_stop_signal_also_reaches_a_command_with_credentials(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    stop = SetAfter(1)
+    result = rt.run(handle, ["sleep", "60"], timeout_seconds=300,
+                    env={"ANTHROPIC_API_KEY": "sk-model"}, stop=stop)  # fmt: skip
+    assert result.cancelled
+    (exec_call,) = [c for c in podman.calls if c.argv[1] == "exec"]
+    assert exec_call.stopped_by is stop
+    assert podman.containers == {}
+
+
+def test_a_preset_stop_signal_execs_nothing_and_removes_everything(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    stop = threading.Event()
+    stop.set()
+    result = rt.run(handle, ["write", "ran.txt", "x"], timeout_seconds=30, stop=stop)
+    assert result.cancelled
+    assert "exec" not in podman.commands()
+    assert not (workspace[0] / "ran.txt").exists()
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+def test_a_stop_signal_removes_the_sidecar_too(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, egress=EGRESS)
+    handle = rt.start(allowlist_spec(workspace))
+    assert rt.run(handle, ["sleep", "60"], timeout_seconds=300, stop=SetAfter(1)).cancelled
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+@pytest.mark.parametrize("behaviour", ["fail", "hang"])
+def test_unconfirmed_removal_after_a_stop_fails_closed_and_quarantines(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, behaviour: str
+) -> None:
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    podman.rm_behaviour = behaviour
+    with pytest.raises(ContainmentError) as caught:
+        rt.run(handle, ["sleep", "60"], timeout_seconds=300, stop=SetAfter(1))
+    assert caught.value.container_id == handle.id
+    assert handle.id in podman.containers  # reported, not assumed gone
+    runs_before = podman.commands().count("run")
+    with pytest.raises(ContainmentError):
+        rt.start(spec(workspace, name="ilmar-exec-1-1-retry"))  # under any name
+    assert podman.commands().count("run") == runs_before
+    podman.rm_behaviour = "ok"
+    replacement = rt.start(spec(workspace))
+    assert handle.id not in podman.containers
+    assert replacement.id != handle.id
+
+
+def test_a_stop_signal_never_affects_a_container_of_another_owner(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    """The runtime removes the container by the id the handle holds, never by name."""
+    rt = runtime(layout, podman)
+    handle = rt.start(spec(workspace))
+    foreign = podman.create("ilmar-someone-else", {})
+    assert rt.run(handle, ["sleep", "60"], timeout_seconds=300, stop=SetAfter(1)).cancelled
+    assert foreign in podman.containers
+    removed = [c.argv[-1] for c in podman.calls if c.argv[1] == "rm"]
+    assert removed == [handle.id]
+
+
+# The real executor: a stop kills exactly the executor's own process group.
+
+
+def _later(event: threading.Event, seconds: float) -> threading.Timer:
+    timer = threading.Timer(seconds, event.set)
+    timer.start()
+    return timer
+
+
+def test_subprocess_executor_stops_within_the_poll_interval() -> None:
+    stop = threading.Event()
+    timer = _later(stop, 0.3)
+    began = time.monotonic()
+    done = subprocess_executor([sys.executable, "-c", "import time; time.sleep(60)"],
+                               dict(os.environ), 120, stop=stop)  # fmt: skip
+    elapsed = time.monotonic() - began
+    timer.cancel()
+    assert (done.cancelled, done.timed_out) == (True, False)
+    assert done.returncode == TIMED_OUT_EXIT_CODE
+    assert elapsed < 0.3 + 1.0 + 1.0  # the signal is looked at at least once a second
+
+
+def test_subprocess_executor_stop_kills_the_whole_own_process_group(tmp_path: Path) -> None:
+    marker = tmp_path / "grandchild-survived"
+    grandchild = tmp_path / "grandchild.py"
+    grandchild.write_text(f"import time\ntime.sleep(3)\nopen({str(marker)!r}, 'w').close()\n")
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(grandchild)!r}])\n"
+        "time.sleep(60)\n"
+    )
+    stop = threading.Event()
+    timer = _later(stop, 0.5)
+    done = subprocess_executor([sys.executable, str(parent)], dict(os.environ), 120, stop=stop)
+    timer.cancel()
+    assert done.cancelled
+    time.sleep(4)
+    assert not marker.exists()
+
+
+def test_subprocess_executor_stop_never_signals_another_process(tmp_path: Path) -> None:
+    """Only the executor's own group is killed: not an unrelated process, not one
+    in the coordinator's own process group, not the coordinator itself."""
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        stop = threading.Event()
+        stop.set()
+        done = subprocess_executor([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   dict(os.environ), 120, stop=stop)  # fmt: skip
+        assert done.cancelled
+        time.sleep(0.5)
+        assert unrelated.poll() is None
+        assert sibling.poll() is None
+        assert os.getpgid(sibling.pid) == os.getpgrp()
+    finally:
+        for process in (unrelated, sibling):
+            process.send_signal(signal.SIGKILL)
+            process.wait(10)
+
+
+def test_subprocess_executor_stops_while_a_leftover_holds_the_pipe(tmp_path: Path) -> None:
+    script = tmp_path / "detach.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    )
+    stop = threading.Event()
+    timer = _later(stop, 0.5)
+    began = time.monotonic()
+    done = subprocess_executor([sys.executable, str(script)], dict(os.environ), 120, stop=stop)
+    timer.cancel()
+    assert (done.cancelled, done.timed_out) == (True, False)
+    assert time.monotonic() - began < 15
+
+
+def test_subprocess_executor_with_an_unset_signal_behaves_as_before() -> None:
+    stop = threading.Event()
+    done = subprocess_executor(
+        [sys.executable, "-c", "import sys; print('done'); sys.exit(4)"], {}, 30, stop=stop
+    )
+    assert (done.returncode, done.stdout.strip(), done.cancelled, done.timed_out) == (
+        4, "done", False, False)  # fmt: skip
+    timed = subprocess_executor([sys.executable, "-c", "import time; time.sleep(60)"], {}, 1,
+                                stop=stop)  # fmt: skip
+    assert (timed.timed_out, timed.cancelled) == (True, False)
