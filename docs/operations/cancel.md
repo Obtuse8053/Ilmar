@@ -44,11 +44,16 @@ While the agent runs, a watcher checks every 2 seconds.
 | While verifying | A verification run in progress finishes, within its own timeout. No further run starts. The evidence is kept. |
 | Before the first push | Nothing is pushed. The candidate and the evidence are kept. |
 | After the first push started | **Too late:** the request is recorded as `too-late`, and publishing completes exactly once. Close the change request to release the task. |
-| After the execution finished | Recorded as `already-terminal`. Nothing changes. |
+| After the execution finished | Recorded as `already-terminal` by the next pass, under the instance lock and the execution's lease. The file is removed. Nothing else changes. |
 
 **How it ends:** the execution ends `cancelled`, with the reason code
 `cancel-requested`. If the task was claimed, Ilmar posts one note on it and
 releases the claim.
+
+**When cleanup fails:** if an error interrupts the cleanup, the coordinator
+runs the whole cleanup again. After three failed tries in one pass, it
+reports the execution blocked and leaves it as it is. The next pass
+continues. A cancellation never becomes a failure or a new attempt.
 
 **When a sandbox cannot be confirmed removed:** the sandbox is quarantined.
 The execution is reported blocked, and the claim is kept for a person.

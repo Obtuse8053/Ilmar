@@ -104,6 +104,8 @@ _DETERMINISTIC = (
     OwnershipConflictError,
     PolicyViolationError,
 )
+CANCEL_TRIES = 3
+"""How often one pass tries a pending cancellation's ending before it reports BLOCKED."""
 CANCEL_STEP = "cancelled"
 """The step of the note and the claim release that end a cancellation (ADR-0025 §3)."""
 _UNFINISHED = (ST.INTENDED, ST.AMBIGUOUS)
@@ -183,6 +185,23 @@ class ExecutionWorker:
         with self.leases.acquire(execution_id) as lease:
             return _Run(self, lease, execution_id, task).drive()
 
+    def stranded_requests(self) -> tuple[str, ...]:
+        """Execution ids with an entry left in the request inbox."""
+        return self.cancellations.pending()
+
+    def apply_stranded(self, execution_id: str) -> tuple[str, ...]:
+        """Record and clean up a request left for a **terminal** execution (ADR-0025
+        §3: ``already-terminal``), under its lease and the instance fence. Nothing
+        else is done to the execution. Returns what was moved aside."""
+        with self.leases.acquire(execution_id) as lease:
+            execution = self.components.execution_store.get(execution_id)
+            if execution is None or not execution.state.is_terminal:
+                return ()  # unknown, or a live execution: its own worker applies it
+            applied = self.cancellations.apply(execution, lease)
+            for report in applied.reports:
+                _LOG.warning("%s", report)
+            return applied.reports
+
 
 def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
     """Whether a terminal execution still has work: unsettled operations or live sandboxes."""
@@ -247,6 +266,7 @@ class _Run:
         self.lease = lease
         self.id = execution_id
         self.task = task
+        self.cancel_failures = 0
         self.notices: list[str] = []
         """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
 
@@ -332,16 +352,28 @@ class _Run:
                 if finished is not None:
                     return finished
             except TransientError as error:
-                blocked = self.retry_or_fail(str(error), code=error.code)
-                if blocked is not None:
-                    return blocked
+                ended = self.retry_or_fail(str(error), code=error.code)
+                if ended is not None:
+                    return ended
             except (_Deterministic, DeterministicError) as failure:
-                self.fail(str(failure), code=failure.code)
+                ended = self.fail(str(failure), code=failure.code)
+                if ended is not None:
+                    return ended
             except _Blocked as blocked:
                 return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
             except _DETERMINISTIC as error:
-                self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
+                ended = self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
+                if ended is not None:
+                    return ended
             except ContainmentError as error:
+                if self.cancel_pending():
+                    # The sandbox is quarantined; the ending settles the rest, then
+                    # CANCELLED, and finish keeps the claim (ADR-0025 §3).
+                    ended = self.cancel_instead(f"containment: {error}",
+                                                  code="containment-unconfirmed")  # fmt: skip
+                    if ended is not None:
+                        return ended
+                    continue
                 if not self.current().state.is_terminal:
                     self.fail(f"containment: {error}", code="containment-unconfirmed")
                 return WorkerResult(self.id, Outcome.BLOCKED, "a sandbox could not be removed",
@@ -734,8 +766,7 @@ class _Run:
     def retry_or_fail(self, reason: str, *, code: str) -> WorkerResult | None:
         execution = self.current()
         if self.cancel_pending():  # never a new attempt once a cancellation is accepted
-            self.end_cancelled_now(reason)
-            return None
+            return self.cancel_instead(reason, code=code)
         if self.op(execution, K.FREEZE_CANDIDATE) is not None:
             # Never a new agent run once this attempt froze a candidate.
             return WorkerResult(
@@ -744,14 +775,28 @@ class _Run:
         if self.w.machine.retries_remaining(execution) > 0 and execution.state is not S.QUEUED:
             self.move(S.RETRY_WAIT, f"transient: {reason}", code=code, error=reason)
         else:
-            self.fail(f"attempts exhausted: {reason}", code="attempts-exhausted")
+            return self.fail(f"attempts exhausted: {reason}", code="attempts-exhausted")
         return None
 
-    def fail(self, reason: str, *, code: str) -> None:
+    def fail(self, reason: str, *, code: str) -> WorkerResult | None:
         if self.cancel_pending():  # a cancellation never turns into a failure (ADR-0025 §3)
-            self.end_cancelled_now(reason)
-        elif not self.current().state.is_terminal:
+            return self.cancel_instead(reason, code=code)
+        if not self.current().state.is_terminal:
             self.move(S.FAILED, reason, code=code, error=reason)
+        return None
+
+    def cancel_instead(self, reason: str, *, code: str) -> WorkerResult | None:
+        """A failure while a cancellation is pending. It never becomes FAILED, a retry
+        or a bare CANCELLED transition: the loop runs the whole ending again
+        (reconciliation, ownership-verified sandbox removal), at most
+        ``CANCEL_TRIES`` times in this pass, then reports BLOCKED and leaves the
+        execution as it is for the next pass."""
+        self.cancel_failures += 1
+        _LOG.warning("%s: cancelling failed (%s): %s", self.id, code, reason)
+        if self.cancel_failures < CANCEL_TRIES:
+            return None
+        detail = f"the cancellation could not complete yet: {reason}"
+        return WorkerResult(self.id, Outcome.BLOCKED, detail, code=code)
 
     # -- cancellation (ADR-0025) ----------------------------------------------------
 
@@ -799,7 +844,13 @@ class _Run:
                         candidate=candidate, then=lambda _r: Commit(),
                     )  # fmt: skip
         self.sweep_sandboxes()  # journaled, ownership-verified removal of every live sandbox
-        if state is S.RUNNING_AGENT:
+        quarantined = any(
+            r.kind is ResourceKind.CONTAINER
+            for r in self.store.resources(execution_id=self.id, statuses={R.QUARANTINED})
+        )
+        if state is S.RUNNING_AGENT and not quarantined:
+            # Settling these says the sandbox is gone; with a quarantined one it is
+            # not known, so they stay for the human who resolves the quarantine.
             name = container_name(c.instance_id, self.id, execution.attempt)
             start = self.op(execution, K.START_CONTAINER, name)
             if start is not None and start.status in _UNFINISHED:
@@ -810,8 +861,8 @@ class _Run:
         self.end_cancelled_now("cancelled on request")
 
     def end_cancelled_now(self, reason: str) -> None:
-        """The transition itself; what is left is settled by ``finish`` (sandboxes,
-        note, claim) or kept for a human (quarantine)."""
+        """The transition itself, only ever after the ending above; ``finish`` then
+        posts the note and releases the claim, or keeps it (quarantine)."""
         if not self.current().state.is_terminal:
             self.move(S.CANCELLED, reason, code="cancel-requested")
 

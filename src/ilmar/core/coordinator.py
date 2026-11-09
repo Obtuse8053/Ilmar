@@ -222,7 +222,28 @@ class Coordinator:
             result = self._isolated(execution.id, partial(self._recover_one, execution))
             if result is not None:
                 results.append(result)
+        results.extend(self.settle_stranded_requests())
         return tuple(results)
+
+    def settle_stranded_requests(self) -> list[WorkerResult]:
+        """Requests left for executions that are already terminal and need no other
+        work, so no worker visits them: recorded ``already-terminal`` and cleaned
+        up by the worker's applier under the execution's lease (ADR-0025 §3).
+        Live executions are left to their own worker; unknown ids are left alone.
+        Only an unexpected error produces a result line (BLOCKED, never silenced)."""
+        failures = []
+        for execution_id in self._worker.stranded_requests():
+            execution = self._store.get(execution_id)
+            if execution is None or not execution.state.is_terminal:
+                continue
+
+            def settle(execution_id: str = execution_id) -> None:
+                self._worker.apply_stranded(execution_id)
+
+            failure = self._isolated(execution_id, partial(_none_after, settle))
+            if failure is not None:
+                failures.append(failure)
+        return failures
 
     def _recover_one(self, execution: Execution) -> WorkerResult | None:
         try:
@@ -353,3 +374,8 @@ class Coordinator:
                 continue
             return task
         return None
+
+
+def _none_after(work: Callable[[], object]) -> WorkerResult | None:
+    work()
+    return None

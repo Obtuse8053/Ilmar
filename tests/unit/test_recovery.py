@@ -951,6 +951,43 @@ def check_cancelled(world: World) -> list[str]:
     return problems
 
 
+def merge_with_a_stranded_request(world: World) -> None:
+    """The change request is merged, and a cancellation that raced with the finish
+    sits in the inbox for the terminal execution (ADR-0025 §3)."""
+    from ilmar.core import cancel_inbox
+
+    merge(world)
+    fd = cancel_inbox.open_inbox(world.layout.coordinator_root, create=True)
+    try:
+        cancel_inbox.submit(fd, "e1", "alice", now=world.clock())
+    finally:
+        os.close(fd)
+
+
+def check_stranded(world: World) -> list[str]:
+    """The merge is followed up as usual, and the stranded request is recorded
+    ``already-terminal`` exactly once and cleaned up; nothing else changes."""
+    from ilmar.core import cancel_inbox
+    from ilmar.domain.events import EventType
+
+    problems = check_merged(world)
+    with SQLiteExecutionStore(world.db) as store:
+        execution = store.get("e1")
+        events = store.events(execution_id="e1")
+    if execution is None or execution.state is not S.SUCCEEDED:
+        problems.append("the published execution changed state")
+    recorded = [e.data.get("decision") for e in events
+                if e.type is EventType.EXECUTION_CANCEL_REQUESTED]  # fmt: skip
+    if recorded != ["already-terminal"]:
+        problems.append(f"recorded: {recorded}")
+    if len(world.scm.pushes) != 1:
+        problems.append(f"{len(world.scm.pushes)} pushes")
+    box = world.layout.coordinator_root.joinpath(*cancel_inbox.INBOX_PARTS)
+    if os.listdir(box):
+        problems.append(f"inbox leftovers: {os.listdir(box)}")
+    return problems
+
+
 Scenario = tuple[
     Callable[[Path], World], Callable[[World], None] | None, Callable[[World], list[str]]
 ]
@@ -963,6 +1000,7 @@ SCENARIOS: dict[str, Scenario] = {
     "closed": (World, close, partial(check_merged, merged=False)),
     "cancelled-during-run": (cancelled_during_run_world, None, check_cancelled),
     "cancelled-after-claim": (cancelled_after_claim_world, None, check_cancelled),
+    "stranded-after-merge": (World, merge_with_a_stranded_request, check_stranded),
 }
 
 

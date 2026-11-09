@@ -99,6 +99,17 @@ class Cancellations:
         finally:
             os.close(fd)
 
+    def pending(self) -> tuple[str, ...]:
+        """Execution ids with an inbox entry; reads the directory only."""
+        try:
+            fd = inbox_fs.open_inbox(self._root, create=False, uid=self._uid)
+        except (FileNotFoundError, UnsafeInboxError):
+            return ()  # nothing to settle; an unsafe inbox is reported where it is applied
+        try:
+            return inbox_fs.pending(fd)
+        finally:
+            os.close(fd)
+
     def accepted(self, execution_id: str) -> bool:
         """Whether a cancellation of this execution was accepted (durable state)."""
         return cancellation_accepted(self._store, execution_id)
