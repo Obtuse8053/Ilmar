@@ -107,11 +107,12 @@ class FakeTaskProvider:
         self._tasks: dict[TaskRef, _TrackedTask] = {}
         self._ids = itertools.count(1)
         self._tokens = itertools.count(1)
-        self.writes: list[tuple[str, str]] = []
+        self.writes: list[tuple[str, str, str]] = []  # (what, task, claim object or "")
         self.standing_reads: list[TaskRef] = []
         self.unreadable: set[TaskRef] = set()  # standing raises: an uncertain read
         self.lagging: dict[TaskRef, int] = {}  # reads that do not see our claims yet
         self.hooks: dict[str, list[Callable[[HeldClaim], None]]] = {}
+        self.before_standing: list[Callable[[TaskRef], None]] = []  # may raise ProviderError
         for task in tasks:
             self.add(task)
 
@@ -198,7 +199,7 @@ class FakeTaskProvider:
         if not tracked.eligible or tracked.excluded:
             return Claim(ClaimOutcome.NOT_ELIGIBLE)
         claim = FakeClaim(self._object_id(), self._worker, self._token(), self._identity)
-        self._write("post-claim", ref)
+        self._write("post-claim", ref, claim.object_id)
         tracked.claims.append(claim)
         tracked.label = True
         return Claim(ClaimOutcome.CLAIMED, claim.token)
@@ -209,7 +210,7 @@ class FakeTaskProvider:
             return
         own = [c for c in tracked.claims if self._authentic(c)]
         for claim in own:
-            self._write("delete-claim", ref)
+            self._write("delete-claim", ref, claim.object_id)
             tracked.claims.remove(claim)
         if own and not tracked.claims:
             self._write("unlabel", ref)
@@ -224,6 +225,8 @@ class FakeTaskProvider:
 
     def standing(self, ref: TaskRef) -> TaskStanding:
         self.standing_reads.append(ref)
+        for hook in list(self.before_standing):
+            hook(ref)
         if ref in self.unreadable:
             raise ProviderError(f"cannot read {ref}")
         tracked = self._tasks.get(ref)
@@ -276,7 +279,7 @@ class FakeTaskProvider:
             self._hook("delete", claim)
             assert tracked is not None
             if found in tracked.claims:
-                self._write("delete-claim", claim.ref)
+                self._write("delete-claim", claim.ref, found.object_id)
                 tracked.claims.remove(found)
             result = ReleaseResult.RELEASED
         self._hook("label", claim)
@@ -310,8 +313,8 @@ class FakeTaskProvider:
     def _still_ours(self, found: FakeClaim, claim: HeldClaim) -> bool:
         return self._authentic(found) and found.token == claim.claim_id
 
-    def _write(self, what: str, ref: TaskRef) -> None:
-        self.writes.append((what, str(ref)))
+    def _write(self, what: str, ref: TaskRef, obj: str = "") -> None:
+        self.writes.append((what, str(ref), obj))
 
 
 ProgramHandler = Callable[[Sequence[str], float, Mapping[str, str]], CommandResult]
