@@ -170,7 +170,8 @@ def to_schema_4(db: Path) -> None:
         .replace("execution_id TEXT REFERENCES", "execution_id TEXT NOT NULL REFERENCES")
         .replace(
             "    note         TEXT NOT NULL,\n"
-            "    CHECK (execution_id IS NOT NULL OR (kind = 'release-orphan-claim' AND attempt = 1))\n",
+            "    CHECK (execution_id IS NOT NULL OR "
+            "(kind = 'release-orphan-claim' AND attempt = 1))\n",
             "    note         TEXT NOT NULL\n",
         )
     )

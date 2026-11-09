@@ -260,6 +260,7 @@ class GitHubTaskProvider:
         issues = self._client.paginate(
             self._repo_path("/issues"),
             query={"state": "all", "labels": self._claimed, "per_page": "100"},
+            follow_redirects=False,
         )
         held = []
         for issue in issues:
@@ -410,7 +411,9 @@ class GitHubTaskProvider:
     def _claims(self, number: int) -> list[_ClaimComment]:
         """Every claim comment, by anyone, oldest first."""
         comments = self._client.paginate(
-            self._repo_path(f"/issues/{number}/comments"), query={"per_page": "100"}
+            self._repo_path(f"/issues/{number}/comments"),
+            query={"per_page": "100"},
+            follow_redirects=False,
         )
         return sorted(
             (c for c in map(_claim_of, comments) if c is not None), key=lambda c: c.comment_id

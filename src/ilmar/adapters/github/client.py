@@ -156,11 +156,17 @@ class GitHubClient:
         response = self._send(method, url, body, follow_redirects=follow_redirects)
         return json.loads(response.body) if response.body else None
 
-    def paginate(self, path: str, *, query: Mapping[str, str] | None = None) -> Iterator[Any]:
+    def paginate(
+        self,
+        path: str,
+        *,
+        query: Mapping[str, str] | None = None,
+        follow_redirects: bool = True,
+    ) -> Iterator[Any]:
         """Yield items from every page, following ``Link: rel="next"`` on the same host."""
         url: str | None = self._base + path + ("?" + urllib.parse.urlencode(query) if query else "")
         while url is not None:
-            response = self._send("GET", url, None)
+            response = self._send("GET", url, None, follow_redirects=follow_redirects)
             page = json.loads(response.body) if response.body else []
             if not isinstance(page, list):
                 raise ProviderError(f"GitHub returned a non-list page for {path}")
