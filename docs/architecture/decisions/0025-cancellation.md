@@ -1,6 +1,6 @@
 # ADR-0025: Cancellation through a request inbox, applied by the lease holder at safe points
 
-- Status: Proposed
+- Status: Accepted (2026-11-09, maintainer approval on PR #72)
 - Date: 2026-11-09
 - Sources: [R1], [R21] · Findings: F-001, F-024
 - Implements: #16 (design only; implementation follows approval). Prepares
