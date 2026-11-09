@@ -37,6 +37,8 @@ ilmar config validate ilmar.example.toml
   [decision records](docs/architecture/decisions/).
 - [`docs/research/`](docs/research/): source registry, findings and the
   research review process.
+- [`docs/operations/events.md`](docs/operations/events.md): reading and verifying the
+  event log (`ilmar events`).
 - [`docs/STATUS.md`](docs/STATUS.md): where development stands and what is next.
 - [`docs/workflow.md`](docs/workflow.md): how work is planned, claimed and reviewed.
 - [`docs/roadmap.md`](docs/roadmap.md): milestone status and approved improvements.

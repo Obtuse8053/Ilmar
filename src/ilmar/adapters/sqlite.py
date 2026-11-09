@@ -518,6 +518,23 @@ class SQLiteExecutionStore:
         with self._reading(any_version=True) as conn:
             return tuple(Event.from_json(line) for line in _event_lines(conn, after_seq, limit))
 
+    def event_lines(
+        self, *, after_seq: int = 0, limit: int | None = None
+    ) -> tuple[tuple[int, str], ...]:
+        """``(seq, line)`` of the stored events after ``after_seq``, in ``seq`` order,
+        unparsed: an exporter prints them as they are and reports a corrupt one
+        itself. No events table: nothing."""
+        with self._reading(any_version=True) as conn:
+            if not _has_events(conn):
+                return ()
+            query = "SELECT seq, line FROM events WHERE seq > ? ORDER BY seq"
+            values: list[object] = [after_seq]
+            if limit is not None:
+                query += " LIMIT ?"
+                values.append(limit)
+            rows = conn.execute(query, values).fetchall()
+        return tuple((_integer(seq), _text(line)) for seq, line in rows)
+
     def history_snapshot(self) -> tuple[tuple[str, ...], StoredState]:
         """Every stored event line and the rows I11 is checked against, read in one
         transaction (ADR-0024 §8, ``ilmar events verify``). No lines: no coverage."""

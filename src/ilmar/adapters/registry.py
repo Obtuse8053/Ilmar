@@ -70,7 +70,10 @@ class Plan:
     * a ``container_runtime`` plan lists the network policies it can
       enforce in ``networks``;
     * a ``task_provider`` plan may give ``task_repository``, the repository
-      its tasks belong to, which must then equal the target repository.
+      its tasks belong to, which must then equal the target repository;
+    * an ``execution_store`` plan may give ``read_only``, which opens the
+      store for reading only (``ilmar events``): no secret, no migration, no
+      write, and no other adapter is planned or created.
     """
 
     create: Callable[[Secrets], object]
@@ -81,6 +84,7 @@ class Plan:
     networks: frozenset[NetworkPolicy] = frozenset({NetworkPolicy.NONE})
     task_repository: RepositoryRef | None = None
     enters_sandbox: bool = False
+    read_only: Callable[[], object] | None = None
     """True if the secrets in ``environment`` are handed into a sandbox (the
     agent's model credential, ADR-0006). They must then be distinct from every
     other adapter's secrets, by name and by value."""
@@ -181,6 +185,32 @@ def plan(config: IlmarConfig, *, registry: Registry = DEFAULT_REGISTRY) -> Bluep
     target, sandbox = _check_combinations(config, plans)
     kinds = {port: config.adapters[port].kind for port in PORT_NAMES}
     return Blueprint(context, kinds, plans, target, sandbox)
+
+
+def event_reader(
+    config: IlmarConfig, *, registry: Registry = DEFAULT_REGISTRY
+) -> Callable[[], object]:
+    """How to open ``config``'s execution store read-only. Only that adapter's options
+    are planned, so reading events needs nothing else from the host (no container
+    runtime, no agent, no secret). Raises ``ConfigError`` for a store kind that
+    cannot be read this way."""
+    context = _context(config)
+    port = "execution_store"
+    adapter = config.adapters[port]
+    where = f"[adapters.{port}] options"
+    options = Options(adapter.options, where)
+    try:
+        store_plan = registry.parser(port, adapter.kind)(options, context)
+    except ValueError as error:
+        if isinstance(error, ConfigError):
+            raise
+        raise ConfigError(f"{where}: {error}") from None
+    options.finish()
+    if not isinstance(store_plan, Plan) or store_plan.read_only is None:
+        raise ConfigError(
+            f"[adapters.{port}] kind '{adapter.kind}' keeps no event log that can be read here"
+        )
+    return store_plan.read_only
 
 
 def build(

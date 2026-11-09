@@ -273,7 +273,10 @@ def sqlite_store(options: Options, context: BuildContext) -> Plan:
         resolved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         return SQLiteExecutionStore(resolved)
 
-    return Plan(create, close=_close)
+    def read_only() -> SQLiteExecutionStore:
+        return SQLiteExecutionStore.open_read_only(resolved)  # creates nothing, not even a dir
+
+    return Plan(create, close=_close, read_only=read_only)
 
 
 def _close(store: Any) -> None:
