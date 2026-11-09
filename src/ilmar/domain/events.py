@@ -283,6 +283,8 @@ OBSERVATIONS: Mapping[str, str] = MappingProxyType(
         "directory-absent": "The directory does not exist.",
         "directory-unchanged": "The recorded directory is still there.",
         "directory-replaced": "Another directory is at the recorded path.",
+        "change-request-merged": "The change request was merged: the task is complete.",
+        "change-request-closed": "The change request was closed without merging.",
     }
 )
 _POSITIVE = _integer(1)

@@ -17,11 +17,13 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from coordinator_support import Setup, make_setup
 from ilmar.adapters.sqlite import SQLiteExecutionStore
+from ilmar.core.coordinator import Coordinator
 from ilmar.core.effects import DeterministicError, TransientError
 from ilmar.core.event_context import CodedError, PassEvents, error_class, failure_code
 from ilmar.core.journal import Journal
@@ -507,3 +509,188 @@ def test_a_worker_ending_without_its_code_blocks_instead_of_failing(
     assert execution is not None
     assert execution.state is ExecutionState.RUNNING_AGENT  # not silently failed
     assert all(e.reason != "unclassified" for e in events_of(setup))
+
+
+# -- #17 completion: the change-request observation (ADR-0024 §1) -------------------------
+
+
+def published(setup: Setup) -> Coordinator:
+    coordinator = setup.coordinator()
+    assert coordinator.run_once().results[0].outcome is Outcome.PUBLISHED
+    return coordinator
+
+
+def finish_request(setup: Setup, *, merged: bool) -> None:
+    ((_, record),) = setup.scm._change_requests.items()
+    setup.scm.finish_change_request(record.request, merged=merged)
+
+
+def release_events(setup: Setup, step: str) -> list[Event]:
+    return [e for e in events_of(setup) if e.operation == f"release-task:e1:1:{step}"]
+
+
+def request_events(setup: Setup) -> list[Event]:
+    return [e for e in events_of(setup) if e.type.value.startswith("resource.")
+            and e.data.get("kind") == "change-request"]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("merged", "step", "observed"),
+    [(True, "merged", "change-request-merged"), (False, "closed", "change-request-closed")],
+)
+def test_the_change_request_state_is_recorded_with_the_release_it_decides(
+    setup: Setup, merged: bool, step: str, observed: str
+) -> None:
+    coordinator = published(setup)
+    finish_request(setup, merged=merged)
+    coordinator.run_once()
+    intended, succeeded = release_events(setup, step)
+    assert (intended.type, succeeded.type) == (EventType.OPERATION_INTENDED,
+                                               EventType.OPERATION_SUCCEEDED)  # fmt: skip
+    assert intended.data["observed"] == succeeded.data["observed"] == observed
+    # Same commits as the resource changes it decides: releasing with the intent,
+    # released with the outcome, in adjacent seqs and nothing between them.
+    releasing, released = request_events(setup)[-2:]
+    assert (releasing.data["status"], released.data["status"]) == ("releasing", "released")
+
+    def adjacent(first: Event, second: Event) -> bool:
+        assert first.seq is not None
+        assert second.seq is not None
+        return abs(first.seq - second.seq) == 1
+
+    assert adjacent(intended, releasing)
+    assert adjacent(succeeded, released)
+    assert intended.pass_id == releasing.pass_id
+
+
+class FailingCommit:
+    """The store's commit, failing the first commit that writes the release operation
+    with ``status``, as a full disk would: the store writes nothing of it."""
+
+    def __init__(self, commit: Callable[..., None], status: OperationStatus) -> None:
+        self.real, self.status, self.failed = commit, status, False
+
+    def __call__(self, fence: Fence, changes: Commit, **kwargs: Any) -> None:
+        if not self.failed and any(o.kind is K.RELEASE_TASK and o.status is self.status
+                                   for o in changes.operations):  # fmt: skip
+            self.failed = True
+            raise LedgerIntegrityError("the disk is full")
+        self.real(fence, changes, **kwargs)
+
+
+@pytest.mark.parametrize("status", [OperationStatus.INTENDED, OperationStatus.SUCCEEDED])
+def test_the_observation_and_its_changes_are_written_together_or_not_at_all(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, status: OperationStatus
+) -> None:
+    coordinator = published(setup)
+    finish_request(setup, merged=True)
+    failing = FailingCommit(setup.store.commit, status)
+    monkeypatch.setattr(setup.store, "commit", failing)
+    before = len(events_of(setup))
+    coordinator.run_once()
+    assert failing.failed
+    (request,) = [r for r in setup.store.resources() if r.kind.value == "change-request"]
+    if status is OperationStatus.INTENDED:
+        # Refused together: no intent, no observation, and the resource unchanged.
+        assert release_events(setup, "merged") == []
+        assert request.status.value == "active"
+        assert len(events_of(setup)) == before or all(
+            e.operation != "release-task:e1:1:merged" for e in events_of(setup)[before:]
+        )
+    else:
+        # The release happened but its outcome was refused: kept as ambiguous with
+        # the observation, and the resource still releasing, never released alone.
+        assert [e.type.value for e in release_events(setup, "merged")] == [
+            "operation.intended", "operation.ambiguous"]  # fmt: skip
+        assert {e.data["observed"] for e in release_events(setup, "merged")} == {
+            "change-request-merged"}  # fmt: skip
+        assert request.status.value == "releasing"
+    monkeypatch.undo()
+    setup.coordinator().run_once()  # the next pass reads the state again and finishes
+    final = release_events(setup, "merged")
+    assert final[-1].type is EventType.OPERATION_SUCCEEDED
+    assert {e.data["observed"] for e in final} == {"change-request-merged"}
+    assert [r.status.value for r in setup.store.resources()
+            if r.kind.value == "change-request"] == ["released"]  # fmt: skip
+
+
+def test_an_interrupted_release_keeps_its_observation_when_repeated(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = published(setup)
+    finish_request(setup, merged=False)
+
+    def lost(ref: object) -> None:
+        raise ProviderError("the connection dropped")
+
+    monkeypatch.setattr(setup.tasks, "release", lost)
+    coordinator.run_once()
+    monkeypatch.undo()
+    setup.coordinator().run_once()
+    kinds = [(e.type.value, e.data.get("observed")) for e in release_events(setup, "closed")]
+    assert kinds == [
+        ("operation.intended", "change-request-closed"),
+        ("operation.ambiguous", "change-request-closed"),
+        ("operation.intended", "change-request-closed"),  # repeated: safe for a release
+        ("operation.succeeded", "change-request-closed"),
+    ]
+
+
+def test_an_unregistered_observation_is_refused_before_anything_is_written(
+    setup: Setup,
+) -> None:
+    coordinator = published(setup)
+    finish_request(setup, merged=True)
+    execution = setup.store.get("e1")
+    assert execution is not None
+    (request,) = [r for r in setup.store.resources() if r.kind.value == "change-request"]
+    before = events_of(setup)
+    with coordinator.leases.acquire("e1") as lease, pytest.raises(ValueError, match="observation"):
+        coordinator._effects.stop_tracking_change_request(
+            execution, lease, resource=request, note="x", step="merged", observed="it-looked-done"
+        )
+    assert events_of(setup) == before
+
+
+# -- #17 completion: stable codes in the `ilmar run --once` output --------------------------
+
+
+@pytest.mark.parametrize(
+    ("arrange", "line"),
+    [
+        ("agent-failed", "e1: failed [agent-failed] the agent failed: "),
+        ("not-claimed", "e1: cancelled [not-claimed-other]"),
+        ("ownership", "e1: blocked [resource-ownership-conflict] quarantined resources remain"),
+        ("published", "e1: published https://"),
+    ],
+)
+def test_the_run_summary_shows_each_code_beside_the_readable_detail(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, arrange: str, line: str
+) -> None:
+    if arrange == "agent-failed":
+        setup.agent.plan = [(AgentOutcome.FAILED, {})]
+    elif arrange == "not-claimed":
+        monkeypatch.setattr(setup.tasks, "claim", lambda ref: ClaimOutcome.CLAIMED_BY_OTHER)
+    elif arrange == "ownership":
+
+        def foreign(name: str, *, owner: ResourceOwner) -> bool:
+            raise OwnershipConflictError("the sandbox carries another owner's labels")
+
+        monkeypatch.setattr(setup.runtime, "remove_owned", foreign)
+    report = setup.coordinator().run_once()
+    assert report.summary.startswith(line), report.summary
+    if arrange == "published":
+        assert "[" not in report.summary
+
+
+def test_an_unexpected_error_is_reported_with_its_code(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ilmar.core import worker
+
+    def bug(self: object) -> object:
+        raise KeyError("a bug")
+
+    monkeypatch.setattr(worker._Run, "drive", bug)
+    report = setup.coordinator().run_once()
+    assert report.summary.startswith("e1: blocked [unexpected-error] unexpected KeyError")

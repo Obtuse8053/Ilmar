@@ -822,16 +822,31 @@ def merge(world: World) -> None:
     world.scm.finish_change_request(request.request, merged=True)
 
 
-def check_merged(world: World) -> list[str]:
+def close(world: World) -> None:
+    ((_, request),) = world.scm._change_requests.items()
+    world.scm.finish_change_request(request.request, merged=False)
+
+
+def check_merged(world: World, *, merged: bool = True) -> list[str]:
     problems = check_invariants(world)
     problems = [p for p in problems if "not claimed" not in p]  # released after a merge
     if world.tasks.list_eligible() != (task("1"),):
         problems.append("the claim was not released after the merge")
     with SQLiteExecutionStore(world.db) as store:
         rows = store.resources(execution_id="e1")
+        events = store.events(execution_id="e1")
     requests = [r for r in rows if r.kind is ResourceKind.CHANGE_REQUEST]
-    if [(r.status, r.note) for r in requests] != [(R.RELEASED, "merged: task complete")]:
+    note = "merged: task complete" if merged else "closed without merging"
+    if [(r.status, r.note) for r in requests] != [(R.RELEASED, note)]:
         problems.append(f"change request row: {[(r.status.value, r.note) for r in requests]}")
+    # The observation that decided the release is on its events (ADR-0024 §1).
+    step, observed = ("merged", "change-request-merged") if merged else (
+        "closed", "change-request-closed")  # fmt: skip
+    release = [e for e in events if e.operation == f"release-task:e1:1:{step}"]
+    if not release or {e.data.get("observed") for e in release} != {observed}:
+        problems.append(f"release events without {observed}: {[e.type.value for e in release]}")
+    if release and release[-1].type.value != "operation.succeeded":
+        problems.append("the release did not finish")
     return problems + notes_posted_once(world)
 
 
@@ -844,6 +859,7 @@ SCENARIOS: dict[str, Scenario] = {
     "exhausted": (exhausted_world, None, partial(check_failed, verified=False)),
     "security": (security_world, None, partial(check_failed, verified=False)),
     "merged": (World, merge, check_merged),
+    "closed": (World, close, partial(check_merged, merged=False)),
 }
 
 
@@ -1086,3 +1102,28 @@ def test_ilmar_events_reads_and_verifies_a_recovered_crash(tmp_path: Path) -> No
     every = [json.loads(line) for line in ilmar("events", "--db", db)[1].splitlines()]
     passes = {e.get("pass") for e in every if e["actor"]["kind"] == "coordinator"}
     assert len(passes - {None}) >= 2  # the crashed pass and the recovering one
+
+
+def test_a_failure_code_survives_a_crash_into_the_next_pass_output(tmp_path: Path) -> None:
+    """#17: the code is read back from the durable events, so a pass that finishes a
+    failure recorded before a crash still reports its code in `ilmar run --once`."""
+    (tmp_path / "reference").mkdir()
+    reference = failing_world((tmp_path / "reference").resolve())
+    process = reference.process()
+    assert process.run() is not None
+    process.exit()
+    crashed_after_failing = 0
+    for effect in range(1, process.switch.effects + 1):
+        root = tmp_path / f"k{effect}"
+        root.mkdir()
+        world = failing_world(root.resolve())
+        crashed = world.process(Switch(effect_at=effect))
+        if crashed.run() is not None:
+            continue
+        crashed.exit()
+        if one_execution(world).state is not S.FAILED:
+            continue  # crashed before the failure was recorded
+        crashed_after_failing += 1
+        (report,) = recover(world, passes=1)
+        assert "e1: failed [verification-failed] verification checks failed" in report.summary
+    assert crashed_after_failing > 0  # some crash points lie between the failure and the end

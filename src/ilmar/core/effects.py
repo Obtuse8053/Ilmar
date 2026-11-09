@@ -1039,10 +1039,14 @@ class Effects:
         resource: Resource,
         note: str,
         step: str,
+        observed: str,
     ) -> None:
         """The task is complete (merged) or abandoned (closed): release Ilmar's claim.
 
         Resumes a resource left ``RELEASING`` by an earlier, interrupted pass.
+        ``observed`` is the change-request state that decided it
+        (``change-request-merged`` or ``-closed``): it is recorded on the
+        release's events, in the commits that move the resource (ADR-0024 §1).
         """
         if resource.status is R.RELEASING:
             releasing, before = resource, Commit()
@@ -1064,6 +1068,7 @@ class Effects:
             after=lambda _: Commit(
                 resources=(releasing.moved(R.RELEASED, now=self._clock(), note=note),)
             ),
+            observed=observed,
         )
 
     # -- ledger helpers (no external effect) --------------------------------------------

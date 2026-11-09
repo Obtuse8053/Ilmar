@@ -45,6 +45,7 @@ from ilmar.core.effects import (
     TransientError,
     parse_identity,
 )
+from ilmar.core.event_context import failure_code
 from ilmar.core.naming import branch_name, container_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
 from ilmar.core.safe_fs import directory_identity
@@ -63,7 +64,7 @@ from ilmar.domain.errors import (
     PolicyViolationError,
     ProviderError,
 )
-from ilmar.domain.events import reason_for_claim, reason_for_error
+from ilmar.domain.events import EventType, reason_for_claim, reason_for_error
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
@@ -116,6 +117,14 @@ class WorkerResult:
     execution_id: str
     outcome: Outcome
     detail: str = ""
+    code: str | None = None
+    """The stable reason code (ADR-0024 §4) of a failure, cancellation or block,
+    when one is recorded; ``detail`` keeps the human-readable text."""
+
+    def line(self) -> str:
+        """``e1: failed [agent-failed] the agent failed: …``"""
+        code = f"[{self.code}] " if self.code else ""
+        return f"{self.execution_id}: {self.outcome.value} {code}{self.detail}".strip()
 
 
 class _Deterministic(Exception):  # noqa: N818 - internal control flow, never escapes
@@ -290,7 +299,8 @@ class _Run:
             except ContainmentError as error:
                 if not self.current().state.is_terminal:
                     self.fail(f"containment: {error}", code="containment-unconfirmed")
-                return WorkerResult(self.id, Outcome.BLOCKED, "a sandbox could not be removed")
+                return WorkerResult(self.id, Outcome.BLOCKED, "a sandbox could not be removed",
+                                    code="containment-unconfirmed")  # fmt: skip
             except (
                 AmbiguousOperationError,
                 LedgerIntegrityError,
@@ -298,7 +308,8 @@ class _Run:
                 ProviderError,
                 OSError,
             ) as error:
-                return WorkerResult(self.id, Outcome.BLOCKED, f"{type(error).__name__}: {error}")
+                return WorkerResult(self.id, Outcome.BLOCKED, f"{type(error).__name__}: {error}",
+                                    code=failure_code(error))  # fmt: skip
 
     def step(self, execution: Execution) -> None:
         state = execution.state
@@ -649,7 +660,7 @@ class _Run:
         if self.op(execution, K.FREEZE_CANDIDATE) is not None:
             # Never a new agent run once this attempt froze a candidate.
             return WorkerResult(
-                self.id, Outcome.BLOCKED, f"a transient failure after freezing: {reason}"
+                self.id, Outcome.BLOCKED, f"a transient failure after freezing: {reason}", code=code
             )
         if self.w.machine.retries_remaining(execution) > 0 and execution.state is not S.QUEUED:
             self.move(S.RETRY_WAIT, f"transient: {reason}", code=code, error=reason)
@@ -677,16 +688,31 @@ class _Run:
             )
             self.delete_final_workspace(self.current())
             if quarantined:
-                return WorkerResult(self.id, Outcome.BLOCKED, "quarantined resources remain")
+                return self.quarantine_remains()
             return WorkerResult(self.id, Outcome.PUBLISHED, execution.change_request_url or "")
         if execution.state is S.FAILED:
             if quarantined:  # a human must look: the claim stays
-                return WorkerResult(self.id, Outcome.BLOCKED, "quarantined resources remain")
+                return self.quarantine_remains()
             reason = execution.last_error or "failed"
             self.note(execution, "failed", f"Ilmar could not complete this: {reason}")
             effects.release(self.current(), self.lease, step="failed")  # repeatable
-            return WorkerResult(self.id, Outcome.FAILED, reason)
-        return WorkerResult(self.id, Outcome.CANCELLED, execution.last_error or "")
+            code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.FAILED)
+            return WorkerResult(self.id, Outcome.FAILED, reason, code=code)
+        code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.CANCELLED)
+        return WorkerResult(self.id, Outcome.CANCELLED, execution.last_error or "", code=code)
+
+    def quarantine_remains(self) -> WorkerResult:
+        code = self.recorded_code(EventType.RESOURCE_QUARANTINED)
+        return WorkerResult(self.id, Outcome.BLOCKED, "quarantined resources remain", code=code)
+
+    def recorded_code(self, kind: EventType, state: ExecutionState | None = None) -> str | None:
+        """The reason code of this execution's latest ``kind`` event (into ``state``):
+        read from the durable events, so a later pass reports the code of a failure
+        recorded before a crash."""
+        for event in reversed(self.store.events(execution_id=self.id)):
+            if event.type is kind and (state is None or event.data.get("to") == state.value):
+                return event.reason
+        return None
 
     def note(self, execution: Execution, step: str, message: str) -> None:
         if self.op(execution, K.POST_UPDATE, step) is None:

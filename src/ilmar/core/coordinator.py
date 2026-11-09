@@ -200,9 +200,7 @@ class Coordinator:
         if not results:
             return PassReport(ExitCode.SUCCESS, "no eligible task", completed_tasks=completed)
         code = max(_CODES[r.outcome] for r in results)
-        summary = "; ".join(
-            f"{r.execution_id}: {r.outcome.value} {r.detail}".strip() for r in results
-        )
+        summary = "; ".join(r.line() for r in results)
         return PassReport(code, summary, tuple(results), completed)
 
     def recover(self) -> tuple[WorkerResult, ...]:
@@ -224,7 +222,8 @@ class Coordinator:
         try:
             task = self._c.task_provider.get(execution.task)  # read only
         except ProviderError:
-            return WorkerResult(execution.id, Outcome.BLOCKED, "the tracker could not be read")
+            return WorkerResult(execution.id, Outcome.BLOCKED, "the tracker could not be read",
+                                code="transient-provider-error")  # fmt: skip
         return self.dispatch(execution.id, task)
 
     def _isolated(
@@ -247,7 +246,9 @@ class Coordinator:
         except Exception as error:  # the per-execution boundary
             _LOG.exception("execution %s stopped by an unexpected error", execution_id)
             detail = f"unexpected {type(error).__name__}: {error}"
-            return WorkerResult(execution_id, Outcome.BLOCKED, detail[:300])
+            return WorkerResult(
+                execution_id, Outcome.BLOCKED, detail[:300], code="unexpected-error"
+            )
 
     def dispatch(self, execution_id: str, task: Task | None) -> WorkerResult:
         """Run one execution's worker. Safe to call concurrently for different executions."""
@@ -307,6 +308,7 @@ class Coordinator:
                 resource=resource,
                 note="merged: task complete" if merged else "closed without merging",
                 step=state.value,
+                observed="change-request-merged" if merged else "change-request-closed",
             )
             self._effects.post_update(
                 execution,

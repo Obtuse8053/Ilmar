@@ -171,3 +171,23 @@ def test_run_reports_an_unexpected_error_as_blocked(
     monkeypatch.setattr(Coordinator, "run_once", broken)
     assert main(["run", "--once", "--config", str(config)]) == 2
     assert "unexpected RuntimeError" in capsys.readouterr().err
+
+
+def test_run_prints_each_stable_reason_code_beside_its_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#17: the status output carries the stable code; the readable detail stays."""
+    from ilmar.core.coordinator import Coordinator, ExitCode, PassReport
+    from ilmar.core.worker import Outcome, WorkerResult
+
+    config = runnable_config(tmp_path, monkeypatch)
+    result = WorkerResult("e1", Outcome.FAILED, "OwnershipConflictError: foreign labels",
+                          code="resource-ownership-conflict")  # fmt: skip
+
+    def one_pass(self: Coordinator) -> PassReport:
+        return PassReport(ExitCode.FAILURE, result.line(), (result,))
+
+    monkeypatch.setattr(Coordinator, "run_once", one_pass)
+    assert main(["run", "--once", "--config", str(config)]) == 1
+    printed = capsys.readouterr().out
+    assert "e1: failed [resource-ownership-conflict] OwnershipConflictError: foreign" in printed

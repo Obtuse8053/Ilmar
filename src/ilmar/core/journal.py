@@ -122,13 +122,19 @@ class Journal:
         before: Commit = Commit(),  # noqa: B008 - an immutable, empty value
         after: Callable[[Result], Commit] | None = None,
         definitive: tuple[type[BaseException], ...] = (),
+        observed: str | None = None,
     ) -> Result:
         """Perform one side effect with write-ahead intent; see the module docstring.
 
         ``execution`` is this worker's last view of the execution; ``before``
         is committed atomically with the intent and ``after(result)``
-        atomically with the success.
+        atomically with the success. ``observed`` is the read that decided to
+        perform it (:data:`~ilmar.domain.events.OBSERVATIONS`, ADR-0024 §1): it
+        is recorded on the operation's intent and outcome events, in the same
+        commits as ``before`` and ``after``.
         """
+        if observed is not None and observed not in OBSERVATIONS:
+            raise ValueError(f"{observed!r} is not a registered observation")
         lease.check(execution.id)
         _check_scope(before, execution.id)
         definitive = (*definitive, *self._always_definitive)
@@ -137,6 +143,7 @@ class Journal:
             (e.version for e, _ in before.applied if e.id == execution.id), execution.version
         )
         key = operation_key(kind, execution.id, execution.attempt, step)
+        seen = {key: observed} if observed is not None else None
         existing = self._store.operation(key)
         if existing is not None:
             if existing.status is OperationStatus.SUCCEEDED:
@@ -175,7 +182,7 @@ class Journal:
                 expected=((execution.id, expected),),
                 reasons=intent_commit.reasons,
             ),
-            context=self._events.context(fence),
+            context=self._events.context(fence, observations=seen),
         )
 
         # 2. Right before acting: still the owner, still the lease holder, and
@@ -191,10 +198,10 @@ class Journal:
         try:
             result = dict(effect())  # 3. the effect
         except definitive as error:
-            self._settle(operation, OperationStatus.FAILED, error, self._elapsed(started))
+            self._settle(operation, OperationStatus.FAILED, error, self._elapsed(started), seen)
             raise
         except BaseException as error:
-            self._settle(operation, OperationStatus.AMBIGUOUS, error, self._elapsed(started))
+            self._settle(operation, OperationStatus.AMBIGUOUS, error, self._elapsed(started), seen)
             raise
         duration = self._elapsed(started)
         succeeded = operation.moved(
@@ -206,14 +213,16 @@ class Journal:
             self._commit(
                 fence,
                 _with(follow_up, succeeded),
-                context=self._events.context(fence, durations_ms={key: duration}),
+                context=self._events.context(
+                    fence, durations_ms={key: duration}, observations=seen
+                ),
             )
         except FencingError:
             raise  # ownership was lost: nothing more may be written or done
         except Exception as error:
             # The effect happened. Keep that knowledge (and its result) even
             # though the follow-up was refused: recovery reconciles it.
-            self._keep_result(operation, result, error, duration)
+            self._keep_result(operation, result, error, duration, seen)
             raise LedgerIntegrityError(
                 f"{key} succeeded but its follow-up changes were refused "
                 f"({type(error).__name__}); it is recorded as ambiguous with its result"
@@ -303,7 +312,12 @@ class Journal:
         return max(0, round((self._monotonic() - started) * 1000))
 
     def _keep_result(
-        self, operation: Operation, result: Result, error: Exception, duration: int
+        self,
+        operation: Operation,
+        result: Result,
+        error: Exception,
+        duration: int,
+        seen: Mapping[str, str] | None,
     ) -> None:
         try:
             fence = self._ownership.fence
@@ -317,13 +331,18 @@ class Journal:
             self._commit(
                 fence,
                 Commit(operations=(moved,)),
-                context=self._outcome(fence, moved, error, duration),
+                context=self._outcome(fence, moved, error, duration, seen),
             )
         except Exception as failure:  # then it stays intended, which is also safe
             error.add_note(f"{operation.key}: could not keep the result ({type(failure).__name__})")
 
     def _outcome(
-        self, fence: Fence, operation: Operation, error: BaseException, duration: int
+        self,
+        fence: Fence,
+        operation: Operation,
+        error: BaseException,
+        duration: int,
+        seen: Mapping[str, str] | None,
     ) -> EventContext:
         named = error_class(error)
         return self._events.context(
@@ -331,10 +350,16 @@ class Journal:
             reasons={operation.key: failure_code(error)},
             durations_ms={operation.key: duration},
             error_classes={operation.key: named} if named else None,
+            observations=seen,
         )
 
     def _settle(
-        self, operation: Operation, status: OperationStatus, error: BaseException, duration: int
+        self,
+        operation: Operation,
+        status: OperationStatus,
+        error: BaseException,
+        duration: int,
+        seen: Mapping[str, str] | None = None,
     ) -> None:
         """Record a failed or ambiguous outcome.
 
@@ -348,7 +373,7 @@ class Journal:
             self._commit(
                 fence,
                 Commit(operations=(moved,)),
-                context=self._outcome(fence, moved, error, duration),
+                context=self._outcome(fence, moved, error, duration, seen),
             )
         except Exception as failure:  # the effect's error is the one to raise
             error.add_note(
