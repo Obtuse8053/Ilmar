@@ -6,6 +6,9 @@ Needs a *disposable* repository and a token allowed to write its issues:
     ILMAR_TEST_GITHUB_REPO=owner/scratch-repo ILMAR_TEST_GITHUB_TOKEN=... pytest -m integration
 
 It creates one issue, claims and releases it from two instances, then closes it.
+The reconciliation test (ADR-0026) also reads standing and held claims; with
+``ILMAR_TEST_GITHUB_SECOND_TOKEN`` (a second account) it checks that a forged
+claim marker is another party's claim.
 """
 
 from __future__ import annotations
@@ -19,12 +22,13 @@ import pytest
 from ilmar.adapters.github import GitHubClient, GitHubTaskProvider
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.domain.changes import ChangeRequestSpec, RepositoryRef
-from ilmar.domain.tasks import ClaimOutcome, TaskRef
+from ilmar.domain.tasks import ClaimOutcome, ReleaseResult, Standing, TaskRef
 
 pytestmark = pytest.mark.integration
 
 REPO = os.environ.get("ILMAR_TEST_GITHUB_REPO", "")
 TOKEN = os.environ.get("ILMAR_TEST_GITHUB_TOKEN", "")
+SECOND_TOKEN = os.environ.get("ILMAR_TEST_GITHUB_SECOND_TOKEN", "")
 
 
 @pytest.mark.skipif(not (REPO and TOKEN), reason="set ILMAR_TEST_GITHUB_REPO and _TOKEN")
@@ -114,3 +118,46 @@ def test_source_control_round_trip_on_real_github(tmp_path: Path) -> None:
         )
     finally:
         client.request("DELETE", f"/repos/{REPO}/git/refs/heads/{branch}")
+
+
+@pytest.mark.skipif(not (REPO and TOKEN), reason="set ILMAR_TEST_GITHUB_REPO and _TOKEN")
+def test_standing_and_held_claims_on_real_github() -> None:
+    """ADR-0026 §1, §5, §6 against a real repository: identity from ``GET /user``,
+    fresh standing reads, held claims, a targeted release, and a forged marker
+    from a second account (when one is configured)."""
+    client = GitHubClient(TOKEN)
+    label = f"ilmar-test-{uuid.uuid4().hex[:8]}"
+    issue = client.request(
+        "POST",
+        f"/repos/{REPO}/issues",
+        body={"title": "Ilmar reconciliation test (safe to close)", "labels": [label]},
+    )
+    number = int(issue["number"])
+    provider = GitHubTaskProvider(
+        client, repository=REPO, instance_id="it-a", eligible_label=label,
+        claimed_label=f"{label}-claimed",
+    )  # fmt: skip
+    ref = TaskRef("github", f"{REPO}#{number}")
+    try:
+        assert provider.standing(ref).standing is Standing.CLAIM_LOST  # not claimed yet
+        claim = provider.claim(ref)
+        assert claim.outcome is ClaimOutcome.CLAIMED
+        standing = provider.standing(ref)
+        assert standing.standing is Standing.HELD
+        assert standing.claim is not None
+        assert standing.claim.claim_id == claim.claim_id
+        assert [h.ref for h in provider.held_claims()] == [ref]
+        if SECOND_TOKEN:
+            other = GitHubClient(SECOND_TOKEN)
+            other.request(
+                "POST", f"/repos/{REPO}/issues/{number}/comments",
+                body={"body": f"<!-- ilmar:claim instance=it-a token={'f' * 32} -->"},
+            )  # fmt: skip
+            assert provider.standing(ref).reason == "task-claimed-by-other-instance"
+            assert [h.claim_id for h in provider.held_claims()] == [claim.claim_id]
+        client.request("PATCH", f"/repos/{REPO}/issues/{number}", body={"state": "closed"})
+        assert provider.standing(ref).reason == "task-closed"  # fresh: no cached answer
+        assert provider.release_claim(standing.claim) is ReleaseResult.RELEASED
+        assert provider.release_claim(standing.claim) is ReleaseResult.ABSENT
+    finally:
+        client.request("PATCH", f"/repos/{REPO}/issues/{number}", body={"state": "closed"})

@@ -28,6 +28,10 @@ kind = "github"
 # Human sessions claim with status:in-progress (docs/workflow.md), which Ilmar
 # respects and never touches. Run exactly one Ilmar instance per repository:
 # claims are detected, not locked.
+# ADR-0026: only claim comments written by the token's own account count as
+# Ilmar's. That account is read from GET /user; a GitHub App installation token
+# cannot read it, so set bot_login = "<app-slug>[bot]" there. Without either,
+# Ilmar fails closed: it neither releases nor cancels anything.
 options = { repository = "Obtuse8053/Ilmar", eligible_label = "ilmar:ready", claimed_label = "ilmar:claimed", human_claim_labels = ["status:in-progress"], excluded_labels = ["needs:maintainer", "status:blocked", "proposal"], token_env = "GITHUB_TOKEN" }
 
 [adapters.source_control]

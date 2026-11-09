@@ -1032,3 +1032,114 @@ def test_an_orphan_release_survives_crashes_and_never_touches_a_newer_claim(
     assert operation.status.is_final  # settled: by observation, or refused by revalidation
     assert dict(operation.intent)["object"] == old.object_id
     check_i11(setup.store)
+
+
+def test_the_pass_of_an_interrupted_claim_counts_as_its_claim_write(setup: Setup) -> None:
+    """§3a: P0 is the pass of the latest commit of the claim operation, so a claim
+    interrupted in one pass and completed in the next writes in the later pass."""
+    original = setup.tasks.claim
+    died = [False]
+
+    def claim_then_die(ref: TaskRef) -> Claim:
+        result = original(ref)
+        if not died[0]:
+            died[0] = True
+            raise Died("after the claim was posted, before its outcome")
+        return result
+
+    setup.tasks.claim = claim_then_die  # type: ignore[method-assign]
+    with pytest.raises(Died):
+        run(setup)  # pass A: the claim is posted; its outcome is never recorded
+    setup.agent.during = lambda: drop_own_claim(setup)
+    run(setup)  # pass B: the claim is repeated (P0 = B); every later read is in P0
+    claim = next(o for o in setup.store.operations("e1") if o.kind is K.CLAIM_TASK)
+    commits = [e for e in setup.store.events(execution_id="e1") if e.operation == claim.key]
+    assert len({e.pass_id for e in commits}) == 2
+    assert lost(setup) == []
+    assert decisions(setup) == []
+
+
+ORPHAN_WINDOWS = ["listing", "intent", "reread", "delete", "label"]
+
+
+def _newer_own(setup: Setup) -> None:
+    setup.tasks.tracked(REF).claims.append(FakeClaim("o-newer", "ilmar", "t" + "e" * 31,
+                                                     "ilmar-bot"))  # fmt: skip
+
+
+def _edit(setup: Setup, field: str, value: str) -> None:
+    for claim in setup.tasks.tracked(REF).claims:
+        if claim.object_id == "o-1":
+            setattr(claim, field, value)
+
+
+ORPHAN_CHANGES: dict[str, Callable[[Setup], object]] = {
+    "newer-own-claim": _newer_own,
+    "other-instance": lambda s: s.tasks.claim_as(REF, "someone-else"),
+    "human": lambda s: setattr(s.tasks.tracked(REF), "human", True),
+    "edit-token": lambda s: _edit(s, "token", "t" + "d" * 31),
+    "edit-instance": lambda s: _edit(s, "instance", "someone-else"),
+    "delete": lambda s: drop_own_claim(s),
+    "forged-copy": lambda s: s.tasks.forge(REF, token=s.tasks.own_claims(REF)[0].token
+                                           if s.tasks.own_claims(REF) else None),
+    "close": lambda s: setattr(s.tasks.tracked(REF), "open", False),
+    "gone": lambda s: setattr(s.tasks.tracked(REF), "gone", True),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("window", ORPHAN_WINDOWS)
+@pytest.mark.parametrize("change_", sorted(ORPHAN_CHANGES))
+def test_an_orphan_release_acts_only_on_the_observed_object_in_every_window(
+    setup: Setup, window: str, change_: str
+) -> None:
+    """ADR-0026 §5, the mandatory adversarial test at the coordinator: a concurrent
+    change between the listing, the intent commit, the re-read, the delete and the
+    label step. Only the observed object is ever deleted, while still ours."""
+    old = orphan(setup)
+    setup.tasks.tracked(REF).eligible = False  # nothing is picked: the orphan step alone
+    act = ORPHAN_CHANGES[change_]
+    if window == "listing":
+        listed = setup.tasks.held_claims
+
+        def held() -> tuple[HeldClaim, ...]:
+            claims = tuple(listed())
+            act(setup)
+            return claims
+
+        setup.tasks.held_claims = held  # type: ignore[method-assign]
+    elif window == "intent":
+        on_commit(setup.store, operation_is(K.RELEASE_ORPHAN_CLAIM, ST.INTENDED),
+                  lambda: act(setup))  # fmt: skip
+    else:
+
+        def hook(claim: HeldClaim) -> None:
+            act(setup)
+
+        setup.tasks.hooks[window] = [hook]
+    others_before = [
+        (c.object_id, c.instance, c.token, c.author)
+        for c in setup.tasks.tracked(REF).claims
+        if c.object_id != old.object_id
+    ]
+    run(setup)
+    deleted = [w[2] for w in setup.tasks.writes if w[0] == "delete-claim"]
+    assert set(deleted) <= {old.object_id}  # only the observed object
+    assert len(deleted) <= 1
+    remaining = {c.object_id: c for c in setup.tasks.tracked(REF).claims}
+    for object_id, *_ in others_before:
+        assert object_id in remaining  # everything else survives
+    if old.object_id not in remaining:  # deleted: it was still ours when re-read
+        assert not (window in ("listing", "intent", "reread")
+                    and change_ in ("edit-token", "edit-instance"))  # fmt: skip
+    tracked = setup.tasks.tracked(REF)
+    assert tracked.human is (change_ == "human")  # never touched
+    if not tracked.label and not tracked.gone:
+        assert not tracked.claims or window == "label"
+        assert not tracked.human or window == "label"
+    (operation,) = setup.store.instance_operations()
+    assert operation.status.is_final
+    if operation.status is ST.SUCCEEDED:
+        assert operation.result["result"] in ("released", "absent")
+    assert dict(operation.intent)["object"] == old.object_id
+    check_i11(setup.store)
+    assert i13_problems(setup.store, setup.tasks, completed=False) == []
