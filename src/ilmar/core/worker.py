@@ -30,11 +30,15 @@ Failure classes (ADR-0021):
 from __future__ import annotations
 
 import enum
+import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from ilmar.core.cancel_inbox import CancelRequest
+from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS, Watcher
+from ilmar.core.cancellation import Cancellations, cancellation_accepted
 from ilmar.core.clock import not_before
 from ilmar.core.components import Components
 from ilmar.core.effects import (
@@ -82,6 +86,7 @@ from ilmar.domain.verification import EvidenceRecord, Verdict
 from ilmar.domain.workspace import ResourceOwner
 from ilmar.ports.execution_store import ExecutionStore
 
+_LOG = logging.getLogger(__name__)
 S = ExecutionState
 K = OperationKind
 ST = OperationStatus
@@ -99,6 +104,10 @@ _DETERMINISTIC = (
     OwnershipConflictError,
     PolicyViolationError,
 )
+CANCEL_TRIES = 3
+"""How often one pass tries a pending cancellation's ending before it reports BLOCKED."""
+CANCEL_STEP = "cancelled"
+"""The step of the note and the claim release that end a cancellation (ADR-0025 §3)."""
 _UNFINISHED = (ST.INTENDED, ST.AMBIGUOUS)
 _LIVE = (R.INTENDED, R.ACTIVE, R.RELEASING)
 
@@ -134,6 +143,10 @@ class _Deterministic(Exception):  # noqa: N818 - internal control flow, never es
         self.code = code
 
 
+class _Cancelled(Exception):  # noqa: N818 - internal control flow, never escapes
+    """A cancellation is accepted for this execution: end it at this safe point."""
+
+
 class _Blocked(Exception):  # noqa: N818 - internal control flow, never escapes
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -151,6 +164,7 @@ class ExecutionWorker:
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
+        watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
         if machine.max_attempts > MAX_ATTEMPTS:
             raise ValueError(f"at most {MAX_ATTEMPTS} attempts per execution (ADR-0021)")
@@ -161,11 +175,32 @@ class ExecutionWorker:
         self.clock = clock
         self.agent_timeout = agent_timeout_seconds
         self.new_token = new_token
+        self.watch_interval = watch_interval_seconds
+        self.cancellations = Cancellations(
+            store=components.execution_store, journal=effects.journal, layout=components.layout
+        )
 
     def run(self, execution_id: str, task: Task | None) -> WorkerResult:
         """Drive ``execution_id``; ``task`` is the tracker's view, ``None`` if it vanished."""
         with self.leases.acquire(execution_id) as lease:
             return _Run(self, lease, execution_id, task).drive()
+
+    def stranded_requests(self) -> tuple[str, ...]:
+        """Execution ids with an entry left in the request inbox."""
+        return self.cancellations.pending()
+
+    def apply_stranded(self, execution_id: str) -> tuple[str, ...]:
+        """Record and clean up a request left for a **terminal** execution (ADR-0025
+        §3: ``already-terminal``), under its lease and the instance fence. Nothing
+        else is done to the execution. Returns what was moved aside."""
+        with self.leases.acquire(execution_id) as lease:
+            execution = self.components.execution_store.get(execution_id)
+            if execution is None or not execution.state.is_terminal:
+                return ()  # unknown, or a live execution: its own worker applies it
+            applied = self.cancellations.apply(execution, lease)
+            for report in applied.reports:
+                _LOG.warning("%s", report)
+            return applied.reports
 
 
 def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
@@ -186,7 +221,26 @@ def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
             )
             is None
         )
+    if execution.state is S.CANCELLED and cancellation_accepted(store, execution.id):
+        # Cancelled on request: a claim it held must be released (ADR-0025 §5).
+        return (
+            held_claim(store, execution.id)
+            and store.operation(
+                operation_key(K.RELEASE_TASK, execution.id, execution.attempt, CANCEL_STEP)
+            )
+            is None
+        )
     return False
+
+
+def held_claim(store: ExecutionStore, execution_id: str) -> bool:
+    """Whether this execution claimed its task on the tracker."""
+    return any(
+        o.kind is K.CLAIM_TASK
+        and o.status is ST.SUCCEEDED
+        and o.result.get("outcome") == ClaimOutcome.CLAIMED.value
+        for o in store.operations(execution_id)
+    )
 
 
 def recorded_never_transient(operation: Operation | None) -> str | None:
@@ -212,6 +266,9 @@ class _Run:
         self.lease = lease
         self.id = execution_id
         self.task = task
+        self.cancel_failures = 0
+        self.notices: list[str] = []
+        """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
 
     # -- durable state --------------------------------------------------------------
 
@@ -280,23 +337,43 @@ class _Run:
     # -- the loop -------------------------------------------------------------------
 
     def drive(self) -> WorkerResult:
+        result = self._drive()
+        if not self.notices:
+            return result
+        notices = "; ".join(self.notices)
+        detail = f"{result.detail} (inbox: {notices})" if result.detail else f"inbox: {notices}"
+        return WorkerResult(result.execution_id, result.outcome, detail, code=result.code)
+
+    def _drive(self) -> WorkerResult:
         while True:
             execution = self.current()
             try:
-                if execution.state.is_terminal:
-                    return self.finish(execution)
-                self.step(execution)
+                finished = self.advance(execution)
+                if finished is not None:
+                    return finished
             except TransientError as error:
-                blocked = self.retry_or_fail(str(error), code=error.code)
-                if blocked is not None:
-                    return blocked
+                ended = self.retry_or_fail(str(error), code=error.code)
+                if ended is not None:
+                    return ended
             except (_Deterministic, DeterministicError) as failure:
-                self.fail(str(failure), code=failure.code)
+                ended = self.fail(str(failure), code=failure.code)
+                if ended is not None:
+                    return ended
             except _Blocked as blocked:
                 return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
             except _DETERMINISTIC as error:
-                self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
+                ended = self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
+                if ended is not None:
+                    return ended
             except ContainmentError as error:
+                if self.cancel_pending():
+                    # The sandbox is quarantined; the ending settles the rest, then
+                    # CANCELLED, and finish keeps the claim (ADR-0025 §3).
+                    ended = self.cancel_instead(f"containment: {error}",
+                                                  code="containment-unconfirmed")  # fmt: skip
+                    if ended is not None:
+                        return ended
+                    continue
                 if not self.current().state.is_terminal:
                     self.fail(f"containment: {error}", code="containment-unconfirmed")
                 return WorkerResult(self.id, Outcome.BLOCKED, "a sandbox could not be removed",
@@ -310,6 +387,18 @@ class _Run:
             ) as error:
                 return WorkerResult(self.id, Outcome.BLOCKED, f"{type(error).__name__}: {error}",
                                     code=failure_code(error))  # fmt: skip
+
+    def advance(self, execution: Execution) -> WorkerResult | None:
+        """One loop iteration: the safe point, then the step (or the ending)."""
+        if execution.state.is_terminal:
+            self.apply_inbox()  # a request that arrived too late: already-terminal
+            return self.finish(self.current())
+        try:
+            self.cancel_point()
+            self.step(execution)
+        except _Cancelled:
+            self.end_cancelled()
+        return None
 
     def step(self, execution: Execution) -> None:
         state = execution.state
@@ -370,6 +459,7 @@ class _Run:
                 )
         if create is None:
             effects.create_attempt_directory(execution, self.lease, owner_token=self.w.new_token())
+            self.cancel_point()
         branch = branch_name(execution.task)
         effects.checkout(
             self.current(),
@@ -423,9 +513,10 @@ class _Run:
             raise TransientError("the agent timed out", code="agent-timed-out")
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
+        self.cancel_point()  # never frozen once a cancellation is accepted
         if result.outcome is not AgentOutcome.COMPLETED:
-            # A cancelled run's output never becomes a candidate (ADR-0025 §2). The
-            # CANCELLED transition is #16 part 3; until then this fails closed.
+            # A cancelled run's output never becomes a candidate (ADR-0025 §2). A
+            # stopped run whose request was not recorded fails closed.
             raise _Deterministic(
                 f"the agent run ended {result.outcome.value}; nothing is frozen",
                 code="cancel-requested",
@@ -444,12 +535,18 @@ class _Run:
         handle = effects.start_agent_sandbox(
             execution, self.lease, owner=owner, workspace=workspace, identity=identity
         )
+        watcher = Watcher(self.w.cancellations.read, self.id, interval=self.w.watch_interval)
         try:
-            effects.run_agent(self.current(), self.lease, handle=handle, request=self.request())
+            self.cancel_point()  # a started sandbox is removed; the agent never runs
+            with watcher:  # writes nothing; sets the stop signal for a valid request only
+                effects.run_agent(self.current(), self.lease, handle=handle,
+                                  request=self.request(), stop=watcher.signal)  # fmt: skip
         finally:
             sandbox = self.row(execution, ResourceKind.CONTAINER, name)
             if sandbox is not None:
                 effects.remove_sandbox(self.current(), self.lease, resource=sandbox)
+            if watcher.request is not None:  # recorded as validated, right after the run
+                self.apply_inbox(validated=watcher.request)
 
     def freeze(self, execution: Execution, name: str) -> None:
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)
@@ -542,6 +639,7 @@ class _Run:
                 f"verification infrastructure failed {LATE_TRIES} times; the frozen candidate "
                 "is kept"
             )
+        self.cancel_point()  # no verification run starts once a cancellation is accepted
         try:
             effects.verify(
                 self.current(),
@@ -589,6 +687,8 @@ class _Run:
                     )
                     or pushed
                 )
+        if not pushes:
+            self.cancel_point()  # before the first push; after it, a request is too late
         if not pushed:
             failed = sum(
                 1 for o in self.ops(self.current(), K.PUBLISH_REVISION) if o.status is ST.FAILED
@@ -607,6 +707,7 @@ class _Run:
                 )
             except TransientError:
                 return  # pushed again next loop, under a new key
+        self.apply_inbox()  # a publish intent exists: a request now is recorded too-late
         head = c.source_control.branch_head(c.target.repository, branch)  # read only
         if head != candidate.revision:
             raise _Blocked(
@@ -664,6 +765,8 @@ class _Run:
 
     def retry_or_fail(self, reason: str, *, code: str) -> WorkerResult | None:
         execution = self.current()
+        if self.cancel_pending():  # never a new attempt once a cancellation is accepted
+            return self.cancel_instead(reason, code=code)
         if self.op(execution, K.FREEZE_CANDIDATE) is not None:
             # Never a new agent run once this attempt froze a candidate.
             return WorkerResult(
@@ -672,12 +775,96 @@ class _Run:
         if self.w.machine.retries_remaining(execution) > 0 and execution.state is not S.QUEUED:
             self.move(S.RETRY_WAIT, f"transient: {reason}", code=code, error=reason)
         else:
-            self.fail(f"attempts exhausted: {reason}", code="attempts-exhausted")
+            return self.fail(f"attempts exhausted: {reason}", code="attempts-exhausted")
         return None
 
-    def fail(self, reason: str, *, code: str) -> None:
+    def fail(self, reason: str, *, code: str) -> WorkerResult | None:
+        if self.cancel_pending():  # a cancellation never turns into a failure (ADR-0025 §3)
+            return self.cancel_instead(reason, code=code)
         if not self.current().state.is_terminal:
             self.move(S.FAILED, reason, code=code, error=reason)
+        return None
+
+    def cancel_instead(self, reason: str, *, code: str) -> WorkerResult | None:
+        """A failure while a cancellation is pending. It never becomes FAILED, a retry
+        or a bare CANCELLED transition: the loop runs the whole ending again
+        (reconciliation, ownership-verified sandbox removal), at most
+        ``CANCEL_TRIES`` times in this pass, then reports BLOCKED and leaves the
+        execution as it is for the next pass."""
+        self.cancel_failures += 1
+        _LOG.warning("%s: cancelling failed (%s): %s", self.id, code, reason)
+        if self.cancel_failures < CANCEL_TRIES:
+            return None
+        detail = f"the cancellation could not complete yet: {reason}"
+        return WorkerResult(self.id, Outcome.BLOCKED, detail, code=code)
+
+    # -- cancellation (ADR-0025) ----------------------------------------------------
+
+    def apply_inbox(self, *, validated: CancelRequest | None = None) -> None:
+        """Record this execution's request, if any, and clean up the inbox entry."""
+        applied = self.w.cancellations.apply(self.current(), self.lease, validated=validated)
+        for report in applied.reports:
+            _LOG.warning("%s", report)
+            self.notices.append(report)
+
+    def cancel_pending(self) -> bool:
+        return not self.current().state.is_terminal and cancellation_accepted(self.store, self.id)
+
+    def cancel_point(self) -> None:
+        """A safe point: apply a request from the inbox, then stop if one is accepted."""
+        self.apply_inbox()
+        if self.cancel_pending():
+            raise _Cancelled
+
+    def end_cancelled(self) -> None:
+        """Undo what the current state started (ADR-0025 §3), then CANCELLED."""
+        execution = self.current()
+        if execution.state.is_terminal:
+            return
+        c, effects, state = self.w.components, self.w.effects, execution.state
+        if state is S.QUEUED:
+            claim = self.op(execution, K.CLAIM_TASK)
+            if claim is not None and claim.status in _UNFINISHED:  # repeatable: settled first
+                effects.claim(execution, self.lease, then=lambda _r: Commit())
+        elif state is S.PROVISIONING:
+            for kind, path in (
+                (K.CREATE_WORKSPACE, c.layout.attempt_dir(self.id, execution.attempt)),
+                (K.CHECKOUT_BASE, c.layout.agent_workspace(self.id, execution.attempt)),
+            ):
+                operation = self.op(execution, kind)
+                if operation is not None and operation.status in _UNFINISHED:
+                    effects.settle_directory_step(self.current(), self.lease, kind=kind, path=path)
+        elif state is S.VERIFYING:
+            unfinished = [o for o in self.ops(execution, K.VERIFY) if o.status in _UNFINISHED]
+            if unfinished:
+                candidate = effects.load_candidate(execution)
+                for operation in unfinished:  # its sandboxes go; its outcome does not count
+                    effects.settle_verify(
+                        self.current(), self.lease, run=int(operation.key.rsplit("run-", 1)[1]),
+                        candidate=candidate, then=lambda _r: Commit(),
+                    )  # fmt: skip
+        self.sweep_sandboxes()  # journaled, ownership-verified removal of every live sandbox
+        quarantined = any(
+            r.kind is ResourceKind.CONTAINER
+            for r in self.store.resources(execution_id=self.id, statuses={R.QUARANTINED})
+        )
+        if state is S.RUNNING_AGENT and not quarantined:
+            # Settling these says the sandbox is gone; with a quarantined one it is
+            # not known, so they stay for the human who resolves the quarantine.
+            name = container_name(c.instance_id, self.id, execution.attempt)
+            start = self.op(execution, K.START_CONTAINER, name)
+            if start is not None and start.status in _UNFINISHED:
+                effects.settle_start(self.current(), self.lease, name=name)
+            run = self.op(execution, K.RUN_AGENT)
+            if run is not None and run.status in _UNFINISHED:
+                effects.abandon_agent_run(self.current(), self.lease)
+        self.end_cancelled_now("cancelled on request")
+
+    def end_cancelled_now(self, reason: str) -> None:
+        """The transition itself, only ever after the ending above; ``finish`` then
+        posts the note and releases the claim, or keeps it (quarantine)."""
+        if not self.current().state.is_terminal:
+            self.move(S.CANCELLED, reason, code="cancel-requested")
 
     def finish(self, execution: Execution) -> WorkerResult:
         effects = self.w.effects
@@ -705,8 +892,16 @@ class _Run:
             effects.release(self.current(), self.lease, step="failed")  # repeatable
             code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.FAILED)
             return WorkerResult(self.id, Outcome.FAILED, reason, code=code)
+        if cancellation_accepted(self.store, self.id):  # cancelled on request (ADR-0025 §3)
+            if quarantined:  # a human must look: the claim stays
+                return self.quarantine_remains()
+            if held_claim(self.store, self.id):  # never claimed: nothing to tell or release
+                message = "Ilmar stopped working on this task: its cancellation was requested."
+                self.note(execution, CANCEL_STEP, message)
+                effects.release(self.current(), self.lease, step=CANCEL_STEP)  # repeatable
         code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.CANCELLED)
-        return WorkerResult(self.id, Outcome.CANCELLED, execution.last_error or "", code=code)
+        detail = self.recorded_reason(S.CANCELLED) or execution.last_error or ""
+        return WorkerResult(self.id, Outcome.CANCELLED, detail, code=code)
 
     def quarantine_remains(self) -> WorkerResult:
         code = self.recorded_code(EventType.RESOURCE_QUARANTINED)
@@ -719,6 +914,13 @@ class _Run:
         for event in reversed(self.store.events(execution_id=self.id)):
             if event.type is kind and (state is None or event.data.get("to") == state.value):
                 return event.reason
+        return None
+
+    def recorded_reason(self, state: ExecutionState) -> str | None:
+        """The reason of this execution's latest transition into ``state``."""
+        for transition in reversed(self.store.history(self.id)):
+            if transition.to_state is state:
+                return transition.reason
         return None
 
     def note(self, execution: Execution, step: str, message: str) -> None:

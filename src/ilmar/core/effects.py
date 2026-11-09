@@ -70,6 +70,7 @@ from ilmar.domain.workspace import (
     ContainerSpec,
     DirectoryIdentity,
     ResourceOwner,
+    StopSignal,
 )
 from ilmar.ports.execution_store import ExecutionStore
 
@@ -432,9 +433,15 @@ class Effects:
         *,
         handle: ContainerHandle,
         request: AgentRequest,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
+        """``stop`` (ADR-0025 §2) ends the run inside this journaled effect exactly as
+        a timeout does; the operation then succeeds with the outcome ``cancelled``."""
+
         def effect() -> Mapping[str, str]:
-            outcome = self._c.agent_runner.run(self._c.container_runtime, handle, request)
+            outcome = self._c.agent_runner.run(
+                self._c.container_runtime, handle, request, stop=stop
+            )
             return {
                 "outcome": outcome.outcome.value,
                 "exit_code": "" if outcome.exit_code is None else str(outcome.exit_code),

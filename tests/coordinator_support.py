@@ -148,7 +148,9 @@ class Setup:
     clock: Clock
     ids: Iterator[str]
 
-    def coordinator(self, *, max_attempts: int = 3) -> Coordinator:
+    def coordinator(
+        self, *, max_attempts: int = 3, watch_interval_seconds: float = 2.0
+    ) -> Coordinator:
         return Coordinator.create(
             self.components,
             self.ownership,
@@ -157,6 +159,7 @@ class Setup:
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),
+            watch_interval_seconds=watch_interval_seconds,
         )
 
 

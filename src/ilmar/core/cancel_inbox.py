@@ -557,3 +557,21 @@ def leftovers(inbox: int, execution_id: str) -> tuple[list[str], list[str]]:
         elif entry.startswith(f".tmp-{execution_id}."):
             temporary.append(entry)
     return sorted(applying), sorted(temporary)
+
+
+def pending(inbox: int) -> tuple[str, ...]:
+    """The execution ids that have an entry in the inbox: a request name, or a
+    private ``.applying-`` or ``.tmp-`` name. From a listing, so it only says
+    *where to look*; what an entry holds is decided by the validation routine,
+    under the execution's lease (ADR-0025 §1). ``rejected/`` is not looked at."""
+    found = set()
+    for entry in os.listdir(inbox):
+        if entry.endswith(".json") and not entry.startswith("."):
+            candidate = entry[: -len(".json")]
+        elif entry.startswith((".applying-", ".tmp-")) and "." in entry[1:]:
+            candidate = entry.split("-", 1)[1].rsplit(".", 1)[0]
+        else:
+            continue
+        if _IDENTIFIER.match(candidate):
+            found.add(candidate)
+    return tuple(sorted(found))
