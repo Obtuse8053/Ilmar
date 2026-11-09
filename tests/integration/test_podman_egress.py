@@ -32,6 +32,7 @@ from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
 
+from contracts.container_runtime import SetAfter
 from integration.podman_support import (
     IMAGE,
     PODMAN,
@@ -60,7 +61,7 @@ pytestmark = pytest.mark.integration
 ALLOWED = "allowed.ilmar.test"
 UNLISTED = "unlisted.ilmar.test"
 OWNER = ResourceOwner(instance_id="it", execution_id="egress", attempt=1, token="tok-egress")
-NAMES = ("ilmar-it-allow", "ilmar-it-allow2", "ilmar-it-none")
+NAMES = ("ilmar-it-allow", "ilmar-it-allow2", "ilmar-it-none", "ilmar-it-stop")
 CONNECTED = "ILMAR-CONNECTED"
 
 
@@ -402,3 +403,26 @@ def test_outside_targets_are_unreachable(
         pytest.fail(f"{policy} reached {host}:{port}")
     if not control:
         pytest.skip(f"{policy} {host}:{port}: inconclusive (optional): host-side control failed")
+
+
+# -- the stop signal (ADR-0025 §2, #16 part 2) --------------------------------------------
+
+
+def test_a_stop_signal_removes_the_sandbox_its_proxy_and_its_network(
+    runtime: PodmanRuntime, layout: WorkspaceLayout
+) -> None:
+    name = "ilmar-it-stop"
+    _, handle = start(runtime, layout, name, NetworkPolicy.ALLOWLIST)
+    for kind, ref in (("container", name), ("container", f"{name}-egress"),
+                      ("network", f"{name}-net")):  # fmt: skip
+        assert podman(kind, "exists", ref, check=False).returncode == 0, ref
+    result = runtime.run(handle, ["sleep", "120"], timeout_seconds=300, stop=SetAfter(4))
+    assert result.cancelled
+    assert not result.timed_out
+    for kind, ref in (("container", name), ("container", f"{name}-egress"),
+                      ("network", f"{name}-net")):  # fmt: skip
+        assert podman(kind, "exists", ref, check=False).returncode != 0, ref
+    assert runtime.find(name) is None
+    # Nothing is owed any more: the workspace can be used again at once.
+    _, again = start(runtime, layout, name, NetworkPolicy.ALLOWLIST)
+    runtime.stop(again, owner=OWNER)

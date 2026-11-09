@@ -423,6 +423,13 @@ class _Run:
             raise TransientError("the agent timed out", code="agent-timed-out")
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
+        if result.outcome is not AgentOutcome.COMPLETED:
+            # A cancelled run's output never becomes a candidate (ADR-0025 §2). The
+            # CANCELLED transition is #16 part 3; until then this fails closed.
+            raise _Deterministic(
+                f"the agent run ended {result.outcome.value}; nothing is frozen",
+                code="cancel-requested",
+            )
         self.freeze(self.current(), name)
 
     def fresh_agent_run(self, execution: Execution, name: str) -> None:

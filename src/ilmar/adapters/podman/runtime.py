@@ -70,6 +70,7 @@ from ilmar.domain.errors import (
     ProviderError,
 )
 from ilmar.domain.workspace import (
+    STOP_POLL_SECONDS,
     CommandResult,
     ContainerHandle,
     ContainerInfo,
@@ -78,6 +79,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
+    StopSignal,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -133,6 +135,7 @@ class Completed:
     stdout: str
     stderr: str
     timed_out: bool = False
+    cancelled: bool = False  # a stop signal killed it (ADR-0025 §2)
 
 
 ENV_LOADER = (
@@ -153,6 +156,8 @@ class Executor(Protocol):
     ``pass_fds`` are inherited by the child under the same numbers: how values
     reach ``--env-file /dev/fd/N`` without a file on disk. ``stdin`` is written
     to the child's standard input, which is then closed (``None``: no input).
+    A ``stop`` signal, once set, ends the command exactly as its timeout does
+    and reports ``cancelled``.
     """
 
     def __call__(
@@ -163,6 +168,7 @@ class Executor(Protocol):
         *,
         pass_fds: Sequence[int] = (),
         stdin: bytes | None = None,
+        stop: StopSignal | None = None,
     ) -> Completed: ...
 
 
@@ -211,12 +217,15 @@ def subprocess_executor(
     *,
     pass_fds: Sequence[int] = (),
     stdin: bytes | None = None,
+    stop: StopSignal | None = None,
     output_limit: int = OUTPUT_LIMIT_BYTES,
 ) -> Completed:
-    """Run a command in its own process group; on timeout, kill the whole group.
+    """Run a command in its own process group; on timeout, or once ``stop`` is set,
+    kill the whole group, and only that group (ADR-0025 §2).
 
     Each output stream keeps at most ``output_limit`` bytes. Output is still
-    read to the end, so the command never blocks on a full pipe.
+    read to the end, so the command never blocks on a full pipe. ``stop`` is
+    looked at every ``STOP_POLL_SECONDS`` while the command runs.
     """
     try:
         process = subprocess.Popen(  # noqa: S603 - argv is built by this adapter
@@ -238,16 +247,10 @@ def subprocess_executor(
             process.stdin.write(stdin)
         with contextlib.suppress(BrokenPipeError):
             process.stdin.close()
-    deadline = time.monotonic() + timeout
-    timed_out = False
-    try:
-        process.wait(timeout=timeout)
-        for capture in captures:  # a leftover process may still hold the pipes
-            capture.thread.join(max(0.0, deadline - time.monotonic()))
-        timed_out = any(capture.thread.is_alive() for capture in captures)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-    if timed_out:
+    ended = _wait(process, captures, time.monotonic() + timeout, stop)
+    if ended != "done":
+        # The process group is this executor's own (start_new_session): its
+        # leader's pid is the group id, so no other process is ever signalled.
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
@@ -258,9 +261,37 @@ def subprocess_executor(
         with contextlib.suppress(OSError):
             stream.close()
     out, err = (capture.text() for capture in captures)
-    if timed_out:
+    if ended == "stopped":
+        return Completed(TIMED_OUT_EXIT_CODE, out, err, cancelled=True)
+    if ended == "timed-out":
         return Completed(TIMED_OUT_EXIT_CODE, out, err, timed_out=True)
     return Completed(process.returncode, out, err)
+
+
+def _wait(
+    process: subprocess.Popen[bytes],
+    captures: tuple[_Capture, _Capture],
+    deadline: float,
+    stop: StopSignal | None,
+) -> str:
+    """Wait until the command ended and released its pipes ("done"), the deadline
+    passed ("timed-out") or ``stop`` was set ("stopped"). A leftover process
+    that still holds a pipe keeps the command running."""
+    while True:
+        if stop is not None and stop.is_set():
+            return "stopped"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timed-out"
+        step = remaining if stop is None else min(remaining, STOP_POLL_SECONDS)
+        if process.poll() is None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=step)
+            continue
+        alive = [capture for capture in captures if capture.thread.is_alive()]
+        if not alive:
+            return "done"
+        alive[0].thread.join(step)
 
 
 def proc_root_identity(pid: int, path: PurePosixPath) -> DirectoryIdentity:
@@ -473,6 +504,7 @@ class PodmanRuntime:
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         container_id = self._container_id(handle)
         if not argv:
@@ -482,6 +514,10 @@ class PodmanRuntime:
         command_env = self._container_env(env or {}, with_home=False)
         if not self._running(container_id):
             raise ProviderError(f"container is not running: {handle.name}")
+        if stop is not None and stop.is_set():
+            # Stopped before it started: nothing runs, the sandbox goes as on a stop.
+            self._remove_sandbox(container_id, handle.name)
+            return CommandResult(TIMED_OUT_EXIT_CODE, "", "", 0.0, cancelled=True)
 
         began = self._clock()
         if command_env:
@@ -496,19 +532,29 @@ class PodmanRuntime:
                 self._environ,
                 timeout_seconds,
                 stdin=env_stream(command_env),
+                stop=stop,
             )  # fmt: skip
         else:
             done = self._executor(
-                [self._podman, "exec", container_id, *argv], self._environ, timeout_seconds
+                [self._podman, "exec", container_id, *argv],
+                self._environ,
+                timeout_seconds,
+                stop=stop,
             )
         duration = max(0.0, self._clock() - began)
-        if done.timed_out:
+        if done.timed_out or done.cancelled:
             # Processes the command started may still run; nothing may keep
             # writing to the workspace, so the whole container goes (ADR-0014).
-            # If that cannot be confirmed, ContainmentError propagates.
+            # A stop is handled exactly as a timeout (ADR-0025 §2). If removal
+            # cannot be confirmed, ContainmentError propagates.
             self._remove_sandbox(container_id, handle.name)
             return CommandResult(
-                TIMED_OUT_EXIT_CODE, done.stdout, done.stderr, duration, timed_out=True
+                TIMED_OUT_EXIT_CODE,
+                done.stdout,
+                done.stderr,
+                duration,
+                timed_out=done.timed_out and not done.cancelled,
+                cancelled=done.cancelled,
             )
         if done.returncode == 125 and not self._running(container_id):
             raise ProviderError(f"container stopped while running a command: {handle.name}")

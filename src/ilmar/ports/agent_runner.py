@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from ilmar.domain.agent import AgentRequest, AgentResult
-from ilmar.domain.workspace import ContainerHandle
+from ilmar.domain.workspace import ContainerHandle, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
 
 
@@ -21,8 +21,9 @@ class AgentRunner(Protocol):
     Contract (see ``tests/contracts/agent_runner.py``): all commands run in the
     given container; ``COMPLETED`` requires both a clean exit and a structured
     result reporting success (the exit status alone is not trusted, F-021);
-    exceeding the request's timeout yields ``TIMED_OUT``; runs are repeatable
-    without hidden state.
+    exceeding the request's timeout yields ``TIMED_OUT``; a ``stop`` signal is
+    passed to the runtime unchanged, and a command it cancelled yields
+    ``CANCELLED`` (ADR-0025 §2); runs are repeatable without hidden state.
     """
 
     @property
@@ -33,4 +34,6 @@ class AgentRunner(Protocol):
         runtime: ContainerRuntime,
         container: ContainerHandle,
         request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult: ...

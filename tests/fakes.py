@@ -29,6 +29,7 @@ from ilmar.domain.changes import (
 )
 from ilmar.domain.errors import (
     CandidateRejectedError,
+    ContainmentError,
     LeaseConflictError,
     NonFastForwardError,
     OwnershipConflictError,
@@ -44,6 +45,7 @@ from ilmar.domain.workspace import (
     DirectoryIdentity,
     NetworkPolicy,
     ResourceOwner,
+    StopSignal,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
 
@@ -145,6 +147,8 @@ class FakeContainerRuntime:
         self._ids = itertools.count(1)
         self._containers: dict[str, _FakeContainer] = {}  # by immutable id
         self._programs: dict[str, ProgramHandler] = {}
+        self.fail_removal = False  # tests: removal after a timeout or stop is unconfirmed
+        self.quarantined: set[DirectoryIdentity] = set()
         self.commands: list[tuple[str, tuple[str, ...]]] = []
 
     @property
@@ -173,6 +177,18 @@ class FakeContainerRuntime:
             or DirectoryIdentity(info.st_dev, info.st_ino) != spec.workspace_identity
         ):
             raise OwnershipConflictError(f"{spec.host_workspace} is not the recorded workspace")
+        if spec.workspace_identity in self.quarantined:
+            if self.fail_removal:
+                raise ContainmentError(
+                    f"{spec.host_workspace} is quarantined: an earlier sandbox on it could "
+                    "not be confirmed removed",
+                    container_id="",
+                    name=spec.name,
+                )
+            for leftover in [c for c in self._containers.values()
+                             if c.spec.workspace_identity == spec.workspace_identity]:  # fmt: skip
+                del self._containers[leftover.handle.id]
+            self.quarantined.discard(spec.workspace_identity)
         existing = self._by_name(spec.name)
         if existing is not None:
             if existing.owner != spec.owner:
@@ -193,15 +209,31 @@ class FakeContainerRuntime:
         *,
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         container = self._containers.get(handle.id)
         if container is None or not container.running:
             raise ProviderError(f"container is not running: {handle.id}")
+        if stop is not None and stop.is_set():  # stopped before it started: nothing runs
+            self._remove_after_kill(handle)
+            return CommandResult(-9, "", "", 0.0, cancelled=True)
         self.commands.append((handle.id, tuple(argv)))
-        result = self._interpret(container.spec, argv, timeout_seconds, env)
-        if result.timed_out:  # the whole container goes (port contract)
-            del self._containers[handle.id]
+        result = self._interpret(container.spec, argv, timeout_seconds, env, stop)
+        if result.timed_out or result.cancelled:  # the whole container goes (port contract)
+            self._remove_after_kill(handle)
         return result
+
+    def _remove_after_kill(self, handle: ContainerHandle) -> None:
+        """What a timeout or a stop does to the sandbox; ``fail_removal`` makes it
+        unconfirmed, which is containment, not a result (port contract)."""
+        if self.fail_removal:
+            self.quarantined.add(self._containers[handle.id].spec.workspace_identity)
+            raise ContainmentError(
+                f"container {handle.name} could not be confirmed removed",
+                container_id=handle.id,
+                name=handle.name,
+            )
+        del self._containers[handle.id]
 
     def _interpret(
         self,
@@ -209,6 +241,7 @@ class FakeContainerRuntime:
         argv: Sequence[str],
         timeout_seconds: float,
         env: Mapping[str, str] | None,
+        stop: StopSignal | None = None,
     ) -> CommandResult:
         if argv and argv[0] in self._programs:
             return self._programs[argv[0]](argv, timeout_seconds, dict(env or {}))
@@ -219,6 +252,10 @@ class FakeContainerRuntime:
                 return CommandResult(int(code), "", "", 0.0)
             case ["sleep", seconds]:
                 duration = float(seconds)
+                # Simulated time: the stop signal is looked at once per second.
+                for second in range(int(min(duration, timeout_seconds)) + 1):
+                    if stop is not None and stop.is_set():
+                        return CommandResult(-9, "", "", float(second), cancelled=True)
                 if duration > timeout_seconds:
                     return CommandResult(-9, "", "", timeout_seconds, timed_out=True)
                 return CommandResult(0, "", "", duration)
@@ -568,13 +605,21 @@ class FakeAgentRunner:
         return "fake"
 
     def run(
-        self, runtime: ContainerRuntime, container: ContainerHandle, request: AgentRequest
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
     ) -> AgentResult:
         result = runtime.run(
             container,
             [self.PROGRAM, "--print", request.instructions],
             timeout_seconds=request.timeout_seconds,
+            stop=stop,
         )
+        if result.cancelled:
+            return AgentResult(AgentOutcome.CANCELLED, "agent stopped on request", None)
         if result.timed_out:
             return AgentResult(AgentOutcome.TIMED_OUT, "agent timed out", result.exit_code)
         parsed = _parse_result(result.stdout)

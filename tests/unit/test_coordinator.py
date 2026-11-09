@@ -232,6 +232,27 @@ def test_deterministic_and_policy_failures_are_never_retried(
     assert setup.layout.attempt_dir("e1", 1).exists()  # kept for inspection
 
 
+def test_a_cancelled_agent_run_is_never_frozen_or_published(setup: Setup) -> None:
+    """#16 part 2: no caller sets a stop signal yet, but a CANCELLED outcome must
+    never become a candidate (ADR-0025 §2). Until part 3 it fails closed."""
+    setup.agent.plan = [(AgentOutcome.CANCELLED, {"src/app.py": "print('fixed')\n"})]
+    report = setup.coordinator().run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert (report.code, execution.state, execution.attempt) == (1, S.FAILED, 1)
+    assert "nothing is frozen" in (execution.last_error or "")
+    assert setup.store.operation(operation_key(K.FREEZE_CANDIDATE, "e1", 1)) is None
+    assert execution.candidate_revision is None
+    assert setup.scm.pushes == []
+    assert S.RETRY_WAIT not in states(setup)
+    failed = [
+        e
+        for e in setup.store.events(execution_id="e1")
+        if e.type.value == "execution.transitioned" and e.data.get("to") == "failed"
+    ]
+    assert [e.reason for e in failed] == ["cancel-requested"]
+
+
 def test_a_branch_that_moved_is_never_overwritten_or_retried(setup: Setup) -> None:
     def someone_pushes() -> None:
         execution = setup.store.get("e1")

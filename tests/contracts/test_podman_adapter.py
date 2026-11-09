@@ -67,6 +67,17 @@ class TestPodmanRuntimeOverFakePodman(ContainerRuntimeContract):
         ensure_directory(path, root=self._layout.workspaces_root)
         return path
 
+    def make_workspace_named(self, tmp_path: Path, name: str) -> Path:
+        path = self._layout.agent_workspace(name, 1)
+        ensure_directory(path, root=self._layout.workspaces_root)
+        return path
+
+    def break_removal(self, runtime: ContainerRuntime) -> None:
+        self._podman.rm_behaviour = "fail"
+
+    def repair_removal(self, runtime: ContainerRuntime) -> None:
+        self._podman.rm_behaviour = "ok"
+
     def make_spec(
         self, workspace: Path, name: str, owner: ResourceOwner, identity: DirectoryIdentity
     ) -> ContainerSpec:

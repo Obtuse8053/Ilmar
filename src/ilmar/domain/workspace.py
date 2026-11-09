@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 
 DEFAULT_CONTAINER_WORKDIR = PurePosixPath("/workspace")
 _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -154,14 +155,39 @@ class ContainerInfo:
     running: bool
 
 
+class StopSignal(Protocol):
+    """A read-only request to stop a running command (ADR-0025 §2).
+
+    ``threading.Event`` satisfies it. A runtime only reads it; whoever holds the
+    event sets it.
+    """
+
+    def is_set(self) -> bool: ...
+
+
+STOP_POLL_SECONDS = 0.25
+"""How often a runtime looks at a stop signal while a command runs (at most 1 s)."""
+
+
 @dataclass(frozen=True, slots=True)
 class CommandResult:
+    """How one command in a sandbox ended.
+
+    ``timed_out`` and ``cancelled`` (a stop signal, ADR-0025 §2) both mean the
+    command was killed and its whole sandbox removed; at most one is set.
+    """
+
     exit_code: int
     stdout: str
     stderr: str
     duration_seconds: float
     timed_out: bool = False
+    cancelled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.timed_out and self.cancelled:
+            raise ValueError("a command either timed out or was cancelled, not both")
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out
+        return self.exit_code == 0 and not self.timed_out and not self.cancelled
