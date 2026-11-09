@@ -175,12 +175,15 @@ class InMemoryExecutionStore:
                 self._resources[resource.key] = resource
             self._append(events)
 
-    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
+    def events(
+        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+    ) -> Sequence[Event]:
         with self._lock:
             lines = self._events[max(after_seq, 0) :]
-        if limit is not None:
-            lines = lines[:limit]
-        return tuple(Event.from_json(line) for line in lines)
+        events = [Event.from_json(line) for line in lines]
+        if execution_id is not None:
+            events = [e for e in events if e.execution == execution_id]
+        return tuple(events if limit is None else events[:limit])
 
     def operation(self, key: str) -> Operation | None:
         with self._lock:

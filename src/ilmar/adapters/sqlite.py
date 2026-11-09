@@ -514,9 +514,12 @@ class SQLiteExecutionStore:
                 _write_resource(conn, resource, fence)
             _append_events(conn, events)
 
-    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
+    def events(
+        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+    ) -> Sequence[Event]:
         with self._reading(any_version=True) as conn:
-            return tuple(Event.from_json(line) for line in _event_lines(conn, after_seq, limit))
+            lines = _event_lines(conn, after_seq, limit, execution_id)
+        return tuple(Event.from_json(line) for line in lines)
 
     def event_lines(
         self, *, after_seq: int = 0, limit: int | None = None
@@ -743,11 +746,17 @@ def _raw_event_lines(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(_text(line) for (line,) in conn.execute("SELECT line FROM events ORDER BY seq"))
 
 
-def _event_lines(conn: sqlite3.Connection, after_seq: int, limit: int | None) -> list[str]:
+def _event_lines(
+    conn: sqlite3.Connection, after_seq: int, limit: int | None, execution_id: str | None = None
+) -> list[str]:
     if not _has_events(conn):
         return []
-    query = "SELECT seq, line FROM events WHERE seq > ? ORDER BY seq"
+    query = "SELECT seq, line FROM events WHERE seq > ?"
     values: list[object] = [after_seq]
+    if execution_id is not None:  # the events_by_execution index
+        query += " AND execution_id = ?"
+        values.append(execution_id)
+    query += " ORDER BY seq"
     if limit is not None:
         query += " LIMIT ?"
         values.append(limit)

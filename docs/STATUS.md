@@ -57,23 +57,30 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-Finish #17 (plan step 2). Its four implementation parts are merged (PRs #64,
-#65, #66 and #68; ADR-0024 with its clarification, #67). The close-out audit
-([comment on #17](https://github.com/Obtuse8053/Ilmar/issues/17#issuecomment-6734099160))
-found three small gaps, for one more pull request:
-1. record the change-request state (merged or closed) as the observation on
-   the events of the claim release it decides;
-2. show the stable reason code in the `ilmar run --once` output, keeping the
-   human-readable text;
-3. decide on ADR-0024's diagnostic stream (`provider.read`, `pass.started`,
-   `pass.finished`): implement it, or defer it explicitly. It needs a
-   maintainer decision.
+#16 (plan step 3): cancellation of running executions, **starting with an ADR
+for review**. It decides:
+- how a human requests cancellation while a coordinator owns the instance;
+- what happens to an agent that is mid-run;
+- how the ownership-verified stop and removal (ADR-0012 rule 3) and the
+  reserved `execution.cancel_requested` and `execution.cancelled` events
+  (ADR-0024 §5) are used.
 
-After that, #16 (cancellation), as the planned order says.
+It comes after #17 closes. #17's last gaps are fixed in its completion PR,
+and its diagnostic stream is deferred to #70.
 
-**Waiting for the maintainer's explicit go-ahead.**
+**Waiting for the maintainer's explicit go-ahead.** No #16 implementation
+before the ADR is reviewed.
 
 ## Change log
+
+- 2026-11-09: #17 completion PR, for the close-out audit's three gaps:
+  - a merged or closed change request is recorded as the observation on the
+    events of the claim release it decides, in the same commits;
+  - `ilmar run --once` shows each stable reason code beside the readable
+    detail, read back from the durable events;
+  - the optional diagnostic stream is deferred to #70.
+
+  #17 closes after the final acceptance audit.
 
 - 2026-11-09: **#17 implementation merged; close-out found three gaps,** so
   #17 stays open.

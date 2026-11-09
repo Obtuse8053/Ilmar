@@ -142,6 +142,13 @@ def line_problems(line: str) -> list[str]:
         problems.append("no reason code")
     if kind == "operation.reconciled" and "observed" not in data:
         problems.append("a reconciliation without its observation")
+    # A claim released because the change request was merged or closed records that
+    # observation on every event of the release (ADR-0024 §1).
+    key = str(event.get("operation", ""))
+    if key.startswith("release-task:") and key.rsplit(":", 1)[-1] in ("merged", "closed"):
+        expected = "change-request-" + key.rsplit(":", 1)[-1]
+        if data.get("observed") != expected:
+            problems.append(f"a release decided by the change request without {expected}")
     if (
         event["actor"]["kind"] == "coordinator"
         and kind not in _WITHOUT_PASS

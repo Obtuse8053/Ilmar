@@ -147,8 +147,11 @@ class ExecutionStore(Protocol):
         """
         ...
 
-    def events(self, *, after_seq: int = 0, limit: int | None = None) -> Sequence[Event]:
-        """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order."""
+    def events(
+        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+    ) -> Sequence[Event]:
+        """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order; only
+        ``execution_id``'s when given."""
         ...
 
     def operation(self, key: str) -> Operation | None: ...
