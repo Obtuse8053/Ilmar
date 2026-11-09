@@ -221,25 +221,17 @@ def read_entry(
         if problem is not None:
             return Reading(problem=problem)
         raw = _read_bounded(fd)
+        if raw is None:
+            return Reading(problem="the request is larger than 1 KiB")
+        fields, problem = _parse(raw, execution_id)
+        if fields is None:
+            return Reading(problem=problem)
+        if info.st_nlink == 2 and not _only_companion(fd, inbox, execution_id, fields, info):
+            return Reading(problem="a hard link to the request from elsewhere")
     except OSError as error:
         return Reading(problem=f"cannot read the request ({_code(error)})")
     finally:
         os.close(fd)
-    if raw is None:
-        return Reading(problem="the request is larger than 1 KiB")
-    fields, problem = _parse(raw, execution_id)
-    if fields is None:
-        return Reading(problem=problem)
-    if info.st_nlink == 2:
-        # The only second link allowed is the request's own temporary name, left
-        # by a submitter that stopped between linkat and unlink (ADR-0025 §1a).
-        try:
-            companion = os.stat(temporary_name(execution_id, fields["request"]), dir_fd=inbox,
-                                follow_symlinks=False)  # fmt: skip
-        except FileNotFoundError:
-            return Reading(problem="a hard link to the request from elsewhere")
-        if (companion.st_dev, companion.st_ino) != (info.st_dev, info.st_ino):
-            return Reading(problem="a hard link to the request from elsewhere")
     return Reading(
         CancelRequest(
             request_id=fields["request"],
@@ -251,6 +243,20 @@ def read_entry(
             inode=info.st_ino,
         )
     )
+
+
+def _only_companion(
+    fd: int, inbox: int, execution_id: str, fields: dict[str, str], info: os.stat_result
+) -> bool:
+    """Whether the second link is the request's own temporary name, left by a
+    submitter between linkat and unlink (ADR-0025 §1a). That submitter may unlink
+    it at any moment: if the name is gone, the open file must then have one link."""
+    try:
+        companion = os.stat(temporary_name(execution_id, fields["request"]), dir_fd=inbox,
+                            follow_symlinks=False)  # fmt: skip
+    except FileNotFoundError:
+        return os.fstat(fd).st_nlink == 1
+    return (companion.st_dev, companion.st_ino) == (info.st_dev, info.st_ino)
 
 
 def _code(error: OSError) -> str:
