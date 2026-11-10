@@ -8,7 +8,8 @@
   - **ADR-0014:** a command's inactivity timeout and bounded output capture.
   - **ADR-0029 §1:** what "agent output" means for the stall limit.
 - Decided by the maintainer on 2026-11-10: Option A, stream events with a
-  900-second default.
+  900-second default. Amended in review the same day: every event is
+  validated incrementally, including any a capture would drop.
 
 ## Context and problem
 
@@ -96,35 +97,66 @@ content.
   - `agent_timeout_seconds` in the coordinator;
   - Podman's `--timeout`, enforced by conmon (ADR-0029 §1).
 
-### 4. Bounded capture that keeps the result
+### 4. Every event is validated as it arrives
 
-The runtime port gains a capture mode for long transcripts:
+Standard output of the agent command is not captured as text. It is fed,
+chunk by chunk as the runtime reads it, to a **stream validator** owned by
+the runner. The validator splits lines itself and checks **every** line,
+whatever its position in the stream. No line escapes validation because it
+falls in a region a capture would drop.
 
-- **What is kept.** For the agent command, each stream keeps its first
-  `HEAD_BYTES` (256 KiB) and its last `TAIL_BYTES` (8 MiB) in a ring buffer.
-  A marker states how many bytes were dropped in between. The total held
-  per stream stays bounded, as before.
-- **Reading.** Lines are read and checked as they arrive, so the progress
-  timer never depends on what is kept.
-- **The result line must be wholly inside the tail.** If it is not, or is
-  longer than `MAX_EVENT_BYTES`, the outcome is `FAILED` with reason "result
-  too large". It is never parsed from a fragment.
-- **Other commands** (verification, git, probes) keep today's head-only
-  capture.
+**Bounded state.** The validator holds only:
 
-### 5. Strict parsing of the outcome
+- the current incomplete line, at most `MAX_EVENT_BYTES` (1 MiB). Once a
+  line passes that size, its further bytes are counted and discarded, never
+  buffered, and the line is a violation;
+- the result object's line, once seen (at most `MAX_EVENT_BYTES`);
+- counters: lines, events and bytes;
+- the first violation, as a kind and a line number. It never holds the
+  violating line's content.
 
-- **Last line.** The last non-empty line of standard output must be the
-  result object (`{"type": "result", …}`). Anything after it, or no such
-  line, is `FAILED` ("malformed stream").
-- **Unknown lines.** Any kept line that is not a valid event is `FAILED`
-  ("malformed stream"). Claude Code writes only events to standard output.
-- **More than one result object** among the kept lines is `FAILED`.
-- **F-021 is unchanged.** `COMPLETED` still needs all of: exit status 0,
-  `subtype == "success"` and `is_error == false`, on that one result object.
+Memory per agent command is therefore at most about 2 × `MAX_EVENT_BYTES`,
+however long the stream.
+
+**Violations.** Each is checked on every complete line, and at the end of
+the stream:
+
+| Violation | When |
+| --- | --- |
+| `malformed-event` | A line that is not valid JSON, is not an object, or has a missing or undocumented `type`. Empty lines count. |
+| `oversized-line` | A line longer than `MAX_EVENT_BYTES`, detected while it is being read |
+| `duplicate-result` | A second `result` object |
+| `data-after-result` | Any further line after the `result` object |
+| `unterminated-line` | Bytes after the last newline at the end of the stream |
+| `missing-result` | The stream ended without a `result` object |
+
+**The first violation ends the run.** As soon as a violation is found, the
+validator reports it. The runtime ends the command as it does on a timeout:
+the process group is killed and the sandbox removed (ADR-0014). The outcome
+is `FAILED` with the reason "malformed stream: <kind> at line <n>". This
+holds even if a valid result would have followed. A malformed section in the
+middle of the stream fails the run even when the final result is valid. The
+failure is not retried: an agent that breaks its documented output format
+needs a human (for example a version mismatch).
+
+**Progress.** A complete line that passes validation is a progress event
+(§2) and restarts the inactivity timer. A violation never counts as
+progress.
+
+**Standard error** is not validated. It keeps a bounded capture of its first
+256 KiB and last 64 KiB, used only for the redacted one-line diagnostic of a
+failed run, as today.
+
+### 5. The outcome comes from the validator
+
+- **Success** needs a stream that ended with no violation and exactly one
+  result object, which was the last line. F-021 is unchanged: `COMPLETED`
+  also needs exit status 0, `subtype == "success"` and `is_error == false`.
 - **Fields.** Only the result object's documented fields are read. Its cost
   and usage figures are untrusted (ADR-0029 §2) and are recorded only as
   untrusted input for #18.
+- **Ordering.** A violation, a stall, a timeout and a stop each end the run
+  before any result is used. The first of them to occur decides the outcome.
 
 ### 6. Redaction and what is kept
 
@@ -135,7 +167,9 @@ The transcript passes through the coordinator but is never stored:
   - the redacted, truncated result text (4,000 characters, as today);
   - counts: events, bytes and dropped bytes.
 - **Never written:** the raw stream is not written to the ledger, events,
-  logs or evidence, and its buffers are discarded after parsing.
+  logs or evidence. Apart from the bounded validator state of §4, no
+  standard-output bytes are kept at all, and that state is discarded when the
+  command ends.
 - **Redaction:** the model key is removed from every derived string, as today
   (ADR-0017), and so are the values of all other variables in the agent
   command's environment.
@@ -155,22 +189,33 @@ If the coordinator dies during a run:
 
 These are shared by every adapter and tested in the contract suites:
 
-- `ContainerRuntime.run` gains `idle_timeout_seconds` and a `progress` line
-  predicate. It also gains the head-and-tail capture mode.
-- `CommandResult` gains `stalled`. At most one of `timed_out`, `cancelled`
-  and `stalled` is set.
-- `AgentRequest` gains `stall_timeout_seconds`, and `AgentOutcome` gains
-  `STALLED`.
+- **`ContainerRuntime.run`** gains `idle_timeout_seconds` and an optional
+  `stdout_consumer`. The consumer receives each chunk of standard output as
+  it is read (`feed`) and the end of the stream (`close`). Each call returns
+  one of three verdicts: progress, nothing new, or a violation. When a
+  consumer is given:
+  - the runtime keeps no standard-output text;
+  - a progress verdict restarts the idle timer;
+  - a violation ends the command as a timeout does.
+- **`CommandResult`** gains `stalled` and `rejected`. At most one of
+  `timed_out`, `cancelled`, `stalled` and `rejected` is set.
+- **`AgentRequest`** gains `stall_timeout_seconds`, and **`AgentOutcome`**
+  gains `STALLED`.
+- **The validator** is a pure, standard-library class in the Claude Code
+  adapter. It is fed bytes and returns verdicts, so it is tested without a
+  runtime.
 
 ## Consequences
 
 - Good:
   - a hung agent is ended in minutes rather than at the hard timeout;
-  - a long transcript no longer risks losing its result;
-  - the outcome rules become stricter.
+  - a long transcript no longer risks losing its result, and no line goes
+    unchecked;
+  - the outcome rules become stricter, and a malformed stream stops spending
+    at once.
 - Bad:
-  - the coordinator handles the full transcript in memory, bounded but larger
-    than before, and must never persist it;
+  - every byte of the transcript passes through the coordinator, which must
+    stay bounded (about 2 MiB per command) and must never persist it;
   - a single tool step longer than the stall timeout is ended and retried, so
     operators must size the timeout to their slowest step;
   - the format of the documented `stream-json` events becomes a dependency.
@@ -183,13 +228,32 @@ These are shared by every adapter and tested in the contract suites:
     and the retry waits for its backoff;
   - steady events never stall a run;
   - a silent stretch just under the timeout does not stall it;
-  - standard-error output and invalid or unknown lines never reset the timer.
-- **Truncation:** a stream far beyond the limits keeps its result and
-  completes. A result line outside the tail, or over `MAX_EVENT_BYTES`, fails
-  with "result too large". The dropped-bytes marker is correct.
-- **Malformed streams:** non-JSON lines, unknown types, trailing data after
-  the result, two result objects, a missing result and a partial last line
-  each give `FAILED`. F-021's mappings hold on stream output.
+  - standard-error output never resets the timer, and an invalid line ends
+    the run instead of counting as progress.
+- **Validation everywhere in the stream:**
+  - a malformed event, an undocumented `type` or an empty line in the middle
+    of a long stream, followed by a valid final result: the run fails with
+    `malformed-event` at the right line number;
+  - an oversized line in the middle (for example 50 MiB without a newline)
+    followed by a valid result: `oversized-line`, while the validator never
+    holds more than `MAX_EVENT_BYTES` of it;
+  - a second result object: `duplicate-result`;
+  - any line after the result: `data-after-result`;
+  - a final line without a newline: `unterminated-line`;
+  - no result at all: `missing-result`;
+  - the first violation stops the command at once (no further spending), and
+    a later valid result does not change the outcome.
+- **Chunking:** any split of the same stream into chunks, down to one byte,
+  across UTF-8 sequences and JSON tokens, gives the same verdicts and line
+  numbers.
+- **Bounded memory:** the validator's held bytes stay within its bound for
+  streams of any length. The runtime keeps no standard-output text when a
+  consumer is given.
+- **Results:** a long valid stream completes with its result. F-021's
+  mappings hold on stream output.
+- **Nothing raw persisted:** after runs with each violation kind, no stream
+  line appears in the ledger, events, logs, evidence or exception texts. Only
+  the kind and the line number do.
 - **Redaction:** a stream whose events contain the model key and the other
   environment values. None of them appears in the outcome, the summary, an
   exception, a log line, an event or the store.
@@ -198,8 +262,9 @@ These are shared by every adapter and tested in the contract suites:
     lifetime (real Podman, integration), and recovery starts a new attempt
     after backoff;
   - a crash while parsing changes nothing durable.
-- **Contracts:** the `ContainerRuntime` contract covers idle timeout,
-  progress lines and capture, for the fake and Podman. The `AgentRunner`
+- **Contracts:** the `ContainerRuntime` contract covers the idle timeout,
+  the standard-output consumer (progress, violation, end of stream) and the
+  absence of retained standard output, for the fake and for Podman. The `AgentRunner`
   contract covers `STALLED`.
 - **Live:** the opt-in live test runs real Claude Code with `stream-json`. It
   checks that the documented event types arrive and that the last line is the
