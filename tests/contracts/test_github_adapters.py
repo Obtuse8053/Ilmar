@@ -90,6 +90,9 @@ class TestGitHubTaskProvider(TaskProviderContract):
         number = int(task.ref.key.rpartition("#")[2])
         self._api(provider).failures[("GET", rf"/repos/owner/repo/issues/{number}")] = 403
 
+    def make_listing_unreadable(self, provider: TaskProvider) -> None:
+        self._api(provider).failures[("GET", r"/repos/owner/repo/issues")] = 503
+
     def snapshot(self, provider: TaskProvider) -> Hashable:
         api = self._api(provider)
         issues = {n: i.as_json(api.repository) for n, i in api.issues.items()}

@@ -8,6 +8,7 @@ from typing import Protocol
 
 from ilmar.domain.tasks import (
     Claim,
+    ClearResult,
     HeldClaim,
     ReleaseResult,
     RestoreResult,
@@ -35,6 +36,9 @@ class TaskProvider(Protocol):
       Uncertainty raises ``ProviderError``; it is never an outcome.
     * ``release_claim`` and ``restore_label`` act on exactly the one claim
       object they are given, re-read by its id first (ADR-0026 §5).
+    * ``stray_labels`` never writes and reads afresh; ``clear_label`` re-reads
+      the issue and removes only the claim label, and only if no claim of
+      anyone and no human claim is present (ADR-0027 §1).
     * Every ``TaskRef`` this provider returns has ``provider == self.name``.
     """
 
@@ -67,6 +71,16 @@ class TaskProvider(Protocol):
         """Delete exactly ``claim``'s object if it is still this instance's
         authentic claim with that token; then drop the claim label only if no
         claim of anyone remains."""
+        ...
+
+    def stray_labels(self) -> Sequence[TaskRef]:
+        """Tasks carrying the claim label with no claim comment of anyone and no
+        human claim; read-only (ADR-0027 §1)."""
+        ...
+
+    def clear_label(self, ref: TaskRef) -> ClearResult:
+        """Remove only the claim label, after a fresh re-read finds no claim of
+        anyone and no human claim (ADR-0027 §1)."""
         ...
 
     def restore_label(self, claim: HeldClaim) -> RestoreResult:

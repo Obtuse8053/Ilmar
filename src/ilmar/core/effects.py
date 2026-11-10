@@ -64,7 +64,14 @@ from ilmar.domain.ledger import (
     operation_key,
     resource_key,
 )
-from ilmar.domain.tasks import ClaimOutcome, HeldClaim, ReleaseResult, RestoreResult, TaskRef
+from ilmar.domain.tasks import (
+    ClaimOutcome,
+    ClearResult,
+    HeldClaim,
+    ReleaseResult,
+    RestoreResult,
+    TaskRef,
+)
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.domain.workspace import (
     ContainerHandle,
@@ -120,6 +127,17 @@ def orphan_step(claim: HeldClaim) -> str:
         "\0".join((claim.ref.key, claim.object_id, claim.claim_id)).encode()
     ).hexdigest()
     return f"{claim.ref.provider}.{digest[:32]}"
+
+
+def stray_step(ref: TaskRef, n: int) -> str:
+    """The step of the ``n``-th stray-label operation for a task (ADR-0027 §1)."""
+    digest = hashlib.sha256(ref.key.encode()).hexdigest()
+    return f"{ref.provider}.{digest[:32]}.{n}"
+
+
+def stray_number(key: str) -> int:
+    """The ``n`` of a stray-label operation key."""
+    return int(key.rsplit(".", 1)[1])
 
 
 def _absent(result: Mapping[str, str]) -> str | None:
@@ -253,6 +271,35 @@ class Effects:
             outcome_observed=_absent,
         )  # fmt: skip
         return ReleaseResult(result["result"])
+
+    def intend_stray_label(self, ref: TaskRef, *, n: int) -> str:
+        """Record the intent to remove a stray claim label; nothing is written to the
+        tracker in this pass (ADR-0027 §1). Returns the operation's key."""
+        operation = self._journal.intend_instance(
+            K.CLEAR_STRAY_LABEL, step=stray_step(ref, n), intent={"task": str(ref)},
+            reason="stray-label",
+        )  # fmt: skip
+        return operation.key
+
+    def clear_stray_label(
+        self, ref: TaskRef, *, n: int, revalidate: Callable[[], None]
+    ) -> ClearResult:
+        """Resume a recorded stray-label intent in a later pass: revalidate against
+        the store, then let ``clear_label`` re-read the issue and decide."""
+
+        def effect() -> Mapping[str, str]:
+            return {"result": self._c.task_provider.clear_label(ref).value}
+
+        def found(result: Mapping[str, str]) -> str | None:
+            return {"absent": "claim-label-missing", "kept": "claim-present"}.get(
+                result.get("result", "")
+            )
+
+        result = self._journal.perform_instance(
+            K.CLEAR_STRAY_LABEL, effect, step=stray_step(ref, n), intent={"task": str(ref)},
+            reason="stray-label", revalidate=revalidate, outcome_observed=found,
+        )  # fmt: skip
+        return ClearResult(result["result"])
 
     def post_update(
         self, execution: Execution, lease: ExecutionLease, *, step: str, message: str

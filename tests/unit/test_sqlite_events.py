@@ -36,7 +36,7 @@ from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import Commit, OperationStatus, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.ports import event_log
-from recovery_support import PREVIOUS_SCHEMA, to_previous_schema, to_schema_4
+from recovery_support import PREVIOUS_SCHEMA, to_previous_schema, to_schema_4, to_schema_5
 
 from contracts.execution_store import evidence_record
 from helpers import at
@@ -535,7 +535,7 @@ def test_a_covered_store_migrates_to_5_without_a_new_baseline(schema_4: Path) ->
         assert store.instance_operations() == ()  # readable before the migration
         fence = store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(schema_4) == SCHEMA_VERSION == 5
+    assert version(schema_4) == SCHEMA_VERSION == 6
     assert operation_rows(schema_4) == rows  # every row, byte for byte, in order
     assert event_rows(schema_4)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]  # no baseline
@@ -597,3 +597,110 @@ def test_a_schema_4_store_refuses_fenced_writes_until_claimed(schema_4: Path) ->
         with pytest.raises(FencingError, match="not migrated"):
             store.commit(fence, Commit())
     assert version(schema_4) == 4
+
+
+# -- schema 6: a second instance-scoped kind (ADR-0027 §1) ----------------------------------
+
+
+@pytest.fixture
+def schema_5(tmp_path: Path) -> Path:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_5(path)
+    return path
+
+
+def operations_sql(path: Path) -> str:
+    with closing(sqlite3.connect(path)) as conn:
+        (sql,) = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+        ).fetchone()
+    return str(sql)
+
+
+def test_the_schema_5_fixture_admits_one_instance_scoped_kind(schema_5: Path) -> None:
+    assert version(schema_5) == 5
+    assert "'release-orphan-claim'" in operations_sql(schema_5)
+    assert "clear-stray-label" not in operations_sql(schema_5)
+
+
+@pytest.mark.parametrize("start", [4, 5])
+def test_a_covered_store_migrates_to_6_without_a_new_baseline(tmp_path: Path, start: int) -> None:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    (to_schema_4 if start == 4 else to_schema_5)(path)
+    rows, events = operation_rows(path), event_rows(path)
+    with SQLiteExecutionStore(path) as store:
+        store.claim_instance("inst", now=at(10))
+        added = store.events(after_seq=len(events))
+    assert version(path) == SCHEMA_VERSION == 6
+    assert operation_rows(path) == rows
+    assert event_rows(path)[: len(events)] == events
+    assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]
+    assert "'clear-stray-label'" in operations_sql(path)
+    assert report(path).exit_code == 0
+    names = {name for _, name, _ in schema(path)}
+    assert {
+        "operations_by_execution",
+        "operations_unfinished",
+        "operations_cannot_be_removed",
+        "operations_final_are_immutable",
+        "operations_identity_is_immutable",
+    } <= names
+    assert "operations_before" not in names
+
+
+@pytest.mark.parametrize(
+    ("kind", "attempt", "allowed"),
+    [
+        ("release-orphan-claim", 1, True),
+        ("clear-stray-label", 1, True),
+        ("clear-stray-label", 2, False),
+        ("claim-task", 1, False),
+        ("restore-claim-label", 1, False),
+    ],
+)
+def test_only_the_two_instance_scoped_kinds_may_omit_the_execution(
+    schema_5: Path, kind: str, attempt: int, allowed: bool
+) -> None:
+    with SQLiteExecutionStore(schema_5) as store:
+        store.claim_instance("inst", now=at(10))
+    with closing(sqlite3.connect(schema_5)) as conn:
+        insert = (
+            "INSERT INTO operations VALUES (?, NULL, ?, ?, 'intended', 3, 1, 'x', 'x', '{}', "
+            "'{}', '')"
+        )
+        values = (f"{kind}:inst:{attempt}:s", attempt, kind)
+        if allowed:
+            conn.execute(insert, values)
+        else:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, values)
+
+
+def test_a_failed_migration_to_6_changes_nothing_and_is_replayed(
+    schema_5: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = dump(schema_5)
+    monkeypatch.setitem(MIGRATIONS, 5, MIGRATIONS[5] + "\nSELECT no_such_function();\n")
+    with SQLiteExecutionStore(schema_5) as store, pytest.raises(sqlite3.OperationalError):
+        store.claim_instance("inst", now=at(10))
+    assert dump(schema_5) == before
+    assert version(schema_5) == 5
+    monkeypatch.undo()
+    with SQLiteExecutionStore(schema_5) as store:
+        fence = store.claim_instance("inst", now=at(11))
+    assert version(schema_5) == 6
+    assert fence.epoch == 3
+    assert report(schema_5).exit_code == 0
+
+
+def test_a_schema_5_store_refuses_fenced_writes_until_claimed(schema_5: Path) -> None:
+    with SQLiteExecutionStore(schema_5) as store:
+        fence = store.fence()
+        assert fence is not None
+        with pytest.raises(FencingError, match="not migrated"):
+            store.commit(fence, Commit())
+    assert version(schema_5) == 5

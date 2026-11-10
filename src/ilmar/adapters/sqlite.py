@@ -69,7 +69,7 @@ from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
@@ -283,6 +283,59 @@ CREATE TABLE operations (
     result       TEXT NOT NULL,
     note         TEXT NOT NULL,
     CHECK (execution_id IS NOT NULL OR (kind = 'release-orphan-claim' AND attempt = 1))
+) STRICT;
+
+INSERT INTO operations (key, execution_id, attempt, kind, status, epoch, version,
+                        created_at, updated_at, intent, result, note)
+    SELECT key, execution_id, attempt, kind, status, epoch, version,
+           created_at, updated_at, intent, result, note
+    FROM operations_before ORDER BY rowid;
+
+DROP TABLE operations_before;
+
+CREATE INDEX operations_by_execution ON operations (execution_id, created_at);
+CREATE INDEX operations_unfinished ON operations (created_at)
+    WHERE status IN ('intended', 'ambiguous');
+
+CREATE TRIGGER operations_cannot_be_removed BEFORE DELETE ON operations
+BEGIN SELECT RAISE(ABORT, 'operations cannot be removed'); END;
+CREATE TRIGGER operations_final_are_immutable BEFORE UPDATE ON operations
+WHEN OLD.status IN ('succeeded', 'failed')
+BEGIN SELECT RAISE(ABORT, 'a final operation cannot change'); END;
+CREATE TRIGGER operations_identity_is_immutable BEFORE UPDATE ON operations
+WHEN NEW.key IS NOT OLD.key OR NEW.kind IS NOT OLD.kind
+  OR NEW.execution_id IS NOT OLD.execution_id OR NEW.attempt IS NOT OLD.attempt
+  OR NEW.intent IS NOT OLD.intent OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.version <> OLD.version + 1
+BEGIN SELECT RAISE(ABORT, 'an operation keeps its identity and intent'); END;
+""",
+    # ADR-0027 §1: a second instance-scoped kind, clear-stray-label. The same
+    # rebuild as schema 5, with the check widened to the two kinds; rows,
+    # indexes and triggers unchanged, so no event.
+    5: """
+DROP TRIGGER operations_cannot_be_removed;
+DROP TRIGGER operations_final_are_immutable;
+DROP TRIGGER operations_identity_is_immutable;
+DROP INDEX operations_by_execution;
+DROP INDEX operations_unfinished;
+ALTER TABLE operations RENAME TO operations_before;
+
+CREATE TABLE operations (
+    key          TEXT PRIMARY KEY,
+    execution_id TEXT REFERENCES executions (id),
+    attempt      INTEGER NOT NULL CHECK (attempt >= 1),
+    kind         TEXT NOT NULL,
+    status       TEXT NOT NULL
+                 CHECK (status IN ('intended', 'succeeded', 'failed', 'ambiguous')),
+    epoch        INTEGER NOT NULL CHECK (epoch >= 1),
+    version      INTEGER NOT NULL CHECK (version >= 1),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    intent       TEXT NOT NULL,
+    result       TEXT NOT NULL,
+    note         TEXT NOT NULL,
+    CHECK (execution_id IS NOT NULL OR
+           (kind IN ('release-orphan-claim', 'clear-stray-label') AND attempt = 1))
 ) STRICT;
 
 INSERT INTO operations (key, execution_id, attempt, kind, status, epoch, version,

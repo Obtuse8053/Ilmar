@@ -330,7 +330,7 @@ class FencingContract:
             dataclasses.replace(intent(K.CLAIM_TASK, fence), execution_id=None)
         with pytest.raises(ValueError, match="instance-scoped"):
             Operation.intended(K.RELEASE_ORPHAN_CLAIM, "e1", 1, fence=fence, now=at(2))
-        assert {k for k in K if k.instance_scoped} == {K.RELEASE_ORPHAN_CLAIM}
+        assert {k for k in K if k.instance_scoped} == {K.RELEASE_ORPHAN_CLAIM, K.CLEAR_STRAY_LABEL}
 
     def test_an_instance_scoped_operation_is_this_instances(self, store: ExecutionStore) -> None:
         fence = claimed(store)

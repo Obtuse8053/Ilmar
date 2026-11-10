@@ -28,6 +28,8 @@ READS = {
     "load_candidate", "checks", "change_request_state",
     # ADR-0026 §6 (approved): the task's standing and this instance's held claims.
     "standing", "held_claims",
+    # ADR-0027 §1 (approved): stray claim labels.
+    "stray_labels",
 }  # fmt: skip
 
 
@@ -63,6 +65,7 @@ def test_the_mutating_set_is_derived_from_the_ports() -> None:
         "checkout_revision", "publish_revision", "upsert_change_request",
         "start", "stop", "run", "remove_owned",
         "release_claim", "restore_label",  # ADR-0026 §5: targeted, journaled writes
+        "clear_label",  # ADR-0027 §1: targeted, journaled write
     }  # fmt: skip
     assert expected == MUTATING
 
@@ -126,10 +129,11 @@ READ_ONLY = {"load_candidate"}
 """Public ``Effects`` methods that change nothing; they may not call a mutating method."""
 
 
-JOURNALED = {"perform", "reconcile", "perform_instance"}
+JOURNALED = {"perform", "reconcile", "perform_instance", "intend_instance"}
 """The journal's entry points; each is journaled and fenced. ``perform_instance``
 is the instance-scoped one (ADR-0026 §5, the ADR-0020 amendment): fenced by the
-instance lock instead of an execution lease."""
+instance lock instead of an execution lease. ``intend_instance`` commits only
+an instance-scoped intent, for an effect resumed in a later pass (ADR-0027 §1)."""
 
 
 def test_every_effect_goes_through_the_journal() -> None:

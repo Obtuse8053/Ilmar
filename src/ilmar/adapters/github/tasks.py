@@ -65,6 +65,7 @@ from ilmar.domain.errors import ProviderError
 from ilmar.domain.tasks import (
     Claim,
     ClaimOutcome,
+    ClearResult,
     HeldClaim,
     ReleaseResult,
     RestoreResult,
@@ -281,10 +282,12 @@ class GitHubTaskProvider:
             if "pull_request" in issue or self._claimed not in _labels(issue):
                 continue
             ref = TaskRef(self._name, f"{self._repository}#{int(issue['number'])}")
+            try:
+                claims = self._claims(int(issue["number"]))
+            except (GitHubNotFoundError, GitHubMovedError):
+                continue  # gone or moved since it was listed: not ours to act on here
             held += [
-                HeldClaim(ref, c.token, str(c.comment_id))
-                for c in self._claims(int(issue["number"]))
-                if self._authentic(c)
+                HeldClaim(ref, c.token, str(c.comment_id)) for c in claims if self._authentic(c)
             ]
         return tuple(held)
 
@@ -300,6 +303,47 @@ class GitHubTaskProvider:
             result = ReleaseResult.RELEASED
         self._drop_label_if_unclaimed(number)
         return result
+
+    def stray_labels(self) -> Sequence[TaskRef]:
+        self._own_login()
+        issues = self._client.paginate(
+            self._repo_path("/issues"),
+            query={"state": "all", "labels": self._claimed, "per_page": "100"},
+            follow_redirects=False,
+        )
+        stray = []
+        for issue in issues:
+            if "pull_request" in issue or self._claimed not in _labels(issue):
+                continue
+            if self._claimed_by_human(issue):
+                continue
+            try:
+                claims = self._claims(int(issue["number"]))
+            except (GitHubNotFoundError, GitHubMovedError):
+                continue  # gone or moved since it was listed
+            if claims:
+                continue  # any claim of anyone, forged ones included, keeps the label
+            stray.append(TaskRef(self._name, f"{self._repository}#{int(issue['number'])}"))
+        return tuple(stray)
+
+    def clear_label(self, ref: TaskRef) -> ClearResult:
+        self._own_login()
+        number = self._number(ref)
+        if number is None:
+            raise ProviderError(f"{ref} does not belong to {self._repository}")
+        issue = self._issue(number)  # a fresh re-read; a transfer is never followed
+        if issue is None or self._claimed not in _labels(issue):
+            return ClearResult.ABSENT
+        try:
+            claims = self._claims(number)
+        except (GitHubNotFoundError, GitHubMovedError):
+            return ClearResult.ABSENT
+        if claims or self._claimed_by_human(issue):
+            return ClearResult.KEPT
+        # Not atomic (ADR-0013): a claim posted from here on loses only this label,
+        # and its owner restores it (ADR-0027 §1).
+        self._remove_label(number)
+        return ClearResult.CLEARED
 
     def restore_label(self, claim: HeldClaim) -> RestoreResult:
         number = self._claim_number(claim)

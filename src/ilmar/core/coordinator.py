@@ -46,6 +46,7 @@ from ilmar.core.effects import (
     Effects,
     claim_from_intent,
     orphan_step,
+    stray_number,
 )
 from ilmar.core.event_context import (
     PassEvents,
@@ -71,9 +72,11 @@ from ilmar.domain.errors import (
     LedgerIntegrityError,
     ProviderError,
 )
+from ilmar.domain.events import Event, EventType
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import (
     Commit,
+    Operation,
     OperationKind,
     OperationStatus,
     Resource,
@@ -82,7 +85,7 @@ from ilmar.domain.ledger import (
     instance_operation_key,
     operation_key,
 )
-from ilmar.domain.tasks import HeldClaim, ReleaseResult, Task, TaskRef
+from ilmar.domain.tasks import ClearResult, HeldClaim, ReleaseResult, Task, TaskRef
 from ilmar.ports.execution_store import ExecutionStore
 
 _LOG = logging.getLogger(__name__)
@@ -209,8 +212,9 @@ class Coordinator:
         self._events.begin_pass()  # every event this pass writes carries its id
         results = list(self.recover())
         released = self.release_orphaned_claims(results)
+        cleared = self.clear_stray_labels(results)
         completed = self.follow_up_change_requests(results)
-        task = self._pick()
+        task = self._pick(not_now=cleared)
         if task is not None:
             execution, transition = self._machine.start(
                 task.ref, execution_id=self._new_id(), now=self._clock()
@@ -358,6 +362,77 @@ class Coordinator:
                 released += 1
         return released
 
+    # -- stray claim labels (ADR-0027 §1) -----------------------------------------------
+
+    def clear_stray_labels(self, problems: list[WorkerResult]) -> frozenset[TaskRef]:
+        """Two passes per removal: resume intents recorded in an **earlier** pass
+        (revalidate, then a fresh ``clear_label``), then record new intents for the
+        stray labels listed now. Returns the tasks whose label went in this pass;
+        none of them is picked in it. Nothing here is an input to eligibility."""
+        cleared: set[TaskRef] = set()
+        current = self._events.pass_id
+        for operation in self._stray_operations(unfinished=True):
+            intended = self._intent_event(operation.key)
+            if intended is None or intended.pass_id in (None, current):
+                continue  # never in the pass of its own intent
+            ref = TaskRef(*operation.intent["task"].split(":", 1))
+            seq = intended.seq or 0
+
+            def revalidate(ref: TaskRef = ref, seq: int = seq) -> None:
+                if self._backed(ref) or self._created_after(ref, seq):
+                    raise LedgerIntegrityError(f"{ref} is backed; its label is kept")
+
+            try:
+                result = self._effects.clear_stray_label(
+                    ref, n=stray_number(operation.key), revalidate=revalidate
+                )
+            except FencingError:
+                raise
+            except (LedgerIntegrityError, ProviderError) as error:
+                problems.append(WorkerResult("claims", Outcome.BLOCKED,
+                                             f"stray label on {ref}: {error}",
+                                             code=failure_code(error)))  # fmt: skip
+                continue
+            if result is ClearResult.CLEARED:
+                cleared.add(ref)
+        try:
+            listed = list(self._c.task_provider.stray_labels())  # read only
+        except ProviderError as error:
+            problems.append(WorkerResult("claims", Outcome.BLOCKED,
+                                         f"stray labels could not be read: {error}",
+                                         code="transient-provider-error"))  # fmt: skip
+            return frozenset(cleared)
+        for ref in listed:
+            mine = [o for o in self._stray_operations(unfinished=False)
+                    if o.intent.get("task") == str(ref)]  # fmt: skip
+            if self._backed(ref) or any(not o.status.is_final for o in mine):
+                continue
+            self._effects.intend_stray_label(ref, n=len(mine) + 1)
+        return frozenset(cleared)
+
+    def _stray_operations(self, *, unfinished: bool) -> list[Operation]:
+        return [
+            o
+            for o in self._store.instance_operations()
+            if o.kind is OperationKind.CLEAR_STRAY_LABEL
+            and (not unfinished or not o.status.is_final)
+        ]
+
+    def _intent_event(self, key: str) -> Event | None:
+        return next(
+            (e for e in self._store.events()
+             if e.operation == key and e.type is EventType.OPERATION_INTENDED),
+            None,
+        )  # fmt: skip
+
+    def _created_after(self, ref: TaskRef, seq: int) -> bool:
+        """Whether an execution of the task was created after ``seq`` (store order)."""
+        return any(
+            e.type is EventType.EXECUTION_CREATED and (e.seq or 0) > seq
+            for execution in self._executions_of(ref)
+            for e in self._store.events(execution_id=execution.id)
+        )
+
     def _orphan_key(self, claim: HeldClaim) -> str:
         return instance_operation_key(
             OperationKind.RELEASE_ORPHAN_CLAIM, self._effects.fence.instance_id, orphan_step(claim)
@@ -455,7 +530,7 @@ class Coordinator:
 
     # -- choosing work ----------------------------------------------------------------
 
-    def _pick(self) -> Task | None:
+    def _pick(self, *, not_now: frozenset[TaskRef] = frozenset()) -> Task | None:
         """The first eligible task (by key) Ilmar is not already working on or done with.
 
         Never started again automatically: a task with an active execution;
@@ -482,6 +557,8 @@ class Coordinator:
             if reason not in tracker.REPICKABLE:
                 finished.add(execution.task)
         for task in sorted(self._c.task_provider.list_eligible(), key=lambda t: t.ref.key):
+            if task.ref in not_now:
+                continue  # its stray label went in this pass: never picked in the same one
             if task.ref in finished or self._store.active_for_task(task.ref) is not None:
                 continue
             return task

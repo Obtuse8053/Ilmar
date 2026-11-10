@@ -136,6 +136,48 @@ def i13_problems(
             problems.append(f"I13: another party's claim {obj} on {task} was removed")
     for execution in store.list_in_states(set(ExecutionState)):
         problems += lost_claim_problems(store, execution)
+    problems += stray_label_problems(store, tasks)
+    return problems
+
+
+def stray_label_problems(store: ExecutionStore, tasks: FakeTaskProvider) -> list[str]:
+    """ADR-0027's clause of I13: a stray label is removed only by a recorded
+    ``clear-stray-label`` operation, never in the pass of its intent, and never
+    while an execution of the task was active (created before the removal and not
+    yet terminal), whatever the tracker showed."""
+    problems: list[str] = []
+    events = store.events()
+    sweeps = [o for o in store.instance_operations() if o.kind is K.CLEAR_STRAY_LABEL]
+    cleared = [o for o in sweeps if o.result.get("result") in ("cleared", "absent")]
+    writes = [w for w in tasks.writes if w[0] == "clear-label"]
+    # One removal at most per recorded sweep. A sweep whose outcome was lost in a
+    # crash re-reads on recovery and settles ABSENT, so it need not say "cleared".
+    if len(writes) > len([o for o in sweeps if o.status is not OperationStatus.FAILED]):
+        problems.append(f"I13: {len(writes)} label removals for {len(sweeps)} sweeps")
+    for operation in cleared:
+        mine = [e for e in events if e.operation == operation.key]
+        intents = [e for e in mine if e.type is EventType.OPERATION_INTENDED]
+        outcome = [e for e in mine if e.type is EventType.OPERATION_SUCCEEDED]
+        if not intents or not outcome:
+            problems.append(f"I13: {operation.key} has no intent or no outcome")
+            continue
+        if outcome[-1].pass_id == intents[0].pass_id:
+            problems.append(f"I13: {operation.key} acted in the pass of its intent")
+        at = outcome[-1].seq or 0
+        task = operation.intent.get("task")
+        for execution in store.list_in_states(set(ExecutionState)):
+            if str(execution.task) != task:
+                continue
+            own = store.events(execution_id=execution.id)
+            created = min((e.seq or 0) for e in own)
+            ended = [
+                e.seq or 0
+                for e in own
+                if e.type is EventType.EXECUTION_TRANSITIONED
+                and ExecutionState(str(e.data.get("to"))).is_terminal
+            ]
+            if created < at and (not ended or min(ended) > at):
+                problems.append(f"I13: {operation.key} cleared beside active {execution.id}")
     return problems
 
 

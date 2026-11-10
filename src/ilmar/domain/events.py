@@ -116,6 +116,7 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "task-gone": "The task no longer exists in this repository.",
         "task-claim-lost": "This instance's claim on the task is gone, confirmed in two passes.",
         "orphaned-claim": "A claim of this instance that no execution record backs.",
+        "stray-label": "Ilmar's claim label with no claim and no execution behind it.",
         "claim-changed": "A claim object changed: it is no longer this instance's authentic claim.",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }

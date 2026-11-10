@@ -39,6 +39,7 @@ from ilmar.domain.errors import (
 from ilmar.domain.tasks import (
     Claim,
     ClaimOutcome,
+    ClearResult,
     HeldClaim,
     ReleaseResult,
     RestoreResult,
@@ -76,7 +77,8 @@ class _TrackedTask:
     open: bool = True
     eligible: bool = True  # the eligible label is present
     excluded: bool = False
-    human: bool = False  # a human claim label or an assignee
+    human: bool = False  # a human claim label
+    assigned: bool = False  # an assignee: a claim only where skip_assigned says so
     label: bool = False  # the claim label Ilmar owns
     gone: bool = False
     claims: list[FakeClaim] = field(default_factory=list)
@@ -100,8 +102,10 @@ class FakeTaskProvider:
         name: str = "fake",
         worker: str = "ilmar",
         identity: str = "ilmar-bot",
+        skip_assigned: bool = True,
     ):
         self._name = name
+        self.skip_assigned = skip_assigned
         self._worker = worker
         self._identity = identity
         self._tasks: dict[TaskRef, _TrackedTask] = {}
@@ -111,8 +115,14 @@ class FakeTaskProvider:
         self.standing_reads: list[TaskRef] = []
         self.unreadable: set[TaskRef] = set()  # standing raises: an uncertain read
         self.lagging: dict[TaskRef, int] = {}  # reads that do not see our claims yet
+        self.hidden_others: dict[TaskRef, int] = {}  # reads blind to others' claims
+        self.stray_reads = 0
+        self.stray_unreadable = False  # stray_labels raises: an uncertain read
         self.hooks: dict[str, list[Callable[[HeldClaim], None]]] = {}
         self.before_standing: list[Callable[[TaskRef], None]] = []  # may raise ProviderError
+        # clear_label's points: "reread" (before it), "label" (the non-atomic window
+        # between its final re-read and the removal); stray_labels': "listed".
+        self.stray_hooks: dict[str, list[Callable[[TaskRef], None]]] = {}
         for task in tasks:
             self.add(task)
 
@@ -165,6 +175,17 @@ class FakeTaskProvider:
     def _authentic(self, claim: FakeClaim) -> bool:
         return claim.instance == self._worker and claim.author == self._identity
 
+    def _human(self, tracked: _TrackedTask) -> bool:
+        """A human claim: a human claim label, or an assignee where that is one."""
+        return tracked.human or (tracked.assigned and self.skip_assigned)
+
+    def _seen(self, ref: TaskRef, tracked: _TrackedTask) -> list[FakeClaim]:
+        """The claim comments this read sees: another party's may lag (ADR-0026 §6)."""
+        if self.hidden_others.get(ref, 0) > 0:
+            self.hidden_others[ref] -= 1
+            return [c for c in tracked.claims if self._authentic(c)]
+        return list(tracked.claims)
+
     def _hook(self, point: str, claim: HeldClaim) -> None:
         for hook in list(self.hooks.get(point, ())):
             hook(claim)
@@ -174,9 +195,9 @@ class FakeTaskProvider:
     def list_eligible(self) -> Sequence[Task]:
         return tuple(
             t.task
-            for t in self._tasks.values()
-            if t.open and not t.gone and t.eligible and not t.excluded and not t.human
-            and not t.label and not t.claims
+            for ref, t in self._tasks.items()
+            if t.open and not t.gone and t.eligible and not t.excluded and not self._human(t)
+            and not t.label and not self._seen(ref, t)
         )  # fmt: skip
 
     def get(self, ref: TaskRef) -> Task | None:
@@ -187,8 +208,9 @@ class FakeTaskProvider:
         tracked = self._tasks.get(ref)
         if tracked is None or tracked.gone or not tracked.open:
             return Claim(ClaimOutcome.NOT_ELIGIBLE)
-        own = [c for c in tracked.claims if self._authentic(c)]
-        if tracked.human or len(own) != len(tracked.claims):
+        seen = self._seen(ref, tracked)
+        own = [c for c in seen if self._authentic(c)]
+        if self._human(tracked) or len(own) != len(seen):
             return Claim(ClaimOutcome.CLAIMED_BY_OTHER)
         if own:
             self._write("label", ref)
@@ -214,7 +236,7 @@ class FakeTaskProvider:
             tracked.claims.remove(claim)
         # With ours deleted (or already gone), Ilmar's label goes once no claim of
         # anyone remains; as on GitHub, a human claim keeps it only if ours was gone.
-        if tracked.label and not tracked.claims and (own or not tracked.human):
+        if tracked.label and not tracked.claims and (own or not self._human(tracked)):
             self._write("unlabel", ref)
             tracked.label = False
 
@@ -237,8 +259,9 @@ class FakeTaskProvider:
         lagging = self.lagging.get(ref, 0) > 0
         if lagging:
             self.lagging[ref] -= 1
-        own = [] if lagging else [c for c in tracked.claims if self._authentic(c)]
-        others = [c for c in tracked.claims if not self._authentic(c)]
+        seen = self._seen(ref, tracked)
+        own = [] if lagging else [c for c in seen if self._authentic(c)]
+        others = [c for c in seen if not self._authentic(c)]
         reasons = set()
         if not tracked.open:
             reasons.add("task-closed")
@@ -246,7 +269,7 @@ class FakeTaskProvider:
             reasons.add("task-unlabelled")
         if tracked.excluded:
             reasons.add("task-excluded")
-        if tracked.human:
+        if self._human(tracked):
             reasons.add("task-claimed-by-human")
         if others:
             reasons.add("task-claimed-by-other-instance")
@@ -286,7 +309,7 @@ class FakeTaskProvider:
             result = ReleaseResult.RELEASED
         self._hook("label", claim)
         tracked = self._tasks.get(claim.ref)
-        remains = tracked is None or tracked.gone or bool(tracked.claims) or tracked.human
+        remains = tracked is None or tracked.gone or bool(tracked.claims) or self._human(tracked)
         if tracked is not None and tracked.label and not remains:
             self._write("unlabel", claim.ref)
             tracked.label = False
@@ -304,6 +327,35 @@ class FakeTaskProvider:
         self._write("label", claim.ref)
         tracked.label = True
         return RestoreResult.RESTORED
+
+    def stray_labels(self) -> Sequence[TaskRef]:
+        self.stray_reads += 1
+        if self.stray_unreadable:
+            raise ProviderError("cannot list the claim label")
+        listed = tuple(
+            ref
+            for ref, t in self._tasks.items()
+            if t.label and not t.gone and not self._seen(ref, t) and not self._human(t)
+        )
+        for ref in listed:
+            self._stray_hook("listed", ref)
+        return listed
+
+    def _stray_hook(self, point: str, ref: TaskRef) -> None:
+        for hook in list(self.stray_hooks.get(point, ())):
+            hook(ref)
+
+    def clear_label(self, ref: TaskRef) -> ClearResult:
+        self._stray_hook("reread", ref)
+        tracked = self._tasks.get(ref)
+        if tracked is None or tracked.gone or not tracked.label:
+            return ClearResult.ABSENT
+        if self._seen(ref, tracked) or self._human(tracked):
+            return ClearResult.KEPT
+        self._stray_hook("label", ref)  # the non-atomic window
+        self._write("clear-label", ref)
+        tracked.label = False
+        return ClearResult.CLEARED
 
     def _object(self, claim: HeldClaim) -> tuple[_TrackedTask | None, FakeClaim | None]:
         tracked = self._tasks.get(claim.ref)

@@ -166,6 +166,14 @@ class ReleaseResult(enum.Enum):
     CHANGED = "changed"
 
 
+class ClearResult(enum.Enum):
+    """What a targeted removal of a stray claim label did (ADR-0027 §1)."""
+
+    CLEARED = "cleared"
+    KEPT = "kept"
+    ABSENT = "absent"
+
+
 class RestoreResult(enum.Enum):
     """What a targeted label restore beside one claim object did (ADR-0026 §5)."""
 

@@ -18,6 +18,7 @@ import pytest
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.tasks import (
     ClaimOutcome,
+    ClearResult,
     ReleaseResult,
     RestoreResult,
     Standing,
@@ -66,6 +67,10 @@ class TaskProviderContract:
         raise NotImplementedError
 
     def snapshot(self, provider: TaskProvider) -> Hashable:
+        raise NotImplementedError
+
+    def make_listing_unreadable(self, provider: TaskProvider) -> None:
+        """Make listing the claim label fail as a 5xx or a rate limit would."""
         raise NotImplementedError
 
     @pytest.fixture
@@ -249,3 +254,63 @@ class TaskProviderContract:
         assert eligible is (remaining is None)
         assert provider.standing(task.ref) == before  # nobody else's claim was touched
         provider.release(task.ref)  # idempotent
+
+    # -- stray claim labels (ADR-0027 §1) --------------------------------------------
+
+    def _stray(self, provider: TaskProvider) -> Task:
+        """A task left with Ilmar's label and nothing behind it."""
+        task, _ = self._claimed(provider)
+        self.change(provider, task, "drop-own-claim")
+        return task
+
+    def test_stray_labels_lists_exactly_label_only_tasks(self, provider: TaskProvider) -> None:
+        stray = self._stray(provider)
+        others = [t for t in provider.list_eligible() if t.ref != stray.ref]
+        other, human, forged = others[:3]
+        for task, what in ((other, "other-instance"), (human, "human-label"),
+                           (forged, "forge-own-marker")):  # fmt: skip
+            self.change(provider, task, "add-label")
+            self.change(provider, task, what)
+        assert list(provider.stray_labels()) == [stray.ref]
+
+    @pytest.mark.parametrize(
+        "what", ["other-instance", "forge-own-marker", "human-label", "assign"]
+    )
+    def test_any_claim_of_anyone_keeps_the_label(self, provider: TaskProvider, what: str) -> None:
+        stray = self._stray(provider)
+        self.change(provider, stray, what)
+        assert stray.ref not in provider.stray_labels()
+        assert provider.clear_label(stray.ref) is ClearResult.KEPT
+
+    def test_stray_labels_writes_nothing_and_reads_afresh(self, provider: TaskProvider) -> None:
+        stray = self._stray(provider)
+        before = self.snapshot(provider)
+        assert stray.ref in provider.stray_labels()
+        assert self.snapshot(provider) == before
+        self.change(provider, stray, "other-instance")
+        assert stray.ref not in provider.stray_labels()
+
+    def test_an_uncertain_listing_raises(self, provider: TaskProvider) -> None:
+        self._stray(provider)
+        self.make_listing_unreadable(provider)
+        with pytest.raises(ProviderError):
+            provider.stray_labels()
+
+    def test_clearing_removes_only_the_claim_label(self, provider: TaskProvider) -> None:
+        stray = self._stray(provider)
+        before = self.snapshot(provider)
+        assert provider.clear_label(stray.ref) is ClearResult.CLEARED
+        assert stray.ref not in provider.stray_labels()
+        assert provider.clear_label(stray.ref) is ClearResult.ABSENT
+        self.change(provider, stray, "add-label")
+        assert self.snapshot(provider) == before  # the label was the only change
+
+    @pytest.mark.parametrize("what", ["drop-label", "gone"])
+    def test_clearing_a_vanished_label_or_task_is_absent(
+        self, provider: TaskProvider, what: str
+    ) -> None:
+        stray = self._stray(provider)
+        self.change(provider, stray, what)
+        before = self.snapshot(provider)
+        assert provider.clear_label(stray.ref) is ClearResult.ABSENT
+        assert self.snapshot(provider) == before

@@ -52,6 +52,7 @@ def test_only_effects_that_are_safe_to_repeat_are_repeatable() -> None:
         K.UPSERT_CHANGE_REQUEST,
         K.RESTORE_CLAIM_LABEL,  # adds only a label beside one authentic object (ADR-0026)
         K.RELEASE_ORPHAN_CLAIM,  # re-reads exactly the recorded object first (ADR-0026)
+        K.CLEAR_STRAY_LABEL,  # re-reads the issue, removes one label (ADR-0027)
     }
     for risky in (K.PUBLISH_REVISION, K.START_CONTAINER, K.DELETE_WORKSPACE, K.POST_UPDATE):
         assert not risky.repeatable

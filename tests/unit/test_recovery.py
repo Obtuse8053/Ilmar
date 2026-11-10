@@ -75,7 +75,7 @@ K = OperationKind
 R = ResourceStatus
 
 PORT_EFFECTS = {
-    "tasks": {"claim", "release", "post_update", "release_claim", "restore_label"},
+    "tasks": {"claim", "release", "post_update", "release_claim", "restore_label", "clear_label"},
     "scm": {"checkout", "freeze_candidate", "checkout_revision", "publish_revision",
             "upsert_change_request"},
     "runtime": {"start", "run", "stop", "remove_owned"},
@@ -1191,6 +1191,73 @@ def check_reset(world: World) -> list[str]:
     return problems
 
 
+# -- stray claim labels (ADR-0027 §1): the effect pass is the crashed one ----------------
+
+
+def stray_world(root: Path, *, orphan_beside_human: bool) -> World:
+    """Task 1 runs as usual. Task 2, never eligible here, carries Ilmar's label:
+    beside an orphan and a human claim that lets go right after the orphan
+    release, or with nothing behind it at all. Pass 1 records the sweep's intent;
+    the crashed pass, after the merge, is the one that acts."""
+    world = World(root)
+    world.tasks.add(task("2"))
+    tracked = world.tasks.tracked(task("2").ref)
+    if orphan_beside_human:
+        world.tasks.claim(task("2").ref)  # while still eligible
+        tracked.human = True
+        original = world.tasks.release_claim
+
+        def release_claim(claim: Any) -> Any:
+            result = original(claim)
+            tracked.human = False  # the person lets go just after the orphan release
+            return result
+
+        world.tasks.release_claim = release_claim  # type: ignore[method-assign]
+    else:
+        tracked.label = True
+    tracked.eligible = False
+    return world
+
+
+def merge_and_race(world: World) -> None:
+    """The change request is merged; and another instance posts a claim comment in
+    the non-atomic window of the label removal (ADR-0027 §1, the race table)."""
+    merge(world)
+    fired: list[bool] = []
+
+    def other_claims(ref: Any) -> None:
+        if not fired:
+            fired.append(True)
+            tracked = world.tasks.tracked(task("2").ref)
+            world.tasks.claim_as(task("2").ref, "other-instance")
+            tracked.label = False  # its label not yet added
+
+    world.tasks.stray_hooks["label"] = [other_claims]
+
+
+def check_stray(world: World, *, raced: bool) -> list[str]:
+    problems = check_merged(world)
+    tracked = world.tasks.tracked(task("2").ref)
+    clears = [w for w in world.tasks.writes if w[0] == "clear-label"]
+    if len(clears) != 1:
+        problems.append(f"{len(clears)} label removals on task 2")
+    if tracked.label:
+        problems.append("the stray label is still there")
+    if tracked.human:
+        problems.append("the human claim changed")
+    instances = [c.instance for c in tracked.claims]
+    if instances != (["other-instance"] if raced else []):
+        problems.append(f"claims on task 2: {instances}")
+    if world.tasks.own_claims(task("2").ref):
+        problems.append("Ilmar claimed task 2")
+    with SQLiteExecutionStore(world.db) as store:
+        sweeps = [o for o in store.instance_operations() if o.kind is K.CLEAR_STRAY_LABEL]
+        if [o.status.value for o in sweeps] != ["succeeded"]:
+            problems.append(f"sweeps: {[(o.key, o.status.value) for o in sweeps]}")
+        problems += i13(world, store)
+    return problems
+
+
 Scenario = tuple[
     Callable[[Path], World], Callable[[World], None] | None, Callable[[World], list[str]]
 ]
@@ -1215,6 +1282,14 @@ SCENARIOS: dict[str, Scenario] = {
     "orphan-release": (orphan_world, None, check_orphan),
     "label-restoration": (label_world, None, check_label),
     "lost-claim-reset": (lost_claim_reset_world, None, check_reset),
+    "stray-label-after-human-claim": (
+        partial(stray_world, orphan_beside_human=True), merge,
+        partial(check_stray, raced=False),
+    ),
+    "stray-label-raced-by-new-claim": (
+        partial(stray_world, orphan_beside_human=False), merge_and_race,
+        partial(check_stray, raced=True),
+    ),
     "lost-claim-confirmed": (
         lost_claim_world, None, partial(check_tracker_cancelled, reasons={"task-claim-lost"})
     ),
