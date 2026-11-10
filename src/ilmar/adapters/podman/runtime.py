@@ -80,7 +80,9 @@ from ilmar.domain.workspace import (
     ResourceLimits,
     ResourceOwner,
     StopSignal,
+    StreamVerdict,
 )
+from ilmar.ports.container_runtime import StreamConsumer
 
 _LOG = logging.getLogger(__name__)
 
@@ -136,6 +138,8 @@ class Completed:
     stderr: str
     timed_out: bool = False
     cancelled: bool = False  # a stop signal killed it (ADR-0025 §2)
+    stalled: bool = False  # no progress for the idle timeout (ADR-0035 §3)
+    rejected: bool = False  # the stdout consumer found a violation (ADR-0035 §4)
 
 
 ENV_LOADER = (
@@ -157,7 +161,9 @@ class Executor(Protocol):
     reach ``--env-file /dev/fd/N`` without a file on disk. ``stdin`` is written
     to the child's standard input, which is then closed (``None``: no input).
     A ``stop`` signal, once set, ends the command exactly as its timeout does
-    and reports ``cancelled``.
+    and reports ``cancelled``. A ``stdout_consumer`` takes standard output
+    instead of the capture, and ``idle_timeout`` applies to its progress
+    verdicts (ADR-0035): see :func:`subprocess_executor`.
     """
 
     def __call__(
@@ -169,6 +175,8 @@ class Executor(Protocol):
         pass_fds: Sequence[int] = (),
         stdin: bytes | None = None,
         stop: StopSignal | None = None,
+        stdout_consumer: StreamConsumer | None = None,
+        idle_timeout: float | None = None,
     ) -> Completed: ...
 
 
@@ -184,14 +192,23 @@ prints without end within its timeout would exhaust the coordinator's memory.
 """
 
 
-class _Capture:
-    """Reads one pipe to its end, keeping at most ``limit`` bytes."""
+STREAM_HEAD_BYTES = 256 * 1024
+STREAM_TAIL_BYTES = 64 * 1024
+"""Standard error kept beside a stdout consumer: its first and last bytes only
+(ADR-0035 §4), for a one-line diagnostic."""
 
-    def __init__(self, stream: IO[bytes], limit: int) -> None:
+
+class _Capture:
+    """Reads one pipe to its end, keeping at most ``limit`` bytes from its start
+    and, with ``tail``, the last ``tail`` bytes too."""
+
+    def __init__(self, stream: IO[bytes], limit: int, tail: int = 0) -> None:
         self.kept = bytearray()
+        self.last = bytearray()
         self.dropped = 0
         self._stream = stream
         self._limit = limit
+        self._tail = tail
         self.thread = threading.Thread(target=self._drain, daemon=True)
         self.thread.start()
 
@@ -200,14 +217,65 @@ class _Capture:
         while chunk := read(65536):
             room = max(0, self._limit - len(self.kept))
             self.kept += chunk[:room]
-            self.dropped += len(chunk) - min(room, len(chunk))
+            rest = chunk[room:]
+            if self._tail and rest:
+                self.last += rest
+                excess = len(self.last) - self._tail
+                if excess > 0:
+                    del self.last[:excess]
+                    self.dropped += excess
+            else:
+                self.dropped += len(rest)
 
     def text(self) -> str:
-        data = bytes(self.kept)
         note = (
             f"\n[ilmar: {self.dropped} further bytes of output discarded]\n" if self.dropped else ""
         )
-        return _decode(data) + note
+        if self.last:
+            return _decode(bytes(self.kept)) + note + _decode(bytes(self.last))
+        return _decode(bytes(self.kept)) + note
+
+
+class _Consumed:
+    """Reads standard output to its end into a stream consumer (ADR-0035 §4).
+
+    Keeps no output. Records when the consumer last saw progress and whether it
+    found a violation; the waiting thread reads both. After a violation the rest
+    is drained and dropped, so the command never blocks on a full pipe.
+    """
+
+    def __init__(self, stream: IO[bytes], consumer: StreamConsumer) -> None:
+        self._stream = stream
+        self._consumer = consumer
+        self.last_progress = time.monotonic()
+        self.violation = False
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+        self.thread.start()
+
+    def _drain(self) -> None:
+        read = getattr(self._stream, "read1", self._stream.read)
+        try:
+            while chunk := read(65536):
+                if not self.violation:
+                    self._note(self._consumer.feed(chunk))
+            if not self.violation:
+                self._note(self._consumer.close())
+        except BaseException as error:
+            self.error = error
+            self.violation = True
+            with contextlib.suppress(OSError, ValueError):
+                while read(65536):
+                    pass
+
+    def _note(self, verdict: StreamVerdict) -> None:
+        if verdict is StreamVerdict.PROGRESS:
+            self.last_progress = time.monotonic()
+        elif verdict is StreamVerdict.VIOLATION:
+            self.violation = True
+
+    def text(self) -> str:
+        return ""
 
 
 def subprocess_executor(
@@ -218,15 +286,22 @@ def subprocess_executor(
     pass_fds: Sequence[int] = (),
     stdin: bytes | None = None,
     stop: StopSignal | None = None,
+    stdout_consumer: StreamConsumer | None = None,
+    idle_timeout: float | None = None,
     output_limit: int = OUTPUT_LIMIT_BYTES,
 ) -> Completed:
-    """Run a command in its own process group; on timeout, or once ``stop`` is set,
-    kill the whole group, and only that group (ADR-0025 §2).
+    """Run a command in its own process group; on timeout, once ``stop`` is set, on
+    a consumer's violation or after ``idle_timeout`` without progress, kill the
+    whole group, and only that group (ADR-0025 §2, ADR-0035).
 
     Each output stream keeps at most ``output_limit`` bytes. Output is still
-    read to the end, so the command never blocks on a full pipe. ``stop`` is
-    looked at every ``STOP_POLL_SECONDS`` while the command runs.
+    read to the end, so the command never blocks on a full pipe. With a
+    ``stdout_consumer``, standard output goes to it and none is kept, and
+    standard error keeps only its first and last bytes. ``stop``, the consumer's
+    verdicts and the idle timer are looked at every ``STOP_POLL_SECONDS``.
     """
+    if idle_timeout is not None and stdout_consumer is None:
+        raise ValueError("an idle timeout needs a stdout consumer")
     try:
         process = subprocess.Popen(  # noqa: S603 - argv is built by this adapter
             list(argv),
@@ -241,13 +316,25 @@ def subprocess_executor(
         raise ProviderError(f"cannot run {argv[0]}: {error.strerror}") from None
     if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE was requested
         raise ProviderError(f"cannot read the output of {argv[0]}")
-    captures = (_Capture(process.stdout, output_limit), _Capture(process.stderr, output_limit))
+    out_reader: _Capture | _Consumed = (
+        _Capture(process.stdout, output_limit)
+        if stdout_consumer is None
+        else _Consumed(process.stdout, stdout_consumer)
+    )
+    err_reader = (
+        _Capture(process.stderr, output_limit)
+        if stdout_consumer is None
+        else _Capture(process.stderr, STREAM_HEAD_BYTES, tail=STREAM_TAIL_BYTES)
+    )
+    captures = (out_reader, err_reader)
     if stdin is not None and process.stdin is not None:
         with contextlib.suppress(BrokenPipeError):  # the command may not read it all
             process.stdin.write(stdin)
         with contextlib.suppress(BrokenPipeError):
             process.stdin.close()
-    ended = _wait(process, captures, time.monotonic() + timeout, stop)
+    ended = _wait(process, captures, time.monotonic() + timeout, stop, idle_timeout)
+    if ended == "done" and isinstance(out_reader, _Consumed) and out_reader.violation:
+        ended = "rejected"  # found at the stream's end; the command already exited
     if ended != "done":
         # The process group is this executor's own (start_new_session): its
         # leader's pid is the group id, so no other process is ever signalled.
@@ -261,29 +348,50 @@ def subprocess_executor(
         with contextlib.suppress(OSError):
             stream.close()
     out, err = (capture.text() for capture in captures)
+    if isinstance(out_reader, _Consumed) and out_reader.error is not None:
+        raise ProviderError(  # the consumer failed: fail closed, never as a result
+            f"the output consumer of {argv[0]} failed: {type(out_reader.error).__name__}"
+        ) from None
     if ended == "stopped":
         return Completed(TIMED_OUT_EXIT_CODE, out, err, cancelled=True)
     if ended == "timed-out":
         return Completed(TIMED_OUT_EXIT_CODE, out, err, timed_out=True)
+    if ended == "stalled":
+        return Completed(TIMED_OUT_EXIT_CODE, out, err, stalled=True)
+    if ended == "rejected":
+        return Completed(TIMED_OUT_EXIT_CODE, out, err, rejected=True)
     return Completed(process.returncode, out, err)
 
 
 def _wait(
     process: subprocess.Popen[bytes],
-    captures: tuple[_Capture, _Capture],
+    captures: tuple[_Capture | _Consumed, _Capture],
     deadline: float,
     stop: StopSignal | None,
+    idle_timeout: float | None = None,
 ) -> str:
     """Wait until the command ended and released its pipes ("done"), the deadline
-    passed ("timed-out") or ``stop`` was set ("stopped"). A leftover process
-    that still holds a pipe keeps the command running."""
+    passed ("timed-out"), ``stop`` was set ("stopped"), the stdout consumer found
+    a violation ("rejected") or saw no progress for ``idle_timeout`` ("stalled").
+    A leftover process that still holds a pipe keeps the command running."""
+    consumed = captures[0] if isinstance(captures[0], _Consumed) else None
     while True:
         if stop is not None and stop.is_set():
             return "stopped"
-        remaining = deadline - time.monotonic()
+        if consumed is not None and consumed.violation and consumed.thread.is_alive():
+            return "rejected"
+        now = time.monotonic()
+        if (
+            consumed is not None
+            and idle_timeout is not None
+            and now - consumed.last_progress >= idle_timeout
+        ):
+            return "stalled"
+        remaining = deadline - now
         if remaining <= 0:
             return "timed-out"
-        step = remaining if stop is None else min(remaining, STOP_POLL_SECONDS)
+        polled = stop is not None or consumed is not None
+        step = min(remaining, STOP_POLL_SECONDS) if polled else remaining
         if process.poll() is None:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=step)
@@ -505,12 +613,18 @@ class PodmanRuntime:
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
         stop: StopSignal | None = None,
+        idle_timeout_seconds: float | None = None,
+        stdout_consumer: StreamConsumer | None = None,
     ) -> CommandResult:
         container_id = self._container_id(handle)
         if not argv:
             raise ValueError("argv must not be empty")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if idle_timeout_seconds is not None and (
+            stdout_consumer is None or idle_timeout_seconds <= 0
+        ):
+            raise ValueError("idle_timeout_seconds must be positive and needs a stdout consumer")
         command_env = self._container_env(env or {}, with_home=False)
         if not self._running(container_id):
             raise ProviderError(f"container is not running: {handle.name}")
@@ -520,6 +634,12 @@ class PodmanRuntime:
             return CommandResult(TIMED_OUT_EXIT_CODE, "", "", 0.0, cancelled=True)
 
         began = self._clock()
+        # Only passed when used, so executors that predate ADR-0035 keep working.
+        streaming: dict[str, Any] = (
+            {}
+            if stdout_consumer is None
+            else {"stdout_consumer": stdout_consumer, "idle_timeout": idle_timeout_seconds}
+        )
         if command_env:
             # Never `podman exec --env`/`--env-file`: Podman records an exec
             # session's environment in its state database on disk (found on real
@@ -533,6 +653,7 @@ class PodmanRuntime:
                 timeout_seconds,
                 stdin=env_stream(command_env),
                 stop=stop,
+                **streaming,
             )  # fmt: skip
         else:
             done = self._executor(
@@ -540,21 +661,25 @@ class PodmanRuntime:
                 self._environ,
                 timeout_seconds,
                 stop=stop,
+                **streaming,
             )
         duration = max(0.0, self._clock() - began)
-        if done.timed_out or done.cancelled:
+        if done.timed_out or done.cancelled or done.stalled or done.rejected:
             # Processes the command started may still run; nothing may keep
             # writing to the workspace, so the whole container goes (ADR-0014).
-            # A stop is handled exactly as a timeout (ADR-0025 §2). If removal
-            # cannot be confirmed, ContainmentError propagates.
+            # A stop, a stall and a rejected stream are handled exactly as a
+            # timeout (ADR-0025 §2, ADR-0035). If removal cannot be confirmed,
+            # ContainmentError propagates.
             self._remove_sandbox(container_id, handle.name)
             return CommandResult(
                 TIMED_OUT_EXIT_CODE,
                 done.stdout,
                 done.stderr,
                 duration,
-                timed_out=done.timed_out and not done.cancelled,
+                timed_out=done.timed_out,
                 cancelled=done.cancelled,
+                stalled=done.stalled,
+                rejected=done.rejected,
             )
         if done.returncode == 125 and not self._running(container_id):
             raise ProviderError(f"container stopped while running a command: {handle.name}")

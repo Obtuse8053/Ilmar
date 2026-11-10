@@ -58,7 +58,8 @@ from ilmar.domain.workspace import (
     ResourceOwner,
     StopSignal,
 )
-from ilmar.ports.container_runtime import ContainerRuntime
+from ilmar.ports.container_runtime import ContainerRuntime, StreamConsumer
+from stream_support import consume, parse_emit
 
 
 @dataclass
@@ -463,7 +464,13 @@ class FakeContainerRuntime:
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
         stop: StopSignal | None = None,
+        idle_timeout_seconds: float | None = None,
+        stdout_consumer: StreamConsumer | None = None,
     ) -> CommandResult:
+        if idle_timeout_seconds is not None and (
+            stdout_consumer is None or idle_timeout_seconds <= 0
+        ):
+            raise ValueError("idle_timeout_seconds must be positive and needs a stdout consumer")
         container = self._containers.get(handle.id)
         if container is None or not container.running:
             raise ProviderError(f"container is not running: {handle.id}")
@@ -471,8 +478,36 @@ class FakeContainerRuntime:
             self._remove_after_kill(handle)
             return CommandResult(-9, "", "", 0.0, cancelled=True)
         self.commands.append((handle.id, tuple(argv)))
-        result = self._interpret(container.spec, argv, timeout_seconds, env, stop)
-        if result.timed_out or result.cancelled:  # the whole container goes (port contract)
+        if argv and argv[0] == "emit":
+            lines, silence = parse_emit(argv)
+            data, result = "".join(lines).encode(), CommandResult(0, "", "", silence)
+        else:
+            result = self._interpret(container.spec, argv, timeout_seconds, env, stop)
+            data, silence = result.stdout.encode(), 0.0
+        if stdout_consumer is not None and not result.ended_early:
+            # The runtime keeps no standard output when a consumer takes it (ADR-0035).
+            ended = consume(
+                stdout_consumer,
+                data,
+                silence=silence,
+                idle_timeout=idle_timeout_seconds,
+                timeout=timeout_seconds,
+            )
+            flags = {
+                "rejected": {"rejected": True},
+                "stalled": {"stalled": True},
+                "timed-out": {"timed_out": True},
+            }.get(ended)
+            result = (
+                dataclasses.replace(result, stdout="")
+                if flags is None
+                else CommandResult(-9, "", result.stderr, result.duration_seconds, **flags)
+            )
+        elif argv and argv[0] == "emit" and silence >= timeout_seconds:
+            result = CommandResult(-9, "", "", timeout_seconds, timed_out=True)
+        elif argv and argv[0] == "emit":
+            result = dataclasses.replace(result, stdout=data.decode())
+        if result.ended_early:  # the whole container goes (port contract)
             self._remove_after_kill(handle)
         return result
 
@@ -875,6 +910,8 @@ class FakeAgentRunner:
             return AgentResult(AgentOutcome.CANCELLED, "agent stopped on request", None)
         if result.timed_out:
             return AgentResult(AgentOutcome.TIMED_OUT, "agent timed out", result.exit_code)
+        if result.stalled:
+            return AgentResult(AgentOutcome.STALLED, "agent showed no progress", result.exit_code)
         parsed = _parse_result(result.stdout)
         if parsed is None:
             return AgentResult(AgentOutcome.FAILED, "no structured result", result.exit_code)

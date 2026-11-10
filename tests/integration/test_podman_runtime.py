@@ -153,6 +153,9 @@ class TestContractOnRealPodman(ContainerRuntimeContract):
     def write_file(self, relative_path: str, content: str) -> Sequence[str]:
         return sh('printf "%s" "$2" > "$1"', relative_path, content)
 
+    def emit(self, lines: Sequence[str], silence: float = 0.0) -> Sequence[str]:
+        return sh('printf "%s" "$1"; sleep "$2"', "".join(lines), str(int(silence)))
+
 
 # -- the ADR-0011 profile, observed from inside -----------------------------------
 

@@ -26,7 +26,7 @@ from ilmar.domain.workspace import (
     StopSignal,
 )
 from ilmar.ports.agent_runner import AgentRunner
-from ilmar.ports.container_runtime import ContainerRuntime
+from ilmar.ports.container_runtime import ContainerRuntime, StreamConsumer
 
 from helpers import task
 
@@ -43,7 +43,10 @@ class AgentScenario(enum.Enum):
     UNPARSEABLE_OUTPUT = "unparseable_output"
     """Exits 0 but prints no recognisable structured result."""
     HANGS = "hangs"
-    """Runs longer than the request's timeout."""
+    """Keeps showing progress, but runs longer than the request's timeout."""
+    STALLS = "stalls"
+    """Shows progress, then nothing for longer than the request's stall timeout
+    (ADR-0035 §3)."""
 
 
 EXPECTED = {
@@ -53,9 +56,12 @@ EXPECTED = {
     AgentScenario.CRASHES: AgentOutcome.FAILED,
     AgentScenario.UNPARSEABLE_OUTPUT: AgentOutcome.FAILED,
     AgentScenario.HANGS: AgentOutcome.TIMED_OUT,
+    AgentScenario.STALLS: AgentOutcome.STALLED,
 }
 
-REQUEST = AgentRequest(task=task("42"), instructions="Fix the bug.", timeout_seconds=60)
+REQUEST = AgentRequest(
+    task=task("42"), instructions="Fix the bug.", timeout_seconds=60, stall_timeout_seconds=5
+)
 
 
 class StopObservingRuntime:
@@ -84,11 +90,16 @@ class StopObservingRuntime:
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
         stop: StopSignal | None = None,
+        idle_timeout_seconds: float | None = None,
+        stdout_consumer: StreamConsumer | None = None,
     ) -> CommandResult:
         self.stops.append(stop)
         if stop is not None and stop.is_set():
             return CommandResult(-9, "", "", 0.0, cancelled=True)
-        return self.inner.run(handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop)
+        return self.inner.run(
+            handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop,
+            idle_timeout_seconds=idle_timeout_seconds, stdout_consumer=stdout_consumer,
+        )  # fmt: skip
 
     def is_running(self, handle: ContainerHandle) -> bool:
         return self.inner.is_running(handle)

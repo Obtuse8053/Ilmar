@@ -173,8 +173,10 @@ STOP_POLL_SECONDS = 0.25
 class CommandResult:
     """How one command in a sandbox ended.
 
-    ``timed_out`` and ``cancelled`` (a stop signal, ADR-0025 §2) both mean the
-    command was killed and its whole sandbox removed; at most one is set.
+    ``timed_out``, ``cancelled`` (a stop signal, ADR-0025 §2), ``stalled`` (no
+    progress for the idle timeout, ADR-0035 §3) and ``rejected`` (its output
+    stream broke the consumer's rules, ADR-0035 §4) all mean the command was
+    ended and its whole sandbox removed; at most one is set.
     """
 
     exit_code: int
@@ -183,11 +185,31 @@ class CommandResult:
     duration_seconds: float
     timed_out: bool = False
     cancelled: bool = False
+    stalled: bool = False
+    rejected: bool = False
 
     def __post_init__(self) -> None:
-        if self.timed_out and self.cancelled:
-            raise ValueError("a command either timed out or was cancelled, not both")
+        if sum((self.timed_out, self.cancelled, self.stalled, self.rejected)) > 1:
+            raise ValueError(
+                "a command timed out, was cancelled, stalled or was rejected: at most one"
+            )
+
+    @property
+    def ended_early(self) -> bool:
+        """Killed before it finished: its sandbox is gone (port contract)."""
+        return self.timed_out or self.cancelled or self.stalled or self.rejected
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.cancelled
+        return self.exit_code == 0 and not self.ended_early
+
+
+class StreamVerdict(enum.Enum):
+    """What a stream consumer made of the output it was just given (ADR-0035 §8)."""
+
+    NONE = "none"
+    """Nothing new: no complete line, or only lines that are not progress."""
+    PROGRESS = "progress"
+    """At least one complete line that counts as progress: restart the idle timer."""
+    VIOLATION = "violation"
+    """The stream broke the consumer's rules: end the command now."""

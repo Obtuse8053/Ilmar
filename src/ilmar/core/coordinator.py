@@ -130,6 +130,7 @@ class Coordinator:
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
         retry_backoff: RetryBackoff,
+        stall_timeout_seconds: float | None = None,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
@@ -150,6 +151,7 @@ class Coordinator:
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
             retry_backoff=retry_backoff,
+            stall_timeout_seconds=stall_timeout_seconds,
             new_token=new_token,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -164,6 +166,7 @@ class Coordinator:
         agent_timeout_seconds: float,
         retry_backoff: RetryBackoff,
         clock: Callable[[], datetime],
+        stall_timeout_seconds: float | None = None,
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
         new_pass_id: Callable[[], str] = new_pass_id,
@@ -201,6 +204,7 @@ class Coordinator:
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
             retry_backoff=retry_backoff,
+            stall_timeout_seconds=stall_timeout_seconds,
             events=events,
             watch_interval_seconds=watch_interval_seconds,
         )

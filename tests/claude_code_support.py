@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scripted stand-ins for the ``claude`` CLI, speaking its documented JSON result format."""
+"""Scripted stand-ins for the ``claude`` CLI, speaking its documented ``stream-json``
+format (ADR-0035): one JSON event per line, ending with the result object."""
 
 from __future__ import annotations
 
@@ -23,14 +24,37 @@ def result_json(*, subtype: str, is_error: bool, text: str) -> str:
     )
 
 
-SUCCESS = result_json(subtype="success", is_error=False, text="Fixed the bug in app.py.")
-ERROR = result_json(subtype="error_during_execution", is_error=True, text="Tool failed.")
+INIT = json.dumps({"type": "system", "subtype": "init", "session_id": "s", "tools": ["Bash"]})
+ASSISTANT = json.dumps(
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": "Looking."}]}}
+)
+TOOL_RESULT = json.dumps(
+    {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}}
+)
+RATE_LIMIT = json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}})
+API_RETRY = json.dumps({"type": "system", "subtype": "api_retry", "attempt": 1})
+
+
+def stream(
+    result: str,
+    *,
+    before: tuple[str, ...] = (INIT, ASSISTANT, TOOL_RESULT),
+    after: tuple[str, ...] = (),
+) -> str:
+    """A complete ``stream-json`` transcript around one result line."""
+    return "".join(f"{line}\n" for line in (*before, result, *after))
+
+
+SUCCESS_RESULT = result_json(subtype="success", is_error=False, text="Fixed the bug in app.py.")
+ERROR_RESULT = result_json(subtype="error_during_execution", is_error=True, text="Tool failed.")
+SUCCESS = stream(SUCCESS_RESULT)
+ERROR = stream(ERROR_RESULT)
 
 # (exit code, stdout, stderr) per contract scenario; HANGS is handled by timing out.
 OUTPUTS: dict[AgentScenario, tuple[int, str, str]] = {
-    AgentScenario.COMPLETES: (0, SUCCESS + "\n", ""),
-    AgentScenario.REPORTS_ERROR_WITH_EXIT_ZERO: (0, ERROR + "\n", ""),
-    AgentScenario.CLAIMS_SUCCESS_WITH_NONZERO_EXIT: (1, SUCCESS + "\n", ""),
+    AgentScenario.COMPLETES: (0, SUCCESS, ""),
+    AgentScenario.REPORTS_ERROR_WITH_EXIT_ZERO: (0, ERROR, ""),
+    AgentScenario.CLAIMS_SUCCESS_WITH_NONZERO_EXIT: (1, SUCCESS, ""),
     AgentScenario.CRASHES: (2, "", "Error: something broke\n"),
     AgentScenario.UNPARSEABLE_OUTPUT: (0, "All done!\n", ""),
 }
@@ -44,7 +68,10 @@ def shell_script(scenario: AgentScenario, record: str) -> str:
         f'env > "{record}.env"',
         'if [ "$1" = "--version" ]; then echo "9.9.9 (Claude Code)"; exit 0; fi',
     ]
-    if scenario is AgentScenario.HANGS:
+    if scenario is AgentScenario.HANGS:  # busy: progress every second, never done
+        lines.append("while :; do printf '%s\\n' '{\"type\": \"assistant\"}'; sleep 1; done")
+    elif scenario is AgentScenario.STALLS:  # one event, then silence
+        lines.append(f"printf '%s\\n' '{INIT}'")
         lines.append("sleep 600")
     else:
         code, out, err = OUTPUTS[scenario]

@@ -1,0 +1,14 @@
+{
+  "provenance": "synthetic",
+  "note": "NOT recorded from a real run. Shape reconstructed from the upstream report anthropics/claude-code#103253 [R28], which describes rate_limit_event after the result on 2.1.302. Replace or supplement with the record written by tests/integration/test_claude_code_live.py (issue-13-stream-event-types.json) for the pinned version; ADR-0035's enablement gate needs that recorded fixture, not this one.",
+  "claude_code_version": "2.1.302",
+  "events": [
+    {"type": "system", "subtype": "init", "after_result": false},
+    {"type": "rate_limit_event", "subtype": null, "after_result": false},
+    {"type": "assistant", "subtype": null, "after_result": false},
+    {"type": "user", "subtype": null, "after_result": false},
+    {"type": "assistant", "subtype": null, "after_result": false},
+    {"type": "result", "subtype": "success", "after_result": false},
+    {"type": "rate_limit_event", "subtype": null, "after_result": true}
+  ]
+}

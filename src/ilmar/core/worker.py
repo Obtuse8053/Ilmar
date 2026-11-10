@@ -179,6 +179,7 @@ class ExecutionWorker:
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
         retry_backoff: RetryBackoff,
+        stall_timeout_seconds: float | None = None,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
@@ -191,6 +192,7 @@ class ExecutionWorker:
         self.clock = clock
         self.agent_timeout = agent_timeout_seconds
         self.retry_backoff = retry_backoff
+        self.stall_timeout = stall_timeout_seconds
         self.new_token = new_token
         self.watch_interval = watch_interval_seconds
         self.cancellations = Cancellations(
@@ -571,6 +573,8 @@ class _Run:
         )
         if result.outcome is AgentOutcome.TIMED_OUT:
             raise TransientError("the agent timed out", code="agent-timed-out")
+        if result.outcome is AgentOutcome.STALLED:  # ADR-0035 §3: retried after backoff
+            raise TransientError("the agent showed no progress", code="agent-stalled")
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted
@@ -1152,7 +1156,10 @@ class _Run:
     def request(self) -> AgentRequest:
         task = self.require_task()
         return AgentRequest(
-            task=task, instructions=instructions(task), timeout_seconds=self.w.agent_timeout
+            task=task,
+            instructions=instructions(task),
+            timeout_seconds=self.w.agent_timeout,
+            stall_timeout_seconds=self.w.stall_timeout,
         )
 
 

@@ -13,7 +13,22 @@ from ilmar.domain.workspace import (
     ContainerSpec,
     ResourceOwner,
     StopSignal,
+    StreamVerdict,
 )
+
+
+class StreamConsumer(Protocol):
+    """Takes a command's standard output as it arrives (ADR-0035 §8).
+
+    Called from one reader thread at a time, never concurrently. It must keep
+    its own state bounded, whatever the stream's length.
+    """
+
+    def feed(self, chunk: bytes) -> StreamVerdict: ...
+
+    def close(self) -> StreamVerdict:
+        """The stream ended (the command exited or was ended)."""
+        ...
 
 
 class ContainerRuntime(Protocol):
@@ -79,10 +94,21 @@ class ContainerRuntime(Protocol):
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
         stop: StopSignal | None = None,
+        idle_timeout_seconds: float | None = None,
+        stdout_consumer: StreamConsumer | None = None,
     ) -> CommandResult:
         """Run ``argv`` in the container with ``env`` added for this command only.
 
         ``stop``: see the contract above.
+
+        ``stdout_consumer`` (ADR-0035 §4, §8): every byte of standard output is
+        given to ``consumer.feed`` as it is read, and ``consumer.close`` is called
+        once at its end. The runtime then keeps **no** standard-output text
+        (``CommandResult.stdout`` is empty). A ``VIOLATION`` verdict ends the
+        command at once, as a timeout does, and the result is ``rejected``.
+        ``idle_timeout_seconds`` needs a consumer: when no ``PROGRESS`` verdict
+        arrives for that long (counted from the start), the command is ended the
+        same way and the result is ``stalled``. Whichever ending comes first wins.
 
         ``env`` is where a credential goes (the model key: ADR-0006). An adapter
         must keep it out of anything the runtime persists or shows: not the
