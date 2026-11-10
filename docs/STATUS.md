@@ -57,19 +57,29 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#12 (plan step 4): tracker reconciliation, **implementing the accepted
-ADR-0026.** The maintainer approved:
-- the `TaskProvider` additions (`standing`, `held_claims`, `release_claim`,
-  `restore_label`, `claim` returning its claim id, authentic own claims);
-- the ADR-0020 amendment for one instance-scoped operation, with its store
-  migration;
-- the ADR-0024 registry additions;
-- tracker-driven cancellation through ADR-0025's machinery;
-- the two reads added to the side-effect architecture test.
+#12 (plan step 4): tracker reconciliation. **The implementation of the
+accepted ADR-0026 is in review** (the #12 pull request, stacked on #82). It
+must not be merged without the maintainer's approval; #12 closes only after
+its acceptance audit against ADR-0026.
 
-The implementation PR includes every mandatory test in the ADR.
+After #12: #13 (retry backoff and stall detection, plan step 5).
 
 ## Change log
+
+- 2026-11-09: **#12 implementation submitted** (ADR-0026), stacked on #82:
+  - **Store and journal:** schema 5 makes an operation's execution optional
+    for the one instance-scoped kind, `release-orphan-claim`; the journal
+    performs it fenced by the instance lock (`perform_instance`).
+  - **Port and GitHub adapter:** `standing`, `held_claims`, `release_claim`,
+    `restore_label`; `claim` returns its claim id; only authentic own claims
+    (marker and author) count; `bot_login` for tokens that cannot read
+    `GET /user`; a transfer is never followed.
+  - **Coordinator:** standing reads at the pass start and the safe points;
+    tracker decisions through ADR-0025's machinery with their own reason
+    codes; lost claims confirmed only across three ordered passes; label
+    restore; orphan release before the follow-up and the pick; re-pick rules.
+  - **Tests:** contract, adversarial adapter, coordinator, crash suite (six
+    new scenarios with I13) and a real-Podman scenario.
 
 - 2026-11-09: **ADR-0026 accepted** (tracker reconciliation, for #12),
   merged in #81 after three review rounds:

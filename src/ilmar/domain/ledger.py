@@ -74,10 +74,19 @@ class OperationKind(enum.Enum):
     PUBLISH_REVISION = "publish-revision"
     UPSERT_CHANGE_REQUEST = "upsert-change-request"
     DELETE_WORKSPACE = "delete-workspace"
+    RESTORE_CLAIM_LABEL = "restore-claim-label"
+    """Re-adds the claim label beside one recorded claim object (ADR-0026 §5)."""
+    RELEASE_ORPHAN_CLAIM = "release-orphan-claim"
+    """Removes one recorded orphaned claim object; instance-scoped (ADR-0026 §5)."""
 
     @property
     def repeatable(self) -> bool:
         return self in _REPEATABLE
+
+    @property
+    def instance_scoped(self) -> bool:
+        """Names no execution: ADR-0020 as amended by ADR-0026 §5."""
+        return self in INSTANCE_SCOPED_KINDS
 
 
 _REPEATABLE = frozenset(
@@ -87,8 +96,13 @@ _REPEATABLE = frozenset(
         OperationKind.STOP_CONTAINER,  # stopping a gone container is a no-op
         OperationKind.FREEZE_CANDIDATE,  # deterministic revision (port contract)
         OperationKind.UPSERT_CHANGE_REQUEST,  # keyed by head branch
+        OperationKind.RESTORE_CLAIM_LABEL,  # targeted, adds one label (ADR-0026 §5)
+        OperationKind.RELEASE_ORPHAN_CLAIM,  # targeted, rechecks before deleting
     }
 )
+
+INSTANCE_SCOPED_KINDS = frozenset({OperationKind.RELEASE_ORPHAN_CLAIM})
+"""The closed set of operation kinds that name no execution (ADR-0026 §5)."""
 
 
 class OperationStatus(enum.Enum):
@@ -146,6 +160,18 @@ def operation_key(kind: OperationKind, execution_id: str, attempt: int, step: st
     return key
 
 
+def instance_operation_key(kind: OperationKind, instance_id: str, step: str) -> str:
+    """The key of an instance-scoped operation: ``<kind>:<instance>:1:<step>``
+    (the shape every journal key has, with the instance in the scope position)."""
+    if not kind.instance_scoped:
+        raise ValueError(f"{kind.value} is not instance-scoped")
+    if not _IDENTIFIER.match(instance_id):
+        raise ValueError("instance_id must be a safe identifier")
+    if not step or not _DISCRIMINATOR.match(step):
+        raise ValueError("step must be a short identifier")
+    return f"{kind.value}:{instance_id}:1:{step}"
+
+
 def _frozen_fields(values: Mapping[str, str], what: str) -> Mapping[str, str]:
     if len(values) > _MAX_FIELDS:
         raise ValueError(f"{what} has too many fields")
@@ -166,7 +192,7 @@ class Operation:
     """
 
     key: str
-    execution_id: str
+    execution_id: str | None  # None only for an instance-scoped kind (ADR-0026 §5)
     attempt: int
     kind: OperationKind
     status: OperationStatus
@@ -181,9 +207,20 @@ class Operation:
     def __post_init__(self) -> None:
         if self.version < 1 or self.epoch < 1 or self.attempt < 1:
             raise ValueError("version, epoch and attempt start at 1")
-        expected = f"{self.kind.value}:{self.execution_id}:{self.attempt}"
-        if self.key != expected and not self.key.startswith(expected + ":"):
-            raise ValueError("the key does not belong to this kind, execution and attempt")
+        if self.kind.instance_scoped:
+            scope, _, step = self.key.removeprefix(f"{self.kind.value}:").partition(":1:")
+            if (
+                self.execution_id is not None
+                or self.attempt != 1
+                or self.key != instance_operation_key(self.kind, scope, step or "-")
+            ):
+                raise ValueError("an instance-scoped operation names no execution")
+        else:
+            if self.execution_id is None:
+                raise ValueError(f"{self.kind.value} names its execution")
+            expected = f"{self.kind.value}:{self.execution_id}:{self.attempt}"
+            if self.key != expected and not self.key.startswith(expected + ":"):
+                raise ValueError("the key does not belong to this kind, execution and attempt")
         object.__setattr__(self, "intent", _frozen_fields(self.intent, "intent"))
         object.__setattr__(self, "result", _frozen_fields(self.result, "result"))
         if len(self.note) > _MAX_VALUE:
@@ -205,6 +242,31 @@ class Operation:
             key=operation_key(kind, execution_id, attempt, step),
             execution_id=execution_id,
             attempt=attempt,
+            kind=kind,
+            status=OperationStatus.INTENDED,
+            epoch=fence.epoch,
+            version=1,
+            created_at=now,
+            updated_at=now,
+            intent=intent or {},
+        )
+
+    @classmethod
+    def intended_for_instance(
+        cls,
+        kind: OperationKind,
+        instance_id: str,
+        *,
+        fence: Fence,
+        now: datetime,
+        step: str,
+        intent: Mapping[str, str] | None = None,
+    ) -> Operation:
+        """An instance-scoped intent (ADR-0026 §5): no execution, attempt 1."""
+        return cls(
+            key=instance_operation_key(kind, instance_id, step),
+            execution_id=None,
+            attempt=1,
             kind=kind,
             status=OperationStatus.INTENDED,
             epoch=fence.epoch,

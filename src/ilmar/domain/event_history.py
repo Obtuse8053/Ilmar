@@ -232,7 +232,7 @@ def _apply(fold: _Fold, event: Event) -> None:
             return
         state.evidence_seen += 1
         return
-    if event.type is EventType.EXECUTION_CANCEL_REQUESTED:
+    if event.type in (EventType.EXECUTION_CANCEL_REQUESTED, EventType.EXECUTION_CLAIM_LOST):
         # Changes no row (ADR-0025), but must be about an execution the log knows.
         if str(event.execution) not in fold.executions:
             fold.fail("event-before-creation", f"execution:{event.execution}", f"seq {event.seq}")

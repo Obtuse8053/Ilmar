@@ -53,6 +53,7 @@ from ilmar.domain.errors import (
     ContainmentError,
     FencingError,
     PolicyViolationError,
+    ProviderError,
 )
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import OperationKind, ResourceKind, ResourceStatus, operation_key
@@ -74,7 +75,7 @@ K = OperationKind
 R = ResourceStatus
 
 PORT_EFFECTS = {
-    "tasks": {"claim", "release", "post_update"},
+    "tasks": {"claim", "release", "post_update", "release_claim", "restore_label"},
     "scm": {"checkout", "freeze_candidate", "checkout_revision", "publish_revision",
             "upsert_change_request"},
     "runtime": {"start", "run", "stop", "remove_owned"},
@@ -993,6 +994,203 @@ def check_stranded(world: World) -> list[str]:
     return problems
 
 
+# -- tracker reconciliation (ADR-0026 §7: the crash-suite scenarios, with I13) ------------
+
+
+def i13(world: World, store: SQLiteExecutionStore) -> list[str]:
+    from tracker_support import i12_problems, i13_problems
+
+    problems = i13_problems(store, world.tasks)
+    for execution in store.list_in_states(set(ExecutionState)):
+        problems += i12_problems(store, execution.id)
+    return problems
+
+
+def closed_during_run_world(root: Path) -> World:
+    world = World(root)
+    once: list[bool] = []
+
+    def close_issue() -> None:
+        if not once:
+            once.append(True)
+            world.tasks.tracked(task("1").ref).open = False
+
+    world.agent.during = close_issue
+    return world
+
+
+def human_claim_world(root: Path) -> World:
+    world = World(root)
+    original = world.tasks.claim
+    once: list[bool] = []
+
+    def claim(ref: Any) -> Any:
+        outcome = original(ref)
+        if not once:  # a person takes the task right after Ilmar claimed it
+            once.append(True)
+            world.tasks.tracked(ref).human = True
+        return outcome
+
+    world.tasks.claim = claim  # type: ignore[method-assign]
+    return world
+
+
+def check_tracker_cancelled(world: World, *, reasons: set[str]) -> list[str]:
+    """Cancelled by the tracker (or, if a crash fell between the claim and its
+    outcome, refused by the repeated claim): nothing published, nothing frozen
+    after the decision, only Ilmar's claim removed, I12 and I13."""
+    problems = notes_posted_once(world)
+    with SQLiteExecutionStore(world.db) as store:
+        executions = store.list_in_states(set(ExecutionState))
+        if [e.state for e in executions] != [S.CANCELLED]:
+            return [f"expected one cancelled execution: {[e.state.value for e in executions]}"]
+        (execution,) = executions
+        into = [e.reason for e in store.events(execution_id=execution.id)
+                if e.type.value == "execution.transitioned"
+                and e.data.get("to") == "cancelled"]  # fmt: skip
+        if len(into) != 1 or into[0] not in reasons:
+            problems.append(f"transition reasons: {into}")
+        if store.unfinished_operations():
+            problems.append(f"unfinished: {[o.key for o in store.unfinished_operations()]}")
+        problems += i13(world, store)
+    if world.scm.pushes or world.scm._change_requests:
+        problems.append("a cancelled execution published something")
+    if world.runtime._containers:
+        problems.append("live sandboxes remain")
+    if world.tasks.own_claims(task("1").ref):
+        problems.append("Ilmar's claim is still held")
+    tracked = world.tasks.tracked(task("1").ref)
+    # Review of #83: Ilmar's label goes with its claim. The one exception is
+    # ADR-0026 §5, step 5: an orphan release keeps it beside a human claim.
+    if tracked.label and not tracked.human:
+        problems.append("Ilmar's claim label was left behind")
+    return problems
+
+
+def orphan_world(root: Path) -> World:
+    """A claim of this instance that no execution backs (a lost state directory)."""
+    world = World(root)
+    world.tasks.claim(task("1").ref)
+    world.orphan = world.tasks.own_claims(task("1").ref)[0].object_id  # type: ignore[attr-defined]
+    return world
+
+
+def check_orphan(world: World) -> list[str]:
+    problems = check_invariants(world)
+    orphan = world.orphan  # type: ignore[attr-defined]
+    deletes = [w for w in world.tasks.writes if w[0] == "delete-claim"]
+    if [w[2] for w in deletes] != [orphan]:
+        problems.append(f"deleted: {deletes}, expected exactly the orphan {orphan}")
+    with SQLiteExecutionStore(world.db) as store:
+        releases = [o for o in store.instance_operations() if o.kind is K.RELEASE_ORPHAN_CLAIM]
+        if [(o.status.value, o.intent.get("object")) for o in releases] != [("succeeded", orphan)]:
+            problems.append(f"orphan releases: {[(o.key, o.status.value) for o in releases]}")
+        problems += i13(world, store)
+    return problems
+
+
+def label_world(root: Path) -> World:
+    world = World(root)
+    once: list[bool] = []
+
+    def drop_label() -> None:
+        if not once:
+            once.append(True)
+            world.tasks.tracked(task("1").ref).label = False
+
+    world.agent.during = drop_label
+    return world
+
+
+def check_label(world: World) -> list[str]:
+    problems = check_invariants(world)
+    if not world.tasks.tracked(task("1").ref).label:
+        problems.append("the label was not restored")
+    posts = [w for w in world.tasks.writes if w[0] == "post-claim"]
+    if len(posts) != 1:
+        problems.append(f"{len(posts)} claims posted")
+    with SQLiteExecutionStore(world.db) as store:
+        (execution,) = store.list_in_states(set(ExecutionState))
+        restores = [o for o in store.operations(execution.id) if o.kind is K.RESTORE_CLAIM_LABEL]
+        if not restores or any(not o.status.is_final for o in restores):
+            problems.append(f"restores: {[(o.key, o.status.value) for o in restores]}")
+        problems += i13(world, store)
+    return problems
+
+
+def lost_claim_world(root: Path) -> World:
+    """A person deletes Ilmar's claim during the agent run. From then on every
+    other standing read fails, so each pass makes one successful read: the loss is
+    observed in one pass and confirmed in a later one (ADR-0026 §3a)."""
+    world = World(root)
+    once: list[bool] = []
+    count = [0]
+
+    def every_other(ref: Any) -> None:
+        if once:
+            count[0] += 1
+            if count[0] % 2:
+                raise ProviderError("injected: the tracker could not be read")
+
+    def delete() -> None:
+        if not once:
+            once.append(True)
+            tracked = world.tasks.tracked(task("1").ref)
+            own = world.tasks.own_claims(task("1").ref)
+            tracked.claims = [c for c in tracked.claims if c not in own]
+
+    world.agent.during = delete
+    world.tasks.before_standing.append(every_other)
+    return world
+
+
+def lost_claim_reset_world(root: Path) -> World:
+    """As above, but the claim reappears after the first observation: the next
+    fresh read resets it, and the execution goes on to publish."""
+    world = World(root)
+    once: list[bool] = []
+    count = [0]
+    saved: list[Any] = []
+
+    def reads(ref: Any) -> None:
+        if not once:
+            return
+        count[0] += 1
+        if count[0] == 4:
+            world.tasks.tracked(ref).claims.extend(saved)  # a person undoes the deletion
+        if count[0] in (1, 3):
+            raise ProviderError("injected: the tracker could not be read")
+
+    def delete() -> None:
+        if not once:
+            once.append(True)
+            tracked = world.tasks.tracked(task("1").ref)
+            saved.extend(world.tasks.own_claims(task("1").ref))
+            tracked.claims = [c for c in tracked.claims if c not in saved]
+
+    world.agent.during = delete
+    world.tasks.before_standing.append(reads)
+    return world
+
+
+def check_reset(world: World) -> list[str]:
+    from ilmar.domain.events import EventType
+
+    problems = check_invariants(world)
+    with SQLiteExecutionStore(world.db) as store:
+        (execution,) = store.list_in_states(set(ExecutionState))
+        events = store.events(execution_id=execution.id)
+        lost = [(e.data.get("state"), e.data.get("observed")) for e in events
+                if e.type is EventType.EXECUTION_CLAIM_LOST]  # fmt: skip
+        decided = [e for e in events if e.type is EventType.EXECUTION_CANCEL_REQUESTED]
+        if decided:
+            problems.append(f"decided: {[e.reason for e in decided]}")
+        if ("cleared", "claim-present") not in lost and lost:
+            problems.append(f"no reset by a fresh read: {lost}")
+        problems += i13(world, store)
+    return problems
+
+
 Scenario = tuple[
     Callable[[Path], World], Callable[[World], None] | None, Callable[[World], list[str]]
 ]
@@ -1006,7 +1204,21 @@ SCENARIOS: dict[str, Scenario] = {
     "cancelled-during-run": (cancelled_during_run_world, None, check_cancelled),
     "cancelled-after-claim": (cancelled_after_claim_world, None, check_cancelled),
     "stranded-after-merge": (World, merge_with_a_stranded_request, check_stranded),
-}
+    "issue-closed-during-run": (
+        closed_during_run_world, None, partial(check_tracker_cancelled, reasons={"task-closed"})
+    ),
+    "human-claim-mid-pass": (
+        human_claim_world, None,
+        partial(check_tracker_cancelled,
+                reasons={"task-claimed-by-human", "not-claimed-other"}),
+    ),
+    "orphan-release": (orphan_world, None, check_orphan),
+    "label-restoration": (label_world, None, check_label),
+    "lost-claim-reset": (lost_claim_reset_world, None, check_reset),
+    "lost-claim-confirmed": (
+        lost_claim_world, None, partial(check_tracker_cancelled, reasons={"task-claim-lost"})
+    ),
+}  # fmt: skip
 
 
 def scenario_points(tmp_path: Path, name: str) -> tuple[int, int]:

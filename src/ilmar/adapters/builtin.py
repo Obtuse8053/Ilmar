@@ -112,6 +112,7 @@ def github_tasks(options: Options, context: BuildContext) -> Plan:
     excluded = options.strings("excluded_labels")
     human = options.strings("human_claim_labels")
     skip_assigned = options.boolean("skip_assigned", True)
+    bot_login = options.optional_string("bot_login")
     token_env = options.env_name("token_env")
     api_url = options.https_url("api_url", DEFAULT_API_URL)
     check_settings(
@@ -120,6 +121,7 @@ def github_tasks(options: Options, context: BuildContext) -> Plan:
         claimed_label=claimed,
         excluded_labels=excluded,
         human_claim_labels=human,
+        bot_login=bot_login,
     )
 
     def create(secrets: Secrets) -> GitHubTaskProvider:
@@ -133,6 +135,7 @@ def github_tasks(options: Options, context: BuildContext) -> Plan:
             excluded_labels=excluded,
             human_claim_labels=human,
             skip_assigned=skip_assigned,
+            bot_login=bot_login,
         )
 
     return Plan(

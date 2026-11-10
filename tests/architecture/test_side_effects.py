@@ -26,6 +26,8 @@ READS = {
     # Port methods that change nothing outside Ilmar.
     "name", "find", "is_running", "list_eligible", "get", "branch_head",
     "load_candidate", "checks", "change_request_state",
+    # ADR-0026 §6 (approved): the task's standing and this instance's held claims.
+    "standing", "held_claims",
 }  # fmt: skip
 
 
@@ -60,6 +62,7 @@ def test_the_mutating_set_is_derived_from_the_ports() -> None:
         "claim", "release", "post_update", "checkout", "freeze_candidate",
         "checkout_revision", "publish_revision", "upsert_change_request",
         "start", "stop", "run", "remove_owned",
+        "release_claim", "restore_label",  # ADR-0026 §5: targeted, journaled writes
     }  # fmt: skip
     assert expected == MUTATING
 
@@ -123,6 +126,12 @@ READ_ONLY = {"load_candidate"}
 """Public ``Effects`` methods that change nothing; they may not call a mutating method."""
 
 
+JOURNALED = {"perform", "reconcile", "perform_instance"}
+"""The journal's entry points; each is journaled and fenced. ``perform_instance``
+is the instance-scoped one (ADR-0026 §5, the ADR-0020 amendment): fenced by the
+instance lock instead of an execution lease."""
+
+
 def test_every_effect_goes_through_the_journal() -> None:
     """Each public ``Effects`` method acts through ``perform`` or settles through
     ``reconcile`` (both journaled and fenced), or is declared read-only."""
@@ -142,7 +151,7 @@ def test_every_effect_goes_through_the_journal() -> None:
             for n in ast.walk(method)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
-            and n.func.attr in {"perform", "reconcile"}
+            and n.func.attr in JOURNALED
             and "_journal" in _receiver_names(n.func.value)
         }
         if method.name in READ_ONLY:

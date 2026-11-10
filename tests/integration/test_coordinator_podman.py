@@ -367,3 +367,63 @@ def test_a_cancellation_after_a_crash_removes_the_real_sandbox_before_cancelled(
     assert {r.status for r in containers} == {ResourceStatus.RELEASED}
     world.claim_released_and_never_picked_again()
     store.close()
+
+
+# -- tracker reconciliation on real Podman (#12, ADR-0026) -------------------------------
+
+
+class ClosingShellAgent(ShellAgent):
+    """Edits the workspace in its real sandbox; meanwhile a person closes the issue."""
+
+    def __init__(self, tasks: FakeTaskProvider) -> None:
+        self.tasks = tasks
+
+    def run(
+        self,
+        runtime: ContainerRuntime,
+        container: ContainerHandle,
+        request: AgentRequest,
+        *,
+        stop: StopSignal | None = None,
+    ) -> AgentResult:
+        result = super().run(runtime, container, request, stop=stop)
+        self.tasks.close(task("1").ref)  # the tracker is not read during the run
+        return result
+
+
+def test_an_issue_closed_during_a_real_agent_run_is_never_frozen(tmp_path: Path) -> None:
+    """ADR-0026 §2: the safe point before the freeze reads the closed issue, decides
+    a ``task-closed`` cancellation, and ends it through ADR-0025's machinery: the
+    real sandbox, its egress proxy and network are gone, nothing is frozen,
+    verified or pushed, and only Ilmar's claim is released."""
+    world = cancel_world(tmp_path, ShellAgent())
+    world.components.agent_runner = ClosingShellAgent(world.tasks)
+    with world.owner() as owner:
+        report = world.coordinator(owner).run_once()
+    assert (report.code, report.results[0].outcome) == (0, Outcome.CANCELLED), report.summary
+    store = world.store
+    execution = store.get("e1")
+    assert execution is not None
+    assert execution.state is ExecutionState.CANCELLED
+    events = store.events(execution_id="e1")
+    (decision,) = [e for e in events if e.type is EventType.EXECUTION_CANCEL_REQUESTED]
+    assert (decision.actor.kind.value, decision.reason) == ("coordinator", "task-closed")
+    assert dict(decision.data) == {"decision": "accepted", "observed": "task-closed"}
+    into = [e.reason for e in events if e.type is EventType.EXECUTION_TRANSITIONED
+            and e.data.get("to") == "cancelled"]  # fmt: skip
+    assert into == ["task-closed"]
+    run = store.operation(operation_key(OperationKind.RUN_AGENT, "e1", 1))
+    assert run is not None
+    assert run.status is OperationStatus.SUCCEEDED
+    assert store.operation(operation_key(OperationKind.FREEZE_CANDIDATE, "e1", 1)) is None
+    assert store.evidence("e1") == ()
+    assert world.scm.pushes == []
+    world.sandbox_gone()
+    containers = [r for r in store.resources(execution_id="e1") if r.kind is ResourceKind.CONTAINER]
+    assert {r.status for r in containers} == {ResourceStatus.RELEASED}
+    assert world.tasks.own_claims(task("1").ref) == []
+    release = store.operation(operation_key(OperationKind.RELEASE_TASK, "e1", 1, "cancelled"))
+    assert release is not None
+    assert release.status is OperationStatus.SUCCEEDED
+    assert store.unfinished_operations() == ()
+    store.close()

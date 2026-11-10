@@ -24,6 +24,7 @@ rebuilt from journal text in #11b. A replay that would need one raises
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,7 +64,7 @@ from ilmar.domain.ledger import (
     operation_key,
     resource_key,
 )
-from ilmar.domain.tasks import ClaimOutcome
+from ilmar.domain.tasks import ClaimOutcome, HeldClaim, ReleaseResult, RestoreResult, TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.domain.workspace import (
     ContainerHandle,
@@ -94,6 +95,35 @@ Such a failure is transient: it says nothing about the step itself (ADR-0022).""
 
 class DeterministicError(CodedError):
     """The step failed in a way that repeating it would only reproduce (ADR-0021)."""
+
+
+class ClaimChangedError(DeterministicError):
+    """A targeted claim write found its object no longer this instance's authentic
+    claim with the recorded token: nothing of ours to act on (ADR-0026 §5)."""
+
+    default_code = "claim-changed"
+
+
+def claim_intent(claim: HeldClaim) -> dict[str, str]:
+    """What a targeted claim write records in its intent: the exact object."""
+    return {"task": str(claim.ref), "claim": claim.claim_id, "object": claim.object_id}
+
+
+def claim_from_intent(intent: Mapping[str, str]) -> HeldClaim:
+    """The claim a recorded intent names: an interrupted write repeats exactly it."""
+    provider, _, key = intent["task"].partition(":")
+    return HeldClaim(TaskRef(provider, key), intent["claim"], intent["object"])
+
+
+def orphan_step(claim: HeldClaim) -> str:
+    digest = hashlib.sha256(
+        "\0".join((claim.ref.key, claim.object_id, claim.claim_id)).encode()
+    ).hexdigest()
+    return f"{claim.ref.provider}.{digest[:32]}"
+
+
+def _absent(result: Mapping[str, str]) -> str | None:
+    return "claim-absent" if result.get("result") == "absent" else None
 
 
 # Never converted into a transient failure, whatever port raised them: a
@@ -161,7 +191,11 @@ class Effects:
 
     def claim(self, execution: Execution, lease: ExecutionLease, *, then: Then) -> ClaimOutcome:
         def effect() -> Mapping[str, str]:
-            return {"outcome": self._c.task_provider.claim(execution.task).value}
+            claim = self._c.task_provider.claim(execution.task)
+            result = {"outcome": claim.outcome.value}
+            if claim.claim_id is not None:  # the claim this execution holds (ADR-0026 §3a)
+                result["claim_id"] = claim.claim_id
+            return result
 
         result = self._journal.perform(K.CLAIM_TASK, execution, effect, lease=lease, after=then)
         return ClaimOutcome(result["outcome"])
@@ -172,6 +206,53 @@ class Effects:
             return {}
 
         self._journal.perform(K.RELEASE_TASK, execution, effect, lease=lease, step=step)
+
+    def restore_label(
+        self, execution: Execution, lease: ExecutionLease, *, claim: HeldClaim, step: str
+    ) -> RestoreResult:
+        """Add only the claim label beside exactly ``claim``'s object (ADR-0026 §5).
+
+        Never a claim, never a decision: ``RESTORED`` and ``ABSENT`` succeed,
+        ``CHANGED`` fails (``claim-changed``). An interrupted restore is performed
+        again with the claim its intent recorded, never with a newer read.
+        """
+
+        def effect() -> Mapping[str, str]:
+            result = self._c.task_provider.restore_label(claim)
+            if result is RestoreResult.CHANGED:
+                raise ClaimChangedError("the claim is no longer this instance's authentic claim")
+            return {"result": result.value}
+
+        result = self._journal.perform(
+            K.RESTORE_CLAIM_LABEL, execution, effect, lease=lease, step=step,
+            intent=claim_intent(claim), definitive=(ClaimChangedError,),
+            observed="claim-label-missing", outcome_observed=_absent,
+        )  # fmt: skip
+        return RestoreResult(result["result"])
+
+    def release_orphan_claim(
+        self, claim: HeldClaim, *, revalidate: Callable[[], None]
+    ) -> ReleaseResult:
+        """Release exactly one orphaned claim object (ADR-0026 §5, rule 4).
+
+        Instance-scoped and fenced by the instance lock; ``revalidate`` runs
+        after the intent and the fence check, right before the effect. The key
+        is the provider plus a digest of the task, the object and the claim id,
+        so a newer claim is always a different operation.
+        """
+
+        def effect() -> Mapping[str, str]:
+            result = self._c.task_provider.release_claim(claim)
+            if result is ReleaseResult.CHANGED:
+                raise ClaimChangedError("the claim is no longer this instance's authentic claim")
+            return {"result": result.value}
+
+        result = self._journal.perform_instance(
+            K.RELEASE_ORPHAN_CLAIM, effect, step=orphan_step(claim), intent=claim_intent(claim),
+            reason="orphaned-claim", revalidate=revalidate, definitive=(ClaimChangedError,),
+            outcome_observed=_absent,
+        )  # fmt: skip
+        return ReleaseResult(result["result"])
 
     def post_update(
         self, execution: Execution, lease: ExecutionLease, *, step: str, message: str

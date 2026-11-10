@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ilmar.adapters.sqlite import SQLiteExecutionStore
+from ilmar.adapters.sqlite import MIGRATIONS, SQLiteExecutionStore
 from ilmar.domain.event_history import verify_lines
 from ilmar.domain.events import EventContext
 from ilmar.domain.ledger import Commit, Fence
@@ -158,12 +158,35 @@ def line_problems(line: str) -> list[str]:
     return problems
 
 
+def to_schema_4(db: Path) -> None:
+    """The store exactly as schema 4 would have left it: every row and event, but an
+    operation's execution still required (before ADR-0026's migration).
+
+    Schema 5 only rebuilt ``operations`` with a nullable execution reference and
+    a check, so rebuilding it with the earlier column leaves schema 4's layout.
+    """
+    rebuild = (
+        MIGRATIONS[4]
+        .replace("execution_id TEXT REFERENCES", "execution_id TEXT NOT NULL REFERENCES")
+        .replace(
+            "    note         TEXT NOT NULL,\n"
+            "    CHECK (execution_id IS NOT NULL OR "
+            "(kind = 'release-orphan-claim' AND attempt = 1))\n",
+            "    note         TEXT NOT NULL\n",
+        )
+    )
+    assert "CHECK (execution_id" not in rebuild
+    with closing(sqlite3.connect(db)) as conn:
+        conn.executescript(f"BEGIN;\n{rebuild}\nPRAGMA user_version = 4;\nCOMMIT;")
+
+
 def to_previous_schema(db: Path) -> None:
     """The store exactly as schema 3 would have left it: every row, no events.
 
     The events migration only adds the ``events`` table (its index and triggers
     go with it), so removing it and the version leaves the previous layout.
     """
+    to_schema_4(db)
     with closing(sqlite3.connect(db)) as conn:
         conn.execute("DROP TABLE events")
         conn.execute("DELETE FROM sqlite_sequence WHERE name = 'events'")

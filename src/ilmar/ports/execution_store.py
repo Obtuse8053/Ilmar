@@ -164,6 +164,10 @@ class ExecutionStore(Protocol):
         """Every operation still ``INTENDED`` or ``AMBIGUOUS``, oldest first."""
         ...
 
+    def instance_operations(self) -> Sequence[Operation]:
+        """Every instance-scoped operation (no execution, ADR-0026 §5), oldest first."""
+        ...
+
     def resource(self, key: str) -> Resource | None: ...
 
     def resources(
@@ -250,12 +254,20 @@ def check_commit(
     for new in changes.operations:
         if new.epoch != fence.epoch:
             raise LedgerIntegrityError(f"operation {new.key} carries another epoch")
-        owner = current_execution(new.execution_id)
-        if new.attempt != owner.attempt:
-            raise LedgerIntegrityError(
-                f"operation {new.key} is for attempt {new.attempt}, "
-                f"but {owner.id} is at attempt {owner.attempt}"
-            )
+        if new.execution_id is None:
+            # Instance-scoped (ADR-0026 §5): ``Operation`` admits it only for the
+            # closed set of kinds; its key carries this instance.
+            if not new.kind.instance_scoped or not new.key.startswith(
+                f"{new.kind.value}:{fence.instance_id}:1:"
+            ):
+                raise LedgerIntegrityError(f"operation {new.key} names no execution")
+        else:
+            owner = current_execution(new.execution_id)
+            if new.attempt != owner.attempt:
+                raise LedgerIntegrityError(
+                    f"operation {new.key} is for attempt {new.attempt}, "
+                    f"but {owner.id} is at attempt {owner.attempt}"
+                )
         stored = operation(new.key)
         if new.version == 1:
             if stored is not None:

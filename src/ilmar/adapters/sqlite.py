@@ -69,12 +69,13 @@ from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
 coverage marker needs its owner (ADR-0024 §8)."""
 COVERED_VERSION = 4
+"""The first version with event coverage. Later migrations need no baseline."""
 
 SCHEMA_V1 = """
 CREATE TABLE executions (
@@ -254,6 +255,59 @@ CREATE TRIGGER events_are_append_only_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 CREATE TRIGGER events_are_append_only_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+""",
+    # ADR-0026 §5: an instance-scoped operation names no execution. Only the
+    # closed set of instance-scoped kinds may leave execution_id empty. SQLite
+    # cannot relax NOT NULL in place, so the table is rebuilt with its rows,
+    # indexes and triggers unchanged. Its rows are not changed, so no event.
+    4: """
+DROP TRIGGER operations_cannot_be_removed;
+DROP TRIGGER operations_final_are_immutable;
+DROP TRIGGER operations_identity_is_immutable;
+DROP INDEX operations_by_execution;
+DROP INDEX operations_unfinished;
+ALTER TABLE operations RENAME TO operations_before;
+
+CREATE TABLE operations (
+    key          TEXT PRIMARY KEY,
+    execution_id TEXT REFERENCES executions (id),
+    attempt      INTEGER NOT NULL CHECK (attempt >= 1),
+    kind         TEXT NOT NULL,
+    status       TEXT NOT NULL
+                 CHECK (status IN ('intended', 'succeeded', 'failed', 'ambiguous')),
+    epoch        INTEGER NOT NULL CHECK (epoch >= 1),
+    version      INTEGER NOT NULL CHECK (version >= 1),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    intent       TEXT NOT NULL,
+    result       TEXT NOT NULL,
+    note         TEXT NOT NULL,
+    CHECK (execution_id IS NOT NULL OR (kind = 'release-orphan-claim' AND attempt = 1))
+) STRICT;
+
+INSERT INTO operations (key, execution_id, attempt, kind, status, epoch, version,
+                        created_at, updated_at, intent, result, note)
+    SELECT key, execution_id, attempt, kind, status, epoch, version,
+           created_at, updated_at, intent, result, note
+    FROM operations_before ORDER BY rowid;
+
+DROP TABLE operations_before;
+
+CREATE INDEX operations_by_execution ON operations (execution_id, created_at);
+CREATE INDEX operations_unfinished ON operations (created_at)
+    WHERE status IN ('intended', 'ambiguous');
+
+CREATE TRIGGER operations_cannot_be_removed BEFORE DELETE ON operations
+BEGIN SELECT RAISE(ABORT, 'operations cannot be removed'); END;
+CREATE TRIGGER operations_final_are_immutable BEFORE UPDATE ON operations
+WHEN OLD.status IN ('succeeded', 'failed')
+BEGIN SELECT RAISE(ABORT, 'a final operation cannot change'); END;
+CREATE TRIGGER operations_identity_is_immutable BEFORE UPDATE ON operations
+WHEN NEW.key IS NOT OLD.key OR NEW.kind IS NOT OLD.kind
+  OR NEW.execution_id IS NOT OLD.execution_id OR NEW.attempt IS NOT OLD.attempt
+  OR NEW.intent IS NOT OLD.intent OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.version <> OLD.version + 1
+BEGIN SELECT RAISE(ABORT, 'an operation keeps its identity and intent'); END;
 """,
 }
 
@@ -466,6 +520,11 @@ class SQLiteExecutionStore:
                 # coordinator writes between this snapshot and the first
                 # covered event.
                 _migrate_under_lock(conn, version, current, instance_id, now=now)
+            elif version < SCHEMA_VERSION:
+                # Already covered: the later migrations change no row, so the
+                # event log needs no new baseline.
+                _run_script(conn, "\n".join(MIGRATIONS[v] for v in range(version, SCHEMA_VERSION)))
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             fence = Fence(instance_id, 1 if current is None else current.epoch + 1)
             claimed = _encode_time(now)
             conn.execute(
@@ -570,6 +629,16 @@ class SQLiteExecutionStore:
             rows = conn.execute(
                 f"SELECT {_OPERATION_COLUMNS} FROM operations "  # noqa: S608
                 "WHERE status IN ('intended', 'ambiguous') ORDER BY created_at, rowid"
+            ).fetchall()
+        return tuple(_operation_from_row(row) for row in rows)
+
+    def instance_operations(self) -> Sequence[Operation]:
+        with self._reading() as conn:
+            if _version(conn) < SCHEMA_VERSION:
+                return ()  # before ADR-0026's migration no operation can omit it
+            rows = conn.execute(
+                f"SELECT {_OPERATION_COLUMNS} FROM operations "  # noqa: S608
+                "WHERE execution_id IS NULL ORDER BY created_at, rowid"
             ).fetchall()
         return tuple(_operation_from_row(row) for row in rows)
 
@@ -685,6 +754,8 @@ def _check_fenced(conn: sqlite3.Connection, fence: Fence) -> None:
             "this store has no event coverage yet; only claim_instance, under the "
             "instance lock, may start it"
         )
+    if _version(conn) < SCHEMA_VERSION:
+        raise FencingError("the store is not migrated yet; claim it under the instance lock")
 
 
 def _run_script(conn: sqlite3.Connection, script: str) -> None:
@@ -1020,7 +1091,7 @@ def _operation_from_row(row: tuple[object, ...]) -> Operation:
     ) = row
     return Operation(
         key=_text(key),
-        execution_id=_text(execution_id),
+        execution_id=None if execution_id is None else _text(execution_id),
         attempt=_integer(attempt),
         kind=OperationKind(_text(kind)),
         status=OperationStatus(_text(status)),

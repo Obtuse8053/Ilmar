@@ -268,8 +268,18 @@ ADDED_CODES = {
     "no-changes",
     "ci-config-changed",
     "checkout-failed",  # #17 part 3
-    "cancel-requested",
-}  # ADR-0025 (#16)
+    "cancel-requested",  # ADR-0025 (#16)
+    # ADR-0026 (#12)
+    "task-closed",
+    "task-unlabelled",
+    "task-excluded",
+    "task-claimed-by-human",
+    "task-claimed-by-other-instance",
+    "task-gone",
+    "task-claim-lost",
+    "orphaned-claim",
+    "claim-changed",
+}
 
 
 def test_the_reason_codes_are_the_adr_table_and_the_deliberate_additions() -> None:
@@ -659,3 +669,55 @@ def test_deeply_nested_json_is_corrupt_not_a_recursion_error(depth: int) -> None
         Event.from_json("[" * depth + "]" * depth)
     with pytest.raises(CorruptEventError):
         Event.from_json('{"data":' * depth + "{}" + "}" * depth)
+
+
+def test_every_standing_reason_is_a_registered_code_and_observation() -> None:
+    """ADR-0026 §8: the domain's standing reasons and ADR-0024's registry agree."""
+    from ilmar.domain.tasks import REASON_PRECEDENCE, STANDING_REASONS
+
+    reasons = set().union(*STANDING_REASONS.values())
+    assert reasons == set(REASON_PRECEDENCE)
+    assert reasons <= set(ev.REASON_CODES)
+    assert reasons <= set(ev.OBSERVATIONS)
+
+
+def _cancel(actor: ev.Actor, data: dict[str, str]) -> ev.Event:
+    return ev.Event.create(ev.EventType.EXECUTION_CANCEL_REQUESTED, at=NOW, instance="inst",
+                           epoch=1, actor=actor, execution="e1", reason="task-closed",
+                           data={"decision": "accepted", **data})  # fmt: skip
+
+
+def test_a_tracker_decision_names_its_observation_and_no_request() -> None:
+    coordinator = ev.Actor(ev.ActorKind.COORDINATOR)
+    event = _cancel(coordinator, {"observed": "task-closed"})
+    assert dict(event.data) == {"decision": "accepted", "observed": "task-closed"}
+    assert event.flags == frozenset()
+    with pytest.raises(ev.EventEnvelopeError):
+        _cancel(coordinator, {})
+    with pytest.raises(ev.EventEnvelopeError):
+        _cancel(coordinator, {"observed": "task-closed", "request": "q-" + "a" * 32})
+
+
+def test_a_persons_request_names_its_request_and_no_observation() -> None:
+    human = ev.Actor(ev.ActorKind.HUMAN, "alice")
+    assert "request" in _cancel(human, {"request": "q-" + "a" * 32}).data
+    with pytest.raises(ev.EventEnvelopeError):
+        _cancel(human, {"observed": "task-closed"})
+    with pytest.raises(ev.EventEnvelopeError):
+        _cancel(ev.Actor(ev.ActorKind.MIGRATION), {"observed": "task-closed"})
+
+
+@pytest.mark.parametrize("state", ["observed", "cleared"])
+def test_a_claim_lost_event_carries_its_state_and_claim(state: str) -> None:
+    event = ev.Event.create(
+        ev.EventType.EXECUTION_CLAIM_LOST,
+        at=NOW,
+        instance="inst",
+        epoch=1,
+        actor=ev.Actor(ev.ActorKind.COORDINATOR),
+        execution="e1",
+        reason="task-claim-lost",
+        data={"state": state, "claim": "a1b2"},
+    )
+    assert event.flags == frozenset()
+    assert ev.EventType.EXECUTION_CLAIM_LOST in ev.EXTRA_TYPES

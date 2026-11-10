@@ -42,6 +42,7 @@ class FakeIssue:
             "labels": [{"name": name} for name in sorted(self.labels)],
             "assignees": [{"login": login} for login in self.assignees],
             "html_url": f"https://github.com/{repository}/issues/{self.number}",
+            "repository_url": f"https://{HOST}/repos/{repository}",
         }
         if self.pull_request:
             data["pull_request"] = {"url": "https://example.invalid"}
@@ -65,6 +66,15 @@ class FakeGitHub:
         self.statuses: dict[str, list[dict[str, Any]]] = {}
         # Override what GitHub reports as total_count, to simulate truncation.
         self.reported_totals: dict[tuple[str, str], int] = {}
+        # ADR-0026: the token's own account, as GET /user reports it (None: the
+        # endpoint is unavailable, as for a GitHub App installation token).
+        self.user_login: str | None = "ilmar-bot"
+        self.poster = "ilmar-bot"  # the author of comments this token posts
+        self.transferred: dict[int, str] = {}  # issue number -> new repository
+        self.deleted: set[int] = set()  # answered 410 Gone
+        self.repository_readable = True
+        # (method, path regex) -> HTTP status, answered instead (403, 429, 5xx ...)
+        self.failures: dict[tuple[str, str], int] = {}
 
     # -- test helpers ----------------------------------------------------
 
@@ -76,8 +86,19 @@ class FakeGitHub:
 
     def comment(self, number: int, body: str, *, user: str = "someone") -> int:
         comment_id = next(self._comment_ids)
-        self.comments[number].append({"id": comment_id, "body": body, "user": {"login": user}})
+        self.comments[number].append({
+            "id": comment_id, "body": body, "user": {"login": user},
+            "issue_url": f"https://{HOST}/repos/{self.repository}/issues/{number}",
+        })  # fmt: skip
         return comment_id
+
+    def edit_comment(self, comment_id: int, body: str) -> None:
+        for comments in self.comments.values():
+            for comment in comments:
+                if comment["id"] == comment_id:
+                    comment["body"] = body
+                    return
+        raise KeyError(comment_id)
 
     def add_pull(self, head: str, base: str = "main", body: str = "", state: str = "open") -> int:
         """A pull request opened by someone (no Ilmar marker unless ``body`` has one)."""
@@ -109,10 +130,32 @@ class FakeGitHub:
             return _json(400, {"message": "missing API version"})
         query = dict(urllib.parse.parse_qsl(url.query))
         body = json.loads(request.body) if request.body else None
+        for (method, pattern), status in self.failures.items():
+            if method == request.method and re.fullmatch(pattern, url.path):
+                headers = {"x-ratelimit-remaining": "0"} if status in (403, 429) else {}
+                return _json(status, {"message": f"injected {status}"}, headers)
+        if url.path == "/user" and request.method == "GET":
+            if self.user_login is None:
+                return _json(403, {"message": "Resource not accessible by integration"})
+            return _json(200, {"login": self.user_login})
         prefix = f"/repos/{self.repository}"
+        if url.path == prefix and request.method == "GET":
+            if not self.repository_readable:
+                return _json(404, {"message": "Not Found"})
+            return _json(200, {"full_name": self.repository})
         if not url.path.startswith(prefix + "/"):
             return _json(404, {"message": "Not Found"})
-        return self._route(request.method, url.path[len(prefix) :], query, body, request.url)
+        path = url.path[len(prefix) :]
+        if (match := re.fullmatch(r"/issues/(\d+)(/.*)?", path)) and request.method == "GET":
+            number = int(match.group(1))
+            if number in self.deleted:
+                return _json(410, {"message": "This issue was deleted"})
+            if number in self.transferred:
+                if request.follow_redirects:
+                    raise AssertionError("a transferred issue was followed")
+                new = f"https://{HOST}/repos/{self.transferred[number]}/issues/{number}"
+                return HttpResponse(301, {"Location": new}, b"")
+        return self._route(request.method, path, query, body, request.url)
 
     def _route(
         self, method: str, path: str, query: dict[str, str], body: Any, full_url: str
@@ -138,7 +181,7 @@ class FakeGitHub:
             if method == "GET":
                 return self._page(list(self.comments[number]), query, full_url)
             if method == "POST":
-                comment_id = self.comment(number, body["body"], user="ilmar-bot")
+                comment_id = self.comment(number, body["body"], user=self.poster)
                 return _json(201, {"id": comment_id, "body": body["body"]})
         if match := re.fullmatch(r"/issues/comments/(\d+)", path):
             comment_id = int(match.group(1))
@@ -147,6 +190,8 @@ class FakeGitHub:
                     if comment["id"] == comment_id and method == "DELETE":
                         comments.remove(comment)
                         return HttpResponse(204)
+                    if comment["id"] == comment_id and method == "GET":
+                        return _json(200, comment)
             return _json(404, {"message": "Not Found"})
         if (match := re.fullmatch(r"/issues/(\d+)/labels", path)) and int(
             match.group(1)
