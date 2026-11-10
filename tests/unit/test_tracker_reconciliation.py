@@ -378,7 +378,7 @@ def test_a_task_is_never_picked_again_after_a_person_a_lost_claim_or_its_absence
         tracked.gone, tracked.claims, tracked.label = False, [], False
     else:
         confirm_lost_claim(setup)
-        setup.tasks.tracked(REF).label = False  # a person cleared Ilmar's leftover label
+        assert not setup.tasks.tracked(REF).label  # Ilmar removed its leftover label
     assert state(setup) is S.CANCELLED
     assert setup.tasks.list_eligible() == (task("1"),)  # eligible on the tracker again
     assert run(setup).summary == "no eligible task"

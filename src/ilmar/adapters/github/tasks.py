@@ -54,7 +54,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ilmar.adapters.github.client import GitHubClient, GitHubMovedError, GitHubNotFoundError
+from ilmar.adapters.github.client import (
+    GitHubClient,
+    GitHubForbiddenError,
+    GitHubMovedError,
+    GitHubNotFoundError,
+)
 from ilmar.core.naming import safe_identifier
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.tasks import (
@@ -207,8 +212,13 @@ class GitHubTaskProvider:
         except (GitHubNotFoundError, GitHubMovedError):
             return  # the task is gone: nothing to release, and that counts as done
         mine = [c.comment_id for c in claims if self._authentic(c)]
-        if mine:  # never ours: leave other claims, forged copies and labels alone
+        if mine:  # never ours: leave other claims and forged copies alone
             self._withdraw(number, mine)
+        else:
+            # Ilmar's claim is already gone (a person deleted it): its label is
+            # still Ilmar's to remove (ADR-0026 §4), but only if no claim of
+            # anyone remains (§5, step 5).
+            self._drop_label_if_unclaimed(number)
 
     def post_update(self, ref: TaskRef, message: str) -> None:
         number = self._number(ref)
@@ -313,8 +323,11 @@ class GitHubTaskProvider:
             return self._login
         try:
             user = self._client.request("GET", "/user", follow_redirects=False)
-        except ProviderError:
-            user = None  # GitHub App installation tokens cannot read /user
+        except (GitHubForbiddenError, GitHubNotFoundError):
+            user = None  # definitively unavailable, as for an App installation token
+        # Any other failure (5xx, a rate limit, the network) propagates: nothing is
+        # cached, so a transient error never substitutes bot_login for the token's
+        # own login and never skips the mismatch check below.
         login = user.get("login") if isinstance(user, dict) else None
         if isinstance(login, str) and _LOGIN.match(login):
             if self._bot_login is not None and login != self._bot_login:

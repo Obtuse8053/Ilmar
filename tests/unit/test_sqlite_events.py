@@ -582,6 +582,12 @@ def test_a_failed_migration_to_5_changes_nothing(
         store.claim_instance("inst", now=at(10))
     assert dump(schema_4) == before
     assert version(schema_4) == 4
+    monkeypatch.undo()
+    with SQLiteExecutionStore(schema_4) as store:  # replayed: the next claim migrates
+        fence = store.claim_instance("inst", now=at(11))
+    assert version(schema_4) == SCHEMA_VERSION
+    assert fence.epoch == 3  # the failed claim took no epoch
+    assert report(schema_4).exit_code == 0
 
 
 def test_a_schema_4_store_refuses_fenced_writes_until_claimed(schema_4: Path) -> None:

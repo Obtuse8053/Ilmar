@@ -1059,6 +1059,11 @@ def check_tracker_cancelled(world: World, *, reasons: set[str]) -> list[str]:
         problems.append("live sandboxes remain")
     if world.tasks.own_claims(task("1").ref):
         problems.append("Ilmar's claim is still held")
+    tracked = world.tasks.tracked(task("1").ref)
+    # Review of #83: Ilmar's label goes with its claim. The one exception is
+    # ADR-0026 §5, step 5: an orphan release keeps it beside a human claim.
+    if tracked.label and not tracked.human:
+        problems.append("Ilmar's claim label was left behind")
     return problems
 
 

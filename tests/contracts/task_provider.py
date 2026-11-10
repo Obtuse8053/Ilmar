@@ -232,3 +232,20 @@ class TaskProviderContract:
         assert provider.restore_label(held) is RestoreResult.ABSENT
         assert provider.standing(task.ref).standing is Standing.CLAIM_LOST
         assert provider.held_claims() == ()
+
+    @pytest.mark.parametrize("remaining", [None, "other-instance", "human-label"])
+    def test_a_release_after_a_lost_claim_removes_only_ilmars_leftover_label(
+        self, provider: TaskProvider, remaining: str | None
+    ) -> None:
+        """Review of #83: a person deleted Ilmar's claim; the ending's release still
+        removes Ilmar's own label, unless a claim of anyone remains (ADR-0026 §4, §5)."""
+        task, _ = self._claimed(provider)
+        self.change(provider, task, "drop-own-claim")
+        if remaining is not None:
+            self.change(provider, task, remaining)
+        before = provider.standing(task.ref)
+        provider.release(task.ref)
+        eligible = task.ref in {t.ref for t in provider.list_eligible()}
+        assert eligible is (remaining is None)
+        assert provider.standing(task.ref) == before  # nobody else's claim was touched
+        provider.release(task.ref)  # idempotent

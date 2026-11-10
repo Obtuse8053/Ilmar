@@ -212,7 +212,9 @@ class FakeTaskProvider:
         for claim in own:
             self._write("delete-claim", ref, claim.object_id)
             tracked.claims.remove(claim)
-        if own and not tracked.claims:
+        # With ours deleted (or already gone), Ilmar's label goes once no claim of
+        # anyone remains; as on GitHub, a human claim keeps it only if ours was gone.
+        if tracked.label and not tracked.claims and (own or not tracked.human):
             self._write("unlabel", ref)
             tracked.label = False
 

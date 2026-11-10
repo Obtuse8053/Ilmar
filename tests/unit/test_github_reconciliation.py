@@ -412,3 +412,30 @@ def test_releasing_a_vanished_task_is_done(api: FakeGitHub, how: str) -> None:
     p = provider(api)
     p.release(ref(1))  # "not found" counts as done (ADR-0026 §3)
     p.release(ref(1))
+
+
+@pytest.mark.parametrize("status", [500, 502, 429, 403])
+def test_a_transient_identity_failure_never_falls_back_to_bot_login(status: int) -> None:
+    """Review of #83: only a definitive 403 (not a rate limit) or 404 from
+    ``GET /user`` lets ``bot_login`` stand in; anything else fails closed and is
+    not cached, so the mismatch check still runs once ``/user`` answers."""
+    api = FakeGitHub()
+    api.add_issue(1, labels={READY})
+    api.failures[("GET", "/user")] = status  # 403 here carries the rate-limit header
+    p = provider(api, bot_login="someone-else")
+    with pytest.raises(ProviderError):
+        p.standing(ref(1))
+    with pytest.raises(ProviderError):
+        p.claim(ref(1))
+    assert api.comments[1] == []  # nothing written under a guessed identity
+    del api.failures[("GET", "/user")]
+    with pytest.raises(ProviderError, match="does not match"):
+        p.standing(ref(1))  # the real login is read now, and the mismatch is caught
+
+
+def test_a_rate_limited_403_is_not_a_missing_endpoint() -> None:
+    api = FakeGitHub()
+    api.add_issue(1, labels={READY})
+    api.user_login = None  # an installation token: a plain 403
+    p = provider(api, bot_login=ME)
+    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED  # bot_login stands in

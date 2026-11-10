@@ -119,6 +119,10 @@ class GitHubNotFoundError(ProviderError):
     """The resource does not exist (HTTP 404, or 410 for a deleted one)."""
 
 
+class GitHubForbiddenError(ProviderError):
+    """HTTP 403 that is not a rate limit: the token may not read this resource."""
+
+
 class GitHubMovedError(ProviderError):
     """The resource answered with a redirect that was not followed (HTTP 3xx)."""
 
@@ -193,6 +197,10 @@ class GitHubClient:
             raise GitHubNotFoundError(f"GitHub {method} {_path_of(url)}: not found")
         if 300 <= response.status < 400:
             raise GitHubMovedError(f"GitHub {method} {_path_of(url)}: moved (not followed)")
+        if response.status == 403 and not _rate_limited(response):
+            raise GitHubForbiddenError(
+                f"GitHub {method} {_path_of(url)}: HTTP 403 {_message(response)}"
+            )
         if not 200 <= response.status < 300:
             raise ProviderError(
                 f"GitHub {method} {_path_of(url)}: HTTP {response.status} {_message(response)}"
@@ -204,6 +212,12 @@ def _next_link(headers: Mapping[str, str]) -> str | None:
     link = next((v for k, v in headers.items() if k.lower() == "link"), None)
     match = _NEXT_LINK.search(link) if link else None
     return match.group(1) if match else None
+
+
+def _rate_limited(response: HttpResponse) -> bool:
+    """A 403 that GitHub uses for a primary or secondary rate limit: transient."""
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    return headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers
 
 
 def _path_of(url: str) -> str:
