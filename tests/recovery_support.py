@@ -180,6 +180,13 @@ def to_schema_4(db: Path) -> None:
         conn.executescript(f"BEGIN;\n{rebuild}\nPRAGMA user_version = 4;\nCOMMIT;")
 
 
+def to_schema_5(db: Path) -> None:
+    """The store exactly as schema 5 would have left it: one instance-scoped kind
+    (before ADR-0027's migration). Schema 6 only widened the check."""
+    with closing(sqlite3.connect(db)) as conn:
+        conn.executescript(f"BEGIN;\n{MIGRATIONS[4]}\nPRAGMA user_version = 5;\nCOMMIT;")
+
+
 def to_previous_schema(db: Path) -> None:
     """The store exactly as schema 3 would have left it: every row, no events.
 

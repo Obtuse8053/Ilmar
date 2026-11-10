@@ -8,8 +8,10 @@
   journaled as ``release-orphan-claim`` through ``perform_instance``;
   ``restore_label`` only inside ``Effects.restore_label``, journaled as
   ``restore-claim-label``.
-* ``release-orphan-claim`` is the only instance-scoped kind, and
-  ``perform_instance`` is called only for it.
+* ``release-orphan-claim`` and ``clear-stray-label`` are the only
+  instance-scoped kinds (ADR-0027), and ``perform_instance`` and
+  ``intend_instance`` are called only for them, each from its own ``Effects``
+  method. ``clear_label`` is called only inside ``Effects.clear_stray_label``.
 * Of the task provider, only ``standing``, ``held_claims``, ``get`` and
   ``list_eligible`` (and ``name``) are callable outside the journal.
 * Nothing in ``core/tracker.py`` reads a timestamp (ADR-0022 §Time).
@@ -107,6 +109,7 @@ def test_targeted_claim_writes_are_journaled_by_their_own_kind() -> None:
     for method, port_call, entry, kind in (
         ("release_orphan_claim", "release_claim", "perform_instance", "RELEASE_ORPHAN_CLAIM"),
         ("restore_label", "restore_label", "perform", "RESTORE_CLAIM_LABEL"),
+        ("clear_stray_label", "clear_label", "perform_instance", "CLEAR_STRAY_LABEL"),
     ):
         node = _method("Effects", method)
         journal = [c for c in _calls(node) if _name(c) == entry]
@@ -132,20 +135,37 @@ def test_targeted_claim_writes_are_journaled_by_their_own_kind() -> None:
             if isinstance(call.func, ast.Attribute) and call.func.attr in (
                 "release_claim",
                 "restore_label",
+                "clear_label",
             ):
                 assert "task_provider" not in ast.dump(call.func.value), path.name
 
 
-def test_release_orphan_claim_is_the_only_instance_scoped_kind() -> None:
-    assert {OperationKind.RELEASE_ORPHAN_CLAIM} == INSTANCE_SCOPED_KINDS
-    assert {k for k in OperationKind if k.instance_scoped} == {OperationKind.RELEASE_ORPHAN_CLAIM}
-    sites = [
-        path.name
-        for path in _sources()
-        for call in _calls(_tree(path))
-        if _name(call) == "perform_instance" and path.name != "journal.py"
-    ]
-    assert sites == ["effects.py"]
+def test_the_instance_scoped_kinds_are_exactly_the_two_decided() -> None:
+    expected = {OperationKind.RELEASE_ORPHAN_CLAIM, OperationKind.CLEAR_STRAY_LABEL}
+    assert expected == INSTANCE_SCOPED_KINDS
+    assert {k for k in OperationKind if k.instance_scoped} == expected
+    for entry in ("perform_instance", "intend_instance"):
+        sites = [
+            path.name
+            for path in _sources()
+            for call in _calls(_tree(path))
+            if _name(call) == entry and path.name != "journal.py"
+        ]
+        assert set(sites) == {"effects.py"}, entry
+    (intend,) = [c for c in _calls(_method("Effects", "intend_stray_label"))
+                 if _name(c) == "intend_instance"]  # fmt: skip
+    kind = intend.args[0]
+    assert isinstance(kind, ast.Attribute)
+    assert kind.attr == "CLEAR_STRAY_LABEL"
+    callers = {
+        node.name
+        for c in _tree(EFFECTS).body
+        if isinstance(c, ast.ClassDef)
+        for node in c.body
+        if isinstance(node, ast.FunctionDef)
+        and any(_name(call) in ("perform_instance", "intend_instance") for call in _calls(node))
+    }
+    assert callers == {"release_orphan_claim", "intend_stray_label", "clear_stray_label"}
 
 
 def test_only_reads_of_the_task_provider_are_callable_outside_the_journal() -> None:
@@ -156,7 +176,9 @@ def test_only_reads_of_the_task_provider_are_callable_outside_the_journal() -> N
         for f in c.body
         if isinstance(f, ast.FunctionDef)
     }
-    assert provider & READS == {"name", "get", "list_eligible", "standing", "held_claims"}
+    assert provider & READS == {
+        "name", "get", "list_eligible", "standing", "held_claims", "stray_labels",
+    }  # fmt: skip
 
 
 def test_the_lost_claim_confirmation_reads_no_timestamp() -> None:

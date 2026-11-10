@@ -78,6 +78,9 @@ class OperationKind(enum.Enum):
     """Re-adds the claim label beside one recorded claim object (ADR-0026 §5)."""
     RELEASE_ORPHAN_CLAIM = "release-orphan-claim"
     """Removes one recorded orphaned claim object; instance-scoped (ADR-0026 §5)."""
+    CLEAR_STRAY_LABEL = "clear-stray-label"
+    """Removes Ilmar's claim label where nothing claims the task; instance-scoped
+    (ADR-0027 §1)."""
 
     @property
     def repeatable(self) -> bool:
@@ -98,11 +101,15 @@ _REPEATABLE = frozenset(
         OperationKind.UPSERT_CHANGE_REQUEST,  # keyed by head branch
         OperationKind.RESTORE_CLAIM_LABEL,  # targeted, adds one label (ADR-0026 §5)
         OperationKind.RELEASE_ORPHAN_CLAIM,  # targeted, rechecks before deleting
+        OperationKind.CLEAR_STRAY_LABEL,  # re-reads, removes one label (ADR-0027)
     }
 )
 
-INSTANCE_SCOPED_KINDS = frozenset({OperationKind.RELEASE_ORPHAN_CLAIM})
-"""The closed set of operation kinds that name no execution (ADR-0026 §5)."""
+INSTANCE_SCOPED_KINDS = frozenset(
+    {OperationKind.RELEASE_ORPHAN_CLAIM, OperationKind.CLEAR_STRAY_LABEL}
+)
+"""The closed set of operation kinds that name no execution (ADR-0026 §5,
+ADR-0027 §1)."""
 
 
 class OperationStatus(enum.Enum):

@@ -60,8 +60,8 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#89: the M3 ADR bundle (documentation only). #87's implementation is in
-review in #88.
+#89: the M3 ADR bundle (documentation only), in review in #100. After the
+maintainer approves it: #13 (retry backoff, stall and wall-clock kill).
 
 ## Change log
 
@@ -72,6 +72,15 @@ review in #88.
     its gateway item moved to #94.
   - **#14 and #51** moved out of M3.
   - **#85** merged (ADR-0027 accepted).
+
+- 2026-11-10: **#12 closed** after its acceptance audit against ADR-0026.
+  **ADR-0027 implementation submitted** (#87):
+  - **Port:** `stray_labels` and `clear_label`.
+  - **Sweep:** the instance-scoped `clear-stray-label` (intent in one pass,
+    effect in a later one, after a store revalidation).
+  - **Store:** schema 6.
+  - **Tests:** every test ADR-0027 requires, with two new crash-suite
+    scenarios.
 
 - 2026-11-10: **ADR-0027 accepted** (maintainer approval at `8ba90a9`, merged
   in #84 as `19f76b3`). Its implementation starts in a separate pull request.

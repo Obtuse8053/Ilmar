@@ -279,6 +279,7 @@ ADDED_CODES = {
     "task-claim-lost",
     "orphaned-claim",
     "claim-changed",
+    "stray-label",  # ADR-0027 (#87)
 }
 
 

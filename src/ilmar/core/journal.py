@@ -303,6 +303,34 @@ class Journal:
         )
         return settled
 
+    def intend_instance(
+        self, kind: OperationKind, *, step: str, intent: Mapping[str, str], reason: str
+    ) -> Operation:
+        """Commit only the write-ahead intent of an instance-scoped operation.
+
+        ADR-0027 §1: the intent is the durable first observation, and the effect
+        runs only when :meth:`perform_instance` resumes it in a later pass. An
+        existing operation with this key is returned as it is: nothing is
+        recorded twice.
+        """
+        if not kind.instance_scoped:
+            raise LedgerIntegrityError(f"{kind.value} names an execution; use perform")
+        self._ownership.check()
+        fence = self._ownership.fence
+        key = instance_operation_key(kind, fence.instance_id, step)
+        existing = self._store.operation(key)
+        if existing is not None:
+            return existing
+        operation = Operation.intended_for_instance(
+            kind, fence.instance_id, fence=fence, now=self._clock(), step=step, intent=intent
+        )
+        self._commit(
+            fence,
+            Commit(operations=(operation,)),
+            context=self._events.context(fence, reasons={key: reason}),
+        )
+        return operation
+
     def perform_instance(
         self,
         kind: OperationKind,

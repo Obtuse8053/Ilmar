@@ -50,7 +50,7 @@ FAKE_OWNER = ResourceOwner(instance_id="test", execution_id="agent", attempt=1, 
 
 class TestFakeTaskProvider(TaskProviderContract):
     def make_provider(self) -> TaskProvider:
-        return FakeTaskProvider([task("1"), task("2"), task("3")])
+        return FakeTaskProvider([task("1"), task("2"), task("3"), task("4")])
 
     def claim_as_other(self, provider: TaskProvider, task: Task) -> None:
         assert isinstance(provider, FakeTaskProvider)
@@ -65,7 +65,9 @@ class TestFakeTaskProvider(TaskProviderContract):
             tracked.eligible = False
         elif what == "exclude":
             tracked.excluded = True
-        elif what in ("assign", "human-label"):
+        elif what == "assign":
+            tracked.assigned = True
+        elif what == "human-label":
             tracked.human = True
         elif what == "other-instance":
             provider.claim_as(task.ref, "someone-else")
@@ -85,6 +87,10 @@ class TestFakeTaskProvider(TaskProviderContract):
     def make_unreadable(self, provider: TaskProvider, task: Task) -> None:
         assert isinstance(provider, FakeTaskProvider)
         provider.unreadable.add(task.ref)
+
+    def make_listing_unreadable(self, provider: TaskProvider) -> None:
+        assert isinstance(provider, FakeTaskProvider)
+        provider.stray_unreadable = True
 
     def snapshot(self, provider: TaskProvider) -> Hashable:
         assert isinstance(provider, FakeTaskProvider)

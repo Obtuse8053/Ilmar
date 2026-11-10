@@ -20,6 +20,7 @@ from ilmar.adapters.github.client import HttpRequest
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.tasks import (
     ClaimOutcome,
+    ClearResult,
     HeldClaim,
     ReleaseResult,
     RestoreResult,
@@ -439,3 +440,132 @@ def test_a_rate_limited_403_is_not_a_missing_endpoint() -> None:
     api.user_login = None  # an installation token: a plain 403
     p = provider(api, bot_login=ME)
     assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED  # bot_login stands in
+
+
+# -- stray claim labels (ADR-0027 §1) ----------------------------------------------------
+
+
+def stray(api: FakeGitHub, number: int = 1) -> None:
+    """Issue ``number`` carries Ilmar's label and nothing behind it."""
+    api.issues[number].labels.add(CLAIMED)
+
+
+@pytest.mark.parametrize("skip_assigned", [True, False])
+def test_an_assignee_keeps_the_label_only_where_it_is_a_claim(
+    api: FakeGitHub, skip_assigned: bool
+) -> None:
+    stray(api)
+    api.issues[1].assignees.append("human")
+    p = provider(api, skip_assigned=skip_assigned)
+    assert (ref(1) in p.stray_labels()) is not skip_assigned
+    expected = ClearResult.KEPT if skip_assigned else ClearResult.CLEARED
+    assert p.clear_label(ref(1)) is expected
+    assert api.issues[1].assignees == ["human"]  # never touched
+
+
+def test_stray_labels_follow_every_page() -> None:
+    api = FakeGitHub(page_size=2)
+    for number in range(1, 8):
+        api.add_issue(number, labels={READY, CLAIMED})
+        for noise in range(3):
+            api.comment(number, f"noise {noise}")
+    api.comment(7, claim_comment("b"), user=ME)
+    assert set(provider(api).stray_labels()) == {ref(n) for n in range(1, 7)}
+
+
+def test_a_forged_marker_by_a_non_member_keeps_the_label(api: FakeGitHub) -> None:
+    stray(api)
+    forged = api.comment(1, claim_comment("a", "f" * 32), user="drive-by")
+    p = provider(api)
+    assert p.stray_labels() == ()
+    assert p.clear_label(ref(1)) is ClearResult.KEPT
+    api.comments[1] = [c for c in api.comments[1] if c["id"] != forged]  # a person removes it
+    assert p.stray_labels() == (ref(1),)
+    assert p.clear_label(ref(1)) is ClearResult.CLEARED
+
+
+def _transfer(api: FakeGitHub) -> None:
+    api.transferred[1] = "elsewhere/repo"
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["get", "claim", "release", "standing", "held_claims", "stray_labels", "clear_label",
+     "release_claim", "restore_label"],
+)  # fmt: skip
+def test_no_read_follows_a_transfer(api: FakeGitHub, call: str) -> None:
+    """ADR-0027 §3: the fake fails the test if any request follows the redirect."""
+    claim = held(api)
+    _transfer(api)
+    p = provider(api)
+    if call == "get":
+        assert p.get(ref(1)) is None
+    elif call == "claim":
+        assert p.claim(ref(1)).outcome is ClaimOutcome.NOT_ELIGIBLE
+    elif call == "release":
+        p.release(ref(1))
+    elif call == "standing":
+        assert p.standing(ref(1)).standing is Standing.GONE
+    elif call == "held_claims":
+        assert p.held_claims() == ()
+    elif call == "stray_labels":
+        assert p.stray_labels() == ()
+    elif call == "clear_label":
+        assert p.clear_label(ref(1)) is ClearResult.ABSENT
+    elif call == "release_claim":
+        p.release_claim(claim)
+    else:
+        p.restore_label(claim)
+
+
+# The non-atomic removal: what happens between clear_label's final re-read (the
+# comments) and its label DELETE, row by row (ADR-0027 §1, the race table).
+RACES: dict[str, Callable[[FakeGitHub], object]] = {
+    "other-instance-claims": lambda api: api.comment(1, claim_comment("b"), user=ME),
+    "human-claim-label": lambda api: api.issues[1].labels.add(HUMAN),
+    "assignee": lambda api: api.issues[1].assignees.append("human"),
+    "assignee-removed": lambda api: api.issues[1].assignees.clear(),
+    "forged-marker": lambda api: api.comment(1, claim_comment("a", "f" * 32), user="mallory"),
+    "label-removed": lambda api: api.issues[1].labels.discard(CLAIMED),
+    "label-re-added": lambda api: api.issues[1].labels.add(CLAIMED),
+    "closed": lambda api: setattr(api.issues[1], "state", "closed"),
+    "transferred": _transfer,
+}
+
+
+@pytest.mark.parametrize("race", sorted(RACES))
+def test_the_non_atomic_label_removal_touches_nothing_else(api: FakeGitHub, race: str) -> None:
+    stray(api)
+    p = provider(api)
+    p.stray_labels()  # identity learned before the adversary is armed
+    fired: list[bool] = []
+
+    def act(request: HttpRequest) -> None:
+        path = urllib.parse.urlsplit(request.url).path
+        if not fired and request.method == "DELETE" and "/labels/" in path:
+            fired.append(True)
+            RACES[race](api)
+
+    api.before.append(act)
+    comments = [dict(c) for c in api.comments[1]]
+    result = p.clear_label(ref(1))
+    assert fired
+    assert result is ClearResult.CLEARED  # the re-read found nothing: the window is after it
+    assert CLAIMED not in api.issues[1].labels  # only Ilmar's label went
+    added = [c for c in api.comments[1] if c not in comments]
+    assert [c for c in api.comments[1] if c in comments] == comments  # nothing deleted
+    if race == "other-instance-claims":
+        assert len(added) == 1
+        # Repaired by the claim's owner: it reads HELD with the label missing.
+        other = provider(api, "b")
+        standing = other.standing(ref(1))
+        assert standing.standing is Standing.HELD
+        assert standing.label_missing
+        assert standing.claim is not None
+        assert other.restore_label(standing.claim) is RestoreResult.RESTORED
+    if race in ("human-claim-label", "assignee"):
+        # The human claim alone keeps the task out of the queue, and it is untouched.
+        assert ref(1) not in {t.ref for t in p.list_eligible()}
+        assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
+    if race == "forged-marker":
+        assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED_BY_OTHER
