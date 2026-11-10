@@ -1,6 +1,6 @@
 # ADR-0027: Stray claim labels, and two clarifications to ADR-0026
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
 - Sources: [R20] · Findings: F-001
 - Amends (by addition only; no accepted text is edited):

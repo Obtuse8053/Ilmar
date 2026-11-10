@@ -59,12 +59,15 @@ which revisits ADR-0023.
 
 #12 (plan step 4): tracker reconciliation. **The implementation of
 ADR-0026 is merged** (#83). #12 closes only after its acceptance audit
-against ADR-0026. ADR-0027 (stray claim labels, #84) is proposed as a
-follow-up and is not implemented before approval.
+against ADR-0026. ADR-0027 (stray claim labels) is accepted (#84) and is
+being implemented as a separate pull request.
 
 After #12: #13 (retry backoff and stall detection, plan step 5).
 
 ## Change log
+
+- 2026-11-10: **ADR-0027 accepted** (maintainer approval at `8ba90a9`, merged
+  in #84 as `19f76b3`). Its implementation starts in a separate pull request.
 
 - 2026-11-10: **ADR-0027 proposed** (documentation only): a sweep for
   Ilmar's claim label left with no claim behind it, and two clarifications to
