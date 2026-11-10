@@ -28,6 +28,7 @@ from ilmar.core.coordinator import Coordinator, PassReport
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.naming import container_name, verification_container_name
 from ilmar.core.ownership import Ownership
+from ilmar.core.state_machine import NO_BACKOFF
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.errors import OwnershipConflictError
 from ilmar.domain.execution import ExecutionState
@@ -160,6 +161,7 @@ def coordinator_process(
         owner,
         max_attempts=3,
         agent_timeout_seconds=120,
+        retry_backoff=NO_BACKOFF,
         clock=clock,
         new_id=lambda: next(ids),
     )

@@ -69,7 +69,7 @@ from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
@@ -362,12 +362,26 @@ WHEN NEW.key IS NOT OLD.key OR NEW.kind IS NOT OLD.kind
   OR NEW.version <> OLD.version + 1
 BEGIN SELECT RAISE(ABORT, 'an operation keeps its identity and intent'); END;
 """,
+    6: """
+ALTER TABLE executions ADD COLUMN retry_not_before TEXT;
+""",
 }
 
-_COLUMNS = (
+_BASE_COLUMNS = (
     "id, task_provider, task_key, state, attempt, version, created_at, updated_at, "
     "branch, change_request_url, last_error, base_revision, candidate_revision"
 )
+RETRY_SCHEMA_VERSION = 7
+"""The first version with ``executions.retry_not_before`` (#13)."""
+
+
+def _columns(conn: sqlite3.Connection) -> str:
+    """The execution columns this store has. A store never claimed stays at
+    ``NEW_DATABASE_VERSION`` until its first claim migrates it, and takes only
+    unfenced writes until then; none of them can be a retry wait."""
+    if _version(conn) >= RETRY_SCHEMA_VERSION:
+        return _BASE_COLUMNS + ", retry_not_before"
+    return _BASE_COLUMNS
 
 
 class SQLiteExecutionStore:
@@ -458,7 +472,7 @@ class SQLiteExecutionStore:
     def active_for_task(self, task: TaskRef) -> Execution | None:
         with self._reading() as conn:
             row = conn.execute(
-                f"SELECT {_COLUMNS} FROM executions "  # noqa: S608
+                f"SELECT {_columns(conn)} FROM executions "  # noqa: S608
                 "WHERE task_provider = ? AND task_key = ? AND is_terminal = 0",
                 (task.provider, task.key),
             ).fetchone()
@@ -896,7 +910,7 @@ def _event_lines(
 def _list_executions(conn: sqlite3.Connection, states: Sequence[str]) -> tuple[Execution, ...]:
     placeholders = ", ".join("?" for _ in states)
     rows = conn.execute(
-        f"SELECT {_COLUMNS} FROM executions "  # noqa: S608
+        f"SELECT {_columns(conn)} FROM executions "  # noqa: S608
         f"WHERE state IN ({placeholders}) ORDER BY created_at, id",
         list(states),
     ).fetchall()
@@ -949,7 +963,7 @@ def _owner(conn: sqlite3.Connection) -> Fence | None:
 
 def _get_execution(conn: sqlite3.Connection, execution_id: str) -> Execution | None:
     row = conn.execute(
-        f"SELECT {_COLUMNS} FROM executions WHERE id = ?",  # noqa: S608
+        f"SELECT {_columns(conn)} FROM executions WHERE id = ?",  # noqa: S608
         (execution_id,),
     ).fetchone()
     return None if row is None else _execution_from_row(row)
@@ -959,10 +973,12 @@ def _insert_execution(
     conn: sqlite3.Connection, execution: Execution, transition: Transition
 ) -> None:
     try:
+        row = _execution_row(execution, retry=_version(conn) >= RETRY_SCHEMA_VERSION)
+        placeholders = ", ".join("?" for _ in range(len(row) + 1))
         conn.execute(
-            f"INSERT INTO executions ({_COLUMNS}, is_terminal) "  # noqa: S608
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (*_execution_row(execution), int(execution.state.is_terminal)),
+            f"INSERT INTO executions ({_columns(conn)}, is_terminal) "  # noqa: S608
+            f"VALUES ({placeholders})",
+            (*row, int(execution.state.is_terminal)),
         )
     except sqlite3.IntegrityError as exc:
         raise DuplicateExecutionError(
@@ -984,10 +1000,10 @@ def _update_execution(conn: sqlite3.Connection, updated: Execution, transition: 
     if current.task != updated.task or current.created_at != updated.created_at:
         raise ValueError("task and created_at are immutable")
     try:
+        retry = _version(conn) >= RETRY_SCHEMA_VERSION
+        _require_retry_column(updated, retry=retry)
         conn.execute(
-            "UPDATE executions SET state = ?, is_terminal = ?, attempt = ?, version = ?, "
-            "updated_at = ?, branch = ?, change_request_url = ?, last_error = ?, "
-            "base_revision = ?, candidate_revision = ? WHERE id = ?",
+            _UPDATE_EXECUTION_V7 if retry else _UPDATE_EXECUTION,
             (
                 updated.state.value,
                 int(updated.state.is_terminal),
@@ -999,6 +1015,7 @@ def _update_execution(conn: sqlite3.Connection, updated: Execution, transition: 
                 updated.last_error,
                 updated.base_revision,
                 updated.candidate_revision,
+                *((_optional_time(updated.retry_not_before),) if retry else ()),
                 updated.id,
             ),
         )
@@ -1197,8 +1214,26 @@ def _decode_time(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def _execution_row(execution: Execution) -> tuple[object, ...]:
-    return (
+_UPDATE_EXECUTION = (
+    "UPDATE executions SET state = ?, is_terminal = ?, attempt = ?, version = ?, "
+    "updated_at = ?, branch = ?, change_request_url = ?, last_error = ?, "
+    "base_revision = ?, candidate_revision = ? WHERE id = ?"
+)
+_UPDATE_EXECUTION_V7 = (
+    "UPDATE executions SET state = ?, is_terminal = ?, attempt = ?, version = ?, "
+    "updated_at = ?, branch = ?, change_request_url = ?, last_error = ?, "
+    "base_revision = ?, candidate_revision = ?, retry_not_before = ? WHERE id = ?"
+)
+
+
+def _require_retry_column(execution: Execution, *, retry: bool) -> None:
+    if execution.retry_not_before is not None and not retry:
+        raise ValueError("a retry wait needs schema 7: claim the store to migrate it")
+
+
+def _execution_row(execution: Execution, *, retry: bool) -> tuple[object, ...]:
+    _require_retry_column(execution, retry=retry)
+    base = (
         execution.id,
         execution.task.provider,
         execution.task.key,
@@ -1213,6 +1248,7 @@ def _execution_row(execution: Execution) -> tuple[object, ...]:
         execution.base_revision,
         execution.candidate_revision,
     )
+    return (*base, _optional_time(execution.retry_not_before)) if retry else base
 
 
 def _execution_from_row(row: tuple[object, ...]) -> Execution:
@@ -1230,7 +1266,9 @@ def _execution_from_row(row: tuple[object, ...]) -> Execution:
         last_error,
         base_revision,
         candidate_revision,
+        *rest,
     ) = row
+    retry_not_before = rest[0] if rest else None
     return Execution(
         id=_text(id_),
         task=TaskRef(provider=_text(provider), key=_text(key)),
@@ -1244,7 +1282,14 @@ def _execution_from_row(row: tuple[object, ...]) -> Execution:
         last_error=_optional_text(last_error),
         base_revision=_optional_text(base_revision),
         candidate_revision=_optional_text(candidate_revision),
+        retry_not_before=(
+            None if retry_not_before is None else _decode_time(_text(retry_not_before))
+        ),
     )
+
+
+def _optional_time(value: datetime | None) -> str | None:
+    return None if value is None else _encode_time(value)
 
 
 def _text(value: object) -> str:

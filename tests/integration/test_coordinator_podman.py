@@ -33,6 +33,7 @@ from ilmar.core.coordinator import Coordinator
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.naming import container_name, verification_container_name
 from ilmar.core.ownership import Ownership
+from ilmar.core.state_machine import NO_BACKOFF
 from ilmar.core.worker import Outcome
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.events import EventType
@@ -144,6 +145,7 @@ def test_one_execution_end_to_end_on_real_sandboxes(tmp_path: Path) -> None:
             owner,
             max_attempts=3,
             agent_timeout_seconds=120,
+            retry_backoff=NO_BACKOFF,
             clock=clock,
             new_id=lambda: next(ids),
         )
@@ -220,7 +222,8 @@ class CancelWorld:
     def coordinator(self, owner: Ownership) -> Coordinator:
         ids = iter(["e1"])
         return Coordinator.create(
-            self.components, owner, max_attempts=3, agent_timeout_seconds=600, clock=self.clock,
+            self.components, owner, max_attempts=3, agent_timeout_seconds=600,
+            retry_backoff=NO_BACKOFF, clock=self.clock,
             new_id=lambda: next(ids), watch_interval_seconds=0.2,
         )  # fmt: skip
 

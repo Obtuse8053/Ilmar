@@ -80,6 +80,22 @@ def test_every_port_is_required(port: str) -> None:
         (lambda d: d.update(limits={"max_concurrent_executions": 1.5}), "max_concurrent"),
         (lambda d: d.update(limits={"agent_timeout_seconds": -1}), "agent_timeout"),
         (lambda d: d.update(limits={"agent_timeout_seconds": "1h"}), "agent_timeout"),
+        (lambda d: d.update(limits={"retry_backoff_base_seconds": 0}), "retry_backoff_base"),
+        (lambda d: d.update(limits={"retry_backoff_base_seconds": True}), "retry_backoff_base"),
+        (
+            lambda d: d.update(limits={"retry_backoff_max_seconds": float("inf")}),
+            "retry_backoff_max",
+        ),
+        (
+            lambda d: d.update(limits={"retry_backoff_max_seconds": float("nan")}),
+            "retry_backoff_max",
+        ),
+        (
+            lambda d: d.update(
+                limits={"retry_backoff_base_seconds": 600, "retry_backoff_max_seconds": 60}
+            ),
+            "must not be less than",
+        ),
     ],
 )
 def test_invalid_configuration_is_rejected(mutate: Any, message: str) -> None:
@@ -207,3 +223,19 @@ def test_path_classes_can_only_be_extended() -> None:
 def test_verification_errors_are_reported(section: dict[str, Any], message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         parse_config(with_verification(**section), base_dir=BASE)
+
+
+def test_retry_backoff_defaults_and_values() -> None:
+    """#13: a positive base is required in configuration (no immediate retries)."""
+    config = parse_config(minimal(), base_dir=BASE)
+    assert (config.limits.retry_backoff_base_seconds, config.limits.retry_backoff_max_seconds) == (
+        300.0,
+        21600.0,
+    )
+    data = copy.deepcopy(minimal())
+    data["limits"] = {"retry_backoff_base_seconds": 30, "retry_backoff_max_seconds": 30}
+    config = parse_config(data, base_dir=BASE)
+    assert (config.limits.retry_backoff_base_seconds, config.limits.retry_backoff_max_seconds) == (
+        30.0,
+        30.0,
+    )

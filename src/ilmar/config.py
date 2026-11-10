@@ -22,6 +22,7 @@ environment variable" (ADR-0007).
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from collections.abc import Mapping
@@ -67,6 +68,10 @@ class Limits:
     max_attempts: int = 3
     max_concurrent_executions: int = 1
     agent_timeout_seconds: float = 3600.0
+    retry_backoff_base_seconds: float = 300.0
+    """Wait after the first failed attempt; doubled per attempt (#13, ADR-0028)."""
+    retry_backoff_max_seconds: float = 21600.0
+    """The longest wait between attempts."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +216,13 @@ def _parse_limits(raw: Mapping[str, Any]) -> Limits:
     defaults = Limits()
     _reject_unknown(
         raw,
-        {"max_attempts", "max_concurrent_executions", "agent_timeout_seconds"},
+        {
+            "max_attempts",
+            "max_concurrent_executions",
+            "agent_timeout_seconds",
+            "retry_backoff_base_seconds",
+            "retry_backoff_max_seconds",
+        },
         "[limits]",
     )
     max_attempts = _positive_int(raw, "max_attempts", defaults.max_attempts)
@@ -221,11 +232,31 @@ def _parse_limits(raw: Mapping[str, Any]) -> Limits:
     timeout = raw.get("agent_timeout_seconds", defaults.agent_timeout_seconds)
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
         raise ConfigError("[limits] agent_timeout_seconds must be a positive number")
+    base = _positive_number(raw, "retry_backoff_base_seconds", defaults.retry_backoff_base_seconds)
+    cap = _positive_number(raw, "retry_backoff_max_seconds", defaults.retry_backoff_max_seconds)
+    if cap < base:
+        raise ConfigError(
+            "[limits] retry_backoff_max_seconds must not be less than retry_backoff_base_seconds"
+        )
     return Limits(
         max_attempts=max_attempts,
         max_concurrent_executions=max_concurrent,
         agent_timeout_seconds=float(timeout),
+        retry_backoff_base_seconds=base,
+        retry_backoff_max_seconds=cap,
     )
+
+
+def _positive_number(raw: Mapping[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ConfigError(f"[limits] {key} must be a positive, finite number")
+    return float(value)
 
 
 def _parse_adapters(raw: Mapping[str, Any]) -> Mapping[str, AdapterConfig]:

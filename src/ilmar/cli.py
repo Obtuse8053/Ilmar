@@ -16,6 +16,7 @@ from ilmar.config import load_config
 from ilmar.core.coordinator import Coordinator, ExitCode
 from ilmar.core.ownership import Ownership
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
+from ilmar.core.state_machine import RetryBackoff
 from ilmar.domain.errors import ConfigError, FencingError, OwnershipConflictError
 
 UNATTENDED_DISABLED = (
@@ -147,6 +148,10 @@ def _run_once(path: Path) -> int:
                     ownership,
                     max_attempts=config.limits.max_attempts,
                     agent_timeout_seconds=config.limits.agent_timeout_seconds,
+                    retry_backoff=RetryBackoff(
+                        config.limits.retry_backoff_base_seconds,
+                        config.limits.retry_backoff_max_seconds,
+                    ),
                     clock=_now,
                 )
                 report = coordinator.run_once()

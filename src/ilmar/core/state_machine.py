@@ -19,13 +19,18 @@ Candidate revisions (ADR-0010): ``base_revision`` is recorded on entering
 RUNNING_AGENT and ``candidate_revision`` on entering VERIFYING; VERIFYING and
 PUBLISHING cannot be entered without them, they cannot be changed within an
 attempt, and a new attempt (RETRY_WAIT -> PROVISIONING) clears both.
+
+Retry backoff (ADR-0028, #13): entering RETRY_WAIT records
+``retry_not_before``; RETRY_WAIT -> PROVISIONING is refused before that time,
+and leaving RETRY_WAIT clears it. The caller computes the time
+(:class:`RetryBackoff`) and supplies ``now``.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
 
 from ilmar.domain.errors import InvalidTransitionError, RetryLimitExceededError
@@ -52,6 +57,61 @@ ALLOWED_TRANSITIONS: Mapping[ExecutionState, frozenset[ExecutionState]] = Mappin
 )
 
 _REQUIRES_ERROR = frozenset({_S.FAILED, _S.RETRY_WAIT})
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RetryBackoff:
+    """Capped exponential backoff between attempts (F-002, ADR-0028).
+
+    The wait after attempt ``n`` fails is ``base * 2 ** (n - 1)``, at most
+    ``max``. No jitter: one coordinator owns an instance, so there is no herd
+    to spread, and a deterministic wait is testable.
+    """
+
+    base_seconds: float
+    max_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.base_seconds < 0:
+            raise ValueError("base_seconds must not be negative")
+        if self.max_seconds < self.base_seconds:
+            raise ValueError("max_seconds must not be less than base_seconds")
+
+    def delay(self, failed_attempt: int) -> timedelta:
+        if failed_attempt < 1:
+            raise ValueError("attempts start at 1")
+        exponent = min(failed_attempt - 1, 62)  # 2**62 seconds is beyond any cap
+        return timedelta(seconds=min(self.max_seconds, self.base_seconds * 2**exponent))
+
+    def not_before(self, now: datetime, failed_attempt: int) -> datetime:
+        return now + self.delay(failed_attempt)
+
+
+NO_BACKOFF = RetryBackoff(0.0, 0.0)
+"""Retry at once. Tests only: configuration requires a positive base."""
+
+
+def retry_wait_reason(
+    execution: Execution, now: datetime, *, high_water: datetime | None
+) -> str | None:
+    """Why a new attempt of ``execution`` (in RETRY_WAIT) may not start at ``now``,
+    or ``None`` if it may.
+
+    Both the execution's ``retry_not_before`` and the store's high-water mark
+    (the latest persisted time) must lie in the past: a clock that stepped back
+    only makes the wait longer (ADR-0028 §3).
+    """
+    if execution.state is not _S.RETRY_WAIT:
+        raise ValueError(f"execution {execution.id} is not waiting to retry")
+    if high_water is not None and now < high_water:
+        return (
+            f"the clock ({now.isoformat()}) is behind the latest persisted time "
+            f"({high_water.isoformat()}); waiting for it to catch up"
+        )
+    due = execution.retry_not_before
+    if due is not None and now < due:
+        return f"retry not before {due.isoformat()}"
+    return None
 
 
 def can_transition(source: ExecutionState, target: ExecutionState) -> bool:
@@ -117,12 +177,14 @@ class ExecutionStateMachine:
         change_request_url: str | None = None,
         base_revision: str | None = None,
         candidate_revision: str | None = None,
+        retry_not_before: datetime | None = None,
     ) -> tuple[Execution, Transition]:
         """Move ``execution`` to ``target``.
 
         ``error`` is required when entering FAILED or RETRY_WAIT. ``branch`` and
         ``change_request_url``, when given, are recorded on the execution;
-        ``None`` keeps the current value.
+        ``None`` keeps the current value. ``retry_not_before`` is given only
+        when entering RETRY_WAIT, and never earlier than ``now``.
 
         Raises ``InvalidTransitionError`` (or its subclass
         ``RetryLimitExceededError``) if the change is not allowed, and
@@ -143,6 +205,21 @@ class ExecutionStateMachine:
         if target is _S.RETRY_WAIT and attempt >= self._max_attempts:
             raise RetryLimitExceededError(
                 f"execution {execution.id} has used all {self._max_attempts} attempts"
+            )
+        if retry_not_before is not None:
+            if target is not _S.RETRY_WAIT:
+                raise ValueError("retry_not_before is set only on entering retry_wait")
+            if retry_not_before < now:
+                raise ValueError("retry_not_before must not precede now")
+        if (
+            source is _S.RETRY_WAIT
+            and target is _S.PROVISIONING
+            and execution.retry_not_before is not None
+            and now < execution.retry_not_before
+        ):
+            raise InvalidTransitionError(
+                f"execution {execution.id} may not retry before "
+                f"{execution.retry_not_before.isoformat()}"
             )
         if source is _S.RETRY_WAIT and target is _S.PROVISIONING:
             attempt += 1
@@ -168,6 +245,7 @@ class ExecutionStateMachine:
             last_error=error if error is not None else execution.last_error,
             base_revision=base,
             candidate_revision=candidate,
+            retry_not_before=retry_not_before if target is _S.RETRY_WAIT else None,
         )
         transition = Transition(
             execution_id=execution.id,

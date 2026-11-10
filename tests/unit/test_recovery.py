@@ -46,6 +46,7 @@ from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import Coordinator, PassReport
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import Ownership
+from ilmar.core.state_machine import NO_BACKOFF
 from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.changes import CandidateRevision
 from ilmar.domain.errors import (
@@ -139,6 +140,7 @@ class World:
             ownership,
             max_attempts=3,
             agent_timeout_seconds=60,
+            retry_backoff=NO_BACKOFF,
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),
@@ -658,12 +660,29 @@ def test_a_security_failure_leaves_nothing_for_later_passes(world: World) -> Non
 def test_a_wall_clock_stepped_back_across_a_restart_does_not_stop_recovery(
     world: World, boundary: str
 ) -> None:
-    """An NTP step back of a day between crash and restart (ADR-0022, clock rules)."""
+    """An NTP step back of a day between crash and restart (ADR-0022, clock rules).
+
+    Recovery never consults the clock. A crash during the agent run leaves a new
+    attempt to start, which ADR-0028 delays until the clock is past the latest
+    persisted time: the restarted process waits, then completes."""
     crash_before(world, boundary)
-    world.clock.now -= timedelta(days=1)
-    reports = recover(world)
+    stepped_back = world.clock.now - timedelta(days=1)
+    world.clock.now = stepped_back
+    reports = recover(world, passes=1 if boundary == "agent.run" else 6)
     assert [r.code for r in reports] == [0], [r.summary for r in reports]
-    assert check_invariants(world) == []
+    if boundary != "agent.run":
+        assert check_invariants(world) == []
+    else:
+        (waiting,) = reports[0].results
+        assert "behind the latest persisted time" in waiting.detail
+        with SQLiteExecutionStore(world.db) as store:
+            (execution,) = store.list_in_states(set(S))
+            latest = execution.updated_at
+        assert execution.state is S.RETRY_WAIT
+        world.clock.now = latest  # the clock catches up
+        reports = recover(world)
+        assert [r.code for r in reports] == [0], [r.summary for r in reports]
+        assert check_invariants(world) == []
     with SQLiteExecutionStore(world.db) as store:
         history = store.history("e1")
     stamps = [t.at for t in history]

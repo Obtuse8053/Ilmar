@@ -83,6 +83,10 @@ class Execution:
     """The revision the current attempt's agent started from (ADR-0010)."""
     candidate_revision: str | None = None
     """The current attempt's frozen output; what is verified and published."""
+    retry_not_before: datetime | None = None
+    """While in RETRY_WAIT: the earliest time a new attempt may start (ADR-0028,
+    #13). Set with the move into RETRY_WAIT, cleared when the wait ends. ``None``
+    in RETRY_WAIT only for a wait recorded before schema 7: due at once."""
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -97,6 +101,10 @@ class Execution:
             raise ValueError("updated_at must not precede created_at")
         if self.candidate_revision is not None and self.base_revision is None:
             raise ValueError("a candidate revision needs a base revision")
+        if self.retry_not_before is not None:
+            _require_aware(self.retry_not_before, "retry_not_before")
+            if self.state is not ExecutionState.RETRY_WAIT:
+                raise ValueError("only an execution in retry_wait has a retry_not_before")
 
 
 @dataclass(frozen=True, slots=True)

@@ -56,7 +56,7 @@ from ilmar.core.event_context import failure_code
 from ilmar.core.naming import branch_name, container_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
 from ilmar.core.safe_fs import directory_identity
-from ilmar.core.state_machine import ExecutionStateMachine
+from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, retry_wait_reason
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import ChangeRequestSpec
 from ilmar.domain.errors import (
@@ -122,6 +122,9 @@ class Outcome(enum.Enum):
     CANCELLED = "cancelled"
     BLOCKED = "blocked"
     """Needs a human: an unsettleable effect, a quarantine, an inconsistent ledger."""
+    WAITING = "waiting"
+    """Waiting to retry: the backoff has not ended yet (ADR-0028, #13). A later
+    pass starts the next attempt; nothing is wrong."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +159,14 @@ class _Blocked(Exception):  # noqa: N818 - internal control flow, never escapes
         self.reason = reason
 
 
+class _Waiting(Exception):  # noqa: N818 - internal control flow, never escapes
+    """The execution waits to retry and is not due yet: end this run, change nothing."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class ExecutionWorker:
     def __init__(
         self,
@@ -166,6 +177,7 @@ class ExecutionWorker:
         machine: ExecutionStateMachine,
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
+        retry_backoff: RetryBackoff,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
@@ -177,6 +189,7 @@ class ExecutionWorker:
         self.machine = machine
         self.clock = clock
         self.agent_timeout = agent_timeout_seconds
+        self.retry_backoff = retry_backoff
         self.new_token = new_token
         self.watch_interval = watch_interval_seconds
         self.cancellations = Cancellations(
@@ -328,12 +341,20 @@ class _Run:
     def transition_to(
         self, target: ExecutionState, reason: str, *, code: str | None = None, **values: str
     ) -> Commit:
-        """``code`` is the stable reason code of a failure, cancellation or retry."""
+        """``code`` is the stable reason code of a failure, cancellation or retry.
+
+        Entering RETRY_WAIT records when the next attempt may start: the
+        backoff after this attempt, from the same ``now`` as the transition."""
         current = self.current()
+        now = not_before(self.w.clock(), current.updated_at)
+        retry_at = (
+            self.w.retry_backoff.not_before(now, current.attempt)
+            if target is S.RETRY_WAIT
+            else None
+        )
         updated, transition = self.w.machine.advance(
-            current, target, now=not_before(self.w.clock(), current.updated_at), reason=reason,
-            **values,
-        )  # fmt: skip
+            current, target, now=now, reason=reason, retry_not_before=retry_at, **values
+        )
         cleared: tuple[Event, ...] = ()
         if target.is_terminal:  # a terminal execution closes its open observation (§3a)
             cleared = self.clearing(observed=None)
@@ -370,6 +391,8 @@ class _Run:
                     return ended
             except _Blocked as blocked:
                 return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
+            except _Waiting as waiting:
+                return WorkerResult(self.id, Outcome.WAITING, waiting.reason)
             except _DETERMINISTIC as error:
                 ended = self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
                 if ended is not None:
@@ -418,6 +441,8 @@ class _Run:
         if state is S.QUEUED:
             self.claim(execution)
         elif state in (S.CLAIMED, S.RETRY_WAIT):
+            if state is S.RETRY_WAIT:
+                self.wait_for_retry(execution)
             self.cancel_point(tracker=True)  # before a new attempt (ADR-0026 §2)
             self.move(S.PROVISIONING, "provisioning a new attempt")
         elif state is S.PROVISIONING:
@@ -430,6 +455,14 @@ class _Run:
             self.publish(execution)
         else:  # pragma: no cover - every non-terminal state is handled above
             raise LedgerIntegrityError(f"unexpected state {state.value}")
+
+    def wait_for_retry(self, execution: Execution) -> None:
+        """End this run unless the backoff is over (ADR-0028). The clock is read
+        raw here: a wall clock behind the store's latest persisted time waits."""
+        high_water = max((e.updated_at for e in self.store.list_in_states(set(S))), default=None)
+        reason = retry_wait_reason(execution, self.w.clock(), high_water=high_water)
+        if reason is not None:
+            raise _Waiting(reason)
 
     # -- QUEUED ---------------------------------------------------------------------
 

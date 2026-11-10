@@ -56,7 +56,7 @@ from ilmar.core.event_context import (
 )
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
-from ilmar.core.state_machine import ExecutionStateMachine
+from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff
 from ilmar.core.verification import Verifier
 from ilmar.core.worker import (
     MAX_ATTEMPTS,
@@ -106,6 +106,7 @@ _CODES = {
     Outcome.CANCELLED: ExitCode.SUCCESS,
     Outcome.FAILED: ExitCode.FAILURE,
     Outcome.BLOCKED: ExitCode.BLOCKED,
+    Outcome.WAITING: ExitCode.SUCCESS,
 }
 
 
@@ -127,6 +128,7 @@ class Coordinator:
         machine: ExecutionStateMachine,
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
+        retry_backoff: RetryBackoff,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
@@ -146,6 +148,7 @@ class Coordinator:
             machine=machine,
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
+            retry_backoff=retry_backoff,
             new_token=new_token,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -158,6 +161,7 @@ class Coordinator:
         *,
         max_attempts: int,
         agent_timeout_seconds: float,
+        retry_backoff: RetryBackoff,
         clock: Callable[[], datetime],
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
@@ -195,6 +199,7 @@ class Coordinator:
             machine=ExecutionStateMachine(max_attempts=min(max_attempts, MAX_ATTEMPTS)),
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
+            retry_backoff=retry_backoff,
             events=events,
             watch_interval_seconds=watch_interval_seconds,
         )

@@ -8,6 +8,7 @@ import hashlib
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -62,7 +63,7 @@ def drive(store: SQLiteExecutionStore, fence: Fence, execution_id: str) -> Execu
                                           now=at(1))  # fmt: skip
     store.create(execution, transition, fence=fence)
     for n, target in enumerate(PATHS[execution_id], 2):
-        extra: dict[str, str] = {}
+        extra: dict[str, Any] = {}
         ops: tuple[Operation, ...] = ()
         if target is S.RUNNING_AGENT:
             extra["base_revision"] = BASE
