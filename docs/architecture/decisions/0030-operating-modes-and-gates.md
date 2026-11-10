@@ -84,11 +84,19 @@ the higher mode's gate record.
 
 ### 5. What Mode 1 may work on
 
-The loop processes approved tasks of the configured repository. Gate 1 uses
-a dedicated test repository. MANIFEST §10 places work on Ilmar's own
-repository in M4. Pointing the loop at Ilmar's repository is therefore a
-separate maintainer decision after Gate 1, and ADR-0031's protected paths
-apply from the first such run.
+The loop processes approved tasks of the configured repository. Gate 1 and
+Mode 1 use a dedicated test repository (the maintainer's decision of
+2026-11-10).
+
+Ilmar's own repository is not a target until two things hold:
+
+- the appropriate M4 gate has passed (MANIFEST §10 places self-hosting in
+  M4);
+- the maintainer has separately approved it.
+
+Configuration validation refuses `self_repository` as the target in Mode 1.
+ADR-0031's protected paths and its CI rules apply to every target from the
+first run.
 
 ## Consequences
 
@@ -97,7 +105,7 @@ apply from the first such run.
   - three independent opt-ins;
   - lowering autonomy is always one step.
 - Bad:
-  - one more table (`gate_record`) and two commands;
+  - one more table (`gate_record`, schema 9, ADR-0029 §8) and two commands;
   - an operator must remember to revoke a record if the gate evidence is
     later found wrong.
 
@@ -109,11 +117,13 @@ apply from the first such run.
 - Two loops on one store: one owner.
 - The kill file between passes gives exit 78.
 - `autonomous` and `self-hosting` are refused by configuration validation.
+- Ilmar's own repository as the target in Mode 1 is refused by configuration
+  validation.
 - An architecture test: no code path inside the coordinator writes a gate
   record; only the CLI command does.
 
 ## Revisit when
 
-- Gate 1 has passed and the maintainer decides whether Mode 1 may target
-  Ilmar's own repository.
+- The M4 gate for self-hosting has passed and the maintainer considers
+  allowing Ilmar's own repository as a target.
 - ADR-0032 to ADR-0034 are proposed for Modes 2 and 3.

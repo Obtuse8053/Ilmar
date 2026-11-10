@@ -1,4 +1,4 @@
-# ADR-0031: Candidates that touch safety controls are never pushed
+# ADR-0031: Candidates that touch safety controls are never pushed; candidate code never runs with secrets
 
 - Status: Proposed
 - Date: 2026-11-10
@@ -79,19 +79,77 @@ It covers:
 - symbolic links whose target is protected;
 - `.gitattributes` and `.gitmodules`, wherever they are.
 
-### 3. The outcome
+### 3. The outcome: a blocked task
 
 If any protected path is touched:
 
-- the candidate and its evidence are kept;
-- nothing is pushed and no change request is opened;
-- the execution ends as FAILED with reason code `protected-path`, and an
-  event names the paths.
+- **Evidence:** the candidate and its evidence are kept, and an event names
+  the paths.
+- **No publication:** nothing is pushed and no change request is opened,
+  now or by recovery after a crash.
+- **Terminal:** the execution ends as FAILED with reason code
+  `protected-path`.
+- **Claimed and blocked:** the task keeps Ilmar's claim and is *blocked*.
+  It is never retried, never picked again and never published
+  automatically.
 
-#92 ensures that such a task is not attempted again automatically. It stays
-claimed and needs a maintainer to act.
+**Human resolution.** Only a maintainer resolves a blocked task. Two host
+commands do it, in the same shape as #59's quarantine commands:
 
-### 4. Nothing a candidate writes configures the factory
+- `ilmar blocked release <task>` releases the claim, for example after
+  applying the change by hand or rewording the issue, so the task may be
+  picked again;
+- `ilmar blocked abandon <task>` releases the claim and leaves the task
+  out of Ilmar's backlog.
+
+`ilmar blocked list` shows the blocked tasks with their paths and evidence.
+Both resolving commands are journaled tracker effects with fencing, like
+any other claim release (ADR-0026).
+
+**No starvation.** A blocked task holds a claim but no execution slot.
+Because its execution is terminal, it does not count against
+`max_concurrent_executions`. The pick skips blocked tasks explicitly and
+goes on to the next eligible task in the same pass, so any number of
+blocked tasks never stops the rest of the backlog. Each pass emits an event
+with the number of blocked tasks, so they stay visible.
+
+### 4. Candidate code never runs where secrets are
+
+Every candidate is untrusted code, not only those that touch protected
+paths. Pushing a branch to the target repository runs its workflows. In a
+pull request from a branch of the *same* repository, those workflows can
+receive the repository's secrets and a writable token. Before Ilmar pushes
+to a target repository, these must hold:
+
+- **No secrets for candidate code.** No workflow that a pushed branch or
+  its pull request triggers may receive secrets, other than a read-only
+  `GITHUB_TOKEN`. That includes same-repository pull requests.
+- **Read-only tokens.** Such workflows declare read-only `permissions`, and
+  the repository's default token permission is read-only.
+- **No privileged triggers on candidate code.** No `pull_request_target` or
+  `workflow_run` workflow checks out or runs candidate code. No workflow
+  with secrets runs on `push` to the branches Ilmar pushes.
+- **No shared caches.** Workflows that run candidate code share no cache or
+  artifact with a workflow that holds secrets, because a shared cache could
+  carry poisoned content into the privileged workflow.
+- **Manual privileged workflows run reviewed code only.** Workflows with
+  secrets that are started by hand (`workflow_dispatch`) run only a reviewed
+  commit on the default branch, as `live.yml` does today.
+
+How each is checked:
+
+- **Workflow files:** before every push, Ilmar inspects the target's
+  workflow files at the base commit. If it finds a violation it can read
+  from those files, it refuses to push.
+- **Settings:** the repository and organisation settings Ilmar cannot read
+  with its own token (secret scopes, the default token permission) are
+  attested by the operator. Gate 1 verifies them for the test repository.
+- **Ilmar's own repository:** its `ci.yml` already declares `contents: read`
+  and uses no secrets, and `live.yml` is `workflow_dispatch` only. These
+  rules are still checked again before the M4 gate that would allow Ilmar
+  to target this repository.
+
+### 5. Nothing a candidate writes configures the factory
 
 The following are read only from the running release and the operator's
 configuration, never from a candidate's tree:
@@ -105,7 +163,7 @@ configuration, never from a candidate's tree:
 An architecture test asserts that their loaders take no path inside a
 workspace or candidate.
 
-### 5. Promotion
+### 6. Promotion
 
 Promotion of an executable version is a human command in every mode
 (ADR-0034, to come). No configuration value enables automatic promotion.
@@ -133,6 +191,15 @@ Promotion of an executable version is a human command in every mode
   through configuration is rejected.
 - A crash between the check and publication: recovery never publishes a
   protected candidate.
+- A blocked task is never retried or re-picked. A backlog with blocked
+  tasks ahead of eligible ones still processes the eligible ones in the same
+  pass, with `max_concurrent_executions` at 1.
+- `ilmar blocked release` and `abandon` are fenced and crash-safe, and
+  `list` reports every blocked task.
+- The pre-push workflow inspection refuses each violation it can read from
+  workflow files: `pull_request_target` or `workflow_run` running candidate
+  code, secrets in workflows triggered by pushed branches, write
+  permissions, and caches shared with privileged workflows.
 
 ## Revisit when
 

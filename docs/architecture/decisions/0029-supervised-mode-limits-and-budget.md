@@ -58,7 +58,7 @@ All of these limits hold even if the budget is wrong:
 
 | Limit | Enforced by | Survives a coordinator crash |
 | --- | --- | --- |
-| `execution_wall_seconds` | The coordinator, as today, **and** a runtime-side lifetime set at container creation. Podman's container timeout is to be verified against [R21] in #90; failing that, a `timeout` wrapper as the container's entrypoint | Yes, from the runtime side |
+| `execution_wall_seconds` | The coordinator, as today, **and** Podman's `--timeout` set at container creation, which conmon (the per-container monitor, not the coordinator) enforces ([R21], to be confirmed in #90) | Yes, from the runtime side |
 | `stall_timeout_seconds` | The coordinator: no agent output for this long ends the attempt (#13) | No. The runtime lifetime covers it |
 | `max_turns` | Passed to the runner ([R15]) | Yes, it is the agent's own limit |
 | `max_attempts` | The existing attempt counter. A new attempt and owner token are created before the container starts (ADR-0021), so a crash consumes the attempt. The code cap of 3 stays | Yes |
@@ -67,6 +67,17 @@ All of these limits hold even if the budget is wrong:
 
 A recovered execution is never re-run under the same attempt (ADR-0021,
 ADR-0022). This ADR adds a test of that rule at every new step.
+
+**The runtime-side lifetime is required.**
+- **Podman.** The Podman adapter passes `--timeout` with
+  `execution_wall_seconds` plus a small grace period, so the coordinator's
+  own kill normally acts first.
+- **Proof.** A real-Podman crash test must show the container stops after
+  the coordinator process is killed, with no coordinator running.
+- **No fallback without approval.** If #90 finds that `--timeout` does not
+  hold on the supported Podman versions, Mode 1 stays disabled until a
+  replacement is approved. A `timeout` wrapper as the container's entrypoint
+  is the first candidate, but it needs that approval.
 
 ### 2. Accounting reservations
 
@@ -142,13 +153,33 @@ and `clock-anomaly`.
 
   The check runs on the container specification Ilmar builds, and is
   repeated in the contract tests for the runner.
-- **Spend-cap errors suspend.** A provider error that the Gate 1 drill
-  identifies as the spend-cap rejection suspends with `provider-cap` and is
-  never retried. So does any authorization or billing error the runner cannot
-  classify.
+- **Provider errors, fail closed.** According to Anthropic's documentation
+  (as cited by the maintainer; [R27]), a configured workspace spend limit
+  returns HTTP 400, and a usage-tier limit returns HTTP 429.
+
+  | Error | Handling |
+  | --- | --- |
+  | HTTP 400 identified as the workspace spend limit | Suspend with `provider-cap`; never retried |
+  | HTTP 429 that indicates a spend or usage limit | Suspend with `provider-cap`; never retried |
+  | HTTP 429 that is an ordinary rate limit | Transient: the attempt ends and backoff applies (#13). It counts as an attempt and keeps its reservation |
+  | Any authentication, authorization or billing error the runner cannot classify | Suspend; never retried |
+
+  Claude Code may retry inside its own run. Ilmar classifies only the final
+  outcome.
 - **Verified enforcement (Gate 1, #93).** The operator records the
-  workspace's limit. A drill against a scratch workspace with a minimal limit
-  must show both that the provider rejects calls and that Ilmar suspends.
+  workspace's limit. A drill against a scratch workspace with a minimal limit,
+  run through Claude Code, must establish:
+  - the exact status and error body Claude Code surfaces at the cap;
+  - that Ilmar suspends rather than retrying;
+  - how far spending went past the cap (below).
+- **Exact cost containment is not proven.** The provider's limit is the hard
+  limit in Mode 1. How precisely it is enforced is not yet known: requests
+  in flight when the limit is crossed, and any reporting lag, may let
+  spending pass it. Until the drill measures this, the residual exposure is
+  unknown. It is bounded only by concurrency 1, `max_turns`, the
+  runtime-side lifetime and the attempt limit. The Gate 1 evidence must
+  state the observed overshoot. If it is not acceptable to the maintainer,
+  `provider_cap_attested` is set below the real budget by that margin.
 
 ### 6. Fail closed
 
@@ -169,14 +200,21 @@ starts. The provider cap bounds anything forgotten.
 
 ### 8. Schema
 
-Schema 7 adds:
+Each issue that changes the store gets its own schema version, in roadmap
+order. Each migration runs forward from the version before it, and older
+code refuses a newer schema (ADR-0005):
 
-- `budget_ledger`;
-- `suspension`;
-- the clock high-water mark (ADR-0028);
-- `retry_not_before` (#13).
+| Schema | Issue | Adds |
+| --- | --- | --- |
+| 6 | #87 (ADR-0027) | Second instance-scoped journal kind |
+| 7 | #13 | `retry_not_before`; the clock high-water mark (ADR-0028) |
+| 8 | #18 | `budget_ledger`; `suspension` |
+| 9 | #91 | `gate_record` (ADR-0030) |
 
-Earlier schemas migrate forward; older code refuses schema 7 (ADR-0005).
+#90 (limits) and #92 (protected paths) need no schema change. If the order
+of the issues changes, the numbers follow the merge order: no two pull
+requests claim the same version, and each rebases its migration onto the
+version merged before it.
 
 ## Consequences
 
@@ -192,7 +230,9 @@ Earlier schemas migrate forward; older code refuses schema 7 (ADR-0005).
   - one execution can still cost more than its reservation. Only the
     provider cap bounds that in Mode 1. This is the reason for Mode 2's
     gateway;
-  - the runtime-side lifetime adds a Podman feature to verify ([R21]).
+  - the runtime-side lifetime adds a Podman feature to verify ([R21]);
+  - until the Gate 1 drill, how far spending can pass the provider's cap is
+    unknown.
 
 ## Tests required
 
@@ -212,8 +252,9 @@ Earlier schemas migrate forward; older code refuses schema 7 (ADR-0005).
 
 **Runtime limits:**
 
-- the coordinator killed during an agent run: the container still stops by
-  its runtime lifetime (real Podman, integration);
+- the coordinator process killed (`SIGKILL`) during an agent run: with no
+  coordinator running, the container stops by its `--timeout` (real Podman,
+  integration, required in CI);
 - stall;
 - `max_turns` reaches the runner.
 
@@ -222,7 +263,10 @@ Earlier schemas migrate forward; older code refuses schema 7 (ADR-0005).
 **Credential path:**
 
 - each forbidden variable, setting or mount refuses the start;
-- the spend-cap error suspends without a retry.
+- HTTP 400 at the workspace limit and a spend or usage HTTP 429 suspend
+  without a retry;
+- an ordinary rate-limit 429 backs off and counts as an attempt;
+- an unclassified authentication or billing error suspends.
 
 **Concurrency:** two loops on one store never admit beyond the allowance.
 

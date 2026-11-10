@@ -37,7 +37,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0028](0028-time-bounded-scheduling.md) | A persisted time may only delay new work | Proposed |
 | [0029](0029-supervised-mode-limits-and-budget.md) | Mode 1 limits, accounting reservations, suspension and one credential path | Proposed |
 | [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Proposed |
-| [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed | Proposed |
+| [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
