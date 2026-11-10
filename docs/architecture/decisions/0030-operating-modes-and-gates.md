@@ -1,6 +1,6 @@
 # ADR-0030: Operating modes, gate records and the supervised loop
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
 - Sources: none external · Findings: F-013
 - Depends on: ADR-0028, ADR-0029, ADR-0031

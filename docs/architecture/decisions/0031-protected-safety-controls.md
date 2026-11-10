@@ -1,6 +1,6 @@
 # ADR-0031: Candidates that touch safety controls are never pushed; candidate code never runs with secrets
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
 - Sources: none external · Findings: F-013
 - Depends on: ADR-0010, ADR-0018
@@ -103,6 +103,18 @@ commands do it, in the same shape as #59's quarantine commands:
   out of Ilmar's backlog.
 
 `ilmar blocked list` shows the blocked tasks with their paths and evidence.
+
+**A release really makes the task eligible again** (maintainer requirement
+at acceptance, 2026-11-10). Today the pick treats every task with a FAILED
+execution as finished for good (`Coordinator._pick`). Releasing only the
+tracker claim would therefore leave the task stuck. So `ilmar blocked
+release` also records a durable *human release* of that FAILED execution,
+in the same commit as its journaled claim release. The pick ignores released
+FAILED executions. Every other reason a task counts as finished still holds:
+an active execution, a published change request, an unreleased failure, or a
+cancellation that cannot be re-picked. The next attempt is a new execution
+with fresh reservations and limits. A regression test proves that a released
+task is picked again and that an unreleased FAILED task is not.
 Both resolving commands are journaled tracker effects with fencing, like
 any other claim release (ADR-0026).
 

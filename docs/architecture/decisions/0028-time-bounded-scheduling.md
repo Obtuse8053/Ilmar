@@ -1,6 +1,6 @@
 # ADR-0028: A persisted time may only delay new work
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
 - Sources: none external · Findings: F-002
 - Amends (by addition only; no accepted text is edited):
