@@ -1,6 +1,6 @@
 # ADR-0026: Tracker reconciliation: task standing, orphaned claims and tracker-driven cancellation
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-09
 - Sources: [R1], [R11], [R20] · Findings: F-001
 - Amends (by addition only; no accepted text is edited):
