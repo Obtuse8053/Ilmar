@@ -24,47 +24,54 @@ GitHub is right; fix this file in your next PR. See `docs/workflow.md`,
 
 ## Planned order (M3)
 
-Dependency order for M3 (MANIFEST §10: restart recovery, duplicate-work
-prevention, retries, cancellation, structured logs and execution limits).
-This plan is owned here; issues do not repeat it. Skip any step whose issue
-GitHub shows as finished.
+M3 now ends at Gate 1 of the autonomy roadmap (`autonomy-roadmap.md`,
+approved 2026-11-10): Ilmar running continuously under supervision, within
+MANIFEST §10's M3 scope (restart recovery, retries, cancellation, logs and
+execution limits). This plan is owned here; issues do not repeat it. Skip any
+step whose issue GitHub shows as finished.
 
 | Step | Issue | Depends on |
 | --- | --- | --- |
-| 1 | #15 Restart recovery: audit against ADR-0012, ADR-0020 and ADR-0022, with the missing tests | — |
-| 2 | #17 Structured event logging (ADR for the event schema, including stable reason codes such as `resource-ownership-conflict`) | — |
-| 3 | #16 Cancellation of running executions (ownership-verified, ADR-0012 rule 3) | #17 |
-| 4 | #12 Reconcile executions against tracker state every cycle, including orphaned-claim release (needs an ADR for the `TaskProvider` extension) | #16 |
-| 5 | #13 Retry backoff and stall detection (first schema migration) | #17 |
-| 6 | #18 Execution limits and budgets, including the F-019 gateway evaluation | #13, #16 |
-| 7 | #14 Attempt handoff and legible verification output | #13 |
-| 8 | #51 Stateful GitHub emulator over real git, with fault injection | can run in parallel; before #12 if possible |
-| 9 | #59 Human-controlled resolution of quarantined resources (ADR first; quarantine stays final for automation, ADR-0020) | #17; before #20 |
+| 1 | #87 Stray claim label sweep (ADR-0027) | — |
+| 2 | #89 ADRs 0028 to 0031: time-bounded scheduling, Mode 1 limits and budget, operating modes, protected safety controls | — |
+| 3 | #13 Retry backoff, stall and wall-clock kill | #89 |
+| 4 | #90 Execution limits and the single model-credential path | #89 |
+| 5 | #18 Reservation ledger, suspension and kill switch | #13, #90 |
+| 6 | #91 Loop mode with explicit opt-in and gate records | #18 |
+| 7 | #92 Protected safety controls | #89 |
+| 8 | #59 Human-controlled resolution of quarantined resources | — |
+| 9 | #93 Gate 1: supervised live run | all of the above |
+
+Critical path: #89, #13, #18, #91. Steps 1, 4, 7 and 8 run alongside it.
 
 Why this order:
-- Events come first, because cancellation, stall detection and budgets all
-  need to say what they did.
-- Cancellation comes before reconciliation, because a task that becomes
-  ineligible while running has to be cancelled.
-- Limits come last among the core items, because they build on backoff and
-  cancellation.
-- Quarantine resolution (#59) comes after events, so that a resolution can be
-  recorded as an event. It must exist before unattended operation (#20),
-  because a quarantined execution can otherwise never finish.
+- The ADRs come first, because the time rule (ADR-0028) is needed by
+  backoff and by budget days, and every later step implements one of the
+  four ADRs.
+- The ledger comes after backoff and limits, because it charges each
+  attempt that those steps create and bound.
+- Loop mode comes last, because it is the first caller that runs long
+  enough to need all of them.
+- Gate 1 runs on a dedicated test repository.
 
-Unattended operation stays disabled throughout M3. Enabling it is #20 (M4),
-which revisits ADR-0023.
+Unattended operation stays disabled until Gate 1 passes and the
+maintainer records it. M4 order (Modes 2 and 3) is in
+`autonomy-roadmap.md`.
 
 ## Recommended next task
 
-#12 (plan step 4): tracker reconciliation. **The implementation of
-ADR-0026 is merged** (#83). #12 closes only after its acceptance audit
-against ADR-0026. ADR-0027 (stray claim labels) is accepted (#84) and is
-being implemented as a separate pull request.
-
-After #12: #13 (retry backoff and stall detection, plan step 5).
+#89: the M3 ADR bundle (documentation only). #87's implementation is in
+review in #88.
 
 ## Change log
+
+- 2026-11-10: **Autonomy roadmap approved** (`autonomy-roadmap.md`).
+  M3 ends at Gate 1 (supervised autonomy); M4 holds Modes 2 and 3.
+  - **New issues:** #89 to #98.
+  - **#18** re-scoped to the reservation ledger, suspension and kill switch;
+    its gateway item moved to #94.
+  - **#14 and #51** moved out of M3.
+  - **#85** merged (ADR-0027 accepted).
 
 - 2026-11-10: **ADR-0027 accepted** (maintainer approval at `8ba90a9`, merged
   in #84 as `19f76b3`). Its implementation starts in a separate pull request.
