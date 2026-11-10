@@ -66,6 +66,10 @@ class InMemoryExecutionStore:
         with self._lock:
             return self._active(task)
 
+    def latest_update(self) -> datetime | None:
+        with self._lock:
+            return max((e.updated_at for e in self._executions.values()), default=None)
+
     def list_in_states(self, states: Collection[ExecutionState]) -> Sequence[Execution]:
         wanted = frozenset(states)
         with self._lock:
@@ -147,6 +151,7 @@ class InMemoryExecutionStore:
                 execution=self._executions.get,
                 operation=self._operations.get,
                 resource=self._resources.get,
+                latest_update=max((e.updated_at for e in self._executions.values()), default=None),
             )
             events = event_log.commit_events(
                 fence,

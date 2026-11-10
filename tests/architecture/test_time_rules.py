@@ -23,7 +23,7 @@ ALLOWED = {
         "adapters/sqlite.py",
     },
     # the due check: only the worker, before a new attempt
-    "retry_wait_reason": {"core/state_machine.py", "core/worker.py"},
+    "attempt_wait_reason": {"core/state_machine.py", "core/worker.py"},
 }
 
 

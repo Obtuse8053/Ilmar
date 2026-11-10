@@ -91,23 +91,27 @@ NO_BACKOFF = RetryBackoff(0.0, 0.0)
 """Retry at once. Tests only: configuration requires a positive base."""
 
 
-def retry_wait_reason(
-    execution: Execution, now: datetime, *, high_water: datetime | None
-) -> str | None:
-    """Why a new attempt of ``execution`` (in RETRY_WAIT) may not start at ``now``,
-    or ``None`` if it may.
-
-    Both the execution's ``retry_not_before`` and the store's high-water mark
-    (the latest persisted time) must lie in the past: a clock that stepped back
-    only makes the wait longer (ADR-0028 §3).
-    """
-    if execution.state is not _S.RETRY_WAIT:
-        raise ValueError(f"execution {execution.id} is not waiting to retry")
-    if high_water is not None and now < high_water:
+def clock_behind(now: datetime, latest_update: datetime | None) -> str | None:
+    """ADR-0028 §3: why new work may not start at ``now``, or ``None``. New work
+    is never timed before the latest persisted update; the store refuses it too."""
+    if latest_update is not None and now < latest_update:
         return (
             f"the clock ({now.isoformat()}) is behind the latest persisted time "
-            f"({high_water.isoformat()}); waiting for it to catch up"
+            f"({latest_update.isoformat()}); waiting for it to catch up"
         )
+    return None
+
+
+def attempt_wait_reason(
+    execution: Execution, now: datetime, *, latest_update: datetime | None
+) -> str | None:
+    """Why ``execution`` (CLAIMED or RETRY_WAIT) may not start an attempt at
+    ``now``, or ``None`` if it may: the clock must not be behind the latest
+    persisted time, and a retry must be past its ``retry_not_before``."""
+    if execution.state not in (_S.CLAIMED, _S.RETRY_WAIT):
+        raise ValueError(f"execution {execution.id} is not about to start an attempt")
+    if (behind := clock_behind(now, latest_update)) is not None:
+        return behind
     due = execution.retry_not_before
     if due is not None and now < due:
         return f"retry not before {due.isoformat()}"

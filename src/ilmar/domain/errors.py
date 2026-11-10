@@ -105,3 +105,9 @@ class AmbiguousOperationError(IlmarError):
 
 class LedgerIntegrityError(IlmarError):
     """The journal, the ledger or a frozen candidate is inconsistent; work stops (ADR-0020)."""
+
+
+class ClockBehindError(IlmarError):
+    """New work was refused because its time precedes the latest persisted update
+    (ADR-0028 §3): the wall clock stepped back. Nothing was written; wait for the
+    clock to catch up."""

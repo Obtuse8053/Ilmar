@@ -56,7 +56,7 @@ from ilmar.core.event_context import (
 )
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
-from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff
+from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, clock_behind
 from ilmar.core.verification import Verifier
 from ilmar.core.worker import (
     MAX_ATTEMPTS,
@@ -67,6 +67,7 @@ from ilmar.core.worker import (
 )
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
 from ilmar.domain.errors import (
+    ClockBehindError,
     ConflictError,
     FencingError,
     LedgerIntegrityError,
@@ -219,10 +220,15 @@ class Coordinator:
         released = self.release_orphaned_claims(results)
         cleared = self.clear_stray_labels(results)
         completed = self.follow_up_change_requests(results)
-        task = self._pick(not_now=cleared)
+        now = self._clock()
+        behind = clock_behind(now, self._store.latest_update())
+        task = self._pick(not_now=cleared) if behind is None else None
+        if behind is not None and self._pick(not_now=cleared) is not None:
+            # ADR-0028 §3: no new execution while the clock is behind the store.
+            results.append(WorkerResult("admission", Outcome.WAITING, behind))
         if task is not None:
             execution, transition = self._machine.start(
-                task.ref, execution_id=self._new_id(), now=self._clock()
+                task.ref, execution_id=self._new_id(), now=now
             )
             fence = self._effects.fence
             created, context = (
@@ -230,7 +236,12 @@ class Coordinator:
                 self._events.context(fence),
             )
             require_failure_codes(created, context)
-            self._store.commit(fence, created, context=context)
+            try:
+                self._store.commit(fence, created, context=context)
+            except ClockBehindError as refused:  # the store's own check: nothing written
+                results.append(WorkerResult("admission", Outcome.WAITING, str(refused)))
+                task = None
+        if task is not None:
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ilmar.domain.errors import (
+    ClockBehindError,
     ConcurrencyConflictError,
     ExecutionNotFoundError,
     FencingError,
@@ -81,6 +82,11 @@ class ExecutionStore(Protocol):
 
     def list_in_states(self, states: Collection[ExecutionState]) -> Sequence[Execution]:
         """Executions in any of ``states``, oldest first (ties broken by id)."""
+        ...
+
+    def latest_update(self) -> datetime | None:
+        """The latest ``updated_at`` of any execution: the high-water mark of
+        ADR-0028 §3. ``None`` for a store without executions."""
         ...
 
     def apply(
@@ -223,6 +229,25 @@ def check_fence(current: Fence | None, given: Fence | None) -> None:
         )
 
 
+def check_admissions(changes: Commit, latest_update: datetime | None) -> None:
+    """ADR-0028 §3, enforced where it is atomic: a commit that admits new work
+    (creates an execution, or starts an attempt by entering PROVISIONING) must not
+    be timed before the latest update already persisted. A clock that stepped
+    back therefore delays new work; it never lets any start. Recovery, which
+    never enters PROVISIONING, is unaffected."""
+    if latest_update is None:
+        return
+    admissions = [t for _, t in changes.created] + [
+        t for _, t in changes.applied if t.to_state is ExecutionState.PROVISIONING
+    ]
+    for transition in admissions:
+        if transition.at < latest_update:
+            raise ClockBehindError(
+                f"execution {transition.execution_id}: {transition.at.isoformat()} is before "
+                f"the latest persisted update {latest_update.isoformat()}"
+            )
+
+
 def check_commit(
     fence: Fence,
     changes: Commit,
@@ -230,13 +255,18 @@ def check_commit(
     execution: Callable[[str], Execution | None],
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
+    latest_update: datetime | None,
 ) -> None:
     """Validate a commit against the stored records (looked up through the callables).
 
-    Call inside the adapter's transaction, after :func:`check_fence`. Raises
+    Call inside the adapter's transaction, after :func:`check_fence`, with
+    ``latest_update`` read in that same transaction. Raises
     ``ConcurrencyConflictError`` for stale versions, ``LedgerIntegrityError``
-    for anything inconsistent, ``ValueError`` for malformed input.
+    for anything inconsistent, ``ClockBehindError`` for new work admitted at a
+    time before ``latest_update`` (ADR-0028 §3), ``ValueError`` for malformed
+    input.
     """
+    check_admissions(changes, latest_update)
     created = {e.id: e for e, _ in changes.created}
     applied = {e.id: e for e, _ in changes.applied}
     for e, t in changes.created:

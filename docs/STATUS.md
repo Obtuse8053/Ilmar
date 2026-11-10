@@ -72,7 +72,9 @@ following ADR-0028 and ADR-0029.
     the state machine refuses an earlier attempt, and a restart never shortens
     the wait.
   - **Clock:** a wall clock behind the latest persisted time waits
-    (ADR-0028 §3).
+    (ADR-0028 §3). This holds for every admission of new work: a new execution
+    and the start of any attempt. The store also refuses such a commit
+    (`ClockBehindError`).
   - **Not in this PR:** stall detection, which needs a decision on how
     progress is observed (ADR-0017).
 

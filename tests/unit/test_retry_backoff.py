@@ -19,12 +19,13 @@ from ilmar.core.state_machine import (
     NO_BACKOFF,
     ExecutionStateMachine,
     RetryBackoff,
-    retry_wait_reason,
+    attempt_wait_reason,
 )
 from ilmar.core.worker import Outcome
 from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.errors import InvalidTransitionError
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.ledger import Commit
 from ilmar.domain.tasks import TaskRef
 
 S = ExecutionState
@@ -106,22 +107,26 @@ def test_retry_not_before_never_lies_in_the_past() -> None:
 def test_due_needs_both_the_backoff_and_the_high_water_mark_behind_now() -> None:
     execution = waiting()
     due_at = T0 + timedelta(seconds=300)
-    early = retry_wait_reason(execution, due_at - timedelta(seconds=1), high_water=T0)
+    early = attempt_wait_reason(execution, due_at - timedelta(seconds=1), latest_update=T0)
     assert early == f"retry not before {due_at.isoformat()}"
-    assert retry_wait_reason(execution, due_at, high_water=T0) is None
+    assert attempt_wait_reason(execution, due_at, latest_update=T0) is None
     # The backoff is over, but the clock is behind a persisted time: wait.
-    behind = retry_wait_reason(execution, due_at, high_water=due_at + timedelta(seconds=5))
+    later = due_at + timedelta(seconds=5)
+    behind = attempt_wait_reason(execution, due_at, latest_update=later)
     assert behind is not None
     assert "behind the latest persisted time" in behind
     # A wait recorded before schema 7 has no time: due at once.
-    assert retry_wait_reason(waiting(not_before=None), T0, high_water=None) is None
+    assert attempt_wait_reason(waiting(not_before=None), T0, latest_update=None) is None
 
 
-def test_only_a_waiting_execution_has_a_due_time() -> None:
+def test_only_an_execution_about_to_start_an_attempt_is_asked() -> None:
     machine = ExecutionStateMachine(max_attempts=3)
     execution, _ = machine.start(TaskRef("fake", "1"), execution_id="e1", now=T0)
-    with pytest.raises(ValueError, match="not waiting to retry"):
-        retry_wait_reason(execution, T0, high_water=None)
+    with pytest.raises(ValueError, match="not about to start an attempt"):
+        attempt_wait_reason(execution, T0, latest_update=None)
+    claimed, _ = machine.advance(execution, S.CLAIMED, now=T0, reason="r")
+    assert attempt_wait_reason(claimed, T0, latest_update=T0) is None
+    assert attempt_wait_reason(claimed, T0, latest_update=T0 + timedelta(seconds=1)) is not None
 
 
 # -- the coordinator ---------------------------------------------------------------------
@@ -221,3 +226,69 @@ def test_a_cancellation_ends_a_waiting_execution_without_a_new_attempt(setup: Se
     assert execution is not None
     assert (execution.state, execution.retry_not_before) == (S.CANCELLED, None)
     assert setup.agent.runs == 1
+
+
+# -- ADR-0028 §3 for every admission of new work (review of #103) ------------------------
+
+
+def test_a_clock_behind_after_a_restart_starts_no_new_task(tmp_path: Path) -> None:
+    """Regression (maintainer review of #103): the clock rule held for retries but
+    not for new tasks. After a restart with the clock stepped back, an eligible
+    task must not start until the clock catches up."""
+    setup = make_setup(tmp_path, tasks=(task("1"), task("2")))
+    setup.agent.plan = [(AgentOutcome.COMPLETED, FIXED)]
+    setup.coordinator(retry_backoff=BACKOFF).run_once()  # task 1 runs and publishes
+    latest = setup.store.latest_update()
+    assert latest is not None
+    executions = setup.store.list_in_states(set(S))
+    assert [e.task.key for e in executions] == ["1"]
+
+    setup.clock.now = latest - timedelta(hours=2)  # a new process, clock stepped back
+    report = setup.coordinator(retry_backoff=BACKOFF).run_once()
+    assert [(r.execution_id, r.outcome) for r in report.results] == [("admission", Outcome.WAITING)]
+    assert "behind the latest persisted time" in report.results[0].detail
+    assert report.code == 0
+    assert setup.store.list_in_states(set(S)) == executions  # task 2 not started
+    assert setup.agent.runs == 1
+
+    setup.clock.now = latest  # the clock catches up
+    report = setup.coordinator(retry_backoff=BACKOFF).run_once()
+    assert [r.outcome for r in report.results] == [Outcome.PUBLISHED]
+    assert {e.task.key for e in setup.store.list_in_states({S.SUCCEEDED})} == {"1", "2"}
+
+
+class _CrashError(Exception):
+    """Ends a pass right after a commit, as a process crash would."""
+
+
+def test_a_claimed_execution_does_not_start_its_first_attempt_while_behind(
+    setup: Setup,
+) -> None:
+    """A crash right after the claim, then a restart with the clock stepped back:
+    the first attempt waits for the clock, as a retry would."""
+    from tracker_support import on_commit
+
+    def claimed(changes: Commit) -> bool:
+        return any(t.to_state is S.CLAIMED for _, t in changes.applied)
+
+    def crash() -> None:
+        raise _CrashError
+
+    on_commit(setup.store, claimed, crash)
+    # The pass isolates the unexpected error to this execution, as at a crash.
+    setup.coordinator(retry_backoff=BACKOFF).run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is S.CLAIMED
+
+    setup.clock.now = execution.updated_at - timedelta(minutes=10)
+    report = setup.coordinator(retry_backoff=BACKOFF).run_once()
+    assert [(r.execution_id, r.outcome) for r in report.results] == [("e1", Outcome.WAITING)]
+    assert setup.store.get("e1") == execution
+    assert setup.agent.runs == 0
+
+    setup.clock.now = execution.updated_at
+    setup.coordinator(retry_backoff=BACKOFF).run_once()
+    done = setup.store.get("e1")
+    assert done is not None
+    assert (done.state, done.attempt) == (S.SUCCEEDED, 1)

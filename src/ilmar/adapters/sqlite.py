@@ -478,6 +478,10 @@ class SQLiteExecutionStore:
             ).fetchone()
         return None if row is None else _execution_from_row(row)
 
+    def latest_update(self) -> datetime | None:
+        with self._reading() as conn:
+            return _latest_update(conn)
+
     def list_in_states(self, states: Collection[ExecutionState]) -> Sequence[Execution]:
         values = sorted({state.value for state in states})
         if not values:
@@ -620,6 +624,7 @@ class SQLiteExecutionStore:
                 execution=lambda key: _get_execution(conn, key),
                 operation=lambda key: _get_operation(conn, key),
                 resource=lambda key: _get_resource(conn, key),
+                latest_update=_latest_update(conn),
             )
             # Derived and paired against the stored rows, before any is written.
             events = event_log.commit_events(
@@ -905,6 +910,13 @@ def _event_lines(
             raise CorruptEventError(f"event row {seq} holds seq {event.seq}")
         lines.append(_text(line))
     return lines
+
+
+def _latest_update(conn: sqlite3.Connection) -> datetime | None:
+    """Every ``updated_at`` is stored as UTC with microseconds, so the text order
+    is the time order."""
+    (value,) = conn.execute("SELECT MAX(updated_at) FROM executions").fetchone()
+    return None if value is None else _decode_time(_text(value))
 
 
 def _list_executions(conn: sqlite3.Connection, states: Sequence[str]) -> tuple[Execution, ...]:

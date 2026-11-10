@@ -56,12 +56,13 @@ from ilmar.core.event_context import failure_code
 from ilmar.core.naming import branch_name, container_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
 from ilmar.core.safe_fs import directory_identity
-from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, retry_wait_reason
+from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, attempt_wait_reason
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import ChangeRequestSpec
 from ilmar.domain.errors import (
     AmbiguousOperationError,
     CandidateRejectedError,
+    ClockBehindError,
     ConcurrencyConflictError,
     ContainmentError,
     LeaseConflictError,
@@ -346,7 +347,14 @@ class _Run:
         Entering RETRY_WAIT records when the next attempt may start: the
         backoff after this attempt, from the same ``now`` as the transition."""
         current = self.current()
-        now = not_before(self.w.clock(), current.updated_at)
+        # Starting an attempt admits new work: its time is the clock's own, never
+        # raised to the execution's last update, so the store can refuse it if the
+        # clock stepped back (ADR-0028 §3). Every other move keeps time monotonic.
+        now = (
+            self.w.clock()
+            if target is S.PROVISIONING
+            else not_before(self.w.clock(), current.updated_at)
+        )
         retry_at = (
             self.w.retry_backoff.not_before(now, current.attempt)
             if target is S.RETRY_WAIT
@@ -393,6 +401,8 @@ class _Run:
                 return WorkerResult(self.id, Outcome.BLOCKED, blocked.reason)
             except _Waiting as waiting:
                 return WorkerResult(self.id, Outcome.WAITING, waiting.reason)
+            except ClockBehindError as behind:  # the store refused the attempt: nothing written
+                return WorkerResult(self.id, Outcome.WAITING, str(behind))
             except _DETERMINISTIC as error:
                 ended = self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
                 if ended is not None:
@@ -441,8 +451,7 @@ class _Run:
         if state is S.QUEUED:
             self.claim(execution)
         elif state in (S.CLAIMED, S.RETRY_WAIT):
-            if state is S.RETRY_WAIT:
-                self.wait_for_retry(execution)
+            self.wait_for_attempt(execution)
             self.cancel_point(tracker=True)  # before a new attempt (ADR-0026 §2)
             self.move(S.PROVISIONING, "provisioning a new attempt")
         elif state is S.PROVISIONING:
@@ -456,11 +465,13 @@ class _Run:
         else:  # pragma: no cover - every non-terminal state is handled above
             raise LedgerIntegrityError(f"unexpected state {state.value}")
 
-    def wait_for_retry(self, execution: Execution) -> None:
-        """End this run unless the backoff is over (ADR-0028). The clock is read
-        raw here: a wall clock behind the store's latest persisted time waits."""
-        high_water = max((e.updated_at for e in self.store.list_in_states(set(S))), default=None)
-        reason = retry_wait_reason(execution, self.w.clock(), high_water=high_water)
+    def wait_for_attempt(self, execution: Execution) -> None:
+        """End this run unless a new attempt may start now (ADR-0028): the clock is
+        not behind the latest persisted time, and a retry's backoff is over. The
+        store refuses the attempt otherwise, too (``ClockBehindError``)."""
+        reason = attempt_wait_reason(
+            execution, self.w.clock(), latest_update=self.store.latest_update()
+        )
         if reason is not None:
             raise _Waiting(reason)
 

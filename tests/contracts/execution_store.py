@@ -18,6 +18,7 @@ import pytest
 
 from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.domain.errors import (
+    ClockBehindError,
     ConcurrencyConflictError,
     DuplicateExecutionError,
     ExecutionNotFoundError,
@@ -989,6 +990,44 @@ class ExecutionStoreContract(FencingContract, EventLogContract):
         again = store.get("e1")
         assert again is not None
         assert (again.retry_not_before, again.attempt) == (None, 2)
+
+    def test_latest_update_is_the_high_water_mark(self, store: ExecutionStore) -> None:
+        assert store.latest_update() is None
+        fence = claimed(store)
+        first, created = MACHINE.start(TASK_A, execution_id="e1", now=at(5))
+        store.commit(fence, Commit(created=((first, created),)))
+        second, created = MACHINE.start(TASK_B, execution_id="e2", now=at(7))
+        store.commit(fence, Commit(created=((second, created),)))
+        claimed_first, step = MACHINE.advance(first, S.CLAIMED, now=at(9), reason="r")
+        store.commit(fence, Commit(applied=((claimed_first, step),)))
+        assert store.latest_update() == at(9)
+
+    def test_new_work_timed_before_the_latest_update_is_refused(
+        self, store: ExecutionStore
+    ) -> None:
+        """ADR-0028 §3, atomically in the store: neither a new execution nor the
+        start of an attempt may be timed before the latest persisted update."""
+        fence = claimed(store)
+        first, created = MACHINE.start(TASK_A, execution_id="e1", now=at(10))
+        store.commit(fence, Commit(created=((first, created),)))
+        early, created = MACHINE.start(TASK_B, execution_id="e2", now=at(9))
+        with pytest.raises(ClockBehindError, match="before the latest persisted update"):
+            store.commit(fence, Commit(created=((early, created),)))
+        assert store.get("e2") is None
+        on_time, created = MACHINE.start(TASK_B, execution_id="e2", now=at(10))
+        store.commit(fence, Commit(created=((on_time, created),)))  # equal is not before
+
+        claimed_e1, step = MACHINE.advance(first, S.CLAIMED, now=at(20), reason="r")
+        store.commit(fence, Commit(applied=((claimed_e1, step),)))
+        claimed_e2, step = MACHINE.advance(on_time, S.CLAIMED, now=at(11), reason="r")
+        store.commit(fence, Commit(applied=((claimed_e2, step),)))  # not an admission
+        started, step = MACHINE.advance(claimed_e2, S.PROVISIONING, now=at(12), reason="r")
+        with pytest.raises(ClockBehindError):
+            store.commit(fence, Commit(applied=((started, step),)))
+        assert store.get("e2") == claimed_e2
+        started, step = MACHINE.advance(claimed_e2, S.PROVISIONING, now=at(20), reason="r")
+        store.commit(fence, Commit(applied=((started, step),)))
+        assert store.get("e2") == started
 
     def test_evidence_is_appended_in_order_and_round_trips(self, store: ExecutionStore) -> None:
         _create(store, "e1", TASK_A, 0)
