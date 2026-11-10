@@ -65,6 +65,19 @@ following ADR-0028 and ADR-0029.
 
 ## Change log
 
+- 2026-11-10: **#13 retry backoff and durable scheduling submitted** (schema 7).
+  - **Backoff:** capped exponential, configured with
+    `[limits] retry_backoff_base_seconds` and `retry_backoff_max_seconds`.
+  - **Durable:** `retry_not_before` is stored with the move into RETRY_WAIT;
+    the state machine refuses an earlier attempt, and a restart never shortens
+    the wait.
+  - **Clock:** a wall clock behind the latest persisted time waits
+    (ADR-0028 §3). This holds for every admission of new work: a new execution
+    and the start of any attempt. The store also refuses such a commit
+    (`ClockBehindError`).
+  - **Not in this PR:** stall detection, which needs a decision on how
+    progress is observed (ADR-0017).
+
 - 2026-11-10: **ADR-0028 to ADR-0031 accepted** (#100); #87's
   implementation merged (#88). At acceptance, ADR-0031 gained one
   requirement: `ilmar blocked release` records a human release of the FAILED

@@ -8,6 +8,7 @@ import hashlib
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.core.state_machine import ExecutionStateMachine
@@ -58,33 +59,52 @@ def freeze(fence: Fence, execution_id: str) -> tuple[Operation, Operation]:
 
 
 def drive(store: SQLiteExecutionStore, fence: Fence, execution_id: str) -> Execution:
+    execution = begin(store, fence, execution_id)
+    for n in range(2, len(PATHS[execution_id]) + 2):
+        execution = advance_to(store, fence, execution, n)
+    return execution
+
+
+def begin(store: SQLiteExecutionStore, fence: Fence, execution_id: str) -> Execution:
     execution, transition = MACHINE.start(TaskRef("fake", execution_id), execution_id=execution_id,
                                           now=at(1))  # fmt: skip
     store.create(execution, transition, fence=fence)
-    for n, target in enumerate(PATHS[execution_id], 2):
-        extra: dict[str, str] = {}
-        ops: tuple[Operation, ...] = ()
-        if target is S.RUNNING_AGENT:
-            extra["base_revision"] = BASE
-        if target is S.VERIFYING:
-            extra["candidate_revision"] = CANDIDATE
-            first, done = freeze(fence, execution_id)
-            store.commit(fence, Commit(operations=(first,)))
-            ops = (done,)
-        if target in (S.FAILED, S.RETRY_WAIT):
-            extra["error"] = "gave up"
-        updated, step = MACHINE.advance(execution, target, now=at(n), reason="r", **extra)
-        store.commit(fence, Commit(applied=((updated, step),), operations=ops))
-        execution = updated
     return execution
+
+
+def advance_to(
+    store: SQLiteExecutionStore, fence: Fence, execution: Execution, n: int
+) -> Execution:
+    """Move ``execution`` to its ``n``-th state on its path, at ``at(n)``."""
+    target = PATHS[execution.id][n - 2]
+    extra: dict[str, Any] = {}
+    ops: tuple[Operation, ...] = ()
+    if target is S.RUNNING_AGENT:
+        extra["base_revision"] = BASE
+    if target is S.VERIFYING:
+        extra["candidate_revision"] = CANDIDATE
+        first, done = freeze(fence, execution.id)
+        store.commit(fence, Commit(operations=(first,)))
+        ops = (done,)
+    if target in (S.FAILED, S.RETRY_WAIT):
+        extra["error"] = "gave up"
+    updated, moved = MACHINE.advance(execution, target, now=at(n), reason="r", **extra)
+    store.commit(fence, Commit(applied=((updated, moved),), operations=ops))
+    return updated
 
 
 def populate(store: SQLiteExecutionStore) -> Fence:
     """What the previous schema holds after a crash (ADR-0024 §9)."""
     store.claim_instance("inst", now=at(0))
     fence = store.claim_instance("inst", now=at(0))  # a store owned before: epoch 2
-    for execution_id in PATHS:
-        drive(store, fence, execution_id)
+    # Step by step across all executions, so no execution is created or starts an
+    # attempt before a time already persisted (ADR-0028 §3). Each execution keeps
+    # exactly the times it had when driven one after another.
+    current = {execution_id: begin(store, fence, execution_id) for execution_id in PATHS}
+    for n in range(2, max(len(path) for path in PATHS.values()) + 2):
+        for execution_id, path in PATHS.items():
+            if len(path) >= n - 1:
+                current[execution_id] = advance_to(store, fence, current[execution_id], n)
     store.append_evidence(evidence_record("v", seconds=5), fence=fence)
     claim = Operation.intended(K.CLAIM_TASK, "ok", 1, fence=fence, now=at(2))
     store.commit(fence, Commit(operations=(claim,)))

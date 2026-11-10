@@ -36,7 +36,13 @@ from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import Commit, OperationStatus, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.ports import event_log
-from recovery_support import PREVIOUS_SCHEMA, to_previous_schema, to_schema_4, to_schema_5
+from recovery_support import (
+    PREVIOUS_SCHEMA,
+    to_previous_schema,
+    to_schema_4,
+    to_schema_5,
+    to_schema_6,
+)
 
 from contracts.execution_store import evidence_record
 from helpers import at
@@ -535,7 +541,7 @@ def test_a_covered_store_migrates_to_5_without_a_new_baseline(schema_4: Path) ->
         assert store.instance_operations() == ()  # readable before the migration
         fence = store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(schema_4) == SCHEMA_VERSION == 6
+    assert version(schema_4) == SCHEMA_VERSION == 7
     assert operation_rows(schema_4) == rows  # every row, byte for byte, in order
     assert event_rows(schema_4)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]  # no baseline
@@ -635,7 +641,7 @@ def test_a_covered_store_migrates_to_6_without_a_new_baseline(tmp_path: Path, st
     with SQLiteExecutionStore(path) as store:
         store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(path) == SCHEMA_VERSION == 6
+    assert version(path) == SCHEMA_VERSION == 7
     assert operation_rows(path) == rows
     assert event_rows(path)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]
@@ -692,7 +698,7 @@ def test_a_failed_migration_to_6_changes_nothing_and_is_replayed(
     monkeypatch.undo()
     with SQLiteExecutionStore(schema_5) as store:
         fence = store.claim_instance("inst", now=at(11))
-    assert version(schema_5) == 6
+    assert version(schema_5) == SCHEMA_VERSION
     assert fence.epoch == 3
     assert report(schema_5).exit_code == 0
 
@@ -704,3 +710,44 @@ def test_a_schema_5_store_refuses_fenced_writes_until_claimed(schema_5: Path) ->
         with pytest.raises(FencingError, match="not migrated"):
             store.commit(fence, Commit())
     assert version(schema_5) == 5
+
+
+# -- schema 7: retry_not_before (#13) -------------------------------------------------------
+
+
+def execution_rows(path: Path) -> list[tuple[object, ...]]:
+    with closing(sqlite3.connect(path)) as conn:
+        return conn.execute("SELECT * FROM executions ORDER BY id").fetchall()
+
+
+def test_a_schema_6_store_migrates_to_7_keeping_every_row(tmp_path: Path) -> None:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_6(path)
+    assert version(path) == 6
+    before, events = execution_rows(path), event_rows(path)
+    with SQLiteExecutionStore(path) as store:
+        store.claim_instance("inst", now=at(10))
+        waiting = store.list_in_states({S.RETRY_WAIT})
+    assert version(path) == SCHEMA_VERSION == 7
+    # Every row keeps its values; the new column is empty: an old wait is due at once.
+    assert [(*row, None) for row in before] == execution_rows(path)
+    assert event_rows(path)[: len(events)] == events
+    assert all(e.retry_not_before is None for e in waiting)
+    assert report(path).exit_code == 0
+
+
+def test_a_failed_migration_to_7_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_6(path)
+    before = dump(path)
+    monkeypatch.setitem(MIGRATIONS, 6, MIGRATIONS[6] + "\nSELECT no_such_function();\n")
+    with SQLiteExecutionStore(path) as store, pytest.raises(sqlite3.OperationalError):
+        store.claim_instance("inst", now=at(10))
+    assert dump(path) == before
+    assert version(path) == 6

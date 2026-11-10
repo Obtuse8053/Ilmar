@@ -14,6 +14,7 @@ from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import Coordinator
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import Ownership
+from ilmar.core.state_machine import NO_BACKOFF, RetryBackoff
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import RepositoryRef
 from ilmar.domain.tasks import Task, TaskRef
@@ -149,13 +150,18 @@ class Setup:
     ids: Iterator[str]
 
     def coordinator(
-        self, *, max_attempts: int = 3, watch_interval_seconds: float = 2.0
+        self,
+        *,
+        max_attempts: int = 3,
+        watch_interval_seconds: float = 2.0,
+        retry_backoff: RetryBackoff = NO_BACKOFF,
     ) -> Coordinator:
         return Coordinator.create(
             self.components,
             self.ownership,
             max_attempts=max_attempts,
             agent_timeout_seconds=60,
+            retry_backoff=retry_backoff,
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),

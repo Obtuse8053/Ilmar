@@ -518,7 +518,7 @@ def test_publishing_needs_the_latest_evidence_to_be_for_this_candidate(
 
 
 def test_attempts_beyond_three_are_refused_by_construction(setup: Setup) -> None:
-    from ilmar.core.state_machine import ExecutionStateMachine
+    from ilmar.core.state_machine import NO_BACKOFF, ExecutionStateMachine
     from ilmar.core.worker import ExecutionWorker
 
     coordinator = setup.coordinator(max_attempts=9)
@@ -531,6 +531,7 @@ def test_attempts_beyond_three_are_refused_by_construction(setup: Setup) -> None
             machine=ExecutionStateMachine(max_attempts=4),
             clock=setup.clock,
             agent_timeout_seconds=1,
+            retry_backoff=NO_BACKOFF,
         )
 
 

@@ -56,7 +56,7 @@ from ilmar.core.event_context import (
 )
 from ilmar.core.journal import Journal
 from ilmar.core.ownership import ExecutionLeases, Ownership
-from ilmar.core.state_machine import ExecutionStateMachine
+from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, clock_behind
 from ilmar.core.verification import Verifier
 from ilmar.core.worker import (
     MAX_ATTEMPTS,
@@ -67,6 +67,7 @@ from ilmar.core.worker import (
 )
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
 from ilmar.domain.errors import (
+    ClockBehindError,
     ConflictError,
     FencingError,
     LedgerIntegrityError,
@@ -106,6 +107,7 @@ _CODES = {
     Outcome.CANCELLED: ExitCode.SUCCESS,
     Outcome.FAILED: ExitCode.FAILURE,
     Outcome.BLOCKED: ExitCode.BLOCKED,
+    Outcome.WAITING: ExitCode.SUCCESS,
 }
 
 
@@ -127,6 +129,7 @@ class Coordinator:
         machine: ExecutionStateMachine,
         clock: Callable[[], datetime],
         agent_timeout_seconds: float,
+        retry_backoff: RetryBackoff,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
@@ -146,6 +149,7 @@ class Coordinator:
             machine=machine,
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
+            retry_backoff=retry_backoff,
             new_token=new_token,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -158,6 +162,7 @@ class Coordinator:
         *,
         max_attempts: int,
         agent_timeout_seconds: float,
+        retry_backoff: RetryBackoff,
         clock: Callable[[], datetime],
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
@@ -195,6 +200,7 @@ class Coordinator:
             machine=ExecutionStateMachine(max_attempts=min(max_attempts, MAX_ATTEMPTS)),
             clock=clock,
             agent_timeout_seconds=agent_timeout_seconds,
+            retry_backoff=retry_backoff,
             events=events,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -214,10 +220,15 @@ class Coordinator:
         released = self.release_orphaned_claims(results)
         cleared = self.clear_stray_labels(results)
         completed = self.follow_up_change_requests(results)
-        task = self._pick(not_now=cleared)
+        now = self._clock()
+        behind = clock_behind(now, self._store.latest_update())
+        task = self._pick(not_now=cleared) if behind is None else None
+        if behind is not None and self._pick(not_now=cleared) is not None:
+            # ADR-0028 §3: no new execution while the clock is behind the store.
+            results.append(WorkerResult("admission", Outcome.WAITING, behind))
         if task is not None:
             execution, transition = self._machine.start(
-                task.ref, execution_id=self._new_id(), now=self._clock()
+                task.ref, execution_id=self._new_id(), now=now
             )
             fence = self._effects.fence
             created, context = (
@@ -225,7 +236,12 @@ class Coordinator:
                 self._events.context(fence),
             )
             require_failure_codes(created, context)
-            self._store.commit(fence, created, context=context)
+            try:
+                self._store.commit(fence, created, context=context)
+            except ClockBehindError as refused:  # the store's own check: nothing written
+                results.append(WorkerResult("admission", Outcome.WAITING, str(refused)))
+                task = None
+        if task is not None:
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)

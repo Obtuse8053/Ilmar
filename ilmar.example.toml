@@ -21,6 +21,11 @@ instance_id = "default"
 max_attempts = 3
 max_concurrent_executions = 1
 agent_timeout_seconds = 3600
+# #13, ADR-0028: after a transient failure the next attempt waits
+# base * 2 ** (attempt - 1) seconds, at most the maximum. The wait is stored,
+# so a restart never shortens it.
+retry_backoff_base_seconds = 300
+retry_backoff_max_seconds = 21600
 
 [adapters.task_provider]
 kind = "github"

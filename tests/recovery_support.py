@@ -158,6 +158,16 @@ def line_problems(line: str) -> list[str]:
     return problems
 
 
+def to_schema_6(db: Path) -> None:
+    """The store exactly as schema 6 would have left it: no ``retry_not_before``
+    (before #13's migration, which only added that column)."""
+    with closing(sqlite3.connect(db)) as conn:
+        conn.executescript(
+            "BEGIN;\nALTER TABLE executions DROP COLUMN retry_not_before;\n"
+            "PRAGMA user_version = 6;\nCOMMIT;"
+        )
+
+
 def to_schema_4(db: Path) -> None:
     """The store exactly as schema 4 would have left it: every row and event, but an
     operation's execution still required (before ADR-0026's migration).
@@ -176,6 +186,7 @@ def to_schema_4(db: Path) -> None:
         )
     )
     assert "CHECK (execution_id" not in rebuild
+    to_schema_6(db)
     with closing(sqlite3.connect(db)) as conn:
         conn.executescript(f"BEGIN;\n{rebuild}\nPRAGMA user_version = 4;\nCOMMIT;")
 
@@ -183,6 +194,7 @@ def to_schema_4(db: Path) -> None:
 def to_schema_5(db: Path) -> None:
     """The store exactly as schema 5 would have left it: one instance-scoped kind
     (before ADR-0027's migration). Schema 6 only widened the check."""
+    to_schema_6(db)
     with closing(sqlite3.connect(db)) as conn:
         conn.executescript(f"BEGIN;\n{MIGRATIONS[4]}\nPRAGMA user_version = 5;\nCOMMIT;")
 
