@@ -57,15 +57,23 @@ which revisits ADR-0023.
 
 ## Recommended next task
 
-#12 (plan step 4): tracker reconciliation. **The implementation of the
-accepted ADR-0026 is in review** (the #12 pull request, stacked on #82). It
-must not be merged without the maintainer's approval; #12 closes only after
-its acceptance audit against ADR-0026.
+#12 (plan step 4): tracker reconciliation. **The implementation of
+ADR-0026 is merged** (#83). #12 closes only after its acceptance audit
+against ADR-0026. ADR-0027 (stray claim labels, #84) is proposed as a
+follow-up and is not implemented before approval.
 
 After #12: #13 (retry backoff and stall detection, plan step 5).
 
 ## Change log
 
+- 2026-11-10: **ADR-0027 proposed** (documentation only): a sweep for
+  Ilmar's claim label left with no claim behind it, and two clarifications to
+  ADR-0026 (no tracker read while a cancellation is pending; deleted and
+  transferred tasks). It follows the #12 implementation (#83) as a separate
+  change and is not implemented before approval.
+- 2026-11-10: **#12 implementation merged** in #83 (merge commit
+  `3f7c682`, approved head `a5cf89c`, all five checks green). #12 stays
+  open until its acceptance audit.
 - 2026-11-09: **#12 implementation submitted** (ADR-0026), stacked on #82:
   - **Store and journal:** schema 5 makes an operation's execution optional
     for the one instance-scoped kind, `release-orphan-claim`; the journal
