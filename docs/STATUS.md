@@ -60,10 +60,15 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#89: the M3 ADR bundle (documentation only), in review in #100. After the
-maintainer approves it: #13 (retry backoff, stall and wall-clock kill).
+#13: retry backoff, stall detection and durable scheduling (schema 7),
+following ADR-0028 and ADR-0029.
 
 ## Change log
+
+- 2026-11-10: **ADR-0028 to ADR-0031 accepted** (#100); #87's
+  implementation merged (#88). At acceptance, ADR-0031 gained one
+  requirement: `ilmar blocked release` records a human release of the FAILED
+  execution, so the task becomes eligible again (tested in #92).
 
 - 2026-11-10: **Autonomy roadmap approved** (`autonomy-roadmap.md`).
   M3 ends at Gate 1 (supervised autonomy); M4 holds Modes 2 and 3.

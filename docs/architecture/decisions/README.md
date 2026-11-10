@@ -34,10 +34,10 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0025](0025-cancellation.md) | Cancellation through a request inbox, applied by the lease holder at safe points | Accepted |
 | [0026](0026-tracker-reconciliation.md) | Tracker reconciliation: task standing, orphaned claims and tracker-driven cancellation | Accepted |
 | [0027](0027-stray-claim-labels.md) | Stray claim labels, and two clarifications to ADR-0026 | Accepted |
-| [0028](0028-time-bounded-scheduling.md) | A persisted time may only delay new work | Proposed |
-| [0029](0029-supervised-mode-limits-and-budget.md) | Mode 1 limits, accounting reservations, suspension and one credential path | Proposed |
-| [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Proposed |
-| [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Proposed |
+| [0028](0028-time-bounded-scheduling.md) | A persisted time may only delay new work | Accepted |
+| [0029](0029-supervised-mode-limits-and-budget.md) | Mode 1 limits, accounting reservations, suspension and one credential path | Accepted |
+| [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Accepted |
+| [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Accepted |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

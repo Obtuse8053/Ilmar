@@ -1,6 +1,6 @@
 # ADR-0029: Mode 1 limits, accounting reservations, suspension and one credential path
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
 - Sources: [R14], [R15], [R21], [R27] · Findings: F-002, F-019
 - Depends on: ADR-0028 (time), ADR-0030 (modes)
