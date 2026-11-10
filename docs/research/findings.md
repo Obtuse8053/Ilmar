@@ -243,7 +243,7 @@ Entries are paraphrased. Never paste source text here (MANIFEST §7).
   revocable tokens. That would remove ADR-0006's model-key exception and
   provide cost metering.
 - Recommendation: evaluate with execution budgets in M3. Not needed for M2.
-- Status: open (criterion added to #18) · Affects: ADR-0006, ADR-0011
+- Status: open (evaluation in #94, Mode 2 of the autonomy roadmap) · Affects: ADR-0006, ADR-0011
 
 ### F-020: Enforce egress outside the sandbox rather than with an in-container firewall
 
