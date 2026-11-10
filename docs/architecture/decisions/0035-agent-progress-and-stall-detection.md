@@ -8,8 +8,12 @@
   - **ADR-0014:** a command's inactivity timeout and bounded output capture.
   - **ADR-0029 §1:** what "agent output" means for the stall limit.
 - Decided by the maintainer on 2026-11-10: Option A, stream events with a
-  900-second default. Amended in review the same day: every event is
-  validated incrementally, including any a capture would drop.
+  900-second default. Amended in review the same day:
+  - every event is validated incrementally, including any a capture would
+    drop;
+  - verified telemetry events (such as `rate_limit_event`, which Claude Code
+    can emit even after the result) are recognised, never count as progress,
+    and only they may follow the result.
 
 ## Context and problem
 
@@ -31,8 +35,9 @@ Today:
 ## Considered options
 
 1. **`--output-format stream-json --verbose`.** Claude Code writes one JSON
-   object per line as the run progresses, and the last line is the result
-   object ([R15]). **Chosen.**
+   object per line as the run progresses and ends with one result object
+   ([R15]). Telemetry such as `rate_limit_event` can follow the result, as
+   the maintainer observed. **Chosen.**
 2. *CPU progress of the container* (for example `podman stats`). Rejected:
    - a busy loop counts as progress, and a wait on the network does not;
    - it needs polling a second interface;
@@ -55,26 +60,54 @@ ADR-0017's command changes in one place only: `--output-format json` becomes
 - `--max-turns`;
 - the per-command environment, the version pin and the network policy.
 
-### 2. Progress is a validated event
+### 2. Three kinds of event, and only one is progress
 
-A **progress event** is one complete line on the agent command's standard
-output that is:
+Every complete line on the agent command's standard output must be at most
+`MAX_EVENT_BYTES` (1 MiB), valid JSON, and a JSON object whose `type` is in
+one of three closed classes:
 
-- at most `MAX_EVENT_BYTES` (1 MiB) long;
-- valid JSON;
-- a JSON object whose `type` is one of the documented top-level types:
-  `system`, `assistant`, `user` or `result`.
+| Class | Types | Progress? | Allowed after the result? |
+| --- | --- | --- | --- |
+| **Agent activity** | `assistant`, `user`, and `system` except the telemetry subtypes below | **Yes** | No |
+| **Result** | `result` | Yes | Exactly one, and nothing of the agent-activity class after it |
+| **Telemetry** | `rate_limit_event`; `system` with subtype `api_retry` | **No** | Only the types marked as such in the verified list |
 
-Nothing else counts:
+**Telemetry never counts as progress.** A run that only emits telemetry,
+for example while Claude Code waits on rate limits or retries a failing API,
+does not restart the inactivity timer. Such a run is ended as `STALLED` when
+the timeout passes.
 
-- standard error;
-- non-JSON lines;
-- JSON with an unknown or missing `type`;
-- over-long lines;
-- partial lines.
+**The verified list.** The telemetry types live in one constant, the
+**verified list**, in the Claude Code adapter. It sits next to the pinned
+version (`expected_version`, ADR-0017). Each entry records:
 
-The check is structural only. The coordinator never acts on an event's
-content.
+- the type, and the subtype where one applies;
+- whether it may appear after the result;
+- the Claude Code version on which it was observed.
+
+The initial entries:
+
+| Entry | After the result | Basis |
+| --- | --- | --- |
+| `rate_limit_event` | Allowed | Observed by the maintainer, including after the result |
+| `system` / `api_retry` | **Not** allowed | Documented in [R15]; not observed after the result |
+
+**Adding an entry, or allowing one after the result,** needs three things:
+
+- a recorded, redacted sample from the pinned version, kept as a test
+  fixture;
+- the opt-in live test passing on that version;
+- maintainer review.
+
+Nothing is allowed by pattern or by default. A type that is not in a class
+is a violation.
+
+**Validation is structural only.** The coordinator never acts on an event's
+content. It reads only `type` and, for `system` and `result`, `subtype`. The
+result's documented fields (§5) are the one exception.
+
+Nothing else is an event: standard error, non-JSON lines, objects without a
+known `type`, over-long lines and partial lines.
 
 ### 3. The inactivity timeout
 
@@ -111,7 +144,7 @@ falls in a region a capture would drop.
   line passes that size, its further bytes are counted and discarded, never
   buffered, and the line is a violation;
 - the result object's line, once seen (at most `MAX_EVENT_BYTES`);
-- counters: lines, events and bytes;
+- counters: lines, events, telemetry lines after the result, and bytes;
 - the first violation, as a kind and a line number. It never holds the
   violating line's content.
 
@@ -123,10 +156,10 @@ the stream:
 
 | Violation | When |
 | --- | --- |
-| `malformed-event` | A line that is not valid JSON, is not an object, or has a missing or undocumented `type`. Empty lines count. |
+| `malformed-event` | A line that is not valid JSON, is not an object, or has a `type` (or `system` subtype) in none of the classes of §2. Empty lines count. |
 | `oversized-line` | A line longer than `MAX_EVENT_BYTES`, detected while it is being read |
 | `duplicate-result` | A second `result` object |
-| `data-after-result` | Any further line after the `result` object |
+| `data-after-result` | After the `result` object: any line that is not telemetry allowed after the result, or more than `MAX_TRAILING_TELEMETRY` (32) such lines |
 | `unterminated-line` | Bytes after the last newline at the end of the stream |
 | `missing-result` | The stream ended without a `result` object |
 
@@ -139,9 +172,13 @@ middle of the stream fails the run even when the final result is valid. The
 failure is not retried: an agent that breaks its documented output format
 needs a human (for example a version mismatch).
 
-**Progress.** A complete line that passes validation is a progress event
-(§2) and restarts the inactivity timer. A violation never counts as
-progress.
+**Progress.** A complete line of the agent-activity or result class
+restarts the inactivity timer. A valid telemetry line is accepted but
+restarts nothing. A violation never counts as progress.
+
+**Bounded state is unchanged.** Telemetry lines are validated and then
+discarded like any other event. The only extra state is one counter of
+telemetry lines after the result, bounded by `MAX_TRAILING_TELEMETRY`.
 
 **Standard error** is not validated. It keeps a bounded capture of its first
 256 KiB and last 64 KiB, used only for the redacted one-line diagnostic of a
@@ -150,7 +187,8 @@ failed run, as today.
 ### 5. The outcome comes from the validator
 
 - **Success** needs a stream that ended with no violation and exactly one
-  result object, which was the last line. F-021 is unchanged: `COMPLETED`
+  result object. After it there may be only telemetry allowed after the
+  result, at most `MAX_TRAILING_TELEMETRY` lines. F-021 is unchanged: `COMPLETED`
   also needs exit status 0, `subtype == "success"` and `is_error == false`.
 - **Fields.** Only the result object's documented fields are read. Its cost
   and usage figures are untrusted (ADR-0029 §2) and are recorded only as
@@ -238,11 +276,27 @@ These are shared by every adapter and tested in the contract suites:
     followed by a valid result: `oversized-line`, while the validator never
     holds more than `MAX_EVENT_BYTES` of it;
   - a second result object: `duplicate-result`;
-  - any line after the result: `data-after-result`;
+  - agent activity after the result (`assistant`, `user`, a non-telemetry
+    `system` subtype), and `system/api_retry` after the result:
+    `data-after-result`;
+  - more than `MAX_TRAILING_TELEMETRY` telemetry lines after the result:
+    `data-after-result`;
   - a final line without a newline: `unterminated-line`;
   - no result at all: `missing-result`;
   - the first violation stops the command at once (no further spending), and
     a later valid result does not change the outcome.
+- **Telemetry:**
+  - `rate_limit_event` before the result, between agent events and after the
+    result: accepted, and the run completes;
+  - a stream of only telemetry (rate limits, API retries) for longer than the
+    timeout: `STALLED`, because telemetry never restarts the timer;
+  - an unknown type, such as an undocumented telemetry-like name, before or
+    after the result: `malformed-event`, failing closed;
+  - the verified list matches the fixture recorded from the pinned Claude
+    Code version: every type the fixture contains is classified, and the
+    fixture replays to `COMPLETED`.
+  - The opt-in live test fails if the real pinned version emits a type, or a
+    type after the result, that the verified list does not allow.
 - **Chunking:** any split of the same stream into chunks, down to one byte,
   across UTF-8 sequences and JSON tokens, gives the same verdicts and line
   numbers.
@@ -267,13 +321,16 @@ These are shared by every adapter and tested in the contract suites:
   absence of retained standard output, for the fake and for Podman. The `AgentRunner`
   contract covers `STALLED`.
 - **Live:** the opt-in live test runs real Claude Code with `stream-json`. It
-  checks that the documented event types arrive and that the last line is the
-  result object.
+  checks that every event's type is classified by §2, that exactly one result
+  arrives, and that only allowed telemetry follows it. The redacted type
+  sequence it records becomes the fixture for the pinned version.
 
 ## Revisit when
 
 - Claude Code documents a heartbeat or progress event for long tool calls.
   That could allow a shorter default.
-- Its stream format changes in a way the live test reports.
+- Its stream format changes in a way the live test reports, including a new
+  telemetry type or a telemetry type appearing after the result. The
+  verified list is then updated through the process of §2.
 - A second agent runner is added. Its progress signal then needs its own
   definition under this port.
