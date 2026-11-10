@@ -60,10 +60,19 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#13: retry backoff, stall detection and durable scheduling (schema 7),
-following ADR-0028 and ADR-0029.
+#13, second part: stall detection (ADR-0035). Backoff and durable
+scheduling are merged (#103).
 
 ## Change log
+
+- 2026-11-10: **#13 backoff merged** (#103). **ADR-0035 accepted** (#104):
+  stall detection through stream events. Corrections at acceptance:
+  - the post-result `rate_limit_event` is cited from upstream issue R28;
+  - the stream-json runner may not run above manual until a pinned-version
+    live test is recorded.
+
+  Stall detection is next; #13 stays open until it is implemented and
+  audited.
 
 - 2026-11-10: **#13 retry backoff and durable scheduling submitted** (schema 7).
   - **Backoff:** capped exponential, configured with
