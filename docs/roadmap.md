@@ -14,6 +14,10 @@ milestones to their GitHub pages and approved research improvements to issues.
 - [M6 Public stability](https://github.com/Obtuse8053/Ilmar/milestone/6)
 - [Maintenance (no milestone)](https://github.com/Obtuse8053/Ilmar/issues?q=is%3Aopen+no%3Amilestone)
 
+M3 and M4 follow the autonomy roadmap in `autonomy-roadmap.md` (approved
+2026-11-10): three gated operating modes, from supervised autonomy (M3) to
+controlled self-hosting (M4).
+
 Epics (`type:epic`) are split into issues when their milestone starts (see
 `workflow.md`, "Milestone close-out").
 
