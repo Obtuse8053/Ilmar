@@ -114,6 +114,24 @@ def test_container_spec_rejects_invalid_names(tmp_path: Path, name: str) -> None
         )
 
 
+@pytest.mark.parametrize("lifetime", [0.0, -1.0, float("inf"), float("nan")])
+def test_container_spec_rejects_an_unusable_lifetime(tmp_path: Path, lifetime: float) -> None:
+    with pytest.raises(ValueError, match="lifetime_seconds"):
+        ContainerSpec(
+            image="img", host_workspace=tmp_path, name="ilmar-e-1", owner=OWNER,
+            workspace_identity=IDENT, lifetime_seconds=lifetime,
+        )  # fmt: skip
+
+
+def test_container_spec_lifetime_defaults_to_none_and_accepts_a_positive_value(
+    tmp_path: Path,
+) -> None:
+    base = {"image": "img", "host_workspace": tmp_path, "name": "ilmar-e-1", "owner": OWNER,
+            "workspace_identity": IDENT}  # fmt: skip
+    assert ContainerSpec(**base).lifetime_seconds is None  # type: ignore[arg-type]
+    assert ContainerSpec(**base, lifetime_seconds=0.5).lifetime_seconds == 0.5  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("instance", "execution", "attempt", "token"),
     [("", "e", 1, "t"), ("i", "", 1, "t"), ("i", "e", 0, "t"), ("i", "e", 1, "")],

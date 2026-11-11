@@ -258,3 +258,41 @@ def test_stall_timeout_default_and_values() -> None:
     assert parse_config(data, base_dir=BASE).limits.stall_timeout_seconds == 600.0
     data["limits"] = {"agent_timeout_seconds": 600, "stall_timeout_seconds": 2.5}
     assert parse_config(data, base_dir=BASE).limits.stall_timeout_seconds == 2.5
+
+
+def test_execution_wall_default_follows_the_agent_timeout() -> None:
+    """#90, ADR-0029 §1: unset, it is the agent timeout plus 600 seconds."""
+    assert parse_config(minimal(), base_dir=BASE).limits.execution_wall_seconds == 4200.0
+    data = copy.deepcopy(minimal())
+    data["limits"] = {"agent_timeout_seconds": 7200}
+    assert parse_config(data, base_dir=BASE).limits.execution_wall_seconds == 7800.0
+    data["limits"] = {
+        "agent_timeout_seconds": 600,
+        "stall_timeout_seconds": 300,
+        "execution_wall_seconds": 600,
+    }
+    assert parse_config(data, base_dir=BASE).limits.execution_wall_seconds == 600.0
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"execution_wall_seconds": 0}, "execution_wall"),
+        ({"execution_wall_seconds": True}, "execution_wall"),
+        ({"execution_wall_seconds": "1h"}, "execution_wall"),
+        ({"execution_wall_seconds": float("inf")}, "execution_wall"),
+        (
+            {
+                "agent_timeout_seconds": 600,
+                "stall_timeout_seconds": 300,
+                "execution_wall_seconds": 599,
+            },
+            "not be less than",
+        ),
+    ],
+)
+def test_invalid_execution_wall_is_rejected(limits: dict[str, Any], message: str) -> None:
+    data = copy.deepcopy(minimal())
+    data["limits"] = limits
+    with pytest.raises(ConfigError, match=message):
+        parse_config(data, base_dir=BASE)

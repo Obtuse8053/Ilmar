@@ -48,6 +48,7 @@ import contextlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -457,6 +458,15 @@ class EgressSettings:
         object.__setattr__(self, "extra_hosts", pinned)
 
 
+def _lifetime_arguments(spec: ContainerSpec) -> list[str]:
+    """``--timeout``: conmon, the per-container monitor, kills the container this
+    many seconds after it starts, whether or not Ilmar is still running
+    (ADR-0029 §1, [R21]). Rounded up to whole seconds."""
+    if spec.lifetime_seconds is None:
+        return []
+    return [f"--timeout={math.ceil(spec.lifetime_seconds)}"]
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxProfile:
     """Deployment settings of the ADR-0011 profile that ``ContainerSpec`` leaves open."""
@@ -789,6 +799,7 @@ class PodmanRuntime:
             args += ["--cpus", f"{limits.cpus:g}"]
         if profile.init:
             args.append("--init")
+        args += _lifetime_arguments(spec)
         for key, value in (_owner_labels(spec.owner) | {LABEL_ROLE: ROLE_SANDBOX}).items():
             args += ["--label", f"{key}={value}"]
         return [*args, spec.image, *profile.keepalive]
@@ -992,6 +1003,7 @@ class PodmanRuntime:
             "256m",
             "--log-driver=k8s-file",
             "--init",
+            *_lifetime_arguments(spec),  # the proxy never outlives its sandbox
         ]
         for host, address in sorted(settings.extra_hosts.items()):
             args += ["--add-host", f"{host}:{address}"]

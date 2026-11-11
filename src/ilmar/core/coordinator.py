@@ -55,6 +55,7 @@ from ilmar.core.event_context import (
     require_failure_codes,
 )
 from ilmar.core.journal import Journal
+from ilmar.core.lifetimes import agent_sandbox_lifetime, execution_wall
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, clock_behind
 from ilmar.core.verification import Verifier
@@ -167,6 +168,7 @@ class Coordinator:
         retry_backoff: RetryBackoff,
         clock: Callable[[], datetime],
         stall_timeout_seconds: float | None = None,
+        execution_wall_seconds: float | None = None,
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
         new_pass_id: Callable[[], str] = new_pass_id,
@@ -175,7 +177,14 @@ class Coordinator:
         """Wire the journal, the fenced Verifier and the effects for ``components``.
 
         Every persisted timestamp comes from one non-decreasing clock (ADR-0022).
+
+        Every agent sandbox gets a finite, runtime-enforced lifetime (ADR-0029
+        §1): ``execution_wall_seconds`` plus a grace period. The wall time must
+        be at least ``agent_timeout_seconds``; omitted, it is derived from it.
         """
+        lifetime = agent_sandbox_lifetime(
+            execution_wall(agent_timeout_seconds, execution_wall_seconds)
+        )
         clock = NonDecreasingClock(clock)
         events = PassEvents(clock=clock, new_id=new_pass_id)  # one per process, a pass id per pass
         journal = Journal(
@@ -196,7 +205,13 @@ class Coordinator:
             fence=ownership.fence,
             events=events,
         )
-        effects = Effects(components=components, journal=journal, verifier=verifier, clock=clock)
+        effects = Effects(
+            components=components,
+            journal=journal,
+            verifier=verifier,
+            clock=clock,
+            sandbox_lifetime_seconds=lifetime,
+        )
         coordinator = cls(
             components=components,
             effects=effects,

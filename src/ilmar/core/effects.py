@@ -25,6 +25,7 @@ rebuilt from journal text in #11b. A replay that would need one raises
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -183,11 +184,16 @@ class Effects:
         journal: Journal,
         verifier: Verifier,
         clock: Callable[[], datetime],
+        sandbox_lifetime_seconds: float,
     ) -> None:
+        if not (math.isfinite(sandbox_lifetime_seconds) and sandbox_lifetime_seconds > 0):
+            # ADR-0029 §1: no agent sandbox may start without a runtime-side lifetime.
+            raise ValueError("an agent sandbox needs a positive, finite lifetime")
         self._c = components
         self._journal = journal
         self._verifier = verifier
         self._clock = clock
+        self._sandbox_lifetime = sandbox_lifetime_seconds
 
     @property
     def fence(self) -> Fence:
@@ -502,6 +508,7 @@ class Effects:
                 network=sandbox.network,
                 allowed_hosts=sandbox.allowed_hosts,
                 limits=sandbox.limits,
+                lifetime_seconds=self._sandbox_lifetime,
             )
             handle = runtime.start(spec)
             return {"id": handle.id, "name": handle.name, "runtime": handle.runtime}
