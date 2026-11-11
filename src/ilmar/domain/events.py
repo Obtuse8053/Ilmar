@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, NoReturn
 
+from ilmar.domain.budget import SuspensionReason
 from ilmar.domain.errors import (
     CandidateRejectedError,
     ContainmentError,
@@ -125,6 +126,16 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "orphaned-claim": "A claim of this instance that no execution record backs.",
         "stray-label": "Ilmar's claim label with no claim and no execution behind it.",
         "claim-changed": "A claim object changed: it is no longer this instance's authentic claim.",
+        # Accounting reservations and suspension (ADR-0029 §2 and §3, #18).
+        "budget-reserved": "An attempt's accounting reservation was charged as it started.",
+        "budget-daily": "Starting another attempt would exceed the daily allowance.",
+        "budget-monthly": "Starting another attempt would exceed the monthly allowance.",
+        "provider-cap": "The model provider refused for its spend limit, billing or "
+        "authentication.",
+        "kill-switch": "The kill-switch file exists.",
+        "operator-suspended": "An operator suspended new work.",
+        "clock-anomaly": "The clock is behind the latest persisted time.",
+        "operator-resumed": "An operator resumed new work after its cause was gone.",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
 )
@@ -259,6 +270,8 @@ _REQUEST_ID = re.compile(r"^q-[0-9a-f]{32}$")  # a cancellation request (ADR-002
 CANCEL_DECISIONS = frozenset({"accepted", "too-late", "already-terminal", "duplicate"})
 CLAIM_LOST_STATES = frozenset({"observed", "cleared"})  # ADR-0026 §3a
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")  # a tracker's claim id
+_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # a UTC budget day (ADR-0029 §2)
+_MONTH = re.compile(r"^\d{4}-\d{2}$")  # a UTC budget month
 _OPERATION_KEY = re.compile(r"^[a-z-]+:[A-Za-z0-9][A-Za-z0-9_-]{0,63}:[1-9][0-9]{0,5}"
                             r"(:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127})?$")  # fmt: skip
 _TASK = re.compile(r"^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._/#-]{1,200}$")
@@ -323,6 +336,7 @@ OBSERVATIONS: Mapping[str, str] = MappingProxyType(
     }
 )
 _POSITIVE = _integer(1)
+SUSPENSION_REASONS = tuple(r.value for r in SuspensionReason)
 
 _MESSAGE_PARAM_VALUES: Mapping[str, frozenset[str]] = MappingProxyType(
     {"reason": frozenset(REASON_CODES), "kind": frozenset(k.value for k in ResourceKind)}
@@ -380,6 +394,10 @@ class EventType(enum.Enum):
     OWNERSHIP_ACQUIRED = "ownership.acquired"
     EXECUTION_CANCEL_REQUESTED = "execution.cancel_requested"
     EXECUTION_CLAIM_LOST = "execution.claim_lost"
+    BUDGET_RESERVED = "budget.reserved"
+    BUDGET_CHARGED = "budget.charged"
+    INSTANCE_SUSPENDED = "instance.suspended"
+    INSTANCE_RESUMED = "instance.resumed"
 
 
 RESERVED_TYPES: Mapping[str, int] = MappingProxyType(
@@ -390,9 +408,7 @@ RESERVED_TYPES: Mapping[str, int] = MappingProxyType(
         "claim.relabelled": 12,  # ADR-0026: unused; restore-claim-label is an operation
         "retry.scheduled": 13,
         "agent.stalled": 13,
-        "budget.reserved": 18,
-        "budget.charged": 18,
-        "budget.released": 18,
+        "budget.released": 18,  # ADR-0029 §2: unused; a reservation is never released
         "budget.exceeded": 18,
         "quarantine.resolved": 59,
     }
@@ -473,6 +489,20 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
             "request": (_pattern(_REQUEST_ID), False),
             "observed": (_one_of(OBSERVATIONS), False),
             "decision": (_one_of(CANCEL_DECISIONS), True),
+        },
+        EventType.BUDGET_RESERVED: {  # ADR-0029 §2
+            "amount_micros": (_POSITIVE, True),
+            "day": (_pattern(_DAY), True),
+            "month": (_pattern(_MONTH), True),
+        },
+        EventType.BUDGET_CHARGED: {  # ADR-0029 §2: a reported cost above the reservation
+            "amount_micros": (_POSITIVE, True),
+            "day": (_pattern(_DAY), True),
+            "month": (_pattern(_MONTH), True),
+        },
+        EventType.INSTANCE_SUSPENDED: {},  # ADR-0029 §3: the reason code is the cause
+        EventType.INSTANCE_RESUMED: {  # the reason is operator-resumed; this is what cleared
+            "cleared": (_one_of(SUSPENSION_REASONS), True),
         },
         EventType.EXECUTION_CLAIM_LOST: {  # ADR-0026 §3a
             "state": (_one_of(CLAIM_LOST_STATES), True),
@@ -969,6 +999,41 @@ def derive_events(commit: Commit, context: EventContext) -> tuple[Event, ...]:
     for resource in commit.resources:
         events.append(_resource_event(resource, context, new))
     return tuple(events)
+
+
+def accounting_events(commit: Commit, context: EventContext) -> tuple[Event, ...]:
+    """The events of a commit's charges and suspension change (ADR-0029 §2 and §3):
+    one per charge, then one for a suspension set or cleared. They pair with
+    those rows by construction and come after the commit's row events."""
+
+    def new(kind: EventType, **values: Any) -> Event:
+        return Event.create(kind, at=context.at, instance=context.instance,
+                            epoch=context.epoch, actor=context.actor,
+                            pass_id=context.pass_id, **values)  # fmt: skip
+
+    events: list[Event] = []
+    for charge in commit.charges:
+        kind = (
+            EventType.BUDGET_RESERVED
+            if charge.kind.value == "reservation"
+            else EventType.BUDGET_CHARGED
+        )
+        events.append(new(
+            kind, execution=charge.execution_id, attempt=charge.attempt,
+            reason="budget-reserved" if kind is EventType.BUDGET_RESERVED else None,
+            data={"amount_micros": charge.amount_micros, "day": charge.day,
+                  "month": charge.month},
+        ))  # fmt: skip
+    if commit.suspend is not None:
+        events.append(new(EventType.INSTANCE_SUSPENDED, reason=commit.suspend.reason.value))
+    return tuple(events)
+
+
+def resumed_event(cleared: str, context: EventContext) -> Event:
+    """``instance.resumed``: the store adds it, knowing which suspension it cleared."""
+    return Event.create(EventType.INSTANCE_RESUMED, at=context.at, instance=context.instance,
+                        epoch=context.epoch, actor=context.actor, pass_id=context.pass_id,
+                        reason="operator-resumed", data={"cleared": cleared})  # fmt: skip
 
 
 def _operation_event(

@@ -14,6 +14,7 @@ import threading
 from collections.abc import Collection, Sequence
 from datetime import datetime
 
+from ilmar.domain.budget import BudgetTotals, Charge, Suspension, utc_day, utc_month
 from ilmar.domain.errors import (
     ConcurrencyConflictError,
     DuplicateExecutionError,
@@ -38,6 +39,8 @@ class InMemoryExecutionStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._charges: list[Charge] = []
+        self._suspension: Suspension | None = None
         self._executions: dict[str, Execution] = {}
         self._history: dict[str, list[Transition]] = {}
         self._evidence: dict[str, list[str]] = {}  # serialised, so stored copies cannot change
@@ -152,6 +155,8 @@ class InMemoryExecutionStore:
                 operation=self._operations.get,
                 resource=self._resources.get,
                 latest_update=max((e.updated_at for e in self._executions.values()), default=None),
+                suspension=self._suspension,
+                totals=self._totals,
             )
             events = event_log.commit_events(
                 fence,
@@ -160,6 +165,7 @@ class InMemoryExecutionStore:
                 execution=self._executions.get,
                 operation=self._operations.get,
                 resource=self._resources.get,
+                suspended=self._suspension,
             )
             new_tasks = [e.task for e, _ in changes.created if not e.state.is_terminal]
             if len(new_tasks) != len(set(new_tasks)):
@@ -178,7 +184,31 @@ class InMemoryExecutionStore:
                 self._operations[operation.key] = operation
             for resource in changes.resources:
                 self._resources[resource.key] = resource
+            self._charges.extend(changes.charges)
+            if changes.suspend is not None:
+                self._suspension = changes.suspend
+            if changes.resume is not None:
+                self._suspension = None
             self._append(events)
+
+    def _totals(self, at: datetime) -> BudgetTotals:
+        day, month = utc_day(at), utc_month(at)
+        return BudgetTotals(
+            sum(c.amount_micros for c in self._charges if c.day == day),
+            sum(c.amount_micros for c in self._charges if c.month == month),
+        )
+
+    def suspension(self) -> Suspension | None:
+        with self._lock:
+            return self._suspension
+
+    def budget_totals(self, at: datetime) -> BudgetTotals:
+        with self._lock:
+            return self._totals(at)
+
+    def charges(self, execution_id: str) -> Sequence[Charge]:
+        with self._lock:
+            return tuple(c for c in self._charges if c.execution_id == execution_id)
 
     def events(
         self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None

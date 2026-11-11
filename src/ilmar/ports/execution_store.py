@@ -7,12 +7,23 @@ from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
 from typing import Protocol
 
+from ilmar.domain.budget import (
+    BudgetTotals,
+    Charge,
+    ChargeKind,
+    Suspension,
+    exhausted,
+    utc_day,
+    utc_month,
+)
 from ilmar.domain.errors import (
+    BudgetExhaustedError,
     ClockBehindError,
     ConcurrencyConflictError,
     ExecutionNotFoundError,
     FencingError,
     LedgerIntegrityError,
+    SuspendedError,
 )
 from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
@@ -69,6 +80,13 @@ class ExecutionStore(Protocol):
     * Before coverage starts, only an unowned store accepts (unfenced) writes;
       the baseline then records what they left.
 
+    Accounting and suspension (ADR-0029 §2 and §3):
+
+    * charges are append-only: never changed, removed or refunded;
+    * :meth:`commit` checks :func:`check_budget` in its transaction, so an
+      attempt starts only with its reservation, within the allowances given,
+      and never while a suspension is in force.
+
     Inputs must satisfy :func:`check_create` / :func:`check_apply`.
     """
 
@@ -96,6 +114,18 @@ class ExecutionStore(Protocol):
 
         Raises ``ExecutionNotFoundError`` if the execution does not exist.
         """
+        ...
+
+    def suspension(self) -> Suspension | None:
+        """The suspension in force, or ``None``."""
+        ...
+
+    def budget_totals(self, at: datetime) -> BudgetTotals:
+        """What is charged in the UTC day and month of ``at``."""
+        ...
+
+    def charges(self, execution_id: str) -> Sequence[Charge]:
+        """The execution's charges, in the order they were written."""
         ...
 
     def history(self, execution_id: str) -> Sequence[Transition]:
@@ -248,6 +278,99 @@ def check_admissions(changes: Commit, latest_update: datetime | None) -> None:
             )
 
 
+_ADMITTING = frozenset({ExecutionState.CLAIMED, ExecutionState.PROVISIONING})
+
+
+def check_budget(
+    changes: Commit,
+    *,
+    suspension: Suspension | None,
+    totals: Callable[[datetime], BudgetTotals],
+    execution: Callable[[str], Execution | None],
+) -> None:
+    """ADR-0029 §2 and §3, enforced where it is atomic.
+
+    * A suspension in force refuses every commit that admits new work: one that
+      creates a live execution, claims one or starts an attempt
+      (``SuspendedError``). A commit may set a suspension only if none is in
+      force, and clear one only if one is.
+    * A reservation is written only with the transition that starts its
+      attempt, at the same time, for that attempt.
+    * With ``changes.budget`` given, every attempt the commit starts carries a
+      reservation of exactly ``reserve_micros``. The day's and the month's
+      totals, with everything the commit charges, stay within the allowances,
+      or the commit is refused (``BudgetExhaustedError``). Exactly at the limit
+      is allowed.
+    * A reservation without ``changes.budget`` is refused.
+    """
+    if changes.suspend is not None and suspension is not None:
+        raise LedgerIntegrityError("a suspension is already in force")
+    if changes.resume is not None and suspension is None:
+        raise LedgerIntegrityError("there is no suspension to resume")
+    in_force = changes.suspend or (None if changes.resume is not None else suspension)
+    admitting = [t for e, t in changes.created if not e.state.is_terminal] + [
+        t for _, t in changes.applied if t.to_state in _ADMITTING
+    ]
+    if in_force is not None and admitting:
+        raise SuspendedError(
+            f"new work is suspended ({in_force.reason.value})", reason=in_force.reason.value
+        )
+    created = {e.id: e for e, _ in changes.created}
+    applied = {e.id: e for e, _ in changes.applied}
+    starts = {
+        (e.id, e.attempt): t
+        for e, t in changes.applied
+        if t.to_state is ExecutionState.PROVISIONING
+    }
+    for charge in changes.charges:
+        owner = applied.get(charge.execution_id) or created.get(charge.execution_id)
+        owner = owner or execution(charge.execution_id)
+        if owner is None:
+            raise ExecutionNotFoundError(charge.execution_id)
+        if charge.attempt != owner.attempt:
+            raise LedgerIntegrityError(
+                f"a charge for attempt {charge.attempt} of {owner.id}, at attempt {owner.attempt}"
+            )
+        if charge.kind is ChargeKind.RESERVATION:
+            start = starts.get((charge.execution_id, charge.attempt))
+            if start is None or start.at != charge.at:
+                raise LedgerIntegrityError(
+                    "a reservation is written with the transition that starts its attempt"
+                )
+    reservations = {
+        (c.execution_id, c.attempt): c for c in changes.charges if c.kind is ChargeKind.RESERVATION
+    }
+    if changes.budget is None:
+        if reservations:
+            raise LedgerIntegrityError("a reservation needs the allowances it is admitted against")
+        return
+    for key in starts:
+        reservation = reservations.get(key)
+        if reservation is None or reservation.amount_micros != changes.budget.reserve_micros:
+            raise LedgerIntegrityError(
+                f"attempt {key[1]} of {key[0]} starts without its reservation"
+            )
+    added_day: dict[str, int] = {}
+    added_month: dict[str, int] = {}
+    for charge in changes.charges:
+        day, month = utc_day(charge.at), utc_month(charge.at)
+        stored = totals(charge.at)
+        current = BudgetTotals(
+            stored.day_micros + added_day.get(day, 0),
+            stored.month_micros + added_month.get(month, 0),
+        )
+        if charge.kind is ChargeKind.RESERVATION:
+            over = exhausted(changes.budget, current, charge.amount_micros)
+            if over is not None:
+                raise BudgetExhaustedError(
+                    f"attempt {charge.attempt} of {charge.execution_id} would exceed the "
+                    f"{'daily' if over.value == 'budget-daily' else 'monthly'} allowance",
+                    reason=over.value,
+                )
+        added_day[day] = added_day.get(day, 0) + charge.amount_micros
+        added_month[month] = added_month.get(month, 0) + charge.amount_micros
+
+
 def check_commit(
     fence: Fence,
     changes: Commit,
@@ -256,6 +379,8 @@ def check_commit(
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
     latest_update: datetime | None,
+    suspension: Suspension | None,
+    totals: Callable[[datetime], BudgetTotals],
 ) -> None:
     """Validate a commit against the stored records (looked up through the callables).
 
@@ -263,10 +388,12 @@ def check_commit(
     ``latest_update`` read in that same transaction. Raises
     ``ConcurrencyConflictError`` for stale versions, ``LedgerIntegrityError``
     for anything inconsistent, ``ClockBehindError`` for new work admitted at a
-    time before ``latest_update`` (ADR-0028 §3), ``ValueError`` for malformed
-    input.
+    time before ``latest_update`` (ADR-0028 §3), ``SuspendedError`` or
+    ``BudgetExhaustedError`` for new work it may not admit (ADR-0029, see
+    :func:`check_budget`), ``ValueError`` for malformed input.
     """
     check_admissions(changes, latest_update)
+    check_budget(changes, suspension=suspension, totals=totals, execution=execution)
     created = {e.id: e for e, _ in changes.created}
     applied = {e.id: e for e, _ in changes.applied}
     for e, t in changes.created:

@@ -72,6 +72,24 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-12: **#18 part 1 submitted: reservation ledger and suspension**
+  (ADR-0029 §2, §3 and §8; schema 8).
+  - **Reservations:** each attempt is charged `[budget]
+    reserve_per_execution_usd` in the commit that starts it. The store admits
+    the attempt within the daily and monthly allowances (UTC) atomically, or
+    refuses it and its charge together. Charges are append-only and never
+    refunded.
+  - **Suspension:** a durable suspension (budget-daily, budget-monthly,
+    provider-cap, operator and the rest) refuses every admission in the
+    store. The pass exits 78.
+  - **Provider refusals:** a provider refusal fails its execution and
+    suspends with `provider-cap` in the same commit.
+  - **Commands:** `ilmar suspend|resume --as NAME` and `ilmar budget`.
+    `resume` lifts a suspension only when its cause is gone.
+  - **Next, in part 2:** the kill-switch file, cancelling a running agent on
+    suspension, clock-anomaly suspension, agent-reported extra charges and
+    the two-loop concurrency test. Refusing modes above manual without a
+    budget is #91.
 - 2026-11-12: **#110 merged** (#116) and closed after its acceptance audit.
   **#92 part 1 submitted: protected safety controls** (ADR-0031).
   - **The list** is code in the running release: CI configuration,

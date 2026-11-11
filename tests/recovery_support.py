@@ -158,9 +158,22 @@ def line_problems(line: str) -> list[str]:
     return problems
 
 
+def to_schema_7(db: Path) -> None:
+    """The store exactly as schema 7 would have left it: no ``budget_ledger`` and
+    no ``suspension`` (before #18's migration, which only added those tables, their
+    indexes and triggers)."""
+    with closing(sqlite3.connect(db)) as conn:
+        conn.executescript(
+            "BEGIN;\nDROP TABLE budget_ledger;\nDROP TABLE suspension;\n"
+            "DELETE FROM sqlite_sequence WHERE name = 'budget_ledger';\n"
+            "PRAGMA user_version = 7;\nCOMMIT;"
+        )
+
+
 def to_schema_6(db: Path) -> None:
     """The store exactly as schema 6 would have left it: no ``retry_not_before``
     (before #13's migration, which only added that column)."""
+    to_schema_7(db)
     with closing(sqlite3.connect(db)) as conn:
         conn.executescript(
             "BEGIN;\nALTER TABLE executions DROP COLUMN retry_not_before;\n"

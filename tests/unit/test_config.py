@@ -314,3 +314,46 @@ def test_invalid_execution_wall_is_rejected(limits: dict[str, Any], message: str
     data["limits"] = limits
     with pytest.raises(ConfigError, match=message):
         parse_config(data, base_dir=BASE)
+
+
+BUDGET = {
+    "daily_usd": 20,
+    "monthly_usd": 300.5,
+    "reserve_per_execution_usd": 2.25,
+    "provider_cap_attested_usd": 250,
+}
+
+
+def test_budget_is_optional_and_parsed_to_micro_dollars() -> None:
+    assert parse_config(minimal(), base_dir=BASE).budget is None
+    data = copy.deepcopy(minimal())
+    data["budget"] = dict(BUDGET)
+    budget = parse_config(data, base_dir=BASE).budget
+    assert budget is not None
+    assert (budget.limits.daily_micros, budget.limits.monthly_micros,
+            budget.limits.reserve_micros) == (20_000_000, 300_500_000, 2_250_000)  # fmt: skip
+    assert budget.provider_cap_attested_micros == 250_000_000
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"daily_usd": None}, "daily_usd is required"),
+        ({"reserve_per_execution_usd": 0}, "greater than zero"),
+        ({"monthly_usd": -1}, "not negative"),
+        ({"daily_usd": True}, "number of US dollars"),
+        ({"daily_usd": "20"}, "number of US dollars"),
+        ({"daily_usd": float("nan")}, "finite"),
+        ({"reserve_per_execution_usd": 0.0000001}, "six decimal places"),
+        ({"reserve_per_execution_usd": 30}, "reserve_per_execution_usd <= daily_usd"),
+        ({"daily_usd": 400}, "reserve_per_execution_usd <= daily_usd <= monthly_usd"),
+        ({"provider_cap_attested_usd": 301}, "must not exceed monthly_usd"),
+        ({"extra": 1}, "extra"),
+    ],
+)
+def test_an_invalid_budget_fails_closed(change: dict[str, Any], message: str) -> None:
+    budget = {k: v for k, v in {**BUDGET, **change}.items() if v is not None}
+    data = copy.deepcopy(minimal())
+    data["budget"] = budget
+    with pytest.raises(ConfigError, match=message):
+        parse_config(data, base_dir=BASE)

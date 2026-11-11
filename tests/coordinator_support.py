@@ -17,6 +17,7 @@ from ilmar.core.ownership import Ownership
 from ilmar.core.secret_scan import SecretScanner
 from ilmar.core.state_machine import NO_BACKOFF, RetryBackoff
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.budget import BudgetLimits
 from ilmar.domain.changes import RepositoryRef
 from ilmar.domain.tasks import Task, TaskRef
 from ilmar.domain.verification import VerificationCommand, VerificationPolicy
@@ -165,6 +166,7 @@ class Setup:
         watch_interval_seconds: float = 2.0,
         retry_backoff: RetryBackoff = NO_BACKOFF,
         execution_wall_seconds: float | None = None,
+        budget: BudgetLimits | None = None,
     ) -> Coordinator:
         return Coordinator.create(
             self.components,
@@ -173,6 +175,7 @@ class Setup:
             agent_timeout_seconds=60,
             retry_backoff=retry_backoff,
             execution_wall_seconds=execution_wall_seconds,
+            budget=budget,
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),

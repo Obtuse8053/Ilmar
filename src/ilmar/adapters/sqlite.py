@@ -44,12 +44,22 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from ilmar.domain.budget import (
+    BudgetTotals,
+    Charge,
+    ChargeKind,
+    Suspension,
+    SuspensionReason,
+    utc_day,
+    utc_month,
+)
 from ilmar.domain.errors import (
     ConcurrencyConflictError,
     DuplicateExecutionError,
     EvidenceIntegrityError,
     ExecutionNotFoundError,
     FencingError,
+    LedgerIntegrityError,
 )
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import CorruptEventError, Event, EventContext
@@ -69,7 +79,7 @@ from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
@@ -365,7 +375,40 @@ BEGIN SELECT RAISE(ABORT, 'an operation keeps its identity and intent'); END;
     6: """
 ALTER TABLE executions ADD COLUMN retry_not_before TEXT;
 """,
+    # ADR-0029 §2, §3 and §8 (#18): accounting charges and the suspension.
+    7: """
+CREATE TABLE budget_ledger (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id  TEXT NOT NULL REFERENCES executions (id),
+    attempt       INTEGER NOT NULL CHECK (attempt >= 1),
+    kind          TEXT NOT NULL CHECK (kind IN ('reservation', 'extra')),
+    amount_micros INTEGER NOT NULL CHECK (amount_micros > 0),
+    at            TEXT NOT NULL,
+    day           TEXT NOT NULL,
+    month         TEXT NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX budget_one_reservation_per_attempt
+    ON budget_ledger (execution_id, attempt) WHERE kind = 'reservation';
+CREATE INDEX budget_by_day ON budget_ledger (day);
+CREATE INDEX budget_by_month ON budget_ledger (month);
+
+CREATE TRIGGER budget_ledger_cannot_be_removed BEFORE DELETE ON budget_ledger
+BEGIN SELECT RAISE(ABORT, 'charges cannot be removed'); END;
+CREATE TRIGGER budget_ledger_cannot_change BEFORE UPDATE ON budget_ledger
+BEGIN SELECT RAISE(ABORT, 'charges cannot change'); END;
+
+CREATE TABLE suspension (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    reason  TEXT NOT NULL,
+    since   TEXT NOT NULL,
+    detail  TEXT NOT NULL
+) STRICT;
+""",
 }
+
+BUDGET_SCHEMA_VERSION = 8
+"""The first version with ``budget_ledger`` and ``suspension`` (#18)."""
 
 _BASE_COLUMNS = (
     "id, task_provider, task_key, state, attempt, version, created_at, updated_at, "
@@ -481,6 +524,30 @@ class SQLiteExecutionStore:
     def latest_update(self) -> datetime | None:
         with self._reading() as conn:
             return _latest_update(conn)
+
+    def suspension(self) -> Suspension | None:
+        with self._reading(any_version=True) as conn:
+            return _suspension(conn)
+
+    def budget_totals(self, at: datetime) -> BudgetTotals:
+        with self._reading(any_version=True) as conn:
+            return _budget_totals(conn, at)
+
+    def charges(self, execution_id: str) -> Sequence[Charge]:
+        with self._reading(any_version=True) as conn:
+            if _version(conn) < BUDGET_SCHEMA_VERSION:
+                return ()
+            rows = conn.execute(
+                "SELECT execution_id, attempt, kind, amount_micros, at FROM budget_ledger "
+                "WHERE execution_id = ? ORDER BY seq",
+                (execution_id,),
+            ).fetchall()
+        return tuple(
+            Charge(
+                _text(e), _integer(a), ChargeKind(_text(k)), _integer(m), _decode_time(_text(at))
+            )
+            for e, a, k, m, at in rows
+        )
 
     def list_in_states(self, states: Collection[ExecutionState]) -> Sequence[Execution]:
         values = sorted({state.value for state in states})
@@ -625,6 +692,8 @@ class SQLiteExecutionStore:
                 operation=lambda key: _get_operation(conn, key),
                 resource=lambda key: _get_resource(conn, key),
                 latest_update=_latest_update(conn),
+                suspension=_suspension(conn),
+                totals=lambda at: _budget_totals(conn, at),
             )
             # Derived and paired against the stored rows, before any is written.
             events = event_log.commit_events(
@@ -634,6 +703,7 @@ class SQLiteExecutionStore:
                 execution=lambda key: _get_execution(conn, key),
                 operation=lambda key: _get_operation(conn, key),
                 resource=lambda key: _get_resource(conn, key),
+                suspended=_suspension(conn),
             )
             for execution, transition in changes.created:
                 _insert_execution(conn, execution, transition)
@@ -643,6 +713,7 @@ class SQLiteExecutionStore:
                 _write_operation(conn, operation)
             for resource in changes.resources:
                 _write_resource(conn, resource, fence)
+            _write_accounting(conn, changes)
             _append_events(conn, events)
 
     def events(
@@ -1332,3 +1403,50 @@ def _insert_transition(conn: sqlite3.Connection, transition: Transition) -> None
             transition.reason,
         ),
     )
+
+
+# -- accounting and suspension (ADR-0029 §2 and §3) ------------------------------------
+
+
+def _suspension(conn: sqlite3.Connection) -> Suspension | None:
+    if _version(conn) < BUDGET_SCHEMA_VERSION:
+        return None
+    row = conn.execute("SELECT reason, since, detail FROM suspension WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    reason, since, detail = row
+    return Suspension(SuspensionReason(_text(reason)), _decode_time(_text(since)), _text(detail))
+
+
+def _budget_totals(conn: sqlite3.Connection, at: datetime) -> BudgetTotals:
+    if _version(conn) < BUDGET_SCHEMA_VERSION:
+        return BudgetTotals()
+    day, month = conn.execute(
+        "SELECT (SELECT COALESCE(SUM(amount_micros), 0) FROM budget_ledger WHERE day = ?), "
+        "(SELECT COALESCE(SUM(amount_micros), 0) FROM budget_ledger WHERE month = ?)",
+        (utc_day(at), utc_month(at)),
+    ).fetchone()
+    return BudgetTotals(_integer(day), _integer(month))
+
+
+def _write_accounting(conn: sqlite3.Connection, changes: Commit) -> None:
+    if not (changes.charges or changes.suspend is not None or changes.resume is not None):
+        return
+    if _version(conn) < BUDGET_SCHEMA_VERSION:  # pragma: no cover - claim migrates first
+        raise LedgerIntegrityError("this store predates accounting; claim it to migrate")
+    for charge in changes.charges:
+        conn.execute(
+            "INSERT INTO budget_ledger "
+            "(execution_id, attempt, kind, amount_micros, at, day, month) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (charge.execution_id, charge.attempt, charge.kind.value, charge.amount_micros,
+             _encode_time(charge.at), charge.day, charge.month),
+        )  # fmt: skip
+    if changes.suspend is not None:
+        conn.execute(
+            "INSERT INTO suspension (id, reason, since, detail) VALUES (1, ?, ?, ?)",
+            (changes.suspend.reason.value, _encode_time(changes.suspend.since),
+             changes.suspend.detail),
+        )  # fmt: skip
+    if changes.resume is not None:
+        conn.execute("DELETE FROM suspension WHERE id = 1")

@@ -111,3 +111,21 @@ class ClockBehindError(IlmarError):
     """New work was refused because its time precedes the latest persisted update
     (ADR-0028 §3): the wall clock stepped back. Nothing was written; wait for the
     clock to catch up."""
+
+
+class BudgetExhaustedError(IlmarError):
+    """The store refused to start an attempt: its reservation would exceed an
+    allowance (ADR-0029 §2). Nothing was written; the caller suspends."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class SuspendedError(IlmarError):
+    """The store refused new work: a suspension is in force (ADR-0029 §3).
+    Nothing was written."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason

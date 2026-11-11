@@ -108,3 +108,17 @@ job = "tests"
 argv = ["pytest", "-q"]
 timeout_seconds = 1200
 
+
+# Accounting reservations (#18, ADR-0029 §2). Optional in manual operation;
+# every key is required once the section exists. Each attempt is charged
+# reserve_per_execution_usd as it starts and starts only within the daily and
+# monthly allowances (UTC). Reservations are accounting, not a cost limit: the
+# provider's workspace spend limit is the hard limit, attested here. When an
+# allowance is used up, Ilmar suspends new work (exit 78) until
+# `ilmar resume --as <name>` finds room again; nothing is ever refunded.
+#
+# [budget]
+# daily_usd = 20
+# monthly_usd = 300
+# reserve_per_execution_usd = 5
+# provider_cap_attested_usd = 300
