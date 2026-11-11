@@ -799,6 +799,7 @@ class PodmanRuntime:
             args += ["--cpus", f"{limits.cpus:g}"]
         if profile.init:
             args.append("--init")
+        args += self._sealed_arguments(spec, workdir)
         args += _lifetime_arguments(spec)
         for key, value in (_owner_labels(spec.owner) | {LABEL_ROLE: ROLE_SANDBOX}).items():
             args += ["--label", f"{key}={value}"]
@@ -824,6 +825,40 @@ class PodmanRuntime:
                 *no_icmp,
             ]
         return []  # UNRESTRICTED: Podman's default network (opted in)
+
+    def _sealed_arguments(self, spec: ContainerSpec, workdir: PurePosixPath) -> list[str]:
+        """ADR-0036: one tmpfs mount per sealed path. A mount point can be neither
+        removed nor renamed from inside, and a read-only one cannot be written;
+        the user has no capability to unmount it. Whatever was at the path stays
+        on the host, hidden."""
+        args: list[str] = []
+        for sealed in spec.sealed_paths:
+            target = self._sealed_target(sealed.path, workdir)
+            # notmpcopyup: Podman would otherwise copy what is at the path (for
+            # example the repository's .claude/settings.json) into the tmpfs.
+            options = (
+                f"rw,nosuid,nodev,notmpcopyup,mode=1777,size={self._profile.tmpfs_mb}m"
+                if sealed.writable
+                else "ro,nosuid,nodev,noexec,notmpcopyup,mode=0555,size=64k"
+            )
+            args += ["--tmpfs", f"{target}:{options}"]
+        return args
+
+    def _sealed_target(self, path: str, workdir: PurePosixPath) -> PurePosixPath:
+        if path.startswith("~/"):
+            target = self._profile.home / path[2:]
+        elif path.startswith("/"):
+            target = PurePosixPath(path)
+        else:
+            target = workdir / path
+        if target in {
+            PurePosixPath("/"),
+            workdir,
+            self._profile.home,
+            PurePosixPath(_CONTAINER_TMP),
+        }:
+            raise ProviderError(f"cannot seal {path!r}: it is a directory the sandbox needs")
+        return target
 
     def _container_env(self, env: Mapping[str, str], *, with_home: bool = True) -> dict[str, str]:
         result = {"HOME": str(self._profile.home)} if with_home else {}

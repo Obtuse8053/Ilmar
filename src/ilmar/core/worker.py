@@ -575,6 +575,16 @@ class _Run:
             raise TransientError("the agent timed out", code="agent-timed-out")
         if result.outcome is AgentOutcome.STALLED:  # ADR-0035 §3: retried after backoff
             raise TransientError("the agent showed no progress", code="agent-stalled")
+        if result.outcome is AgentOutcome.RATE_LIMITED:  # ADR-0029 §5: an attempt, then backoff
+            raise TransientError(
+                "the provider rate-limited the agent", code="provider-rate-limited"
+            )
+        if result.outcome is AgentOutcome.PROVIDER_REFUSED:
+            # ADR-0029 §5: spend cap, billing or authentication: never retried.
+            # #18 makes this a durable suspension of all new work.
+            raise _Deterministic(
+                f"the provider refused the agent: {result.summary[:200]}", code="provider-refused"
+            )
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted

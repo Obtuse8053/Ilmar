@@ -72,6 +72,40 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-11: **#90 part 1 merged** (#108). **Part 2 submitted: one credential
+  path and provider failures** (ADR-0029 §5).
+  - **Credential path:** before Claude Code starts, a fixed probe runs in the
+    sandbox with Claude Code's own environment. It reports variable names,
+    credential files and project settings that mention a credential setting.
+    Any other route refuses the run (`policy-violation`, never retried):
+    `ANTHROPIC_*` beyond the key, `ANTHROPIC_BASE_URL` without a gateway,
+    OAuth, Bedrock, Vertex and cloud credentials, login files, managed
+    settings, `apiKeyHelper`. A probe that cannot finish never lets Claude
+    Code start.
+  - **Provider failures:** a spend, usage, credit or billing limit, or an
+    authentication failure, ends the execution without a retry
+    (`provider-refused`). An ordinary rate limit or overload is transient
+    (`provider-rate-limited`).
+  - **Review fixes (ADR-0036, Proposed):**
+    - The probe is strictly fail-closed: a missing tool, an unreadable file or
+      any unfinished step means Claude Code does not start.
+    - Claude Code's settings locations are sealed at the sandbox boundary
+      (read-only tmpfs mounts the agent cannot write, remove or rename), so no
+      `apiKeyHelper` can appear after the check.
+    - `~/.claude/.credentials.json` is sealed too, so no OAuth login can be
+      planted during a run.
+    - The pinned-version check is `tests/integration/test_claude_code_pinned.py`
+      (no credential needed); it is mandatory Gate 1 evidence.
+    - **Not a complete single-credential guarantee.** `~/.claude.json` stays
+      writable. Credentials already in the sandbox, including the configured
+      key, remain usable. Only the credential-injecting proxy (#111) closes
+      these routes. ADR-0036 recommends a candidate secret check (#110) as a
+      Gate 1 prerequisite, and the proxy before any uncontrolled repository,
+      Mode 2 or self-hosting. Both await maintainer decision.
+  - **Not yet in place:** #18 turns `provider-refused` into a durable
+    suspension of all new work. The exact texts at a workspace cap are
+    unverified until the Gate 1 drill (#93). The supervised-mode concurrency
+    rule moves to #91, with the mode setting.
 - 2026-11-11: **#90 part 1 submitted: runtime-side sandbox lifetime.**
   - **What:** `ContainerSpec.lifetime_seconds`; Podman passes it as
     `--timeout`, which conmon enforces, to the sandbox and its egress sidecar.

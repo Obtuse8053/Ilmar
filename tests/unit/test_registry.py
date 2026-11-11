@@ -16,6 +16,7 @@ import pytest
 
 import registry_fakes
 from ilmar.adapters.builtin import ANTHROPIC_API_HOST
+from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
 from ilmar.adapters.claude_code.runner import ClaudeCodeRunner
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.adapters.github.tasks import GitHubTaskProvider
@@ -124,8 +125,17 @@ def test_builds_the_configured_adapters(built: Components, tmp_path: Path) -> No
 
 def test_the_agent_sandbox_reaches_only_the_model_endpoint(built: Components) -> None:
     assert built.agent_sandbox == AgentSandbox(
-        "localhost/agent:1", NetworkPolicy.ALLOWLIST, (ANTHROPIC_API_HOST,)
+        "localhost/agent:1",
+        NetworkPolicy.ALLOWLIST,
+        (ANTHROPIC_API_HOST,),
+        sealed_paths=SEALED_PATHS,
     )
+
+
+def test_the_claude_code_sandbox_seals_its_settings_locations(built: Components) -> None:
+    """ADR-0036: no configuration option removes the sealed paths."""
+    assert built.agent_sandbox.sealed_paths == SEALED_PATHS
+    assert {s.path for s in SEALED_PATHS} >= {".claude", "~/.claude/settings.json"}
 
 
 def test_a_gateway_replaces_the_model_endpoint(tmp_path: Path) -> None:

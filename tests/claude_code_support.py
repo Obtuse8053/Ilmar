@@ -5,8 +5,12 @@ format (ADR-0035): one JSON event per line, ending with the result object."""
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
+
+from ilmar.domain.workspace import CommandResult
 
 from contracts.agent_runner import AgentScenario
+from fakes import FakeContainerRuntime
 
 
 def result_json(*, subtype: str, is_error: bool, text: str) -> str:
@@ -81,3 +85,84 @@ def shell_script(scenario: AgentScenario, record: str) -> str:
             lines.append(f"cat >&2 <<'ILMAR_EOF'\n{err.rstrip()}\nILMAR_EOF")
         lines.append(f"exit {code}")
     return "\n".join(lines) + "\n"
+
+
+# -- the credential-path probe (ADR-0029 §5, #90) ------------------------------------------
+
+
+class ProbeStandIn:
+    """Answers ``/bin/sh -c <probe>`` the way the real probe does in a correctly
+    sealed sandbox: the names of the environment it was given plus any
+    ``image_env``, listed files and settings, the home and working directory,
+    and the mount table with every sealed path in place unless named in
+    ``unsealed``. ``drop`` removes output lines that start with a marker (to
+    simulate a step that never finished). Records each environment it saw."""
+
+    def __init__(
+        self,
+        *,
+        image_env: Sequence[str] = (),
+        hide_env: Sequence[str] = (),
+        files: Sequence[str] = (),
+        settings: Sequence[str] = (),
+        unsealed: Sequence[str] = (),
+        wrong_access: Sequence[str] = (),
+        exit_code: int = 0,
+        drop: Sequence[str] = (),
+        extra: Sequence[str] = (),
+        nonempty: Sequence[str] = (),
+        mounted_after: Sequence[str] = (),
+    ) -> None:
+        self.image_env = tuple(image_env)
+        self.hide_env = set(hide_env)
+        self.files = tuple(files)
+        self.settings = tuple(settings)
+        self.unsealed = set(unsealed)
+        self.wrong_access = set(wrong_access)
+        self.exit_code = exit_code
+        self.drop = tuple(drop)
+        self.extra = tuple(extra)
+        self.nonempty = tuple(nonempty)
+        self.mounted_after = tuple(mounted_after)
+        self.seen: list[dict[str, str]] = []
+
+    def __call__(
+        self, argv: Sequence[str], timeout: float, env: Mapping[str, str]
+    ) -> CommandResult:
+        from ilmar.adapters.claude_code.credential_route import (
+            PROBE_END,
+            PROBE_SCRIPT,
+            SEALED_PATHS,
+        )
+
+        assert list(argv) == ["/bin/sh", "-c", PROBE_SCRIPT], argv
+        self.seen.append(dict(env))
+        names = sorted({*env, *self.image_env, "HOME", "PATH"} - self.hide_env)
+        lines = [f"ENV {name}" for name in names] + ["ENV-DONE"]
+        lines += ["HOME-DIR /home/ilmar", "WORKDIR /workspace"]
+        lines += [f"FILE {f}" for f in self.files] + [f"SETTING {s}" for s in self.settings]
+        lines += ["MOUNT / ro,nosuid", "MOUNT /workspace rw,relatime", "MOUNT /home/ilmar rw"]
+        for sealed in SEALED_PATHS:
+            target = (
+                "/home/ilmar/" + sealed.path[2:]
+                if sealed.path.startswith("~/")
+                else "/workspace/" + sealed.path
+            )
+            if target in self.unsealed:
+                continue
+            access = "rw" if sealed.writable else "ro"
+            if target in self.wrong_access:
+                access = "ro" if access == "rw" else "rw"
+            lines.append(f"MOUNT {target} {access},nosuid,nodev")
+        lines += [f"MOUNT {point} rw,relatime" for point in self.mounted_after]
+        lines += [f"NONEMPTY {d}" for d in self.nonempty]
+        lines += ["MOUNTS-DONE", *self.extra, PROBE_END]
+        kept = [line for line in lines if not line.startswith(self.drop)] if self.drop else lines
+        return CommandResult(self.exit_code, "\n".join(kept) + "\n", "", 0.1)
+
+
+def allow_probe(runtime: FakeContainerRuntime, probe: ProbeStandIn | None = None) -> ProbeStandIn:
+    """Register a clean probe (or ``probe``) on a fake runtime."""
+    probe = probe or ProbeStandIn()
+    runtime.register("/bin/sh", probe)
+    return probe

@@ -23,7 +23,7 @@ from ilmar.domain.workspace import (
 from ilmar.ports.agent_runner import AgentRunner
 from ilmar.ports.container_runtime import ContainerRuntime
 
-from claude_code_support import OUTPUTS
+from claude_code_support import OUTPUTS, allow_probe
 from contracts.agent_runner import AgentRunnerContract, AgentScenario
 from contracts.container_runtime import identity_of
 from fakes import FakeContainerRuntime
@@ -57,6 +57,7 @@ class TestClaudeCodeRunner(AgentRunnerContract):
             return CommandResult(code, out, err, 1.0)
 
         runtime.register("claude", claude)
+        allow_probe(runtime)
         workspace = self._tmp / scenario.value
         workspace.mkdir(parents=True, exist_ok=True)
         spec = ContainerSpec(
@@ -71,3 +72,30 @@ class TestClaudeCodeRunner(AgentRunnerContract):
     def commands_run_in(self, runtime: ContainerRuntime, container: ContainerHandle) -> int:
         assert isinstance(runtime, FakeContainerRuntime)
         return sum(1 for container_id, _ in runtime.commands if container_id == container.id)
+
+
+def test_another_credential_route_refuses_before_any_agent_command(tmp_path: Path) -> None:
+    """ADR-0029 §5, repeated with the runner contract: the credential-path probe
+    runs first, and a route other than the one key stops the run before
+    ``claude`` is invoked."""
+    from ilmar.domain.errors import PolicyViolationError
+
+    from claude_code_support import ProbeStandIn
+    from contracts.agent_runner import REQUEST
+
+    runtime = FakeContainerRuntime()
+    invoked: list[str] = []
+
+    def claude(argv: Sequence[str], timeout: float, env: Mapping[str, str]) -> CommandResult:
+        invoked.append(argv[0])
+        return CommandResult(0, "", "", 0.0)
+
+    runtime.register("claude", claude)
+    allow_probe(runtime, ProbeStandIn(image_env=["ANTHROPIC_AUTH_TOKEN"]))
+    handle = runtime.start(
+        ContainerSpec(image="fake:latest", host_workspace=tmp_path, name="agent", owner=OWNER,
+                      workspace_identity=identity_of(tmp_path))
+    )  # fmt: skip
+    with pytest.raises(PolicyViolationError, match="ANTHROPIC_AUTH_TOKEN"):
+        ClaudeCodeRunner(api_key=API_KEY).run(runtime, handle, REQUEST)
+    assert invoked == []

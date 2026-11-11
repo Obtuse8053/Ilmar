@@ -22,6 +22,7 @@ from claude_code_support import (
     RATE_LIMIT,
     SUCCESS,
     SUCCESS_RESULT,
+    allow_probe,
     result_json,
     stream,
 )
@@ -53,6 +54,7 @@ def setup(
     runtime = FakeContainerRuntime()
     script = Scripted(*results)
     runtime.register("claude", script)
+    allow_probe(runtime)
     spec = ContainerSpec(
         image="img",
         host_workspace=tmp_path,
@@ -257,6 +259,7 @@ class Spy(FakeContainerRuntime):
 def spy_setup(tmp_path: Path, *results: CommandResult) -> tuple[Spy, ContainerHandle]:
     runtime = Spy()
     runtime.register("claude", Scripted(*results))
+    allow_probe(runtime)
     spec = ContainerSpec(
         image="img", host_workspace=tmp_path, name="agent", owner=OWNER,
         workspace_identity=identity_of(tmp_path),
@@ -271,7 +274,8 @@ def test_the_stall_timeout_and_a_validator_go_to_the_runtime(tmp_path: Path) -> 
     )
     result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, stalling)
     assert result.outcome is AgentOutcome.COMPLETED
-    (asked,) = runtime.asked
+    probe, asked = runtime.asked  # the credential-path probe, then Claude Code
+    assert probe.get("stdout_consumer") is None
     assert asked["idle_timeout_seconds"] == 90
     assert isinstance(asked["stdout_consumer"], StreamValidator)
 

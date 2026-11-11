@@ -508,6 +508,7 @@ class Effects:
                 network=sandbox.network,
                 allowed_hosts=sandbox.allowed_hosts,
                 limits=sandbox.limits,
+                sealed_paths=sandbox.sealed_paths,
                 lifetime_seconds=self._sandbox_lifetime,
             )
             handle = runtime.start(spec)

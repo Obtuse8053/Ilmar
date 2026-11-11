@@ -39,6 +39,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Accepted |
 | [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Accepted |
 | [0035](0035-agent-progress-and-stall-detection.md) | Agent progress from stream events, and stall detection | Accepted |
+| [0036](0036-sealed-agent-settings.md) | Seal the agent's own settings at the sandbox boundary | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

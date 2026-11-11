@@ -17,6 +17,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
+    SealedPath,
 )
 
 from helpers import at
@@ -230,3 +231,18 @@ def test_allowlist_needs_hosts_and_hosts_need_allowlist(tmp_path: Path) -> None:
     for policy in (NetworkPolicy.NONE, NetworkPolicy.UNRESTRICTED):
         with pytest.raises(ValueError, match="only meaningful"):
             _spec(tmp_path, network=policy, allowed_hosts=("example.org",))
+
+
+@pytest.mark.parametrize(
+    "path", [".claude", "~/.claude", "~/.claude/settings.json", "/etc/claude-code", "a/b-c_d.e"]
+)
+def test_a_sealed_path_accepts_plain_paths(path: str) -> None:
+    assert SealedPath(path).path == path
+
+
+@pytest.mark.parametrize(
+    "path", ["", "~/", "/", "../x", "a/../b", "a//b", "~/a/./b", "a b", "~x", "a/", "$HOME/x"]
+)
+def test_a_sealed_path_refuses_anything_else(path: str) -> None:
+    with pytest.raises(ValueError, match="sealable"):
+        SealedPath(path)

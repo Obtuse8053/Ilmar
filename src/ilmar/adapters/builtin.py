@@ -234,6 +234,7 @@ def podman_runtime(options: Options, context: BuildContext) -> Plan:
 
 
 def claude_code_runner(options: Options, context: BuildContext) -> Plan:
+    from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
     from ilmar.adapters.claude_code.runner import ClaudeCodeRunner, ClaudeCodeSettings
 
     _refuse_weakening(options)
@@ -250,7 +251,13 @@ def claude_code_runner(options: Options, context: BuildContext) -> Plan:
     )
     host = urllib.parse.urlsplit(base_url).hostname if base_url else ANTHROPIC_API_HOST
     # The agent reaches exactly the model endpoint: no option widens this.
-    sandbox = AgentSandbox(image, NetworkPolicy.ALLOWLIST, (host or ANTHROPIC_API_HOST,))
+    sandbox = AgentSandbox(
+        image,
+        NetworkPolicy.ALLOWLIST,
+        (host or ANTHROPIC_API_HOST,),
+        # ADR-0036: Claude Code's settings locations, sealed at the sandbox boundary.
+        sealed_paths=SEALED_PATHS,
+    )
 
     def create(secrets: Secrets) -> ClaudeCodeRunner:
         return ClaudeCodeRunner(
