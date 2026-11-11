@@ -137,11 +137,15 @@ def coordinator_run(tmp_path: Path, text: str) -> tuple[S, int, str | None, list
         1, error_stream(text), "", 1.0))  # fmt: skip
     allow_probe(setup.runtime)
     setup.components.agent_runner = ClaudeCodeRunner(api_key=KEY)
-    setup.coordinator(retry_backoff=BACKOFF).run_once()
-    execution = setup.store.get("e1")
-    assert execution is not None
-    reasons = [e.reason for e in setup.store.events() if e.reason]
-    return execution.state, execution.attempt, execution.last_error, reasons
+    try:
+        setup.coordinator(retry_backoff=BACKOFF).run_once()
+        execution = setup.store.get("e1")
+        assert execution is not None
+        reasons = [e.reason for e in setup.store.events() if e.reason]
+        return execution.state, execution.attempt, execution.last_error, reasons
+    finally:
+        setup.ownership.release()
+        setup.store.close()  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("text", [CAP[0], AUTH[0]])
