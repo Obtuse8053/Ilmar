@@ -55,7 +55,7 @@ from ilmar.core.event_context import (
     require_failure_codes,
 )
 from ilmar.core.journal import Journal
-from ilmar.core.lifetimes import agent_sandbox_lifetime
+from ilmar.core.lifetimes import agent_sandbox_lifetime, execution_wall
 from ilmar.core.ownership import ExecutionLeases, Ownership
 from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, clock_behind
 from ilmar.core.verification import Verifier
@@ -178,15 +178,13 @@ class Coordinator:
 
         Every persisted timestamp comes from one non-decreasing clock (ADR-0022).
 
-        ``execution_wall_seconds`` gives the agent sandbox a runtime-side
-        lifetime (ADR-0029 §1): it must be at least ``agent_timeout_seconds``.
-        ``None`` sets none (the configuration always sets one).
+        Every agent sandbox gets a finite, runtime-enforced lifetime (ADR-0029
+        §1): ``execution_wall_seconds`` plus a grace period. The wall time must
+        be at least ``agent_timeout_seconds``; omitted, it is derived from it.
         """
-        lifetime = None
-        if execution_wall_seconds is not None:
-            if execution_wall_seconds < agent_timeout_seconds:
-                raise ValueError("execution_wall_seconds must be at least agent_timeout_seconds")
-            lifetime = agent_sandbox_lifetime(execution_wall_seconds)
+        lifetime = agent_sandbox_lifetime(
+            execution_wall(agent_timeout_seconds, execution_wall_seconds)
+        )
         clock = NonDecreasingClock(clock)
         events = PassEvents(clock=clock, new_id=new_pass_id)  # one per process, a pass id per pass
         journal = Journal(

@@ -25,6 +25,7 @@ rebuilt from journal text in #11b. A replay that would need one raises
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -183,8 +184,11 @@ class Effects:
         journal: Journal,
         verifier: Verifier,
         clock: Callable[[], datetime],
-        sandbox_lifetime_seconds: float | None = None,
+        sandbox_lifetime_seconds: float,
     ) -> None:
+        if not (math.isfinite(sandbox_lifetime_seconds) and sandbox_lifetime_seconds > 0):
+            # ADR-0029 §1: no agent sandbox may start without a runtime-side lifetime.
+            raise ValueError("an agent sandbox needs a positive, finite lifetime")
         self._c = components
         self._journal = journal
         self._verifier = verifier

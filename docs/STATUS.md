@@ -77,6 +77,8 @@ Hard gates that stay in force:
     `--timeout`, which conmon enforces, to the sandbox and its egress sidecar.
   - **Agent sandbox:** lives at most `[limits] execution_wall_seconds` (at
     least `agent_timeout_seconds`; default plus 600) plus a 60-second grace.
+    The lifetime is mandatory: omitting the wall time derives it from the
+    agent timeout, and no agent sandbox can start without a finite lifetime.
   - **Verification sandboxes:** at most the sum of their job's command
     timeouts plus the grace.
   - **Proof:** the real-Podman coordinator-SIGKILL test

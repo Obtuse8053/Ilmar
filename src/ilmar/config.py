@@ -64,7 +64,8 @@ class AdapterConfig:
 
 
 WALL_MARGIN_SECONDS = 600.0
-"""Default ``execution_wall_seconds`` beyond ``agent_timeout_seconds``."""
+"""Default ``execution_wall_seconds`` beyond ``agent_timeout_seconds``; equal to
+``ilmar.core.lifetimes.DEFAULT_WALL_MARGIN_SECONDS`` (checked by a test)."""
 
 
 @dataclass(frozen=True, slots=True)
