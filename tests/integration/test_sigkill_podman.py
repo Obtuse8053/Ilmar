@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from ilmar.core.coordinator import Coordinator
+from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.lifetimes import SANDBOX_GRACE_SECONDS
 from ilmar.core.naming import container_name
 from ilmar.core.ownership import Ownership
@@ -155,7 +156,7 @@ def recover(tmp: Path, agent: FixingAgent) -> ExecutionState:
 
 def test_a_sigkilled_coordinator_leaves_no_sandbox_running(tmp_path: Path) -> None:
     tmp = tmp_path.resolve()
-    (tmp / "state").mkdir()
+    WorkspaceLayout.under(tmp / "state").workspaces_root.mkdir(parents=True)
     child, name = start_coordinator(tmp)
     assert name == FIRST
     running = state(FIRST)

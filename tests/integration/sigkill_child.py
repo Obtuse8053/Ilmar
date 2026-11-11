@@ -12,6 +12,7 @@ Usage: ``python sigkill_child.py <state dir> <execution_wall_seconds>``.
 
 from __future__ import annotations
 
+import logging
 import pickle
 import sys
 from datetime import UTC, datetime
@@ -103,6 +104,7 @@ class HangingAgent:
 
 
 def main(tmp: Path, wall: float) -> None:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     scm = FakeSourceControl()
     scm.seed(REPO, "main", BASE_FILES)
     world = (FakeTaskProvider((task("1"),)), scm)
@@ -118,7 +120,11 @@ def main(tmp: Path, wall: float) -> None:
         clock=utc_now,
         new_id=lambda: "e1",
     )
-    coordinator.run_once()
+    report = coordinator.run_once()
+    # Reaching here means the agent never started: say why, for the test's message.
+    print(f"PASS-ENDED code={report.code} {report.summary}", flush=True)
+    for result in report.results:
+        print(f"RESULT {result.outcome} {result.detail}", flush=True)
 
 
 if __name__ == "__main__":
