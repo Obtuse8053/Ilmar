@@ -147,3 +147,24 @@ def test_a_failing_consumer_fails_closed_and_never_hangs() -> None:
 def test_an_idle_timeout_needs_a_consumer() -> None:
     with pytest.raises(ValueError, match="consumer"):
         subprocess_executor(python("pass"), ENV, 5.0, idle_timeout=1.0)
+
+
+def test_a_stream_of_only_telemetry_stalls_with_the_real_validator() -> None:
+    """ADR-0035 tests: rate limits and API retries never restart the timer, so a
+    run that only reports them for longer than the timeout is STALLED."""
+    from ilmar.adapters.claude_code.stream import StreamValidator
+
+    from claude_code_support import API_RETRY, INIT, RATE_LIMIT
+
+    events = [RATE_LIMIT, API_RETRY]
+    code = PRINT + f"p({INIT!r})\nfor i in range(200): p({events!r}[i % 2]); time.sleep(0.1)"
+    validator = StreamValidator()
+    began = time.monotonic()
+    done = subprocess_executor(python(code), ENV, 30.0, stdout_consumer=validator, idle_timeout=1.0)
+    assert done.stalled
+    assert (done.rejected, done.timed_out) == (False, False)
+    # Closing the killed stream finds no result; nothing was rejected before that.
+    assert validator.rejection is not None
+    assert validator.rejection.kind.value == "missing-result"
+    assert validator.events > 3  # telemetry kept arriving and was accepted
+    assert time.monotonic() - began < 10

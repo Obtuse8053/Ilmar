@@ -34,7 +34,7 @@ from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.workspace import CommandResult
 
-from claude_code_support import ASSISTANT, INIT, SUCCESS_RESULT, stream
+from claude_code_support import ASSISTANT, INIT, SUCCESS_RESULT, result_json, stream
 
 S = ExecutionState
 BACKOFF = RetryBackoff(300.0, 1200.0)
@@ -160,3 +160,30 @@ def test_a_crash_in_the_middle_of_a_stream_is_recovered_as_an_interrupted_attemp
     done = setup.store.get("e1")
     assert done is not None
     assert (done.state, done.attempt) == (S.SUCCEEDED, 2)
+
+
+def test_the_model_key_in_a_stream_never_reaches_the_store_logs_events_or_report(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ADR-0035 redaction, end to end: the key appears in agent events and in the
+    result text; it reaches neither the outcome, the ledger, the events, the
+    logs nor the report."""
+    db = tmp_path / "executions.sqlite3"
+    setup = make_setup(tmp_path, store=SQLiteExecutionStore(db))
+    leaking = stream(
+        result_json(subtype="error", is_error=True, text=f"failed with {KEY}"),
+        before=(INIT, ASSISTANT.replace("Looking.", f"using {KEY}")),
+    )
+    with_claude(setup, leaking)
+    with caplog.at_level(logging.DEBUG):
+        report = setup.coordinator(retry_backoff=BACKOFF).run_once()
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.last_error is not None
+    assert KEY not in execution.last_error
+    assert all(KEY not in r.detail for r in report.results)
+    assert all(KEY not in repr(event) for event in setup.store.events())
+    assert KEY not in caplog.text
+    setup.store.close()  # type: ignore[attr-defined]
+    stored = b"".join(path.read_bytes() for path in tmp_path.rglob("executions.sqlite3*"))
+    assert KEY.encode() not in stored
