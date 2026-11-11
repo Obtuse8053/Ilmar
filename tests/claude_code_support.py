@@ -91,38 +91,68 @@ def shell_script(scenario: AgentScenario, record: str) -> str:
 
 
 class ProbeStandIn:
-    """Answers ``/bin/sh -c <probe>`` the way the real probe does: the names of
-    the environment it was given plus any ``image_env`` names, and any listed
-    files and project settings. Records each environment it saw."""
+    """Answers ``/bin/sh -c <probe>`` the way the real probe does in a correctly
+    sealed sandbox: the names of the environment it was given plus any
+    ``image_env``, listed files and settings, the home and working directory,
+    and the mount table with every sealed path in place unless named in
+    ``unsealed``. ``drop`` removes output lines that start with a marker (to
+    simulate a step that never finished). Records each environment it saw."""
 
     def __init__(
         self,
         *,
         image_env: Sequence[str] = (),
+        hide_env: Sequence[str] = (),
         files: Sequence[str] = (),
         settings: Sequence[str] = (),
+        unsealed: Sequence[str] = (),
+        wrong_access: Sequence[str] = (),
         exit_code: int = 0,
-        finish: bool = True,
+        drop: Sequence[str] = (),
+        extra: Sequence[str] = (),
     ) -> None:
         self.image_env = tuple(image_env)
+        self.hide_env = set(hide_env)
         self.files = tuple(files)
         self.settings = tuple(settings)
+        self.unsealed = set(unsealed)
+        self.wrong_access = set(wrong_access)
         self.exit_code = exit_code
-        self.finish = finish
+        self.drop = tuple(drop)
+        self.extra = tuple(extra)
         self.seen: list[dict[str, str]] = []
 
     def __call__(
         self, argv: Sequence[str], timeout: float, env: Mapping[str, str]
     ) -> CommandResult:
-        from ilmar.adapters.claude_code.credential_route import PROBE_END, PROBE_SCRIPT
+        from ilmar.adapters.claude_code.credential_route import (
+            PROBE_END,
+            PROBE_SCRIPT,
+            SEALED_PATHS,
+        )
 
         assert list(argv) == ["/bin/sh", "-c", PROBE_SCRIPT], argv
         self.seen.append(dict(env))
-        lines = [f"ENV {name}" for name in sorted({*env, *self.image_env, "HOME", "PATH"})]
+        names = sorted({*env, *self.image_env, "HOME", "PATH"} - self.hide_env)
+        lines = [f"ENV {name}" for name in names] + ["ENV-DONE"]
+        lines += ["HOME-DIR /home/ilmar", "WORKDIR /workspace"]
         lines += [f"FILE {f}" for f in self.files] + [f"SETTING {s}" for s in self.settings]
-        if self.finish:
-            lines.append(PROBE_END)
-        return CommandResult(self.exit_code, "\n".join(lines) + "\n", "", 0.1)
+        lines += ["MOUNT / ro,nosuid", "MOUNT /workspace rw,relatime", "MOUNT /home/ilmar rw"]
+        for sealed in SEALED_PATHS:
+            target = (
+                "/home/ilmar/" + sealed.path[2:]
+                if sealed.path.startswith("~/")
+                else "/workspace/" + sealed.path
+            )
+            if target in self.unsealed:
+                continue
+            access = "rw" if sealed.writable else "ro"
+            if target in self.wrong_access:
+                access = "ro" if access == "rw" else "rw"
+            lines.append(f"MOUNT {target} {access},nosuid,nodev")
+        lines += ["MOUNTS-DONE", *self.extra, PROBE_END]
+        kept = [line for line in lines if not line.startswith(self.drop)] if self.drop else lines
+        return CommandResult(self.exit_code, "\n".join(kept) + "\n", "", 0.1)
 
 
 def allow_probe(runtime: FakeContainerRuntime, probe: ProbeStandIn | None = None) -> ProbeStandIn:

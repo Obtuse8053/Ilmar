@@ -37,6 +37,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
+    SealedPath,
 )
 
 from contracts.container_runtime import SetAfter
@@ -1173,3 +1174,43 @@ def test_the_egress_proxy_gets_the_same_lifetime(
     assert sandbox is not None
     assert "--timeout=90" in proxy.run_args
     assert "--timeout=90" in sandbox.run_args
+
+
+# -- sealed paths (ADR-0036) --------------------------------------------------------------
+
+
+def tmpfs_args(podman: FakePodman) -> list[str]:
+    args = run_args(podman)
+    return [args[i + 1] for i, a in enumerate(args) if a == "--tmpfs"]
+
+
+def test_sealed_paths_become_tmpfs_mounts_with_their_access(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    sealed = (
+        SealedPath(".claude"),
+        SealedPath("~/.claude", writable=True),
+        SealedPath("~/.claude/settings.json"),
+        SealedPath("/etc/example"),
+    )
+    runtime(layout, podman).start(spec(workspace, sealed_paths=sealed))
+    mounts = tmpfs_args(podman)
+    assert "/workspace/.claude:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
+    assert any(m.startswith("/home/ilmar/.claude:rw,nosuid,nodev,mode=1777,") for m in mounts)
+    assert "/home/ilmar/.claude/settings.json:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
+    assert "/etc/example:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
+
+
+def test_no_sealed_paths_add_no_mounts(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman).start(spec(workspace))
+    assert [m.split(":")[0] for m in tmpfs_args(podman)] == ["/tmp", "/home/ilmar"]
+
+
+@pytest.mark.parametrize("path", ["/tmp", "/workspace", "/home/ilmar"])
+def test_a_directory_the_sandbox_needs_is_never_sealed(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, path: str
+) -> None:
+    with pytest.raises(ProviderError, match="cannot seal"):
+        runtime(layout, podman).start(spec(workspace, sealed_paths=(SealedPath(path),)))

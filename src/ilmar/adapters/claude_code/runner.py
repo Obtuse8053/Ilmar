@@ -253,7 +253,7 @@ class ClaudeCodeRunner:
             raise ProviderError(
                 f"the credential-path probe did not complete (exit {probe.exit_code})"
             )
-        reason = refusal(report, gateway_configured=gateway)
+        reason = refusal(report, gateway_configured=gateway, expected_variables=env)
         if reason is not None:
             raise PolicyViolationError(reason)
 

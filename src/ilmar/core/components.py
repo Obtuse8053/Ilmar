@@ -21,7 +21,7 @@ from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.changes import RepositoryRef
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.verification import VerificationPolicy
-from ilmar.domain.workspace import NetworkPolicy, ResourceLimits
+from ilmar.domain.workspace import NetworkPolicy, ResourceLimits, SealedPath
 from ilmar.ports.agent_runner import AgentRunner
 from ilmar.ports.container_runtime import ContainerRuntime
 from ilmar.ports.execution_store import ExecutionStore
@@ -42,6 +42,8 @@ class AgentSandbox:
     network: NetworkPolicy
     allowed_hosts: tuple[str, ...] = ()
     limits: ResourceLimits = field(default_factory=ResourceLimits)
+    sealed_paths: tuple[SealedPath, ...] = ()
+    """Paths the agent runner needs sealed in its sandbox (ADR-0036)."""
 
     def __post_init__(self) -> None:
         if not self.image:

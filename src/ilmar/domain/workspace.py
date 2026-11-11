@@ -94,6 +94,33 @@ class ResourceOwner:
             raise ValueError("attempt starts at 1")
 
 
+_SEALED_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class SealedPath:
+    """An empty directory the runtime mounts over ``path`` in the container.
+
+    ``path`` is ``~/<relative>`` (under the container user's home), a relative
+    path (under the working directory) or an absolute path. The processes in
+    the container can neither remove nor rename it, and with ``writable``
+    false they cannot create anything in it either. Whatever the image or the
+    workspace has at that path is hidden for the container's lifetime, and the
+    host's copy is left unchanged (ADR-0036).
+    """
+
+    path: str
+    writable: bool = False
+
+    def __post_init__(self) -> None:
+        relative = self.path.removeprefix("~/").removeprefix("/")
+        segments = relative.split("/")
+        if not relative or not all(
+            _SEALED_SEGMENT.match(s) and s not in {".", ".."} for s in segments
+        ):
+            raise ValueError(f"not a sealable path: {self.path!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class ContainerSpec:
     """How to start an isolated workspace.
@@ -120,6 +147,9 @@ class ContainerSpec:
     allowed_hosts: tuple[str, ...] = ()
     """Hostnames reachable on port 443 under ``ALLOWLIST``; empty for other policies."""
     limits: ResourceLimits = field(default_factory=ResourceLimits)
+    sealed_paths: tuple[SealedPath, ...] = ()
+    """Directories sealed by the runtime (ADR-0036); a runtime that cannot seal
+    them refuses to start the container."""
     lifetime_seconds: float | None = None
     """The longest the container may exist after it starts (ADR-0029 §1). The
     runtime itself stops it then, even if the process that started it has died;

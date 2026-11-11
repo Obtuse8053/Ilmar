@@ -86,6 +86,14 @@ Hard gates that stay in force:
     authentication failure, ends the execution without a retry
     (`provider-refused`). An ordinary rate limit or overload is transient
     (`provider-rate-limited`).
+  - **Review fixes (ADR-0036, Proposed):**
+    - The probe is strictly fail-closed: a missing tool, an unreadable file or
+      any unfinished step means Claude Code does not start.
+    - Claude Code's settings locations are sealed at the sandbox boundary
+      (read-only tmpfs mounts the agent cannot write, remove or rename), so no
+      `apiKeyHelper` can appear after the check.
+    - The pinned-version check is `tests/integration/test_claude_code_pinned.py`
+      (no credential needed); it joins the Gate 1 evidence.
   - **Not yet in place:** #18 turns `provider-refused` into a durable
     suspension of all new work. The exact texts at a workspace cap are
     unverified until the Gate 1 drill (#93). The supervised-mode concurrency

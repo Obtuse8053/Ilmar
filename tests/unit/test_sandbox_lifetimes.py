@@ -146,3 +146,18 @@ def test_lifetime_helpers() -> None:
         agent_sandbox_lifetime(0)
     commands = [VerificationCommand("x", ("true",), timeout_seconds=12.5, job="j")] * 2
     assert verification_sandbox_lifetime(commands) == 25.0 + SANDBOX_GRACE_SECONDS
+
+
+def test_the_agent_sandbox_carries_the_runner_sealed_paths(tmp_path: Path) -> None:
+    """ADR-0036: the sealed paths the agent runner declares reach the sandbox spec."""
+    from dataclasses import replace
+
+    from ilmar.domain.workspace import SealedPath
+
+    setup = make_setup(tmp_path, tasks=(task("1"),))
+    sealed = (SealedPath(".claude"), SealedPath("~/.claude", writable=True))
+    setup.components.agent_sandbox = replace(setup.components.agent_sandbox, sealed_paths=sealed)
+    setup.coordinator().run_once()
+    agent, *verification = setup.runtime.started_specs
+    assert agent.sealed_paths == sealed
+    assert all(spec.sealed_paths == () for spec in verification)

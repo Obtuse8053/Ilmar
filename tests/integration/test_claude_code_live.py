@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
+from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
 from ilmar.adapters.claude_code.stream import (
     ACTIVITY_TYPES,
     RESULT_TYPE,
@@ -179,6 +180,7 @@ def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Pa
             workspace_identity=identity_of(workspace),
             network=NetworkPolicy.ALLOWLIST,
             allowed_hosts=ALLOWED,
+            sealed_paths=SEALED_PATHS,  # ADR-0036, as the claude-code adapter sets them
         )
     )
     try:

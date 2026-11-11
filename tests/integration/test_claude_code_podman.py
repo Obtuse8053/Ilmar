@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
+from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
 from ilmar.adapters.podman import PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.agent import AgentOutcome
@@ -92,6 +93,7 @@ class TestClaudeCodeRunnerOnRealPodman(AgentRunnerContract):
                 name=name,
                 owner=OWNER,
                 workspace_identity=identity_of(workspace),
+                sealed_paths=SEALED_PATHS,  # ADR-0036, as the claude-code adapter sets them
             )
         )
         self._workspaces[handle.id] = workspace
@@ -133,16 +135,21 @@ def test_arguments_and_credential_reach_only_the_agent_command(layout: Workspace
 
 
 @pytest.mark.parametrize(
-    ("env", "settings_file", "expected"),
+    ("env", "settings_file", "sealed", "expected"),
     [
-        ({"ANTHROPIC_AUTH_TOKEN": "not-a-real-token"}, None, "ANTHROPIC_AUTH_TOKEN"),
-        ({"CLAUDE_CODE_USE_BEDROCK": "1"}, None, "CLAUDE_CODE_USE_BEDROCK"),
-        ({}, '{"apiKeyHelper": "/bin/echo"}', ".claude/settings.json"),
+        ({"ANTHROPIC_AUTH_TOKEN": "not-a-real-token"}, None, True, "ANTHROPIC_AUTH_TOKEN"),
+        ({"CLAUDE_CODE_USE_BEDROCK": "1"}, None, True, "CLAUDE_CODE_USE_BEDROCK"),
+        ({"CLAUDE_CONFIG_DIR": "/tmp/elsewhere"}, None, True, "CLAUDE_CONFIG_DIR"),
+        ({}, '{"apiKeyHelper": "/bin/echo"}', False, "not sealed"),
     ],
-    ids=["auth-token", "bedrock", "api-key-helper"],
+    ids=["auth-token", "bedrock", "config-dir", "unsealed-settings"],
 )
 def test_another_credential_route_refuses_before_claude_runs_on_real_podman(
-    layout: WorkspaceLayout, env: dict[str, str], settings_file: str | None, expected: str
+    layout: WorkspaceLayout,
+    env: dict[str, str],
+    settings_file: str | None,
+    sealed: bool,
+    expected: str,
 ) -> None:
     """ADR-0029 §5: the real probe in a real sandbox finds a route set by the
     container's own environment or by project settings, and Claude Code never
@@ -161,7 +168,8 @@ def test_another_credential_route_refuses_before_claude_runs_on_real_podman(
     runtime = PodmanRuntime(layout=layout)
     handle = runtime.start(
         ContainerSpec(image=IMAGE, host_workspace=workspace, name=name, owner=OWNER,
-                      workspace_identity=identity_of(workspace), env=env)
+                      workspace_identity=identity_of(workspace), env=env,
+                      sealed_paths=SEALED_PATHS if sealed else ())
     )  # fmt: skip
     try:
         with pytest.raises(PolicyViolationError, match=expected) as refused:

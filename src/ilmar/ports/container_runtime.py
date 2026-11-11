@@ -85,6 +85,11 @@ class ContainerRuntime(Protocol):
         runtime enforces this on its own side: it must hold even if the calling
         process is killed (ADR-0029 §1). A runtime that cannot do this raises
         ``ProviderError`` instead of starting the container.
+
+        Each of ``spec.sealed_paths`` becomes an empty directory that processes
+        in the container can neither remove nor rename, and, unless it is
+        writable, cannot create anything in (ADR-0036). A runtime that cannot
+        seal them raises ``ProviderError`` instead of starting the container.
         """
         ...
 
