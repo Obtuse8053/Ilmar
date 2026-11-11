@@ -88,16 +88,37 @@ Releases with schema migrations never roll back automatically.
 | Milestone | Ends at | Pull requests (estimate) | Critical path |
 | --- | --- | --- | --- |
 | M3 Reliability | Gate 1 (#93) | about 8, plus gate evidence | #89 ADRs → #13 → #18 → #91 loop mode |
-| M4 Self-hosting, Mode 2 part | Gate 2 (#96) | about 5, plus gate evidence | #94 evaluation → #94 integration |
+| M4 Self-hosting, Mode 2 part | Gate 2 (#96) | about 6, plus gate evidence | #111 proxy ADR and implementation; #94 evaluation → #94 integration |
 | M4 Self-hosting, Mode 3 part | Gate 3 (#98) | about 6, plus gate evidence | #97 releases |
 
-In parallel within M3: #90 (limits and credential path), #92 (protected
+In parallel within M3: #110 (candidate secret scan, a Gate 1 prerequisite),
+#90 (limits and credential path), #92 (protected
 safety controls) and #59 (quarantine recovery). #87 (stray labels) is off the
 critical path. #14 and #51 are outside the autonomy path.
 
 Gate 1 runs on a dedicated test repository. MANIFEST §10 places work on
 Ilmar's own repository in M4, so pointing the loop at this repository waits
 for the maintainer's decision after Gate 1.
+
+### Credential containment by gate (maintainer decisions, 2026-11-11)
+
+ADR-0036 sets out which routes to a model are enforced today. These decisions
+follow from it:
+
+- **Candidate secret scan (#110): mandatory before Gate 1.** Before
+  publication, Ilmar scans the frozen candidate for the values of configured
+  secrets and refuses to publish a match, without exposing the values. It
+  detects the values and the specific encodings listed in #110. It does not
+  detect arbitrary transformations of a secret.
+- **Pinned-version compatibility test: mandatory before Gate 1.**
+  `tests/integration/test_claude_code_pinned.py` passes on the pinned image,
+  together with the pinned-version live test and its reviewed, recorded
+  stream fixture.
+- **Credential-injecting egress proxy (#111): not required for Gate 1.**
+  This holds only if Gate 1 runs on a controlled test repository that holds
+  no credentials, with trusted tasks and a capped workspace.
+- **#111 is mandatory before** Mode 2, any untrusted repository, and
+  self-hosting.
 
 ## Mandatory test areas
 
