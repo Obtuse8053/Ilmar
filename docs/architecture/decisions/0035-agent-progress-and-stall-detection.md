@@ -1,8 +1,8 @@
 # ADR-0035: Agent progress from stream events, and stall detection
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-10
-- Sources: [R15], [R21] · Findings: F-002, F-021
+- Sources: [R15], [R21], [R28] · Findings: F-002, F-021
 - Amends (by addition; no accepted text is edited):
   - **ADR-0017:** the invocation and the result parsing.
   - **ADR-0014:** a command's inactivity timeout and bounded output capture.
@@ -37,7 +37,7 @@ Today:
 1. **`--output-format stream-json --verbose`.** Claude Code writes one JSON
    object per line as the run progresses and ends with one result object
    ([R15]). Telemetry such as `rate_limit_event` can follow the result, as
-   the maintainer observed. **Chosen.**
+   an upstream Claude Code issue reports for v2.1.302 ([R28]). **Chosen.**
 2. *CPU progress of the container* (for example `podman stats`). Rejected:
    - a busy loop counts as progress, and a wait on the network does not;
    - it needs polling a second interface;
@@ -89,7 +89,7 @@ The initial entries:
 
 | Entry | After the result | Basis |
 | --- | --- | --- |
-| `rate_limit_event` | Allowed | Observed by the maintainer, including after the result |
+| `rate_limit_event` | Allowed | Reported after the result in upstream Claude Code issue anthropics/claude-code#103253, on v2.1.302 ([R28]). Not yet verified on Ilmar's pinned version |
 | `system` / `api_retry` | **Not** allowed | Documented in [R15]; not observed after the result |
 
 **Adding an entry, or allowing one after the result,** needs three things:
@@ -108,6 +108,24 @@ result's documented fields (§5) are the one exception.
 
 Nothing else is an event: standard error, non-JSON lines, objects without a
 known `type`, over-long lines and partial lines.
+
+**Correction at acceptance (maintainer, 2026-11-10).** The basis for
+`rate_limit_event` after the result is the upstream report above, not an
+observation by the maintainer, as the proposed text said. No entry is
+treated as verified for Ilmar until the pinned-version fixture and the live
+test confirm it.
+
+**Enablement gate (maintainer, 2026-11-10).** The stream-json runner may
+run single, manual passes (`ilmar run --once`) once it is merged. It may not
+run in any mode above manual (ADR-0030) until both of these hold:
+
+- `expected_version` is set, so the version pin is mandatory rather than
+  optional;
+- a successful opt-in live test on exactly that version is recorded as gate
+  evidence, with its redacted event-type fixture committed.
+
+Configuration validation refuses a mode above manual without
+`expected_version`. The Gate 1 checklist (#93) includes the live test.
 
 ### 3. The inactivity timeout
 
