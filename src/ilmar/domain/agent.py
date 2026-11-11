@@ -39,6 +39,8 @@ class AgentOutcome(enum.Enum):
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"  # stopped by a stop signal (ADR-0025 §2); never frozen
     STALLED = "stalled"  # no progress for the stall timeout (ADR-0035 §3); retried
+    RATE_LIMITED = "rate_limited"  # an ordinary provider rate limit (ADR-0029 §5); retried
+    PROVIDER_REFUSED = "provider_refused"  # spend cap, billing or auth (ADR-0029 §5); never retried
 
 
 @dataclass(frozen=True, slots=True)

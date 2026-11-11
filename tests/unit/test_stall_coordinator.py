@@ -34,7 +34,14 @@ from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.workspace import CommandResult
 
-from claude_code_support import ASSISTANT, INIT, SUCCESS_RESULT, result_json, stream
+from claude_code_support import (
+    ASSISTANT,
+    INIT,
+    SUCCESS_RESULT,
+    allow_probe,
+    result_json,
+    stream,
+)
 
 S = ExecutionState
 BACKOFF = RetryBackoff(300.0, 1200.0)
@@ -70,6 +77,7 @@ def with_claude(setup: Setup, stdout: str) -> None:
         return CommandResult(0, stdout, "", 1.0)
 
     setup.runtime.register("claude", claude)
+    allow_probe(setup.runtime)
     setup.components.agent_runner = ClaudeCodeRunner(api_key=KEY)
 
 
@@ -139,6 +147,7 @@ def test_a_crash_in_the_middle_of_a_stream_is_recovered_as_an_interrupted_attemp
         raise _CoordinatorDied  # as if the process ended during the run
 
     setup.runtime.register("claude", claude)
+    allow_probe(setup.runtime)
     setup.components.agent_runner = ClaudeCodeRunner(api_key=KEY)
     with pytest.raises(_CoordinatorDied):
         setup.coordinator(retry_backoff=BACKOFF).run_once()

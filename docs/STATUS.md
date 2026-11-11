@@ -72,6 +72,24 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-11: **#90 part 1 merged** (#108). **Part 2 submitted: one credential
+  path and provider failures** (ADR-0029 §5).
+  - **Credential path:** before Claude Code starts, a fixed probe runs in the
+    sandbox with Claude Code's own environment. It reports variable names,
+    credential files and project settings that mention a credential setting.
+    Any other route refuses the run (`policy-violation`, never retried):
+    `ANTHROPIC_*` beyond the key, `ANTHROPIC_BASE_URL` without a gateway,
+    OAuth, Bedrock, Vertex and cloud credentials, login files, managed
+    settings, `apiKeyHelper`. A probe that cannot finish never lets Claude
+    Code start.
+  - **Provider failures:** a spend, usage, credit or billing limit, or an
+    authentication failure, ends the execution without a retry
+    (`provider-refused`). An ordinary rate limit or overload is transient
+    (`provider-rate-limited`).
+  - **Not yet in place:** #18 turns `provider-refused` into a durable
+    suspension of all new work. The exact texts at a workspace cap are
+    unverified until the Gate 1 drill (#93). The supervised-mode concurrency
+    rule moves to #91, with the mode setting.
 - 2026-11-11: **#90 part 1 submitted: runtime-side sandbox lifetime.**
   - **What:** `ContainerSpec.lifetime_seconds`; Podman passes it as
     `--timeout`, which conmon enforces, to the sandbox and its egress sidecar.

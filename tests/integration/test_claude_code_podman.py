@@ -19,6 +19,7 @@ from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
 from ilmar.adapters.podman import PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.agent import AgentOutcome
+from ilmar.domain.errors import PolicyViolationError
 from ilmar.domain.workspace import ContainerHandle, ContainerSpec, ResourceOwner
 from ilmar.ports.agent_runner import AgentRunner
 from ilmar.ports.container_runtime import ContainerRuntime
@@ -129,3 +130,45 @@ def test_arguments_and_credential_reach_only_the_agent_command(layout: Workspace
         assert KEY not in other.stdout
     finally:
         runtime.stop(handle, owner=OWNER)
+
+
+@pytest.mark.parametrize(
+    ("env", "settings_file", "expected"),
+    [
+        ({"ANTHROPIC_AUTH_TOKEN": "not-a-real-token"}, None, "ANTHROPIC_AUTH_TOKEN"),
+        ({"CLAUDE_CODE_USE_BEDROCK": "1"}, None, "CLAUDE_CODE_USE_BEDROCK"),
+        ({}, '{"apiKeyHelper": "/bin/echo"}', ".claude/settings.json"),
+    ],
+    ids=["auth-token", "bedrock", "api-key-helper"],
+)
+def test_another_credential_route_refuses_before_claude_runs_on_real_podman(
+    layout: WorkspaceLayout, env: dict[str, str], settings_file: str | None, expected: str
+) -> None:
+    """ADR-0029 §5: the real probe in a real sandbox finds a route set by the
+    container's own environment or by project settings, and Claude Code never
+    starts."""
+    name = "ilmar-it-claude-route"
+    remove_everything(name)
+    workspace = make_workspace(layout, "claude-route")
+    fake = workspace / FAKE
+    fake.mkdir()
+    script = fake / "claude"
+    script.write_text(shell_script(AgentScenario.COMPLETES, f"/workspace/{FAKE}/record"))
+    script.chmod(0o755)
+    if settings_file is not None:
+        (workspace / ".claude").mkdir()
+        (workspace / ".claude" / "settings.json").write_text(settings_file)
+    runtime = PodmanRuntime(layout=layout)
+    handle = runtime.start(
+        ContainerSpec(image=IMAGE, host_workspace=workspace, name=name, owner=OWNER,
+                      workspace_identity=identity_of(workspace), env=env)
+    )  # fmt: skip
+    try:
+        with pytest.raises(PolicyViolationError, match=expected) as refused:
+            ClaudeCodeRunner(api_key=KEY, settings=settings()).run(runtime, handle, REQUEST)
+        assert KEY not in str(refused.value)
+        assert "not-a-real-token" not in str(refused.value)
+        assert not (fake / "record.argv").exists()  # claude never ran
+    finally:
+        runtime.stop(handle, owner=OWNER)
+        remove_everything(name)

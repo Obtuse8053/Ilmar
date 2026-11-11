@@ -94,6 +94,8 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "agent-failed": "The agent reported a failure.",
         "agent-timed-out": "The agent did not finish in time.",
         "agent-stalled": "The agent showed no progress for the stall timeout.",
+        "provider-rate-limited": "The model provider rate-limited the agent; it is retried.",
+        "provider-refused": "The model provider refused: spend limit, billing or authentication.",
         "verification-failed": "A verification run did not pass.",
         "attempts-exhausted": "No attempt is left.",
         "transient-provider-error": "A provider failed in a way that is retried.",

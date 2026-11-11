@@ -37,10 +37,19 @@ decides (ADR-0010).
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from ilmar.adapters.claude_code.stream import EventObserver, StreamValidator
+from ilmar.adapters.claude_code.credential_route import (
+    own_environment_refusal,
+    parse_probe,
+    probe_command,
+    refusal,
+)
+from ilmar.adapters.claude_code.provider_errors import ProviderFailure, classify
+from ilmar.adapters.claude_code.stream import EventObserver, StreamValidator, Violation
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.errors import PolicyViolationError, ProviderError
 from ilmar.domain.workspace import ContainerHandle, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
 
@@ -110,6 +119,9 @@ class ClaudeCodeRunner:
         stop: StopSignal | None = None,
     ) -> AgentResult:
         settings = self._settings
+        env = self._environment()
+        # ADR-0029 §5: one credential path, checked before Claude Code starts.
+        self._require_one_credential_path(runtime, container, env)
         if settings.expected_version is not None:
             mismatch = self._version_mismatch(runtime, container)
             if mismatch is not None:
@@ -120,7 +132,7 @@ class ClaudeCodeRunner:
             container,
             self.command(request),
             timeout_seconds=request.timeout_seconds,
-            env=self._environment(),
+            env=env,
             stop=stop,
             idle_timeout_seconds=request.stall_timeout_seconds,
             stdout_consumer=validator,
@@ -141,9 +153,11 @@ class ClaudeCodeRunner:
             rejection = validator.rejection
             text = str(rejection) if rejection is not None else "malformed stream"
             detail = self._stderr_detail(result.stderr)
-            return AgentResult(
-                AgentOutcome.FAILED, f"{text} ({detail})" if detail else text, result.exit_code
-            )
+            summary = f"{text} ({detail})" if detail else text
+            if rejection is not None and rejection.kind is Violation.MISSING_RESULT:
+                # The process ended without a result: often an API failure on stderr.
+                return self._failure(summary, detail, result.exit_code)
+            return AgentResult(AgentOutcome.FAILED, summary, result.exit_code)
         parsed = validator.result
         if parsed is None:  # pragma: no cover - the validator rejects a missing result
             return AgentResult(AgentOutcome.FAILED, "malformed stream: no result", None)
@@ -153,14 +167,31 @@ class ClaudeCodeRunner:
         if result.exit_code == 0 and success:
             return AgentResult(AgentOutcome.COMPLETED, text or "Claude Code finished", 0)
         reason = subtype or "error"
+        detail = self._stderr_detail(result.stderr)
         if success:  # claims success, but the process failed (F-021)
             reason = f"exit status {result.exit_code} despite a success result"
-            detail = self._stderr_detail(result.stderr)
             if detail:
                 reason += f" ({detail})"
-        return AgentResult(
-            AgentOutcome.FAILED, f"{reason}: {text}" if text else reason, result.exit_code
-        )
+            return AgentResult(
+                AgentOutcome.FAILED, f"{reason}: {text}" if text else reason, result.exit_code
+            )
+        summary = f"{reason}: {text}" if text else reason
+        return self._failure(summary, f"{text} {detail}", result.exit_code)
+
+    @staticmethod
+    def _failure(summary: str, evidence: str, exit_code: int | None) -> AgentResult:
+        """A failed run, classified by what the provider reported (ADR-0029 §5).
+
+        ``evidence`` is redacted text from the result and standard error.
+        """
+        failure = classify(evidence)
+        if failure is None:
+            return AgentResult(AgentOutcome.FAILED, summary, exit_code)
+        if failure is ProviderFailure.RATE_LIMIT:
+            outcome = AgentOutcome.RATE_LIMITED
+        else:  # CAP or AUTH: fail closed, never retried
+            outcome = AgentOutcome.PROVIDER_REFUSED
+        return AgentResult(outcome, f"provider {failure.value}: {summary}", exit_code)
 
     def command(self, request: AgentRequest) -> list[str]:
         settings = self._settings
@@ -197,6 +228,34 @@ class ClaudeCodeRunner:
         if self._settings.base_url is not None:
             env["ANTHROPIC_BASE_URL"] = self._settings.base_url
         return env
+
+    def _require_one_credential_path(
+        self, runtime: ContainerRuntime, container: ContainerHandle, env: Mapping[str, str]
+    ) -> None:
+        """Refuse the run if the sandbox offers any other route to a model.
+
+        Raises ``PolicyViolationError`` (never retried) naming the variables,
+        files or settings found, never their values; ``ProviderError`` if the
+        probe cannot run, so Claude Code never starts unchecked.
+        """
+        gateway = self._settings.base_url is not None
+        own = own_environment_refusal(env, gateway_configured=gateway)
+        if own is not None:  # pragma: no cover - the environment is fixed above
+            raise PolicyViolationError(own)
+        probe = runtime.run(
+            container,
+            probe_command(),
+            timeout_seconds=self._settings.version_timeout_seconds,
+            env=env,
+        )
+        report = parse_probe(probe.stdout) if probe.succeeded else None
+        if report is None:
+            raise ProviderError(
+                f"the credential-path probe did not complete (exit {probe.exit_code})"
+            )
+        reason = refusal(report, gateway_configured=gateway)
+        if reason is not None:
+            raise PolicyViolationError(reason)
 
     def _version_mismatch(
         self, runtime: ContainerRuntime, container: ContainerHandle
