@@ -8,6 +8,12 @@
   every kind of violation.
 * A crash in the middle of a stream changes nothing durable beyond what
   recovery already handles: the attempt is abandoned and retried.
+
+The crash here is simulated in-process with fakes. It does **not** show that a
+real container stops by itself when the coordinator is killed: that needs the
+runtime-side lifetime (Podman ``--timeout``) from #90 and a real-Podman
+SIGKILL integration test, which is a blocking #90 / Gate 1 requirement and has
+not been run.
 """
 
 from __future__ import annotations
@@ -122,7 +128,8 @@ def test_a_crash_in_the_middle_of_a_stream_is_recovered_as_an_interrupted_attemp
 ) -> None:
     """The coordinator dies while the agent streams: the stream is lost with it,
     nothing of it was stored, and recovery abandons the attempt and retries it
-    after backoff."""
+    after backoff. Simulated: says nothing about the container stopping on its
+    own (see the module note)."""
     setup = make_setup(tmp_path)
 
     class _CoordinatorDied(BaseException):

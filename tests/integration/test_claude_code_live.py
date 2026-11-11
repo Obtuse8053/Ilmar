@@ -10,13 +10,17 @@ suite's requirements:
   Anthropic's terms; Ilmar never distributes it);
 * ``ILMAR_TEST_PODMAN_PROXY_IMAGE``: an image with ``python3`` for the proxy;
 * ``ANTHROPIC_API_KEY``: a model credential (costs a few cents);
-* optionally ``ILMAR_TEST_CLAUDE_VERSION`` to check the pinned version.
+* ``ILMAR_TEST_CLAUDE_VERSION``: the pinned ``x.y.z`` the image was built
+  with. Optional for a local smoke run, which then writes no record. Under
+  ``ILMAR_LIVE_REQUIRED=1`` it is required: an unpinned run fails and is never
+  Gate 1 evidence.
 
 It is also ADR-0035's pinned-version stream check (#13): every event the real
 CLI emits must be classified, exactly one result must appear and only verified
-after-result telemetry may follow it. With ``ILMAR_LIVE_REPORT_DIR`` set, the
-sequence of event *types* (never content) is written as the recorded fixture
-the enablement gate asks for.
+after-result telemetry may follow it. With ``ILMAR_LIVE_REPORT_DIR`` set and
+a pinned version, the sequence of event *types* (never content) is written,
+marked ``"provenance": "recorded"``; only such a record, reviewed, meets the
+enablement gate. The checked-in ``*-synthetic.json`` fixture never does.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from ilmar.adapters.podman import EgressSettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.agent import AgentOutcome, AgentRequest
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
-from live_harness import Secret, write_report
+from live_harness import LiveGuardError, Secret, pinned_claude_version, write_report
 
 from helpers import task
 from integration.podman_support import (
@@ -54,19 +58,21 @@ pytestmark = pytest.mark.integration
 
 IMAGE = os.environ.get("ILMAR_TEST_CLAUDE_IMAGE", "")
 KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-VERSION = os.environ.get("ILMAR_TEST_CLAUDE_VERSION") or None
 NAME = "ilmar-it-claude-live"
 ALLOWED = ("api.anthropic.com",)
 
 
-def record_smoke_test(contacted: list[str]) -> None:
-    """The #44 record: version, image digest, date and hosts; never the key."""
+def record_smoke_test(contacted: list[str], version: str | None) -> None:
+    """The #44 record: version, image digest, date and hosts; never the key.
+
+    Written only for a pinned version: an unpinned run is not evidence.
+    """
     directory = os.environ.get("ILMAR_LIVE_REPORT_DIR")
-    if not directory:
+    if not directory or version is None:
         return
     digest = podman("image", "inspect", "--format", "{{.Digest}}", IMAGE).stdout.strip()
     path = write_report(Path(directory), "issue-44-smoke-test", {
-        "claude_code_version": VERSION or "(not pinned: set ILMAR_TEST_CLAUDE_VERSION)",
+        "claude_code_version": version,
         "image": IMAGE, "image_digest": digest, "hosts_contacted": contacted,
         "denied": [], "at": datetime.now(UTC).isoformat(),
     }, [Secret("ANTHROPIC_API_KEY", KEY)])  # fmt: skip
@@ -118,13 +124,19 @@ def unclassified(events: list[tuple[str, str | None, bool]]) -> list[str]:
     return problems
 
 
-def record_stream_fixture(events: list[tuple[str, str | None, bool]]) -> None:
-    """The ADR-0035 enablement record: the pinned version's event types."""
+def record_stream_fixture(events: list[tuple[str, str | None, bool]], version: str | None) -> None:
+    """The ADR-0035 enablement record: the pinned version's event types.
+
+    Written only for a pinned version, and marked ``recorded`` so it can never
+    be confused with the synthetic fixture.
+    """
     directory = os.environ.get("ILMAR_LIVE_REPORT_DIR")
-    if not directory:
+    if not directory or version is None:
         return
     path = write_report(Path(directory), "issue-13-stream-event-types", {
-        "claude_code_version": VERSION or "(not pinned: set ILMAR_TEST_CLAUDE_VERSION)",
+        "provenance": "recorded",
+        "note": "Recorded by tests/integration/test_claude_code_live.py from a real run.",
+        "claude_code_version": version,
         "image": IMAGE, "at": datetime.now(UTC).isoformat(),
         "events": [{"type": k, "subtype": s, "after_result": a} for k, s, a in events],
     }, [Secret("ANTHROPIC_API_KEY", KEY)])  # fmt: skip
@@ -138,13 +150,19 @@ NEEDS = "podman, ILMAR_TEST_CLAUDE_IMAGE, ILMAR_TEST_PODMAN_PROXY_IMAGE and ANTH
 
 @pytest.fixture(autouse=True)
 def _required_never_skips() -> None:
-    """Under ``ILMAR_LIVE_REQUIRED=1`` (scripts/live_run.py) a missing need fails the run."""
+    """Under ``ILMAR_LIVE_REQUIRED=1`` (scripts/live_run.py) a missing need fails the
+    run, and so does a missing or unpinned Claude Code version."""
+    try:
+        pinned_claude_version(os.environ, required=REQUIRED)
+    except LiveGuardError as error:
+        pytest.fail(str(error))
     if MISSING and REQUIRED:
         pytest.fail(f"#44 needs {NEEDS}")
 
 
 @pytest.mark.skipif(MISSING and not REQUIRED, reason=f"set {NEEDS}")
 def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Path) -> None:
+    version = pinned_claude_version(os.environ, required=REQUIRED)
     layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
     layout.workspaces_root.mkdir(parents=True)
     workspace = make_workspace(layout, "live")
@@ -167,7 +185,7 @@ def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Pa
         observed = EventTypes()
         runner = ClaudeCodeRunner(
             api_key=KEY,
-            settings=ClaudeCodeSettings(max_turns=5, expected_version=VERSION),
+            settings=ClaudeCodeSettings(max_turns=5, expected_version=version),
             event_observer=observed,
         )
         result = runner.run(
@@ -191,7 +209,7 @@ def test_claude_code_completes_a_tiny_task_using_only_allowed_hosts(tmp_path: Pa
         assert not unclassified(observed.events), unclassified(observed.events)
         assert (workspace / "hello.txt").read_text().strip() == "hi"
         assert contacted, "Claude Code never reached the model API"
-        record_smoke_test(contacted)
-        record_stream_fixture(observed.events)
+        record_smoke_test(contacted, version)
+        record_stream_fixture(observed.events, version)
     finally:
         runtime.stop(handle, owner=owner)

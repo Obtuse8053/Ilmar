@@ -77,8 +77,14 @@ scheduling are merged (#103).
   - **Port:** `ContainerRuntime.run` gains a stdout consumer and an idle
     timeout; Podman and the fakes pass the new contract tests.
   - **Gate:** no mode above manual until a pinned-version live run records the
-    event types (the live test writes them). The checked-in fixture is
-    synthetic. Enforcing `expected_version` belongs to #91.
+    event types (the live test writes them, marked `recorded`). The checked-in
+    `2.1.302-synthetic.json` is not evidence. A live run under
+    `ILMAR_LIVE_REQUIRED=1` fails without an exact `ILMAR_TEST_CLAUDE_VERSION`.
+    Enforcing `expected_version` belongs to #91.
+  - **Not yet shown:** that a container stops by itself when the coordinator
+    is SIGKILLed (ADR-0035 "Crashes"). The crash test in this PR is simulated.
+    The real-Podman SIGKILL test needs the runtime-side `--timeout` from #90
+    and is a blocking #90 and Gate 1 (#93) requirement. It has not been run.
 - 2026-11-10: **#13 backoff merged** (#103). **ADR-0035 accepted** (#104):
   stall detection through stream events. Corrections at acceptance:
   - the post-result `rate_limit_event` is cited from upstream issue R28;

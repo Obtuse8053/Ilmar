@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -323,8 +324,14 @@ def test_recorded_type_sequences_are_accepted(path: Path) -> None:
     comes from the live test; a synthetic one must say so."""
     fixture = json.loads(path.read_text())
     assert fixture["provenance"] in {"recorded", "synthetic"}
-    if fixture["provenance"] == "synthetic":
+    synthetic = fixture["provenance"] == "synthetic"
+    # A synthetic fixture says so in its name and its note, and is never
+    # mistaken for evidence; a recorded one names the exact pinned version.
+    assert synthetic == path.stem.endswith("-synthetic"), path.name
+    if synthetic:
         assert "NOT recorded" in fixture["note"]
+    else:
+        assert re.fullmatch(r"\d+\.\d+\.\d+", fixture["claude_code_version"])
     seen: list[tuple[str, str | None, bool]] = []
     validator = StreamValidator(observer=lambda *event: seen.append(event))
     validator.feed(fixture_stream(fixture["events"]))
