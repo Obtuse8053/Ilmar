@@ -18,6 +18,17 @@ M3 and M4 follow the autonomy roadmap in `autonomy-roadmap.md` (approved
 2026-11-10): three gated operating modes, from supervised autonomy (M3) to
 controlled self-hosting (M4).
 
+Credential-containment requirements by gate (maintainer decisions,
+2026-11-11; details in `autonomy-roadmap.md` and ADR-0036):
+
+- **Before Gate 1:**
+  - #110, the candidate secret scan;
+  - the pinned-version compatibility test;
+  - a controlled, credential-free test repository with trusted tasks and a
+    capped workspace.
+- **Before Mode 2, untrusted repositories or self-hosting:** #111, the
+  credential-injecting egress proxy.
+
 Epics (`type:epic`) are split into issues when their milestone starts (see
 `workflow.md`, "Milestone close-out").
 
