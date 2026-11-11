@@ -79,6 +79,12 @@ class ContainerRuntime(Protocol):
         If a container with that name exists and is owned by ``spec.owner``, it
         is removed and replaced. If it has any other owner, or none,
         ``OwnershipConflictError`` is raised and nothing changes.
+
+        With ``spec.lifetime_seconds`` set, the runtime stops the container (and
+        anything it started for it) no later than that long after it starts. The
+        runtime enforces this on its own side: it must hold even if the calling
+        process is killed (ADR-0029 §1). A runtime that cannot do this raises
+        ``ProviderError`` instead of starting the container.
         """
         ...
 

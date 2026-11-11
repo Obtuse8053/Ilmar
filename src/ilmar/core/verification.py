@@ -29,6 +29,7 @@ from datetime import datetime
 
 from ilmar.core.event_context import PassEvents
 from ilmar.core.layout import WorkspaceLayout
+from ilmar.core.lifetimes import verification_sandbox_lifetime
 from ilmar.core.naming import verification_container_name
 from ilmar.core.safe_fs import directory_identity, ensure_directory
 from ilmar.domain.agent import AgentResult
@@ -226,6 +227,7 @@ class Verifier:
                 workspace_identity=identity,
                 network=NetworkPolicy.NONE,  # always, and no credential (ADR-0011 §7)
                 limits=self._policy.limits,
+                lifetime_seconds=verification_sandbox_lifetime(commands),
             )
         )
         results: list[CheckEvidence] = []

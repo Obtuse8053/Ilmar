@@ -72,9 +72,20 @@ Hard gates that stay in force:
 
 ## Change log
 
-- 2026-11-11: **#13 audited** after stall detection merged (#106). All four
+- 2026-11-11: **#90 part 1 submitted: runtime-side sandbox lifetime.**
+  - **What:** `ContainerSpec.lifetime_seconds`; Podman passes it as
+    `--timeout`, which conmon enforces, to the sandbox and its egress sidecar.
+  - **Agent sandbox:** lives at most `[limits] execution_wall_seconds` (at
+    least `agent_timeout_seconds`; default plus 600) plus a 60-second grace.
+  - **Verification sandboxes:** at most the sum of their job's command
+    timeouts plus the grace.
+  - **Proof:** the real-Podman coordinator-SIGKILL test
+    (`tests/integration/test_sigkill_podman.py`) runs in CI's Podman job.
+    The rest of #90 follows in a separate PR: the single credential path,
+    provider-cap classification and the supervised concurrency check.
+- 2026-11-11: **#13 audited and closed** after stall detection merged (#106). All four
   of its acceptance criteria are met. The audit found two ADR-0035 test gaps,
-  added here: a telemetry-only stream stalls with the real validator, and a
+  added in #107: a telemetry-only stream stalls with the real validator, and a
   model key inside the stream reaches no store, log, event or report. The
   coordinator-SIGKILL test is tracked as blocking on #90 and #93, and the
   version and gate enforcement on #91.

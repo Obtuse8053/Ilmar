@@ -160,6 +160,7 @@ class Setup:
         max_attempts: int = 3,
         watch_interval_seconds: float = 2.0,
         retry_backoff: RetryBackoff = NO_BACKOFF,
+        execution_wall_seconds: float | None = None,
     ) -> Coordinator:
         return Coordinator.create(
             self.components,
@@ -167,6 +168,7 @@ class Setup:
             max_attempts=max_attempts,
             agent_timeout_seconds=60,
             retry_backoff=retry_backoff,
+            execution_wall_seconds=execution_wall_seconds,
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),

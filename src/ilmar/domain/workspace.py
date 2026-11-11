@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -119,8 +120,16 @@ class ContainerSpec:
     allowed_hosts: tuple[str, ...] = ()
     """Hostnames reachable on port 443 under ``ALLOWLIST``; empty for other policies."""
     limits: ResourceLimits = field(default_factory=ResourceLimits)
+    lifetime_seconds: float | None = None
+    """The longest the container may exist after it starts (ADR-0029 §1). The
+    runtime itself stops it then, even if the process that started it has died;
+    ``None`` sets no runtime-side limit."""
 
     def __post_init__(self) -> None:
+        if self.lifetime_seconds is not None and not (
+            math.isfinite(self.lifetime_seconds) and self.lifetime_seconds > 0
+        ):
+            raise ValueError("lifetime_seconds must be a positive, finite number")
         if not _RESOURCE_NAME.match(self.name):
             raise ValueError(f"invalid container name: {self.name!r}")
         hosts = tuple(sorted({normalise_hostname(host) for host in self.allowed_hosts}))

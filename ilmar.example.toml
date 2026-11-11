@@ -26,6 +26,11 @@ agent_timeout_seconds = 3600
 # transient failures. Must not exceed agent_timeout_seconds, which stays the
 # independent hard lifetime.
 stall_timeout_seconds = 900
+# #90, ADR-0029: the agent sandbox's hard lifetime. The container runtime
+# (Podman's --timeout, enforced by conmon) stops the sandbox 60 seconds after
+# this even if Ilmar itself is killed. At least agent_timeout_seconds; unset, it
+# is agent_timeout_seconds + 600.
+execution_wall_seconds = 4200
 # #13, ADR-0028: after a transient failure the next attempt waits
 # base * 2 ** (attempt - 1) seconds, at most the maximum. The wait is stored,
 # so a restart never shortens it.

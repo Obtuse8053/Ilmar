@@ -404,6 +404,7 @@ class FakeContainerRuntime:
         self.fail_removal = False  # tests: removal after a timeout or stop is unconfirmed
         self.quarantined: set[DirectoryIdentity] = set()
         self.commands: list[tuple[str, tuple[str, ...]]] = []
+        self.started_specs: list[ContainerSpec] = []  # every spec start() accepted, in order
 
     @property
     def name(self) -> str:
@@ -448,6 +449,7 @@ class FakeContainerRuntime:
             if existing.owner != spec.owner:
                 raise OwnershipConflictError(f"container {spec.name} is owned by someone else")
             del self._containers[existing.handle.id]
+        self.started_specs.append(spec)
         return self._create(spec, spec.owner)
 
     def find(self, name: str) -> ContainerInfo | None:

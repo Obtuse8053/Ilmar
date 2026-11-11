@@ -1140,3 +1140,36 @@ def test_subprocess_executor_with_an_unset_signal_behaves_as_before() -> None:
     timed = subprocess_executor([sys.executable, "-c", "import time; time.sleep(60)"], {}, 1,
                                 stop=stop)  # fmt: skip
     assert (timed.timed_out, timed.cancelled) == (True, False)
+
+
+# -- runtime-side lifetime (ADR-0029 §1, #90) ---------------------------------------
+
+
+@pytest.mark.parametrize(("lifetime", "expected"), [(60.0, "60"), (4260.2, "4261"), (0.5, "1")])
+def test_a_lifetime_becomes_conmons_timeout_rounded_up(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, lifetime: float,
+    expected: str,
+) -> None:  # fmt: skip
+    runtime(layout, podman).start(spec(workspace, lifetime_seconds=lifetime))
+    timeouts = [a for a in run_args(podman) if a.startswith("--timeout")]
+    assert timeouts == [f"--timeout={expected}"]
+    assert run_args(podman).index(timeouts[0]) < run_args(podman).index("localhost/ilmar-test:1")
+
+
+def test_no_lifetime_sets_no_timeout(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman).start(spec(workspace))
+    assert not [a for a in run_args(podman) if a.startswith("--timeout")]
+
+
+def test_the_egress_proxy_gets_the_same_lifetime(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    runtime(layout, podman, egress=EGRESS).start(allowlist_spec(workspace, lifetime_seconds=90))
+    proxy = podman.by_name("ilmar-exec-1-1-egress")
+    sandbox = podman.by_name("ilmar-exec-1-1")
+    assert proxy is not None
+    assert sandbox is not None
+    assert "--timeout=90" in proxy.run_args
+    assert "--timeout=90" in sandbox.run_args

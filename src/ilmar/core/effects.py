@@ -183,11 +183,13 @@ class Effects:
         journal: Journal,
         verifier: Verifier,
         clock: Callable[[], datetime],
+        sandbox_lifetime_seconds: float | None = None,
     ) -> None:
         self._c = components
         self._journal = journal
         self._verifier = verifier
         self._clock = clock
+        self._sandbox_lifetime = sandbox_lifetime_seconds
 
     @property
     def fence(self) -> Fence:
@@ -502,6 +504,7 @@ class Effects:
                 network=sandbox.network,
                 allowed_hosts=sandbox.allowed_hosts,
                 limits=sandbox.limits,
+                lifetime_seconds=self._sandbox_lifetime,
             )
             handle = runtime.start(spec)
             return {"id": handle.id, "name": handle.name, "runtime": handle.runtime}
