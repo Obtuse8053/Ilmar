@@ -52,7 +52,7 @@ sandbox before Claude Code starts. Review found two gaps:
      credentials out of the sandbox.
    - It needs a sandbox-trusted CA and TLS termination: a new security
      component and its own ADR.
-   - Recorded as the follow-up.
+   - Recorded as the follow-up (#111).
 
 ## Decision
 
