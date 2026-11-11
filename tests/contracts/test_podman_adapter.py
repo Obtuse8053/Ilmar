@@ -28,6 +28,7 @@ from ilmar.domain.workspace import (
     ResourceOwner,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
+from stream_support import emit_command
 
 from contracts.container_runtime import ContainerRuntimeContract
 from fake_podman import FakePodman
@@ -106,3 +107,6 @@ class TestPodmanRuntimeOverFakePodman(ContainerRuntimeContract):
 
     def write_file(self, relative_path: str, content: str) -> Sequence[str]:
         return ["write", relative_path, content]
+
+    def emit(self, lines: Sequence[str], silence: float = 0.0) -> Sequence[str]:
+        return emit_command(lines, silence)

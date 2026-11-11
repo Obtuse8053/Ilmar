@@ -152,6 +152,7 @@ def _run_once(path: Path) -> int:
                         config.limits.retry_backoff_base_seconds,
                         config.limits.retry_backoff_max_seconds,
                     ),
+                    stall_timeout_seconds=config.limits.stall_timeout_seconds,
                     clock=_now,
                 )
                 report = coordinator.run_once()

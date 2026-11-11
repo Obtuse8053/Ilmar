@@ -280,6 +280,7 @@ ADDED_CODES = {
     "orphaned-claim",
     "claim-changed",
     "stray-label",  # ADR-0027 (#87)
+    "agent-stalled",  # ADR-0035 (#13)
 }
 
 

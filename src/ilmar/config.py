@@ -72,6 +72,9 @@ class Limits:
     """Wait after the first failed attempt; doubled per attempt (#13, ADR-0028)."""
     retry_backoff_max_seconds: float = 21600.0
     """The longest wait between attempts."""
+    stall_timeout_seconds: float = 900.0
+    """End an agent run with no progress for this long (ADR-0035 §3); at most
+    ``agent_timeout_seconds``. A single long tool step may legitimately be silent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +225,7 @@ def _parse_limits(raw: Mapping[str, Any]) -> Limits:
             "agent_timeout_seconds",
             "retry_backoff_base_seconds",
             "retry_backoff_max_seconds",
+            "stall_timeout_seconds",
         },
         "[limits]",
     )
@@ -238,12 +242,18 @@ def _parse_limits(raw: Mapping[str, Any]) -> Limits:
         raise ConfigError(
             "[limits] retry_backoff_max_seconds must not be less than retry_backoff_base_seconds"
         )
+    stall = _positive_number(raw, "stall_timeout_seconds", defaults.stall_timeout_seconds)
+    if stall > float(timeout):
+        raise ConfigError(
+            "[limits] stall_timeout_seconds must not be greater than agent_timeout_seconds"
+        )
     return Limits(
         max_attempts=max_attempts,
         max_concurrent_executions=max_concurrent,
         agent_timeout_seconds=float(timeout),
         retry_backoff_base_seconds=base,
         retry_backoff_max_seconds=cap,
+        stall_timeout_seconds=stall,
     )
 
 

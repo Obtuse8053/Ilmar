@@ -28,6 +28,8 @@ from typing import Any
 
 from ilmar.adapters.podman.runtime import TIMED_OUT_EXIT_CODE, Completed
 from ilmar.domain.workspace import DirectoryIdentity, StopSignal
+from ilmar.ports.container_runtime import StreamConsumer
+from stream_support import consume, parse_emit
 
 PODMAN = "podman"
 
@@ -59,6 +61,8 @@ class Call:
     """What the in-container loader exported from stdin (``podman exec`` only)."""
     stopped_by: StopSignal | None = None
     """The stop signal the executor was given (``podman exec`` of ``sleep`` only)."""
+    silence: float = 0.0
+    """Simulated seconds of silence after an ``emit`` command's output."""
 
 
 @dataclass
@@ -105,6 +109,8 @@ class FakePodman:
         pass_fds: Sequence[int] = (),
         stdin: bytes | None = None,
         stop: StopSignal | None = None,
+        stdout_consumer: StreamConsumer | None = None,
+        idle_timeout: float | None = None,
     ) -> Completed:
         args = list(argv)
         assert args[0] == PODMAN, args
@@ -123,7 +129,28 @@ class FakePodman:
         if command == "run":
             return self._run(rest, call)
         if command == "exec":
-            return self._exec(rest, call, timeout, stop)
+            done = self._exec(rest, call, timeout, stop)
+            if stdout_consumer is None or done.timed_out or done.cancelled:
+                return done
+            # As the real executor does: the consumer takes standard output and
+            # none is kept; its verdicts and the simulated silence decide the ending.
+            ended = consume(
+                stdout_consumer,
+                done.stdout.encode(),
+                silence=call.silence,
+                idle_timeout=idle_timeout,
+                timeout=timeout,
+            )
+            if ended == "done":
+                return Completed(done.returncode, "", done.stderr)
+            return Completed(
+                TIMED_OUT_EXIT_CODE,
+                "",
+                done.stderr,
+                stalled=ended == "stalled",
+                rejected=ended == "rejected",
+                timed_out=ended == "timed-out",
+            )
         if command == "network":
             return self._network(rest)
         if command == "logs":
@@ -304,6 +331,11 @@ class FakePodman:
                 return Completed(0, f"{text}\n", "")
             case ["exit", code]:
                 return Completed(int(code), "", "")
+            case ["emit", *_]:
+                lines, call.silence = parse_emit(rest[1:])
+                if call.silence >= timeout:
+                    return Completed(TIMED_OUT_EXIT_CODE, "", "", timed_out=True)
+                return Completed(0, "".join(lines), "")
             case ["sleep", seconds]:
                 call.stopped_by = stop
                 # Simulated time: the executor looks at the stop signal once per poll.

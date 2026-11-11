@@ -51,6 +51,8 @@ class TestClaudeCodeRunner(AgentRunnerContract):
             assert argv[1] == "-p"
             if scenario is AgentScenario.HANGS:
                 return CommandResult(-9, "", "", timeout, timed_out=True)
+            if scenario is AgentScenario.STALLS:  # the runtime's idle timer fired
+                return CommandResult(-9, "", "", 5.0, stalled=True)
             code, out, err = OUTPUTS[scenario]
             return CommandResult(code, out, err, 1.0)
 

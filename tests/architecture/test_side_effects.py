@@ -30,6 +30,9 @@ READS = {
     "standing", "held_claims",
     # ADR-0027 §1 (approved): stray claim labels.
     "stray_labels",
+    # ADR-0035 §3: StreamConsumer, which a runtime adapter feeds with the
+    # command's stdout; validating it changes nothing outside Ilmar.
+    "feed", "close",
 }  # fmt: skip
 
 

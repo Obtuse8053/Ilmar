@@ -26,6 +26,7 @@ from ilmar.ports.agent_runner import AgentRunner
 from ilmar.ports.container_runtime import ContainerRuntime
 from ilmar.ports.source_control import SourceControlProvider
 from ilmar.ports.task_provider import TaskProvider
+from stream_support import emit_command
 
 from contracts.agent_runner import AgentRunnerContract, AgentScenario
 from contracts.container_runtime import ContainerRuntimeContract, identity_of
@@ -138,6 +139,9 @@ class TestFakeContainerRuntime(ContainerRuntimeContract):
     def write_file(self, relative_path: str, content: str) -> Sequence[str]:
         return ["write", relative_path, content]
 
+    def emit(self, lines: Sequence[str], silence: float = 0.0) -> Sequence[str]:
+        return emit_command(lines, silence)
+
 
 class TestFakeSourceControl(SourceControlContract):
     def make_provider(self) -> SourceControlProvider:
@@ -201,6 +205,8 @@ class TestFakeAgentRunner(AgentRunnerContract):
         def agent(argv: Sequence[str], timeout: float, env: Mapping[str, str]) -> CommandResult:
             if scenario is AgentScenario.HANGS:
                 return CommandResult(-9, "", "", timeout, timed_out=True)
+            if scenario is AgentScenario.STALLS:  # the runtime's idle timer fired
+                return CommandResult(-9, "", "", 5.0, stalled=True)
             return _SCENARIOS[scenario]
 
         runtime.register(FakeAgentRunner.PROGRAM, agent)

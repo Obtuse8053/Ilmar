@@ -13,29 +13,33 @@ environment of this one command, never the container's own environment, so
 other commands and verification sandboxes never see it. It is redacted from
 every summary.
 
-**Invocation.** ``claude -p <prompt> --output-format json --permission-mode
-<mode> --no-session-persistence --strict-mcp-config`` plus optional
-``--max-turns`` and ``--model``. The sandbox is the security boundary, so the
+**Invocation.** ``claude -p <prompt> --output-format stream-json --verbose
+--permission-mode <mode> --no-session-persistence --strict-mcp-config`` plus
+optional ``--max-turns`` and ``--model`` (ADR-0035 §1). The sandbox is the security boundary, so the
 default permission mode is ``bypassPermissions``, which Claude Code's
 documentation reserves for isolated environments. ``--strict-mcp-config``
 without an MCP config means no MCP servers, hence no extra network
 destinations. ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` turns off
 auto-updates, telemetry and error reporting.
 
-**Outcome (F-021).** ``COMPLETED`` needs all three: exit status 0, a parsed
-``{"type": "result"}`` object, and ``is_error`` false with ``subtype``
-``success``. Anything else is ``FAILED``; a runtime timeout is ``TIMED_OUT``.
-The result is advisory: verification decides (ADR-0010).
+**Stream (ADR-0035).** Standard output goes, chunk by chunk, to a
+:class:`~ilmar.adapters.claude_code.stream.StreamValidator`; none of it is
+kept. Its first violation ends the run at once as ``FAILED`` (not retried).
+No agent progress for the stall timeout ends it as ``STALLED`` (retried).
+
+**Outcome (F-021).** ``COMPLETED`` needs all three: exit status 0, a stream
+with exactly one ``{"type": "result"}`` object and no violation, and
+``is_error`` false with ``subtype`` ``success``. Anything else is ``FAILED``;
+a runtime timeout is ``TIMED_OUT``. The result is advisory: verification
+decides (ADR-0010).
 """
 
 from __future__ import annotations
 
-import json
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
+from ilmar.adapters.claude_code.stream import EventObserver, StreamValidator
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.workspace import ContainerHandle, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
@@ -44,6 +48,7 @@ _PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "dontAsk"})
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
 _VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 _SUMMARY_LIMIT = 4000
+_REDACT_MIN = 8
 REDACTED = "[redacted]"
 
 
@@ -76,13 +81,21 @@ class ClaudeCodeSettings:
 
 class ClaudeCodeRunner:
     def __init__(
-        self, *, api_key: str, settings: ClaudeCodeSettings | None = None, name: str = "claude-code"
+        self,
+        *,
+        api_key: str,
+        settings: ClaudeCodeSettings | None = None,
+        name: str = "claude-code",
+        event_observer: EventObserver | None = None,
     ) -> None:
+        """``event_observer`` sees only each event's type, subtype and whether it
+        followed the result (the pinned-version live test records these)."""
         if not api_key or any(c in api_key for c in "\r\n\0"):
             raise ValueError("a single-line model credential is required")
         self._api_key = api_key
         self._settings = settings or ClaudeCodeSettings()
         self._name = name
+        self._observer = event_observer
 
     @property
     def name(self) -> str:
@@ -102,24 +115,38 @@ class ClaudeCodeRunner:
             if mismatch is not None:
                 return AgentResult(AgentOutcome.FAILED, mismatch, None)
 
+        validator = StreamValidator(observer=self._observer)
         result = runtime.run(
             container,
             self.command(request),
             timeout_seconds=request.timeout_seconds,
             env=self._environment(),
             stop=stop,
+            idle_timeout_seconds=request.stall_timeout_seconds,
+            stdout_consumer=validator,
         )
         if result.cancelled:  # the runtime removed the sandbox, as on a timeout
             return AgentResult(AgentOutcome.CANCELLED, "Claude Code was stopped on request", None)
         if result.timed_out:
             return AgentResult(AgentOutcome.TIMED_OUT, "Claude Code timed out", result.exit_code)
-        parsed = parse_result(result.stdout)
-        if parsed is None:
-            lines = result.stderr.strip().splitlines()
-            detail = self._redact(lines[-1])[:500] if lines else ""
-            summary = f"no structured result (exit {result.exit_code})"
-            text = f"{summary}: {detail}" if detail else summary
-            return AgentResult(AgentOutcome.FAILED, text, result.exit_code)
+        if result.stalled:
+            return AgentResult(
+                AgentOutcome.STALLED,
+                f"Claude Code showed no progress for {request.stall_timeout_seconds:g} seconds",
+                result.exit_code,
+            )
+        if result.rejected or validator.rejection is not None:
+            # Only the kind and the line number: never a line of the stream. The
+            # last line of standard error, redacted, says why (ADR-0035 §4, §6).
+            rejection = validator.rejection
+            text = str(rejection) if rejection is not None else "malformed stream"
+            detail = self._stderr_detail(result.stderr)
+            return AgentResult(
+                AgentOutcome.FAILED, f"{text} ({detail})" if detail else text, result.exit_code
+            )
+        parsed = validator.result
+        if parsed is None:  # pragma: no cover - the validator rejects a missing result
+            return AgentResult(AgentOutcome.FAILED, "malformed stream: no result", None)
         text = self._redact(str(parsed.get("result") or ""))[:_SUMMARY_LIMIT]
         subtype = str(parsed.get("subtype") or "")
         success = parsed.get("is_error") is False and subtype == "success"
@@ -128,6 +155,9 @@ class ClaudeCodeRunner:
         reason = subtype or "error"
         if success:  # claims success, but the process failed (F-021)
             reason = f"exit status {result.exit_code} despite a success result"
+            detail = self._stderr_detail(result.stderr)
+            if detail:
+                reason += f" ({detail})"
         return AgentResult(
             AgentOutcome.FAILED, f"{reason}: {text}" if text else reason, result.exit_code
         )
@@ -143,7 +173,8 @@ class ClaudeCodeRunner:
             "-p",
             prompt,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--permission-mode",
             settings.permission_mode,
             "--no-session-persistence",
@@ -183,19 +214,15 @@ class ClaudeCodeRunner:
         found = reported or f"none (exit {probe.exit_code})"
         return f"Claude Code version {found[:40]}, expected {settings.expected_version}"
 
+    def _stderr_detail(self, stderr: str) -> str:
+        lines = stderr.strip().splitlines()
+        return self._redact(lines[-1])[:500] if lines else ""
+
     def _redact(self, text: str) -> str:
-        return text.replace(self._api_key, REDACTED)
-
-
-def parse_result(stdout: str) -> Mapping[str, Any] | None:
-    """The documented ``--output-format json`` result object, or ``None``."""
-    candidates = [stdout.strip()]
-    candidates += [line for line in reversed(stdout.splitlines()) if line.strip().startswith("{")]
-    for text in candidates:
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and data.get("type") == "result":
-            return data
-    return None
+        """Remove the key and every other value of the agent command's environment
+        (ADR-0035 §6). Values shorter than ``_REDACT_MIN`` (flags such as ``1``)
+        cannot be secrets and would mangle ordinary text."""
+        for value in sorted(self._environment().values(), key=len, reverse=True):
+            if len(value) >= _REDACT_MIN:
+                text = text.replace(value, REDACTED)
+        return text

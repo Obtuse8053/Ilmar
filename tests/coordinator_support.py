@@ -25,7 +25,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     StopSignal,
 )
-from ilmar.ports.container_runtime import ContainerRuntime
+from ilmar.ports.container_runtime import ContainerRuntime, StreamConsumer
 from ilmar.ports.execution_store import ExecutionStore
 
 from fakes import FakeContainerRuntime, FakeSourceControl, FakeTaskProvider
@@ -71,6 +71,8 @@ class WorkspaceRuntime(FakeContainerRuntime):
         timeout_seconds: float,
         env: Mapping[str, str] | None = None,
         stop: StopSignal | None = None,
+        idle_timeout_seconds: float | None = None,
+        stdout_consumer: StreamConsumer | None = None,
     ) -> CommandResult:
         if argv and argv[0] == "check":
             container = self._containers[handle.id]
@@ -78,7 +80,10 @@ class WorkspaceRuntime(FakeContainerRuntime):
             ok = target.is_file() and argv[2] in target.read_text()
             self.commands.append((handle.id, tuple(argv)))
             return CommandResult(0 if ok else 1, "", "" if ok else "not fixed\n", 0.1)
-        return super().run(handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop)
+        return super().run(
+            handle, argv, timeout_seconds=timeout_seconds, env=env, stop=stop,
+            idle_timeout_seconds=idle_timeout_seconds, stdout_consumer=stdout_consumer,
+        )  # fmt: skip
 
     def stop(self, handle: ContainerHandle, *, owner: Any) -> None:
         if self.stop_hook is not None:

@@ -5,15 +5,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
-from ilmar.adapters.claude_code.runner import REDACTED, parse_result
+from ilmar.adapters.claude_code.runner import REDACTED
+from ilmar.adapters.claude_code.stream import StreamValidator
 from ilmar.domain.agent import AgentOutcome, AgentRequest
 from ilmar.domain.workspace import CommandResult, ContainerHandle, ContainerSpec, ResourceOwner
 
-from claude_code_support import ERROR, SUCCESS, result_json
+from claude_code_support import (
+    API_RETRY,
+    ASSISTANT,
+    ERROR,
+    RATE_LIMIT,
+    SUCCESS,
+    SUCCESS_RESULT,
+    result_json,
+    stream,
+)
 from contracts.container_runtime import identity_of
 from fakes import FakeContainerRuntime
 from helpers import task
@@ -71,7 +82,7 @@ def test_documented_non_interactive_invocation(tmp_path: Path) -> None:
     argv, _ = script.calls[0]
     assert argv[:2] == ["claude", "-p"]
     assert argv[3:] == [
-        "--output-format", "json", "--permission-mode", "bypassPermissions",
+        "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions",
         "--no-session-persistence", "--strict-mcp-config",
         "--max-turns", "50", "--model", "sonnet",
     ]  # fmt: skip
@@ -108,7 +119,7 @@ def test_gateway_url_is_passed_when_configured(tmp_path: Path) -> None:
 
 
 def test_the_credential_is_redacted_from_summaries(tmp_path: Path) -> None:
-    leaked = result_json(subtype="success", is_error=False, text=f"my key is {KEY}")
+    leaked = stream(result_json(subtype="success", is_error=False, text=f"my key is {KEY}"))
     runtime, handle, _ = setup(tmp_path, ok(leaked), ok("", 1, f"Error: bad key {KEY}"))
     runner = ClaudeCodeRunner(api_key=KEY)
     first = runner.run(runtime, handle, request())
@@ -123,38 +134,43 @@ def test_the_credential_is_redacted_from_summaries(tmp_path: Path) -> None:
     ("stdout", "code", "outcome"),
     [
         (SUCCESS, 0, AgentOutcome.COMPLETED),
-        ("progress line\n" + SUCCESS, 0, AgentOutcome.COMPLETED),
-        (
-            '{\n  "type": "result", "subtype": "success",\n  "is_error": false, "result": "ok"\n}',
-            0,
-            AgentOutcome.COMPLETED,
-        ),
-        (
-            result_json(subtype="error_max_turns", is_error=True, text="ran out"),
-            0,
-            AgentOutcome.FAILED,
-        ),
-        (result_json(subtype="success", is_error=True, text="odd"), 0, AgentOutcome.FAILED),
-        (result_json(subtype="other", is_error=False, text="?"), 0, AgentOutcome.FAILED),
-        (
-            '{"type": "result", "subtype": "success", "result": "no is_error"}',
-            0,
-            AgentOutcome.FAILED,
-        ),
-        ('{"type": "assistant", "is_error": false, "subtype": "success"}', 0, AgentOutcome.FAILED),
-        ("[1, 2]", 0, AgentOutcome.FAILED),
+        (stream(SUCCESS_RESULT, before=()), 0, AgentOutcome.COMPLETED),
+        (stream(SUCCESS_RESULT, after=(RATE_LIMIT,)), 0, AgentOutcome.COMPLETED),
+        (stream(SUCCESS_RESULT, before=(RATE_LIMIT, ASSISTANT, API_RETRY)), 0,
+         AgentOutcome.COMPLETED),
+        # Anything that is not a valid event fails the run, wherever it is.
+        ("progress line\n" + SUCCESS, 0, AgentOutcome.FAILED),
+        ('{\n  "type": "result", "subtype": "success",\n  "is_error": false, "result": "ok"\n}\n',
+         0, AgentOutcome.FAILED),
+        (SUCCESS.rstrip("\n"), 0, AgentOutcome.FAILED),  # unterminated last line
+        (stream(SUCCESS_RESULT, after=(SUCCESS_RESULT,)), 0, AgentOutcome.FAILED),
+        (stream(SUCCESS_RESULT, after=(ASSISTANT,)), 0, AgentOutcome.FAILED),
+        (stream(SUCCESS_RESULT, after=(API_RETRY,)), 0, AgentOutcome.FAILED),
+        (stream(result_json(subtype="error_max_turns", is_error=True, text="ran out")), 0,
+         AgentOutcome.FAILED),
+        (stream(result_json(subtype="success", is_error=True, text="odd")), 0,
+         AgentOutcome.FAILED),
+        (stream(result_json(subtype="other", is_error=False, text="?")), 0, AgentOutcome.FAILED),
+        (stream('{"type": "result", "subtype": "success", "result": "no is_error"}'), 0,
+         AgentOutcome.FAILED),
+        (stream(ASSISTANT, before=()), 0, AgentOutcome.FAILED),  # no result
+        ("[1, 2]\n", 0, AgentOutcome.FAILED),
         (ERROR, 1, AgentOutcome.FAILED),
     ],
-)
+)  # fmt: skip
 def test_outcome_mapping(tmp_path: Path, stdout: str, code: int, outcome: AgentOutcome) -> None:
     runtime, handle, _ = setup(tmp_path, ok(stdout, code))
     result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, request())
     assert result.outcome is outcome
-    assert result.exit_code == code
+    rejected = result.summary.startswith("malformed stream")
+    # A rejected stream ends the command (killed: -9), as a timeout does.
+    assert result.exit_code == (-9 if rejected else code)
 
 
 def test_failure_summaries_say_why(tmp_path: Path) -> None:
-    max_turns = result_json(subtype="error_max_turns", is_error=True, text="ran out of turns")
+    max_turns = stream(
+        result_json(subtype="error_max_turns", is_error=True, text="ran out of turns")
+    )
     runtime, handle, _ = setup(
         tmp_path, ok(max_turns), ok(SUCCESS, 3), ok("plain text", 0, "Error: auth failed\n")
     )
@@ -164,11 +180,12 @@ def test_failure_summaries_say_why(tmp_path: Path) -> None:
         "exit status 3 despite a success result" in runner.run(runtime, handle, request()).summary
     )
     summary = runner.run(runtime, handle, request()).summary
-    assert summary == "no structured result (exit 0): Error: auth failed"
+    assert summary == "malformed stream: unterminated-line at line 1 (Error: auth failed)"
+    assert "plain text" not in summary  # never a line of the stream
 
 
 def test_long_summaries_are_truncated(tmp_path: Path) -> None:
-    long = result_json(subtype="success", is_error=False, text="x" * 10000)
+    long = stream(result_json(subtype="success", is_error=False, text="x" * 10000))
     runtime, handle, _ = setup(tmp_path, ok(long))
     assert len(ClaudeCodeRunner(api_key=KEY).run(runtime, handle, request()).summary) == 4000
 
@@ -222,8 +239,75 @@ def test_a_usable_credential_is_required(key: str) -> None:
         ClaudeCodeRunner(api_key=key)
 
 
-def test_parse_result_ignores_non_result_objects() -> None:
-    assert parse_result('{"type": "system"}\n{"type": "assistant"}') is None
-    parsed = parse_result('noise\n{"type": "result", "subtype": "success"}\n')
-    assert parsed is not None
-    assert parsed["subtype"] == "success"
+# -- stream-json (ADR-0035) ----------------------------------------------------------------
+
+
+class Spy(FakeContainerRuntime):
+    """Records what the runner asks of the runtime for each command."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked: list[dict[str, object]] = []
+
+    def run(self, handle: ContainerHandle, argv: Sequence[str], **kwargs: Any) -> CommandResult:
+        self.asked.append(dict(kwargs))
+        return super().run(handle, argv, **kwargs)
+
+
+def spy_setup(tmp_path: Path, *results: CommandResult) -> tuple[Spy, ContainerHandle]:
+    runtime = Spy()
+    runtime.register("claude", Scripted(*results))
+    spec = ContainerSpec(
+        image="img", host_workspace=tmp_path, name="agent", owner=OWNER,
+        workspace_identity=identity_of(tmp_path),
+    )  # fmt: skip
+    return runtime, runtime.start(spec)
+
+
+def test_the_stall_timeout_and_a_validator_go_to_the_runtime(tmp_path: Path) -> None:
+    runtime, handle = spy_setup(tmp_path, ok())
+    stalling = AgentRequest(
+        task=task("42"), instructions="x", timeout_seconds=600, stall_timeout_seconds=90
+    )
+    result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, stalling)
+    assert result.outcome is AgentOutcome.COMPLETED
+    (asked,) = runtime.asked
+    assert asked["idle_timeout_seconds"] == 90
+    assert isinstance(asked["stdout_consumer"], StreamValidator)
+
+
+def test_a_stall_is_reported_as_stalled(tmp_path: Path) -> None:
+    runtime, handle, _ = setup(tmp_path, CommandResult(-9, "", "", 90.0, stalled=True))
+    stalling = AgentRequest(
+        task=task("42"), instructions="x", timeout_seconds=600, stall_timeout_seconds=90
+    )
+    result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, stalling)
+    assert result.outcome is AgentOutcome.STALLED
+    assert result.summary == "Claude Code showed no progress for 90 seconds"
+
+
+def test_every_environment_value_is_redacted(tmp_path: Path) -> None:
+    gateway = "https://llm-gateway.example.com/v1"
+    leaked = stream(
+        result_json(subtype="error", is_error=True, text=f"key {KEY} via {gateway} and 1")
+    )
+    runtime, handle, _ = setup(tmp_path, ok(leaked), ok("", 1, f"Error: {gateway} refused"))
+    runner = ClaudeCodeRunner(api_key=KEY, settings=ClaudeCodeSettings(base_url=gateway))
+    first = runner.run(runtime, handle, request())
+    second = runner.run(runtime, handle, request())
+    for result in (first, second):
+        assert KEY not in result.summary
+        assert gateway not in result.summary
+    assert first.summary == f"error: key {REDACTED} via {REDACTED} and 1"  # short flags stay
+    assert (
+        second.summary == f"malformed stream: missing-result at line 0 (Error: {REDACTED} refused)"
+    )
+
+
+def test_a_rejected_stream_never_quotes_its_lines(tmp_path: Path) -> None:
+    secret_line = f'{{"type": "unknown", "leak": "{KEY}", "data": "private"}}'
+    runtime, handle, _ = setup(tmp_path, ok(stream(SUCCESS_RESULT, before=(secret_line,))))
+    result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, request())
+    assert result.outcome is AgentOutcome.FAILED
+    assert result.summary == "malformed stream: malformed-event at line 1"
+    assert "private" not in result.summary

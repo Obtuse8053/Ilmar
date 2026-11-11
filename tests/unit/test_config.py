@@ -96,6 +96,15 @@ def test_every_port_is_required(port: str) -> None:
             ),
             "must not be less than",
         ),
+        (lambda d: d.update(limits={"stall_timeout_seconds": 0}), "stall_timeout"),
+        (lambda d: d.update(limits={"stall_timeout_seconds": -5}), "stall_timeout"),
+        (lambda d: d.update(limits={"stall_timeout_seconds": True}), "stall_timeout"),
+        (lambda d: d.update(limits={"stall_timeout_seconds": "15m"}), "stall_timeout"),
+        (lambda d: d.update(limits={"stall_timeout_seconds": float("nan")}), "stall_timeout"),
+        (
+            lambda d: d.update(limits={"agent_timeout_seconds": 600, "stall_timeout_seconds": 601}),
+            "must not be greater than agent_timeout",
+        ),
     ],
 )
 def test_invalid_configuration_is_rejected(mutate: Any, message: str) -> None:
@@ -239,3 +248,13 @@ def test_retry_backoff_defaults_and_values() -> None:
         30.0,
         30.0,
     )
+
+
+def test_stall_timeout_default_and_values() -> None:
+    """#13, ADR-0035: 900 s by default, never longer than the hard lifetime."""
+    assert parse_config(minimal(), base_dir=BASE).limits.stall_timeout_seconds == 900.0
+    data = copy.deepcopy(minimal())
+    data["limits"] = {"agent_timeout_seconds": 600, "stall_timeout_seconds": 600}
+    assert parse_config(data, base_dir=BASE).limits.stall_timeout_seconds == 600.0
+    data["limits"] = {"agent_timeout_seconds": 600, "stall_timeout_seconds": 2.5}
+    assert parse_config(data, base_dir=BASE).limits.stall_timeout_seconds == 2.5

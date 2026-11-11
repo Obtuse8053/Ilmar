@@ -29,6 +29,7 @@ from ilmar.domain.workspace import (
     DirectoryIdentity,
     NetworkPolicy,
     ResourceOwner,
+    StreamVerdict,
 )
 from ilmar.ports.container_runtime import ContainerRuntime
 
@@ -65,6 +66,27 @@ class SetAfter:
 
 STOP_BOUND_SECONDS = 30.0
 """How long a real runtime may take to kill, remove and confirm after a stop."""
+
+
+class LineConsumer:
+    """A stream consumer for the contract: a line ``ok`` is progress, a line
+    ``bad`` (or an unterminated last line) is a violation. Records what it got."""
+
+    def __init__(self) -> None:
+        self.received = bytearray()
+        self.closed = False
+        self._partial = b""
+
+    def feed(self, chunk: bytes) -> StreamVerdict:
+        self.received += chunk
+        *complete, self._partial = (self._partial + chunk).split(b"\n")
+        if b"bad" in complete:
+            return StreamVerdict.VIOLATION
+        return StreamVerdict.PROGRESS if b"ok" in complete else StreamVerdict.NONE
+
+    def close(self) -> StreamVerdict:
+        self.closed = True
+        return StreamVerdict.VIOLATION if self._partial else StreamVerdict.NONE
 
 
 class ContainerRuntimeContract:
@@ -110,6 +132,11 @@ class ContainerRuntimeContract:
         raise NotImplementedError
 
     def write_file(self, relative_path: str, content: str) -> Sequence[str]:
+        raise NotImplementedError
+
+    def emit(self, lines: Sequence[str], silence: float = 0.0) -> Sequence[str]:
+        """Print ``lines`` exactly as given (each with its own newline, or not),
+        then stay silent for ``silence`` seconds and exit 0."""
         raise NotImplementedError
 
     @pytest.fixture
@@ -176,6 +203,83 @@ class ContainerRuntimeContract:
         assert runtime.find(NAME) is None
         with pytest.raises(ProviderError):
             runtime.run(container, self.echo("after timeout"), timeout_seconds=30)
+
+    # -- standard-output consumer and idle timeout (ADR-0035 §8) -------------
+
+    def test_a_consumer_receives_all_output_and_none_is_kept(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        consumer = LineConsumer()
+        result = runtime.run(
+            container, self.emit(["ok\n", "other\n", "ok\n"]), timeout_seconds=30,
+            stdout_consumer=consumer,
+        )  # fmt: skip
+        assert result.succeeded
+        assert result.stdout == ""
+        assert bytes(consumer.received) == b"ok\nother\nok\n"
+        assert consumer.closed
+        assert runtime.is_running(container)
+
+    def test_a_violation_ends_the_command_and_removes_the_sandbox(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(
+            container, self.emit(["ok\n", "bad\n", "ok\n"], silence=20), timeout_seconds=30,
+            stdout_consumer=LineConsumer(),
+        )  # fmt: skip
+        assert result.rejected
+        assert (result.timed_out, result.stalled, result.cancelled) == (False, False, False)
+        assert not result.succeeded
+        assert result.stdout == ""
+        assert not runtime.is_running(container)
+        assert runtime.find(NAME) is None
+
+    def test_a_violation_at_the_end_of_the_stream_is_rejected_too(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(
+            container, self.emit(["ok\n", "unterminated"]), timeout_seconds=30,
+            stdout_consumer=LineConsumer(),
+        )  # fmt: skip
+        assert result.rejected
+        assert runtime.find(NAME) is None
+
+    def test_no_progress_for_the_idle_timeout_stalls_the_command(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(
+            container, self.emit(["ok\n"], silence=20), timeout_seconds=30,
+            idle_timeout_seconds=2, stdout_consumer=LineConsumer(),
+        )  # fmt: skip
+        assert result.stalled
+        assert (result.timed_out, result.rejected, result.cancelled) == (False, False, False)
+        assert result.stdout == ""
+        assert runtime.find(NAME) is None
+
+    def test_output_that_is_no_progress_does_not_keep_a_command_alive(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(
+            container, self.emit(["noise\n", "noise\n"], silence=20), timeout_seconds=30,
+            idle_timeout_seconds=2, stdout_consumer=LineConsumer(),
+        )  # fmt: skip
+        assert result.stalled
+
+    def test_a_command_with_progress_and_no_long_silence_completes(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        result = runtime.run(
+            container, self.emit(["ok\n"] * 5), timeout_seconds=30,
+            idle_timeout_seconds=10, stdout_consumer=LineConsumer(),
+        )  # fmt: skip
+        assert result.succeeded
+        assert runtime.is_running(container)
+
+    def test_an_idle_timeout_needs_a_consumer(
+        self, runtime: ContainerRuntime, container: ContainerHandle
+    ) -> None:
+        with pytest.raises(ValueError, match="consumer"):
+            runtime.run(container, self.echo("x"), timeout_seconds=30, idle_timeout_seconds=5)
 
     def test_workspace_is_shared_with_host(
         self, runtime: ContainerRuntime, container: ContainerHandle, workspace: Path

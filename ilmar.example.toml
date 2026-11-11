@@ -21,6 +21,11 @@ instance_id = "default"
 max_attempts = 3
 max_concurrent_executions = 1
 agent_timeout_seconds = 3600
+# #13, ADR-0035: end an agent run that shows no progress (no validated
+# agent event) for this long; it is retried after backoff like other
+# transient failures. Must not exceed agent_timeout_seconds, which stays the
+# independent hard lifetime.
+stall_timeout_seconds = 900
 # #13, ADR-0028: after a transient failure the next attempt waits
 # base * 2 ** (attempt - 1) seconds, at most the maximum. The wait is stored,
 # so a restart never shortens it.

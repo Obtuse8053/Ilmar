@@ -177,6 +177,27 @@ LIVE_VARIABLES = (
 )
 
 
+VERSION_ENV = "ILMAR_TEST_CLAUDE_VERSION"
+PINNED_VERSION = re.compile(r"\d+\.\d+\.\d+")
+
+
+def pinned_claude_version(env: Mapping[str, str], *, required: bool) -> str | None:
+    """The pinned Claude Code version a live run is evidence for (ADR-0035 §6).
+
+    Under ``ILMAR_LIVE_REQUIRED=1`` an unpinned run fails: it can never count as
+    Gate 1 evidence. Otherwise an unset version gives ``None`` (a smoke run that
+    writes no record). A set version must be an exact ``x.y.z``.
+    """
+    version = env.get(VERSION_ENV, "")
+    if not version:
+        if required:
+            raise LiveGuardError(f"{VERSION_ENV} is required: an unpinned run is not evidence")
+        return None
+    if not PINNED_VERSION.fullmatch(version):
+        raise LiveGuardError(f"{VERSION_ENV} must be a pinned x.y.z version")
+    return version
+
+
 def missing_variables(env: Mapping[str, str]) -> list[str]:
     return [name for name in LIVE_VARIABLES if not env.get(name)]
 
@@ -198,9 +219,8 @@ def settings_from(env: Mapping[str, str], *, default_report: Path) -> LiveSettin
     key = Secret(ANTHROPIC_KEY_ENV, env[ANTHROPIC_KEY_ENV])
     if key.reveal() == token.reveal():
         raise LiveGuardError("the two credentials must differ")
-    version = env["ILMAR_TEST_CLAUDE_VERSION"]
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise LiveGuardError("ILMAR_TEST_CLAUDE_VERSION must be a pinned x.y.z version")
+    version = pinned_claude_version(env, required=True)
+    assert version is not None
     proxy = env["ILMAR_TEST_PODMAN_PROXY_IMAGE"]
     return LiveSettings(
         repository=repository,
