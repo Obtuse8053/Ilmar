@@ -60,11 +60,24 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#13, second part: stall detection (ADR-0035). Backoff and durable
-scheduling are merged (#103).
+#90 (runtime limits, Podman `--timeout` and the single model-credential
+path), then #18 (reservation ledger, suspension and kill switch). These are the
+essentials for supervised autonomy.
+
+Hard gates that stay in force:
+- the real-Podman coordinator-SIGKILL test in #90, which Gate 1 also needs;
+- a passed pinned-version live test and a reviewed, recorded stream fixture
+  before Mode 1 (the synthetic fixture never counts);
+- #91 enforces the version and gate requirements before it allows loop mode.
 
 ## Change log
 
+- 2026-11-11: **#13 audited** after stall detection merged (#106). All four
+  of its acceptance criteria are met. The audit found two ADR-0035 test gaps,
+  added here: a telemetry-only stream stalls with the real validator, and a
+  model key inside the stream reaches no store, log, event or report. The
+  coordinator-SIGKILL test is tracked as blocking on #90 and #93, and the
+  version and gate enforcement on #91.
 - 2026-11-10: **#13 stall detection submitted** (ADR-0035). #13 stays open
   until it is audited.
   - **Stream:** Claude Code runs with `--output-format stream-json --verbose`.
