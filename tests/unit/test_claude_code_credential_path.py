@@ -111,7 +111,6 @@ def test_a_configured_gateway_url_is_the_one_allowed_base_url(tmp_path: Path) ->
     "path",
     [
         "/home/ilmar/.claude.json",
-        "/home/ilmar/.claude/.credentials.json",
         "/home/ilmar/.aws",
         "/home/ilmar/.config/gcloud",
         "/etc/claude-code/managed-settings.json",
@@ -133,6 +132,7 @@ TARGETS = [
     "/home/ilmar/.claude",
     "/home/ilmar/.claude/settings.json",
     "/home/ilmar/.claude/settings.local.json",
+    "/home/ilmar/.claude/.credentials.json",
 ]
 
 
@@ -142,6 +142,7 @@ def test_the_sealed_paths_cover_every_settings_location_claude_code_reads() -> N
         ("~/.claude", True),
         ("~/.claude/settings.json", False),
         ("~/.claude/settings.local.json", False),
+        ("~/.claude/.credentials.json", False),
     }
 
 
@@ -279,9 +280,12 @@ def test_the_real_probe_finds_every_kind_of_route(dirs: tuple[Path, Path]) -> No
     assert report is not None
     reason = refusal(report, gateway_configured=False, sealed_paths=())
     assert reason is not None
-    for found in ("ANTHROPIC_AUTH_TOKEN", ".credentials.json", ".claude.json",
-                  ".claude/settings.local.json"):  # fmt: skip
+    for found in ("ANTHROPIC_AUTH_TOKEN", ".claude.json", ".claude/settings.local.json"):
         assert found in reason
+    # The credentials file is a seal: outside a sandbox it is simply not sealed.
+    sealed = refusal(report, gateway_configured=False)
+    assert sealed is not None
+    assert str(home / ".claude" / ".credentials.json") in sealed
 
 
 @pytest.mark.parametrize(

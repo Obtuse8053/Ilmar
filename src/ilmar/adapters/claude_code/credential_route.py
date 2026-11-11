@@ -8,10 +8,17 @@ Anthropic workspace carries the spend limit. Two layers enforce this.
 ``apiKeyHelper`` and ``env``, from ``.claude/`` in the project and from
 ``~/.claude/settings*.json``, and may reload them while it runs. The agent
 sandbox therefore seals those locations (``SEALED_PATHS``): the project's
-``.claude/`` and both user settings files are empty, read-only mounts that the
-agent can neither write, remove nor rename, and ``~/.claude`` itself is a
-writable mount that cannot be renamed away. Nothing the agent does after the
-check can create a settings file that Claude Code reads.
+``.claude/``, both user settings files and the login credentials file
+``~/.claude/.credentials.json`` are empty, read-only mounts that the agent can
+neither write, remove nor rename, and ``~/.claude`` itself is a writable mount
+that cannot be renamed away. Nothing the agent does after the check can
+create one of those files.
+
+This is not a complete single-credential guarantee. ``~/.claude.json`` stays
+writable (Claude Code keeps its state there), and a credential already present
+in the sandbox, for example in the repository, can still be used directly
+against the allow-listed model host. Only a credential-injecting egress proxy
+closes those routes (ADR-0036).
 
 **The probe, before Claude Code starts.** A fixed script runs in the sandbox
 with exactly the environment Claude Code will get. It reports variable
@@ -52,11 +59,11 @@ SEALED_PATHS = (
     SealedPath("~/.claude", writable=True),  # Claude Code's state; cannot be renamed away
     SealedPath("~/.claude/settings.json"),
     SealedPath("~/.claude/settings.local.json"),
+    SealedPath("~/.claude/.credentials.json"),  # Claude login and OAuth tokens on Linux
 )
 
 HOME_FILES = (
     "$HOME/.claude.json",
-    "$HOME/.claude/.credentials.json",
     "$HOME/.aws",
     "$HOME/.config/gcloud",
     "/etc/claude-code/managed-settings.json",

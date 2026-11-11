@@ -83,6 +83,7 @@ sandbox before Claude Code starts. Review found two gaps:
    | `~/.claude` | writable | Claude Code keeps state here; as a mount point it cannot be renamed away to plant a new settings file |
    | `~/.claude/settings.json` | read-only, empty | user settings |
    | `~/.claude/settings.local.json` | read-only, empty | user local settings |
+   | `~/.claude/.credentials.json` | read-only, empty | Claude login and OAuth tokens on Linux; added in review, because the writable `~/.claude` would otherwise let the agent create it after the check |
 
    The sealed project directory hides the repository's own `.claude/` from the
    agent. The agent can neither read nor change it, so a candidate can never
@@ -104,22 +105,65 @@ sandbox before Claude Code starts. Review found two gaps:
 
 ## Consequences
 
-- **What it guarantees:** after the check, no settings file Claude Code reads
-  from these locations can change. The guarantee rests on the kernel's mount
-  rules, not on Claude Code's behaviour.
-- **What stays open:**
-  - **The global state file.** `~/.claude.json`, which holds the OAuth
-    session, MCP configuration and state [R29], must stay writable for Claude
-    Code's state. The probe refuses it at the start, and `--strict-mcp-config`
-    already ignores its MCP servers.
-  - **Other credentials.** An agent could still use a credential that is
-    already in the sandbox, for example one committed to the repository, by
-    calling the API directly. The egress allowlist limits it to the model
-    host, and the spend limit applies only to the configured workspace.
-  - **The proxy.** Option 4 closes both of these. It is the recommended
-    follow-up ADR.
-- **What the agent loses:** it cannot see or edit a repository's `.claude/`
-  directory.
+This decision does **not** give a complete single-credential guarantee. The
+table separates what is enforced today from what only the credential-injecting
+proxy (option 4) can enforce.
+
+| Route to a model | Enforced today | Needs the proxy |
+| --- | --- | --- |
+| A credential variable in the image, container or runner environment | Refused at start by the probe (names only) | — |
+| A Bedrock, Vertex or other provider endpoint | Blocked by the egress allowlist (the model host only) | — |
+| A foreign `ANTHROPIC_BASE_URL` | Refused at start; other hosts are blocked by the allowlist | — |
+| `apiKeyHelper` or `env` in project or user settings, at start or during the run | Sealed: the files cannot be created or changed (real-Podman tests) | — |
+| An OAuth login in `~/.claude/.credentials.json`, at start or during the run | Sealed: it cannot be created or changed | — |
+| `CLAUDE_CONFIG_DIR` moving the settings elsewhere | Refused at start; the agent cannot change the environment of the running Claude Code | — |
+| Login state or an API key in `~/.claude.json` | Refused only if the file exists at start; **it stays writable during the run** | Yes |
+| A nested `claude` started by the agent, with its own configuration | Not prevented; it can use only credentials already in the sandbox | Yes |
+| A credential already in the sandbox (committed to the repository, or the configured key itself), used directly against the model host | Not prevented: the allowlist admits any credential to the model host | Yes |
+| The configured key copied into a published candidate | **Not prevented today** (see Gate 1 below) | Yes: the key would never be in the sandbox |
+
+**`~/.claude.json`.** According to the documentation, it holds the OAuth
+session, MCP server configuration and per-project state [R29]. Claude Code
+rewrites it during a run, so it cannot be sealed without breaking Claude Code.
+- **What the agent can write there:** login data or an API key. Whether a
+  given Claude Code version would use such an entry ahead of the
+  `ANTHROPIC_API_KEY` it was started with is not established; no version could
+  be run from the development environment.
+- **MCP servers:** those in the file are ignored, because Ilmar runs Claude
+  Code with `--strict-mcp-config`.
+- **Bounded, not closed:** a value written there must already exist in the
+  sandbox, and the allowlist admits only the model host. So this route
+  matters only where another credential is reachable from inside the sandbox.
+  It stays open until the proxy exists.
+
+**What the agent loses:** it cannot see or edit a repository's `.claude/`
+directory.
+
+### Gate 1 and the proxy (recommendation, for the maintainer to decide)
+
+Gate 1 runs Mode 1, supervised, on a dedicated test repository (ADR-0030). On
+that repository the routes the proxy would close need a credential other than
+the configured key inside the sandbox. A test repository the maintainer
+controls holds none. **The proxy is therefore not strictly required for Gate
+1**, provided that:
+
+1. **The pinned-version compatibility test passes** (mandatory, as before):
+   the pinned Claude Code runs with these seals, including the
+   credentials-file seal, and never uses repository settings.
+2. **The test repository has no credentials:** none in its content or
+   history, and no secret-bearing workflows. This is recorded with the gate
+   evidence.
+3. **Publication cannot leak the configured key.** Today the agent can read
+   the key and could write it into a candidate that Ilmar then publishes. A
+   deterministic check that refuses to publish a candidate containing the
+   value of any configured secret (#110) is a **Gate 1 prerequisite**. The proxy
+   removes the need, because the key never enters the sandbox.
+
+**The proxy must be in place before:**
+- any repository that is not fully controlled by the maintainer or may contain
+  credentials;
+- Mode 2 or any unsupervised operation;
+- self-hosting (M4).
 
 ## Tests required
 
@@ -135,13 +179,17 @@ sandbox before Claude Code starts. Review found two gaps:
   - an incomplete environment scan refuses;
   - no `claude` command runs after any refusal.
 - **Real Podman (`test_sealed_paths_podman.py`), in CI:**
-  - as the sandbox user, writing, creating, removing, renaming, unmounting or
-    remounting each sealed location fails;
+  - as the sandbox user, writing, creating, removing, renaming, linking,
+    unmounting or remounting each sealed location fails, including
+    `~/.claude/.credentials.json`; after every attempt it is still the empty
+    seal, and the probe still accepts the sandbox;
   - the repository's `.claude/` is hidden inside and unchanged on the host;
   - Claude Code's state directory stays writable;
   - the real probe accepts the sealed sandbox and refuses an unsealed one.
-- **Pinned version (`test_claude_code_pinned.py`), no credential needed:**
-  - the real, pinned Claude Code runs sealed with an invalid key;
+- **Pinned version (`test_claude_code_pinned.py`), no credential needed;
+  mandatory for Gate 1:**
+  - the real, pinned Claude Code runs sealed with an invalid key, including
+    the read-only directory where it would look for login credentials;
   - a repository `apiKeyHelper` never runs;
   - the authentication failure is classified as a provider refusal.
   - It needs the pinned image, so it runs with the Gate 1 evidence, not in

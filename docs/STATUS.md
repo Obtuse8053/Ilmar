@@ -92,8 +92,16 @@ Hard gates that stay in force:
     - Claude Code's settings locations are sealed at the sandbox boundary
       (read-only tmpfs mounts the agent cannot write, remove or rename), so no
       `apiKeyHelper` can appear after the check.
+    - `~/.claude/.credentials.json` is sealed too, so no OAuth login can be
+      planted during a run.
     - The pinned-version check is `tests/integration/test_claude_code_pinned.py`
-      (no credential needed); it joins the Gate 1 evidence.
+      (no credential needed); it is mandatory Gate 1 evidence.
+    - **Not a complete single-credential guarantee.** `~/.claude.json` stays
+      writable. Credentials already in the sandbox, including the configured
+      key, remain usable. Only the credential-injecting proxy (#111) closes
+      these routes. ADR-0036 recommends a candidate secret check (#110) as a
+      Gate 1 prerequisite, and the proxy before any uncontrolled repository,
+      Mode 2 or self-hosting. Both await maintainer decision.
   - **Not yet in place:** #18 turns `provider-refused` into a durable
     suspension of all new work. The exact texts at a workspace cap are
     unverified until the Gate 1 drill (#93). The supervised-mode concurrency

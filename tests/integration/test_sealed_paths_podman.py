@@ -90,6 +90,12 @@ ATTEMPTS = [
     "rmdir $HOME/.claude/settings.json",
     "mv $HOME/.claude/settings.json $HOME/.claude/old",
     "mv $HOME/.claude/settings.local.json $HOME/.claude/old-local",
+    # the login credentials file (OAuth tokens), which Claude Code would read
+    'printf \'%s\' \'{"claudeAiOauth": {"accessToken": "x"}}\' > $HOME/.claude/.credentials.json',
+    "touch $HOME/.claude/.credentials.json/x",
+    "rmdir $HOME/.claude/.credentials.json",
+    "mv $HOME/.claude/.credentials.json $HOME/.claude/old-credentials",
+    "ln -s /tmp/creds.json $HOME/.claude/.credentials.json",
     # the user settings directory itself
     "mv $HOME/.claude $HOME/.claude-moved",
     "rm -rf $HOME/.claude",
@@ -109,7 +115,7 @@ def test_every_seal_is_in_place_and_empty(
     runtime, handle, _ = sandbox
     script = (
         'for p in /workspace/.claude "$HOME/.claude/settings.json" '
-        '"$HOME/.claude/settings.local.json"; do '
+        '"$HOME/.claude/settings.local.json" "$HOME/.claude/.credentials.json"; do '
         '[ -d "$p" ] || { echo "missing $p"; exit 1; }; '
         '[ -w "$p" ] && { echo "writable $p"; exit 1; }; '
         '[ -z "$(ls -A "$p")" ] || { echo "not empty $p"; exit 1; }; '
@@ -185,3 +191,25 @@ def test_the_real_probe_refuses_an_unsealed_sandbox(tmp_path: Path) -> None:
         assert "not sealed" in reason
     finally:
         runtime.stop(handle, owner=OWNER)
+
+
+def test_no_credentials_file_can_appear_after_the_check(
+    sandbox: tuple[PodmanRuntime, ContainerHandle, Path],
+) -> None:
+    """After every attempt to plant one, ``~/.claude/.credentials.json`` is still
+    the empty, read-only seal and the probe still accepts the sandbox."""
+    runtime, handle, _ = sandbox
+    for script in ATTEMPTS:
+        runtime.run(handle, sh(script), timeout_seconds=30)
+    check = runtime.run(
+        handle,
+        sh('p="$HOME/.claude/.credentials.json"; [ -d "$p" ] && [ ! -w "$p" ] '
+           '&& [ -z "$(ls -A "$p")" ] && echo SEALED'),
+        timeout_seconds=30,
+    )  # fmt: skip
+    assert check.stdout.strip() == "SEALED", check.stdout + check.stderr
+    env = {"ANTHROPIC_API_KEY": "sk-ant-integration-not-real"}
+    done = runtime.run(handle, probe_command(), timeout_seconds=30, env=env)
+    report = parse_probe(done.stdout)
+    assert report is not None, done.stdout
+    assert refusal(report, gateway_configured=False, expected_variables=env) is None
