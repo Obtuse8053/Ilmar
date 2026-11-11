@@ -71,6 +71,13 @@ def _quoted(paths: Iterable[str]) -> str:
     return " ".join('"' + path + '"' for path in paths)
 
 
+def _shell_path(sealed: SealedPath) -> str:
+    return "$HOME/" + sealed.path[2:] if sealed.path.startswith("~/") else sealed.path
+
+
+READ_ONLY_SEALS = tuple(_shell_path(s) for s in SEALED_PATHS if not s.writable)
+
+
 PROBE_SCRIPT = "\n".join(
     [
         "for tool in awk grep; do",
@@ -91,6 +98,12 @@ PROBE_SCRIPT = "\n".join(
         '    if [ "$status" -eq 0 ]; then echo "SETTING $f";',
         '    elif [ "$status" -ne 1 ]; then echo "' + PROBE_ERROR + ' read $f"; exit 4; fi',
         "  fi",
+        "done",
+        # A read-only seal must be empty: nothing copied or left in it.
+        "for d in " + _quoted(READ_ONLY_SEALS) + "; do",
+        '  for e in "$d"/* "$d"/.[!.]* "$d"/..?*; do',
+        '    if [ -e "$e" ] || [ -L "$e" ]; then echo "NONEMPTY $d"; break; fi',
+        "  done",
         "done",
         'awk \'{ print "MOUNT " $2 " " $4 } END { print "MOUNTS-DONE" }\' /proc/self/mounts '
         '|| { echo "' + PROBE_ERROR + ' mounts"; exit 5; }',
@@ -122,8 +135,9 @@ class ProbeReport:
     settings: tuple[str, ...]
     home: PurePosixPath
     workdir: PurePosixPath
-    mounts: Mapping[str, frozenset[str]]
-    """Mount point to its options; a later mount over the same point wins."""
+    mounts: tuple[tuple[str, frozenset[str]], ...]
+    """Mount points and options, in the order of the mount table."""
+    nonempty: tuple[str, ...] = ()
 
 
 def parse_probe(stdout: str) -> ProbeReport | None:
@@ -131,7 +145,8 @@ def parse_probe(stdout: str) -> ProbeReport | None:
     variables: set[str] = set()
     files: list[str] = []
     settings: list[str] = []
-    mounts: dict[str, frozenset[str]] = {}
+    mounts: list[tuple[str, frozenset[str]]] = []
+    nonempty: list[str] = []
     home = workdir = None
     seen: set[str] = set()
     for line in stdout.splitlines():
@@ -150,11 +165,21 @@ def parse_probe(stdout: str) -> ProbeReport | None:
             workdir = PurePosixPath(rest)
         elif kind == "MOUNT":
             point, _, options = rest.partition(" ")
-            mounts[point] = frozenset(options.split(","))
+            mounts.append((point, frozenset(options.split(","))))
+        elif kind == "NONEMPTY" and rest:
+            nonempty.append(rest)
     complete = {PROBE_END, "ENV-DONE", "MOUNTS-DONE"} <= seen and PROBE_ERROR not in seen
     if not complete or home is None or workdir is None:
         return None
-    return ProbeReport(frozenset(variables), tuple(files), tuple(settings), home, workdir, mounts)
+    return ProbeReport(
+        frozenset(variables),
+        tuple(files),
+        tuple(settings),
+        home,
+        workdir,
+        tuple(mounts),
+        tuple(nonempty),
+    )
 
 
 def forbidden_variables(names: Iterable[str], *, gateway_configured: bool) -> list[str]:
@@ -176,14 +201,25 @@ def sealed_target(sealed: SealedPath, report: ProbeReport) -> PurePosixPath:
     return report.workdir / sealed.path
 
 
+def _top_mount(report: ProbeReport, target: PurePosixPath) -> tuple[str, frozenset[str]] | None:
+    """The mount that is visible at ``target``: the last one in the table whose
+    mount point is ``target`` or one of its parents. A later mount on a parent
+    hides an earlier one below it."""
+    for point, options in reversed(report.mounts):
+        mounted = PurePosixPath(point)
+        if mounted == target or mounted in target.parents:
+            return point, options
+    return None
+
+
 def unsealed(report: ProbeReport, sealed_paths: Iterable[SealedPath]) -> list[str]:
-    """The sealed paths that are not mounted with the access they need."""
+    """The sealed paths that are not the visible mount, with the access they need."""
     missing = []
     for sealed in sealed_paths:
         target = sealed_target(sealed, report)
-        options = report.mounts.get(str(target))
+        top = _top_mount(report, target)
         wanted = "rw" if sealed.writable else "ro"
-        if options is None or wanted not in options:
+        if top is None or top[0] != str(target) or wanted not in top[1]:
             missing.append(str(target))
     return missing
 
@@ -207,6 +243,8 @@ def refusal(
         parts.append("project settings " + ", ".join(sorted(report.settings)))
     if missing := unsealed(report, sealed_paths):
         parts.append("settings locations not sealed: " + ", ".join(missing))
+    if report.nonempty:
+        parts.append("sealed settings locations not empty: " + ", ".join(report.nonempty))
     if not parts:
         return None
     return "the agent sandbox is not limited to one model credential: " + "; ".join(parts)

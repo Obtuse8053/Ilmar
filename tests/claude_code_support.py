@@ -110,6 +110,8 @@ class ProbeStandIn:
         exit_code: int = 0,
         drop: Sequence[str] = (),
         extra: Sequence[str] = (),
+        nonempty: Sequence[str] = (),
+        mounted_after: Sequence[str] = (),
     ) -> None:
         self.image_env = tuple(image_env)
         self.hide_env = set(hide_env)
@@ -120,6 +122,8 @@ class ProbeStandIn:
         self.exit_code = exit_code
         self.drop = tuple(drop)
         self.extra = tuple(extra)
+        self.nonempty = tuple(nonempty)
+        self.mounted_after = tuple(mounted_after)
         self.seen: list[dict[str, str]] = []
 
     def __call__(
@@ -150,6 +154,8 @@ class ProbeStandIn:
             if target in self.wrong_access:
                 access = "ro" if access == "rw" else "rw"
             lines.append(f"MOUNT {target} {access},nosuid,nodev")
+        lines += [f"MOUNT {point} rw,relatime" for point in self.mounted_after]
+        lines += [f"NONEMPTY {d}" for d in self.nonempty]
         lines += ["MOUNTS-DONE", *self.extra, PROBE_END]
         kept = [line for line in lines if not line.startswith(self.drop)] if self.drop else lines
         return CommandResult(self.exit_code, "\n".join(kept) + "\n", "", 0.1)

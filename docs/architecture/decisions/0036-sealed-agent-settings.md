@@ -66,8 +66,12 @@ sandbox before Claude Code starts. Review found two gaps:
    - **The host is untouched:** whatever is at the path on the host stays
      there unchanged, hidden from the sandbox.
    - **Refusal:** a runtime that cannot seal a path refuses to start the
-     container. Podman uses `--tmpfs <path>:ro,nosuid,nodev,noexec`, or `rw`
-     for writable paths.
+     container.
+   - **Podman:** uses `--tmpfs <path>:ro,nosuid,nodev,noexec,notmpcopyup`, or
+     `rw` for writable paths. `notmpcopyup` matters: without it, Podman copies
+     whatever is at the path into the tmpfs. The first CI run of this change
+     showed the repository's `.claude/settings.json` reappearing inside the
+     seal.
    - **Paths the sandbox needs:** `/`, `/tmp`, the working directory and the
      home directory are never sealed.
 2. **What the Claude Code sandbox seals** (`SEALED_PATHS`), always and with no
@@ -87,7 +91,10 @@ sandbox before Claude Code starts. Review found two gaps:
    starts, the probe runs with Claude Code's exact environment and reports the
    mount table.
    - **Refused (`policy-violation`, never retried):**
-     - a sealed path that is not mounted with the right access;
+     - a sealed path that is not the visible mount (none at all, or one hidden
+       under a later mount of a parent directory), or that has the wrong
+       access;
+     - a read-only seal that is not empty;
      - a variable the runner passed that is missing from the scan;
      - `CLAUDE_CONFIG_DIR`, which would move user settings elsewhere;
      - any route ADR-0029 §5 already forbids.

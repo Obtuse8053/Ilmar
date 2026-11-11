@@ -100,6 +100,27 @@ ATTEMPTS = [
 ]
 
 
+def test_every_seal_is_in_place_and_empty(
+    sandbox: tuple[PodmanRuntime, ContainerHandle, Path],
+) -> None:
+    """Without this, a failed write could just mean a missing directory. Each
+    read-only seal exists, is empty (no copy of what was there) and is not
+    writable; ``~/.claude`` exists and is writable."""
+    runtime, handle, _ = sandbox
+    script = (
+        'for p in /workspace/.claude "$HOME/.claude/settings.json" '
+        '"$HOME/.claude/settings.local.json"; do '
+        '[ -d "$p" ] || { echo "missing $p"; exit 1; }; '
+        '[ -w "$p" ] && { echo "writable $p"; exit 1; }; '
+        '[ -z "$(ls -A "$p")" ] || { echo "not empty $p"; exit 1; }; '
+        "done; "
+        '[ -d "$HOME/.claude" ] && [ -w "$HOME/.claude" ] || { echo "state dir"; exit 1; }; '
+        "echo OK"
+    )
+    done = runtime.run(handle, sh(script), timeout_seconds=30)
+    assert (done.exit_code, done.stdout.strip()) == (0, "OK"), done.stdout + done.stderr
+
+
 @pytest.mark.parametrize("script", ATTEMPTS)
 def test_no_sealed_settings_location_can_be_changed(
     sandbox: tuple[PodmanRuntime, ContainerHandle, Path], script: str

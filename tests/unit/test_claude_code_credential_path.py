@@ -156,6 +156,24 @@ def test_a_sealed_path_with_the_wrong_access_refuses(tmp_path: Path, target: str
     refused(tmp_path, ProbeStandIn(wrong_access=[target]), "not sealed")
 
 
+@pytest.mark.parametrize(
+    ("parent", "hidden"),
+    [("/workspace", "/workspace/.claude"), ("/home/ilmar", "/home/ilmar/.claude"),
+     ("/home/ilmar/.claude", "/home/ilmar/.claude/settings.json"), ("/", "/workspace/.claude")],
+)  # fmt: skip
+def test_a_seal_hidden_by_a_later_mount_on_a_parent_refuses(
+    tmp_path: Path, parent: str, hidden: str
+) -> None:
+    """The seal must be the mount that is visible, not one buried under a
+    later mount of a parent directory."""
+    message = refused(tmp_path, ProbeStandIn(mounted_after=[parent]), "not sealed")
+    assert hidden in message
+
+
+def test_a_non_empty_seal_refuses(tmp_path: Path) -> None:
+    refused(tmp_path, ProbeStandIn(nonempty=[".claude"]), "not empty")
+
+
 # -- a probe that does not finish never lets Claude Code start -----------------------------
 
 
@@ -233,14 +251,14 @@ def dirs(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_the_real_probe_reports_a_clean_sandbox_completely(dirs: tuple[Path, Path]) -> None:
     work, home = dirs
-    (work / ".claude" / "settings.json").write_text('{"permissions": {"allow": ["Bash"]}}')
     done = real_probe(work, home, {"ANTHROPIC_API_KEY": "x"})
     assert done.returncode == 0, done.stdout
     report = parse_probe(done.stdout)
     assert report is not None
     assert str(report.home) == str(home)
     assert str(report.workdir) == str(work)
-    assert "/" in report.mounts  # the real mount table was read
+    assert any(point == "/" for point, _ in report.mounts)  # the real mount table was read
+    assert report.nonempty == ()
     # Outside a sandbox nothing is sealed; everything else is clean.
     assert refusal(report, gateway_configured=False, expected_variables=["ANTHROPIC_API_KEY"],
                    sealed_paths=()) is None  # fmt: skip
@@ -264,6 +282,44 @@ def test_the_real_probe_finds_every_kind_of_route(dirs: tuple[Path, Path]) -> No
     for found in ("ANTHROPIC_AUTH_TOKEN", ".credentials.json", ".claude.json",
                   ".claude/settings.local.json"):  # fmt: skip
         assert found in reason
+
+
+@pytest.mark.parametrize(
+    ("make", "reported"),
+    [
+        (lambda w, h: (w / ".claude" / "settings.json").write_text("{}"), ".claude"),
+        (lambda w, h: (w / ".claude" / ".hidden").write_text("x"), ".claude"),
+        (lambda w, h: (w / ".claude" / "..odd").mkdir(), ".claude"),
+        (
+            lambda w, h: (
+                (h / ".claude" / "settings.json").mkdir(parents=True)
+                or (h / ".claude" / "settings.json" / "x").write_text("x")
+            ),
+            "/.claude/settings.json",
+        ),
+        (
+            lambda w, h: (
+                (h / ".claude" / "settings.local.json").mkdir(parents=True)
+                or (h / ".claude" / "settings.local.json" / "link").symlink_to("/nowhere")
+            ),
+            "/.claude/settings.local.json",
+        ),
+    ],
+    ids=["project-file", "project-hidden", "project-dotdot-name", "user-file", "user-link"],
+)
+def test_the_real_probe_finds_anything_inside_a_read_only_seal(
+    dirs: tuple[Path, Path], make: object, reported: str
+) -> None:
+    """A read-only seal must be empty: Podman's copy-up once copied the
+    repository's settings into it (the CI failure on #109)."""
+    work, home = dirs
+    make(work, home)  # type: ignore[operator]
+    report = parse_probe(real_probe(work, home, {}).stdout)
+    assert report is not None
+    assert any(d.endswith(reported) for d in report.nonempty), report.nonempty
+    reason = refusal(report, gateway_configured=False, sealed_paths=())
+    assert reason is not None
+    assert "not empty" in reason
 
 
 def tool_dir(tmp_path: Path, *tools: str) -> str:

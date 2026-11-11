@@ -834,10 +834,12 @@ class PodmanRuntime:
         args: list[str] = []
         for sealed in spec.sealed_paths:
             target = self._sealed_target(sealed.path, workdir)
+            # notmpcopyup: Podman would otherwise copy what is at the path (for
+            # example the repository's .claude/settings.json) into the tmpfs.
             options = (
-                f"rw,nosuid,nodev,mode=1777,size={self._profile.tmpfs_mb}m"
+                f"rw,nosuid,nodev,notmpcopyup,mode=1777,size={self._profile.tmpfs_mb}m"
                 if sealed.writable
-                else "ro,nosuid,nodev,noexec,mode=0555,size=64k"
+                else "ro,nosuid,nodev,noexec,notmpcopyup,mode=0555,size=64k"
             )
             args += ["--tmpfs", f"{target}:{options}"]
         return args

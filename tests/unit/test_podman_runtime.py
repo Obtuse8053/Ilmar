@@ -1195,10 +1195,15 @@ def test_sealed_paths_become_tmpfs_mounts_with_their_access(
     )
     runtime(layout, podman).start(spec(workspace, sealed_paths=sealed))
     mounts = tmpfs_args(podman)
-    assert "/workspace/.claude:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
-    assert any(m.startswith("/home/ilmar/.claude:rw,nosuid,nodev,mode=1777,") for m in mounts)
-    assert "/home/ilmar/.claude/settings.json:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
-    assert "/etc/example:ro,nosuid,nodev,noexec,mode=0555,size=64k" in mounts
+    sealed_ro = "ro,nosuid,nodev,noexec,notmpcopyup,mode=0555,size=64k"
+    assert f"/workspace/.claude:{sealed_ro}" in mounts
+    assert any(
+        m.startswith("/home/ilmar/.claude:rw,nosuid,nodev,notmpcopyup,mode=1777,") for m in mounts
+    )
+    assert f"/home/ilmar/.claude/settings.json:{sealed_ro}" in mounts
+    assert f"/etc/example:{sealed_ro}" in mounts
+    # Never a copy of what was at the path (the CI failure that found this).
+    assert all("notmpcopyup" in m for m in mounts[2:])
 
 
 def test_no_sealed_paths_add_no_mounts(
