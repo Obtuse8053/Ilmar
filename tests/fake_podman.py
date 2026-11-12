@@ -85,6 +85,7 @@ class FakePodman:
     rootless: bool = True
     rm_behaviour: str = "ok"  # "ok", "fail" (exit 125, container stays) or "hang"
     proxy_ready: bool = True
+    gateway_keys: list[tuple[str, str]] = field(default_factory=list)  # (host path, content)
     fail_rm_names: set[str] = field(default_factory=set)  # containers whose rm fails
     network_rm_fails: bool = False
     after_network_inspect: Callable[[str], None] | None = None  # to race a removal
@@ -261,7 +262,13 @@ class FakePodman:
             fake.hosts += 1
             base = fake.subnet.split("/")[0].rsplit(".", 1)[0]
             container.networks[network] = f"{base}.{fake.hosts}"
-        if self.proxy_ready and "python3" in rest:
+        if self.proxy_ready and "/ilmar-model-gateway.py" in rest:
+            container.logs = "ilmar-gateway READY\n"
+            for arg in rest:  # what the sidecar would read from its key mount, at start
+                if arg.endswith("destination=/run/ilmar-gateway-key,ro=true"):
+                    source = arg.split("source=", 1)[1].split(",destination=", 1)[0]
+                    self.gateway_keys.append((source, Path(source).read_text()))
+        elif self.proxy_ready and "python3" in rest:
             container.logs = "ilmar-egress READY listen=0.0.0.0:3128\n"
         return Completed(0, container.id + "\n", "")
 

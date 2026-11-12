@@ -50,7 +50,7 @@ from ilmar.adapters.claude_code.provider_errors import ProviderFailure, classify
 from ilmar.adapters.claude_code.stream import EventObserver, StreamValidator, Violation
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.errors import PolicyViolationError, ProviderError
-from ilmar.domain.workspace import ContainerHandle, StopSignal
+from ilmar.domain.workspace import ContainerHandle, ModelAccess, StopSignal
 from ilmar.ports.container_runtime import ContainerRuntime
 
 _PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "dontAsk"})
@@ -119,7 +119,13 @@ class ClaudeCodeRunner:
         stop: StopSignal | None = None,
     ) -> AgentResult:
         settings = self._settings
-        env = self._environment()
+        route = runtime.model_access(container)
+        if route is not None and settings.base_url is not None:
+            raise PolicyViolationError(
+                "a gateway sandbox reaches the model only through its own sidecar; "
+                "remove base_url (ADR-0037)"
+            )
+        env = self._environment(route)
         # ADR-0029 §5: one credential path, checked before Claude Code starts.
         self._require_one_credential_path(runtime, container, env)
         if settings.expected_version is not None:
@@ -152,7 +158,7 @@ class ClaudeCodeRunner:
             # last line of standard error, redacted, says why (ADR-0035 §4, §6).
             rejection = validator.rejection
             text = str(rejection) if rejection is not None else "malformed stream"
-            detail = self._stderr_detail(result.stderr)
+            detail = self._stderr_detail(result.stderr, env)
             summary = f"{text} ({detail})" if detail else text
             if rejection is not None and rejection.kind is Violation.MISSING_RESULT:
                 # The process ended without a result: often an API failure on stderr.
@@ -161,13 +167,13 @@ class ClaudeCodeRunner:
         parsed = validator.result
         if parsed is None:  # pragma: no cover - the validator rejects a missing result
             return AgentResult(AgentOutcome.FAILED, "malformed stream: no result", None)
-        text = self._redact(str(parsed.get("result") or ""))[:_SUMMARY_LIMIT]
+        text = self._redact(str(parsed.get("result") or ""), env)[:_SUMMARY_LIMIT]
         subtype = str(parsed.get("subtype") or "")
         success = parsed.get("is_error") is False and subtype == "success"
         if result.exit_code == 0 and success:
             return AgentResult(AgentOutcome.COMPLETED, text or "Claude Code finished", 0)
         reason = subtype or "error"
-        detail = self._stderr_detail(result.stderr)
+        detail = self._stderr_detail(result.stderr, env)
         if success:  # claims success, but the process failed (F-021)
             reason = f"exit status {result.exit_code} despite a success result"
             if detail:
@@ -217,15 +223,20 @@ class ClaudeCodeRunner:
             argv += ["--model", settings.model]
         return argv
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, route: ModelAccess | None = None) -> dict[str, str]:
+        """The agent command's environment. In a ``GATEWAY`` sandbox (ADR-0037 §1)
+        the key is the sidecar's throwaway token and the base URL is the address
+        the runtime provided: the real key never enters the sandbox."""
         env = {
-            "ANTHROPIC_API_KEY": self._api_key,
+            "ANTHROPIC_API_KEY": self._api_key if route is None else route.token,
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
         }
-        if self._settings.base_url is not None:
+        if route is not None:
+            env["ANTHROPIC_BASE_URL"] = route.base_url
+        elif self._settings.base_url is not None:
             env["ANTHROPIC_BASE_URL"] = self._settings.base_url
         return env
 
@@ -238,7 +249,7 @@ class ClaudeCodeRunner:
         files or settings found, never their values; ``ProviderError`` if the
         probe cannot run, so Claude Code never starts unchecked.
         """
-        gateway = self._settings.base_url is not None
+        gateway = "ANTHROPIC_BASE_URL" in env
         own = own_environment_refusal(env, gateway_configured=gateway)
         if own is not None:  # pragma: no cover - the environment is fixed above
             raise PolicyViolationError(own)
@@ -273,15 +284,16 @@ class ClaudeCodeRunner:
         found = reported or f"none (exit {probe.exit_code})"
         return f"Claude Code version {found[:40]}, expected {settings.expected_version}"
 
-    def _stderr_detail(self, stderr: str) -> str:
+    def _stderr_detail(self, stderr: str, env: Mapping[str, str]) -> str:
         lines = stderr.strip().splitlines()
-        return self._redact(lines[-1])[:500] if lines else ""
+        return self._redact(lines[-1], env)[:500] if lines else ""
 
-    def _redact(self, text: str) -> str:
+    def _redact(self, text: str, env: Mapping[str, str]) -> str:
         """Remove the key and every other value of the agent command's environment
         (ADR-0035 §6). Values shorter than ``_REDACT_MIN`` (flags such as ``1``)
         cannot be secrets and would mangle ordinary text."""
-        for value in sorted(self._environment().values(), key=len, reverse=True):
+        values = {*self._environment().values(), *env.values()}  # the key and any token
+        for value in sorted(values, key=len, reverse=True):
             if len(value) >= _REDACT_MIN:
                 text = text.replace(value, REDACTED)
         return text

@@ -54,6 +54,7 @@ from ilmar.domain.workspace import (
     ContainerInfo,
     ContainerSpec,
     DirectoryIdentity,
+    ModelAccess,
     NetworkPolicy,
     ResourceOwner,
     StopSignal,
@@ -405,6 +406,7 @@ class FakeContainerRuntime:
         self.quarantined: set[DirectoryIdentity] = set()
         self.commands: list[tuple[str, tuple[str, ...]]] = []
         self.started_specs: list[ContainerSpec] = []  # every spec start() accepted, in order
+        self.model_routes: dict[str, ModelAccess] = {}  # GATEWAY sandboxes, by id
 
     @property
     def name(self) -> str:
@@ -562,6 +564,14 @@ class FakeContainerRuntime:
     def is_running(self, handle: ContainerHandle) -> bool:
         container = self._containers.get(handle.id)
         return container is not None and container.running
+
+    def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
+        container = self._containers.get(handle.id)
+        if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
+            return None
+        return self.model_routes.setdefault(
+            handle.id, ModelAccess("http://10.89.0.2:8080", f"fake-gateway-token-{handle.id:0>16}")
+        )
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
         found = self._by_name(name)

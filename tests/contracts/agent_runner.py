@@ -22,6 +22,7 @@ from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerInfo,
     ContainerSpec,
+    ModelAccess,
     ResourceOwner,
     StopSignal,
 )
@@ -103,6 +104,9 @@ class StopObservingRuntime:
 
     def is_running(self, handle: ContainerHandle) -> bool:
         return self.inner.is_running(handle)
+
+    def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
+        return self.inner.model_access(handle)
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
         return self.inner.remove_owned(name, owner=owner)

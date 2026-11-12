@@ -11,6 +11,7 @@ from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerInfo,
     ContainerSpec,
+    ModelAccess,
     ResourceOwner,
     StopSignal,
     StreamVerdict,
@@ -130,6 +131,16 @@ class ContainerRuntime(Protocol):
         ...
 
     def is_running(self, handle: ContainerHandle) -> bool: ...
+
+    def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
+        """How the ``GATEWAY`` sandbox ``handle`` reaches the model (ADR-0037 §1).
+
+        ``None`` for any other sandbox, and for one this runtime object did not
+        start: the throwaway token lives only in the memory of the runtime that
+        made it, so a restarted coordinator cannot reuse a sandbox's route. The
+        caller passes the token only through ``run(env=...)``.
+        """
+        ...
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
         """Remove the sandbox named ``name`` and everything that belongs to it (ADR-0022).

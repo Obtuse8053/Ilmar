@@ -21,12 +21,39 @@ class NetworkPolicy(enum.Enum):
     * ``NONE``: no network at all (the default).
     * ``ALLOWLIST``: HTTPS (``CONNECT host:443``) through a filtering proxy to
       the hostnames in ``ContainerSpec.allowed_hosts`` only.
+    * ``GATEWAY``: the model only, through the sandbox's own gateway sidecar on a
+      private network (ADR-0037). Nothing else is reachable; the sandbox never
+      holds the real model credential (see ``ModelAccess``).
     * ``UNRESTRICTED``: needs an explicit deployment opt-in (ADR-0014).
     """
 
     NONE = "none"
     ALLOWLIST = "allowlist"
+    GATEWAY = "gateway"
     UNRESTRICTED = "unrestricted"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelAccess:
+    """How a ``GATEWAY`` sandbox reaches the model (ADR-0037 §1).
+
+    ``base_url`` is the sidecar's plain-HTTP address on the sandbox's private
+    network, provided by the runtime itself. ``token`` is a random, per-sandbox
+    throwaway credential that only that sidecar accepts. It is held in memory
+    by the runtime that made it, never persisted, and never shown.
+    """
+
+    base_url: str
+    token: str
+
+    def __post_init__(self) -> None:
+        if not re.match(r"^http://\d{1,3}(\.\d{1,3}){3}:\d{1,5}$", self.base_url):
+            raise ValueError("a gateway base URL is http://<IPv4>:<port>, from the runtime")
+        if len(self.token) < 32 or not self.token.isprintable() or " " in self.token:
+            raise ValueError("a gateway token is at least 32 printable characters")
+
+    def __repr__(self) -> str:  # never the token
+        return f"ModelAccess(base_url={self.base_url!r})"
 
 
 _HOST_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
