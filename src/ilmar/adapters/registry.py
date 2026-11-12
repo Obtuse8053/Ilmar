@@ -35,6 +35,7 @@ from ilmar.config import PORT_NAMES, IlmarConfig
 from ilmar.core.components import AgentSandbox, Components, Target, close_all
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.naming import safe_identifier
+from ilmar.core.secret_scan import SecretScanner, SecretTooShortError
 from ilmar.domain.changes import RepositoryRef
 from ilmar.domain.errors import ConfigError, ProviderError
 from ilmar.domain.verification import VerificationPolicy
@@ -223,6 +224,7 @@ def build(
     blueprint = plan(config, registry=registry)
     environment = os.environ if environ is None else environ
     _check_sandbox_secrets_by_value(blueprint.plans, environment)
+    scanner = _secret_scanner(blueprint.plans, environment)
     secrets = Secrets(environment)
     created: dict[str, object] = {}
     closers: list[Callable[[], None]] = []
@@ -262,6 +264,7 @@ def build(
         target=blueprint.target,
         verification=context.verification,
         closers=closers,
+        secret_scanner=scanner,
     )
 
 
@@ -334,6 +337,18 @@ def _check_sandbox_secrets_by_name(plans: Mapping[str, Plan]) -> None:
             f"{', '.join(shared)} would be handed into the agent sandbox and is also a "
             "task-tracker or source-control credential (ADR-0006); use separate variables"
         )
+
+
+def _secret_scanner(plans: Mapping[str, Plan], environ: Mapping[str, str]) -> SecretScanner:
+    """Every configured secret, the model credential included, is looked for in
+    what Ilmar publishes (#110, ADR-0038)."""
+    values = {
+        name: environ[name] for p in plans.values() for name in p.environment if environ.get(name)
+    }
+    try:
+        return SecretScanner(values)
+    except SecretTooShortError as error:
+        raise ConfigError(f"{error}; use a real credential") from None
 
 
 def _check_sandbox_secrets_by_value(plans: Mapping[str, Plan], environ: Mapping[str, str]) -> None:

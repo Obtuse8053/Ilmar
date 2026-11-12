@@ -72,6 +72,19 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-12: **#110 submitted: candidate secret scan** (ADR-0038, Proposed;
+  a mandatory Gate 1 prerequisite).
+  - Every configured secret, the model credential included, is looked for
+    by value: raw, base64 (standard and URL-safe, every alignment), hex,
+    percent-encoding and JSON escaping. Arbitrary transformations are **not**
+    detected.
+  - The frozen candidate's changed paths are scanned before any check runs:
+    names, symlink targets and file bytes. A finding gives the verdict
+    `rejected-candidate-secret` and fails the execution without a retry
+    (`candidate-secret`).
+  - The change request's text is scanned before the first push. Tracker
+    notes that contain a secret are replaced by a fixed text.
+  - No value appears in evidence, events, transitions or notes.
 - 2026-11-11: **#90 part 1 merged** (#108). **Part 2 submitted: one credential
   path and provider failures** (ADR-0029 §5).
   - **Credential path:** before Claude Code starts, a fixed probe runs in the

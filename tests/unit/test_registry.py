@@ -110,6 +110,21 @@ def built(tmp_path: Path, tools: dict[str, str]) -> Iterator[Components]:
 # -- the configured adapters -------------------------------------------------------------
 
 
+def test_every_configured_secret_is_scanned_for(built: Components) -> None:
+    """#110: the model credential and the source-control token, by value; shown by name."""
+    scanner = built.secret_scanner
+    assert scanner.names == ("ANTHROPIC_API_KEY", "GITHUB_TOKEN")
+    for secret in SECRETS:
+        assert scanner.scan_text(f"x{secret}x", where="w")
+        assert secret not in repr(scanner)
+
+
+def test_a_secret_too_short_to_scan_for_is_refused(tmp_path: Path, tools: dict[str, str]) -> None:
+    with pytest.raises(ConfigError, match="GITHUB_TOKEN is shorter than 8 bytes") as caught:
+        build(config(data(tools), tmp_path), environ={**ENVIRON, "GITHUB_TOKEN": "ghp_1"})
+    assert "ghp_1" not in str(caught.value)
+
+
 def test_builds_the_configured_adapters(built: Components, tmp_path: Path) -> None:
     assert isinstance(built.task_provider, GitHubTaskProvider)
     assert isinstance(built.source_control, GitHubSourceControl)

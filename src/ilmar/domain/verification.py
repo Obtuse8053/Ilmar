@@ -54,6 +54,8 @@ class Verdict(enum.Enum):
     """Publish with ``requires_human_review`` and the review label."""
     REJECTED_CHECKS_FAILED = "rejected-checks-failed"
     REJECTED_CI_CONFIG = "rejected-ci-config"
+    REJECTED_CANDIDATE_SECRET = "rejected-candidate-secret"  # noqa: S105 - a verdict
+    """The candidate holds one of the deployment's own secrets (#110, ADR-0038)."""
 
     @property
     def publishable(self) -> bool:

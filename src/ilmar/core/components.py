@@ -18,6 +18,7 @@ from types import TracebackType
 from typing import Self
 
 from ilmar.core.layout import WorkspaceLayout
+from ilmar.core.secret_scan import SecretScanner
 from ilmar.domain.changes import RepositoryRef
 from ilmar.domain.errors import ProviderError
 from ilmar.domain.verification import VerificationPolicy
@@ -79,6 +80,7 @@ class Components:
         target: Target,
         verification: VerificationPolicy,
         closers: Sequence[Callable[[], None]] = (),
+        secret_scanner: SecretScanner | None = None,
     ) -> None:
         self.instance_id = instance_id
         self.layout = layout
@@ -90,6 +92,8 @@ class Components:
         self.agent_sandbox = agent_sandbox
         self.target = target
         self.verification = verification
+        self.secret_scanner = SecretScanner.empty() if secret_scanner is None else secret_scanner
+        """The deployment's own secrets, looked for before anything leaves (#110)."""
         self._closers = list(closers)
 
     def __repr__(self) -> str:  # never shows adapter internals, which may hold credentials

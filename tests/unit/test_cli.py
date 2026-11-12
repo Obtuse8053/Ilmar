@@ -137,8 +137,8 @@ def runnable_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config = tmp_path / "ilmar.toml"
     config.write_text(text)
     config.chmod(0o600)
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-y")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test-token-x")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-y")
     (tmp_path / "state").mkdir()
     return config
 

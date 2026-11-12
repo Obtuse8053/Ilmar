@@ -94,6 +94,8 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "agent-failed": "The agent reported a failure.",
         "agent-timed-out": "The agent did not finish in time.",
         "agent-stalled": "The agent showed no progress for the stall timeout.",
+        "candidate-secret": "The candidate or its change request contains one of the "
+        "deployment's own secrets; nothing is published (ADR-0038).",
         "provider-rate-limited": "The model provider rate-limited the agent; it is retried.",
         "provider-refused": "The model provider refused: spend limit, billing or authentication.",
         "verification-failed": "A verification run did not pass.",

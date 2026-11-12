@@ -283,6 +283,7 @@ ADDED_CODES = {
     "agent-stalled",  # ADR-0035 (#13)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
+    "candidate-secret",  # ADR-0038 (#110)
 }
 
 

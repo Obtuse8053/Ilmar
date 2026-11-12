@@ -14,6 +14,7 @@ from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import Coordinator
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import Ownership
+from ilmar.core.secret_scan import SecretScanner
 from ilmar.core.state_machine import NO_BACKOFF, RetryBackoff
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import RepositoryRef
@@ -111,6 +112,8 @@ class ScriptedAgent:
     )
     during: Callable[[], None] | None = None
     runs: int = 0
+    summary: str | None = None
+    """What the agent reports; by default ``run <n>: <outcome>``."""
 
     @property
     def name(self) -> str:
@@ -130,7 +133,8 @@ class ScriptedAgent:
             runtime.run(container, ["write", path, content], timeout_seconds=10)
         if self.during is not None:
             self.during()
-        return AgentResult(outcome, f"run {self.runs}: {outcome.value}", 0)
+        said = self.summary if self.summary is not None else f"run {self.runs}: {outcome.value}"
+        return AgentResult(outcome, said, 0)
 
 
 def policy(*commands: VerificationCommand) -> VerificationPolicy:
@@ -182,6 +186,7 @@ def make_setup(
     tasks: Sequence[Task] = (),
     store: ExecutionStore | None = None,
     verification: VerificationPolicy | None = None,
+    secret_scanner: SecretScanner | None = None,
 ) -> Setup:
     state = tmp_path.resolve() / "state"
     state.mkdir()
@@ -204,6 +209,7 @@ def make_setup(
         agent_sandbox=AgentSandbox("localhost/agent:1", NetworkPolicy.ALLOWLIST, ("api.example",)),
         target=Target(REPO, "main"),
         verification=verification or policy(),
+        secret_scanner=secret_scanner,
     )
     clock = Clock()
     ownership = Ownership.take(layout=layout, store=store, instance_id="inst", now=clock())
