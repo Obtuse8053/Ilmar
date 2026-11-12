@@ -108,9 +108,6 @@ The same encodings as the scan decide what "holds" means.
 When no secret is configured, nothing changes: there is no scan checkout and
 no check.
 
-When no secret is configured, nothing changes: there is no scan checkout and
-no check.
-
 ### 3. Outgoing text
 
 - **The change request.** Before the first push, the branch name, the title
