@@ -682,13 +682,7 @@ class _Run:
             verdict = Verdict(r["verdict"])
             if verdict.publishable:
                 return self.transition_to(S.PUBLISHING, f"verified: {verdict.value}")
-            ci = verdict is Verdict.REJECTED_CI_CONFIG
-            reason = (
-                "CI configuration changed: a human must take over"
-                if ci
-                else "verification checks failed"
-            )
-            code = "ci-config-changed" if ci else "verification-failed"
+            reason, code = _REJECTIONS.get(verdict, _CHECKS_FAILED)
             return self.transition_to(S.FAILED, reason, code=code, error=reason)
 
         runs = sorted(self.ops(execution, K.VERIFY), key=lambda o: int(o.key.rsplit("run-", 1)[1]))
@@ -746,6 +740,18 @@ class _Run:
                 "it is not published on the old evidence"
             )
         branch = execution.branch or branch_name(execution.task)
+        task = self.require_task()
+        description = describe(task, evidence)
+        found = c.secret_scanner.scan_text(
+            f"{branch}\n{task.title}\n{description}", where="the change request"
+        )
+        if found:  # before the first push: neither the branch nor the text leaves
+            names = ", ".join(sorted({f.name for f in found}))
+            raise _Deterministic(
+                f"the change request text contains a configured secret ({names}); "
+                "nothing is published",
+                code="candidate-secret",
+            )
         checkout = self.op(execution, K.CHECKOUT_BASE)
         if checkout is None or checkout.status is not ST.SUCCEEDED:
             raise LedgerIntegrityError(f"{self.id} has no recorded checkout")
@@ -793,14 +799,13 @@ class _Run:
                 f"{branch} moved while the change request was opened; it does not show the "
                 "verified candidate, so the execution is not complete"
             )
-        task = self.require_task()
         labels = (REVIEW_LABEL,) if evidence.verdict is Verdict.PUBLISH_FOR_REVIEW else ()
         spec = ChangeRequestSpec(
             repository=c.target.repository,
             source_branch=branch,
             target_branch=c.target.base_branch,
             title=task.title,
-            description=describe(task, evidence),
+            description=description,
             task=task.ref,
             labels=labels,
         )
@@ -1184,6 +1189,20 @@ def instructions(task: Task) -> str:
         "Do not change CI configuration. Your work will be verified independently.\n\n"
         f"Task: {task.title}\n\n{task.description}"
     )
+
+
+_CHECKS_FAILED = ("verification checks failed", "verification-failed")
+_REJECTIONS = {
+    Verdict.REJECTED_CI_CONFIG: (
+        "CI configuration changed: a human must take over",
+        "ci-config-changed",
+    ),
+    # The variable names and paths are in the evidence; the tracker note says only this.
+    Verdict.REJECTED_CANDIDATE_SECRET: (
+        "the candidate contains one of this deployment's secrets; it is never published",
+        "candidate-secret",
+    ),
+}
 
 
 def describe(task: Task, evidence: EvidenceRecord) -> str:

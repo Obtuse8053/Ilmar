@@ -310,7 +310,18 @@ class Effects:
     def post_update(
         self, execution: Execution, lease: ExecutionLease, *, step: str, message: str
     ) -> bool:
-        """Informational. An unclear outcome is never repeated (no duplicate notes)."""
+        """Informational. An unclear outcome is never repeated (no duplicate notes).
+
+        A note that contains a configured secret (an agent's summary in a failure
+        reason, say) is replaced by a fixed text that names only the variables
+        (#110, ADR-0038)."""
+        found = self._c.secret_scanner.scan_text(message, where="a tracker note")
+        if found:
+            names = ", ".join(sorted({f.name for f in found}))
+            message = (
+                f"Ilmar withheld this update: it contained a configured secret ({names}). "
+                "The details are in Ilmar's own records."
+            )
 
         def effect() -> Mapping[str, str]:
             self._c.task_provider.post_update(execution.task, message)

@@ -12,6 +12,7 @@ import pytest
 
 from ilmar.adapters.memory import InMemoryExecutionStore
 from ilmar.core.layout import WorkspaceLayout
+from ilmar.core.secret_scan import SecretScanner
 from ilmar.core.state_machine import ExecutionStateMachine
 from ilmar.core.verification import Verifier
 from ilmar.domain.agent import AgentOutcome, AgentResult
@@ -162,7 +163,12 @@ class World:
             )
         return execution
 
-    def verifier(self, *commands: VerificationCommand, **kwargs: object) -> Verifier:
+    def verifier(
+        self,
+        *commands: VerificationCommand,
+        scanner: SecretScanner | None = None,
+        **kwargs: object,
+    ) -> Verifier:
         policy = self.policy = VerificationPolicy(
             image="localhost/verify:1",
             commands=commands or (VerificationCommand("tests", ("tests",)),),
@@ -177,6 +183,7 @@ class World:
             policy=policy,
             instance_id="inst",
             clock=lambda: at(100),
+            scanner=scanner,
         )
 
 
@@ -532,3 +539,97 @@ def test_candidate_stderr_cannot_inject_control_sequences_into_evidence(world: W
     (check,) = [c for c in record.checks if c.name == "tests"]
     assert all(c.isprintable() for c in check.detail)
     assert "\x1b" not in check.detail
+
+
+# -- the candidate secret scan (#110, ADR-0038) ---------------------------------------
+
+SECRET = "sk-ant-verifier-secret-0123456789"
+SCANNER = SecretScanner({"ANTHROPIC_API_KEY": SECRET})
+
+
+def scan_verify(world: World, changes: Mapping[str, str | None]) -> EvidenceRecord:
+    execution, candidate = world.candidate(changes)
+    return world.verifier(scanner=SCANNER).verify(
+        execution=execution, repository=REPO, candidate=candidate, agent_result=COMPLETED,
+        owner=OWNER,
+    )  # fmt: skip
+
+
+def test_a_candidate_with_a_secret_is_rejected_and_nothing_of_it_runs(world: World) -> None:
+    record = scan_verify(world, {"src/app.py": f"KEY = '{SECRET}'\n"})
+    assert record.verdict is Verdict.REJECTED_CANDIDATE_SECRET
+    assert not record.verdict.publishable
+    assert world.runtime.started == []
+    (scan,) = [c for c in record.checks if c.name == "candidate-secrets"]
+    assert not scan.passed
+    assert scan.check_class is CheckClass.INDEPENDENT
+    assert scan.detail == "found ANTHROPIC_API_KEY (raw) in src/app.py"
+    assert SECRET not in record.to_json()
+
+
+def test_the_scan_wins_over_a_ci_configuration_rejection(world: World) -> None:
+    encoded = SECRET.encode().hex()
+    record = scan_verify(world, {".github/workflows/ci.yml": f"env: {encoded}\n"})
+    assert record.verdict is Verdict.REJECTED_CANDIDATE_SECRET
+    assert record.independence is Independence.CI_CONFIG_MODIFIED
+
+
+def test_a_clean_candidate_passes_the_scan_and_is_verified_as_before(world: World) -> None:
+    record = scan_verify(world, {"src/app.py": "print(2)\n"})
+    assert record.verdict is Verdict.PUBLISH
+    assert record.checks[0].name == "candidate-secrets"
+    assert record.checks[0].passed
+    assert "plain encodings only" in record.checks[0].detail
+    assert world.runtime.started  # the candidate's checks ran
+
+
+def test_only_changed_paths_are_scanned(world: World) -> None:
+    world.scm.seed(REPO, "main", {**BASE_FILES, "README.md": f"{SECRET}\n"})
+    record = scan_verify(world, {"src/app.py": "print(2)\n"})
+    assert record.verdict is Verdict.PUBLISH  # the base already held it; the agent did not add it
+
+
+def test_the_scan_checkout_is_inside_the_run_directory_and_is_not_a_job(world: World) -> None:
+    scan_verify(world, {"src/app.py": "print(2)\n"})
+    run = world.layout.verification_checkout("e9", 1, 1)
+    assert (run / ".secret-scan" / "src" / "app.py").read_text() == "print(2)\n"
+
+
+def test_without_configured_secrets_nothing_changes(world: World) -> None:
+    record = verify(world, {"src/app.py": f"KEY = '{SECRET}'\n"})
+    assert record.verdict is Verdict.PUBLISH
+    assert all(c.name != "candidate-secrets" for c in record.checks)
+
+
+ENCODED = SECRET.encode().hex()
+
+
+@pytest.mark.parametrize(
+    ("leaked", "field_name", "reason"),
+    [
+        (f".github/workflows/{SECRET}.yml", "ci_config_paths", "ci-config-modified"),
+        (f".claude/{ENCODED}.json", "protected_paths", "protected-paths"),
+        (f"tests/test_{SECRET}.py", "check_influencing_paths", "modified-checks"),
+    ],
+)
+def test_a_secret_bearing_path_is_classified_but_never_recorded(
+    world: World, leaked: str, field_name: str, reason: str
+) -> None:
+    """The class still applies (the reason is there); only the name is withheld."""
+    record = scan_verify(world, {leaked: "x\n", f"src/{SECRET}.py": SECRET})
+    assert record.verdict is Verdict.REJECTED_CANDIDATE_SECRET
+    assert record.requires_human_review
+    placeholder = "[a path withheld: its name holds ANTHROPIC_API_KEY]"
+    assert getattr(record, field_name) == (placeholder,)
+    assert any(r.startswith(f"{reason}: {placeholder}") for r in record.review_reasons)
+    text = record.to_json()
+    assert SECRET not in text
+    assert ENCODED not in text
+    (scan,) = [c for c in record.checks if c.name == "candidate-secrets"]
+    assert placeholder in scan.detail  # the file's content finding names no path either
+
+
+def test_paths_without_a_secret_are_recorded_as_before(world: World) -> None:
+    record = scan_verify(world, {"tests/test_app.py": "x\n", ".claude/settings.json": "{}\n"})
+    assert record.check_influencing_paths == ("tests/test_app.py",)
+    assert record.protected_paths == (".claude/settings.json",)

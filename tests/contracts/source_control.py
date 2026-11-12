@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from ilmar.core.secret_scan import SecretScanner
 from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
@@ -294,6 +295,30 @@ class SourceControlContract:
         os.mkfifo(workspace / "pipe")
         with pytest.raises(CandidateRejectedError):
             self._freeze(provider, repo, workspace)
+
+    def test_the_secret_scan_sees_the_candidate_exactly_as_published(
+        self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path
+    ) -> None:
+        """ADR-0038 relies on ``changed_paths`` and ``checkout_revision`` alone: a
+        secret in a file, a path name or a symlink target of the frozen revision is
+        found; one only on the host, behind a link, is not."""
+        value = "sk-ant-contract-scan-0123456789"
+        scanner = SecretScanner({"MODEL_KEY": value})
+        (workspace / "src" / "leak.py").write_text(f"KEY = {value!r}\n")
+        (workspace / f"named-{value}.txt").write_text("x\n")
+        (workspace / "link").symlink_to(f"../{value}")
+        host = tmp_path / "host.txt"
+        host.write_text(value)
+        (workspace / "host-link").symlink_to(host)
+        (workspace / "README.md").unlink()
+        candidate = self._freeze(provider, repo, workspace)
+        provider.checkout_revision(repo, revision=candidate.revision, destination=tmp_path / "v")
+        found = scanner.scan_candidate(tmp_path / "v", candidate.changed_paths)
+        assert sorted(f.where for f in found) == [
+            "a changed path's name",
+            "src/leak.py",
+            "symlink target of link",
+        ]
 
     def test_symlinks_are_stored_as_links_and_never_followed(
         self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path

@@ -204,6 +204,7 @@ class Coordinator:
             clock=clock,
             fence=ownership.fence,
             events=events,
+            scanner=components.secret_scanner,
         )
         effects = Effects(
             components=components,

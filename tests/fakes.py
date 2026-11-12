@@ -553,6 +553,7 @@ class FakeContainerRuntime:
                 target = (spec.host_workspace / relative).resolve()
                 if not target.is_relative_to(spec.host_workspace.resolve()):
                     return CommandResult(1, "", "path escapes workspace\n", 0.0)
+                target.parent.mkdir(parents=True, exist_ok=True)  # like an agent would
                 target.write_text(content)
                 return CommandResult(0, "", "", 0.0)
             case _:

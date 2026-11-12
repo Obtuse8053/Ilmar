@@ -15,6 +15,9 @@ The :class:`Verifier` decides only from evidence Ilmar produces itself:
    Pass or fail comes only from the exit status and timeout the harness
    measures. Output is reduced to a digest; reports the candidate writes are
    never read.
+   Before either, when secrets are configured, a fresh checkout of the
+   candidate is scanned for them (#110, ADR-0038). A finding gives
+   ``REJECTED_CANDIDATE_SECRET`` and nothing of the candidate runs.
 4. The verdict follows the ADR-0010 §5 table. The agent's own report is kept
    in the record, labelled as reported, and never influences the verdict.
 
@@ -26,12 +29,14 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 
 from ilmar.core.event_context import PassEvents
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.lifetimes import verification_sandbox_lifetime
 from ilmar.core.naming import verification_container_name
 from ilmar.core.safe_fs import directory_identity, ensure_directory
+from ilmar.core.secret_scan import SecretScanner
 from ilmar.domain.agent import AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
 from ilmar.domain.errors import ContainmentError, ProviderError
@@ -62,6 +67,9 @@ from ilmar.ports.source_control import SourceControlProvider
 REVIEW_LABEL = "ilmar:needs-human-review"
 _SUMMARY_LIMIT = 2000
 _DETAIL_LIMIT = 200
+SECRET_SCAN_CHECK = "candidate-secrets"  # noqa: S105 - a check name, not a secret
+SECRET_SCAN_DIRECTORY = ".secret-scan"  # noqa: S105 - a directory name
+"""Never a job name (jobs start with a letter or digit), so never a job's checkout."""
 
 
 class Verifier:
@@ -77,6 +85,7 @@ class Verifier:
         clock: Callable[[], datetime],
         fence: Fence | None = None,
         events: PassEvents | None = None,
+        scanner: SecretScanner | None = None,
     ) -> None:
         self._source_control = source_control
         self._runtime = runtime
@@ -87,6 +96,7 @@ class Verifier:
         self._clock = clock
         self._fence = fence  # evidence is a fenced write once a coordinator owns the store
         self._events = events
+        self._scanner = SecretScanner.empty() if scanner is None else scanner
 
     def verify(
         self,
@@ -102,45 +112,65 @@ class Verifier:
         _check_inputs(execution, candidate, owner)
         policy = self._policy
         changed = candidate.changed_paths
+        # Classification uses the real paths. What is recorded never repeats a path
+        # whose name holds a configured secret (ADR-0038 §2): such a candidate is
+        # rejected, and its evidence is still kept.
+        shown = self._scanner.shown_path
         protected = matching(changed, policy.protected_paths)
         influencing = matching(changed, policy.check_influencing_paths)
         ci = matching(changed, policy.ci_config_paths)
+        protected_shown = tuple(shown(p) for p in protected)
+        influencing_shown = tuple(shown(p) for p in influencing)
+        ci_shown = tuple(shown(p) for p in ci)
 
         checks = [
             CheckEvidence(
                 "ci-config-paths",
                 CheckClass.INDEPENDENT,
                 passed=not ci,
-                detail=_paths_detail("changes CI configuration", ci),
+                detail=_paths_detail("changes CI configuration", ci_shown),
             ),
             CheckEvidence(
                 "protected-paths",
                 CheckClass.INDEPENDENT,
                 passed=True,
-                detail=_paths_detail("flags protected paths", protected),
+                detail=_paths_detail("flags protected paths", protected_shown),
             ),
             CheckEvidence(
                 "check-influencing-paths",
                 CheckClass.INDEPENDENT,
                 passed=True,
-                detail=_paths_detail("flags check-influencing paths", influencing),
+                detail=_paths_detail("flags check-influencing paths", influencing_shown),
             ),
         ]
         reasons: list[str] = []
         if ci:
-            reasons.append(f"ci-config-modified: {', '.join(ci)}")
+            reasons.append(f"ci-config-modified: {', '.join(ci_shown)}")
         if influencing:
-            reasons.append(f"modified-checks: {', '.join(influencing)}")
+            reasons.append(f"modified-checks: {', '.join(influencing_shown)}")
         if protected:
-            reasons.append(f"protected-paths: {', '.join(protected)}")
+            reasons.append(f"protected-paths: {', '.join(protected_shown)}")
 
+        run_directory = self._new_run_directory(execution, run) if self._scanner or not ci else None
+        secrets = (
+            self._scan_candidate(repository, candidate, run_directory)
+            if run_directory is not None
+            else None
+        )
+        if secrets is not None:
+            checks.insert(0, secrets)
         if ci:
-            independence, verdict = Independence.CI_CONFIG_MODIFIED, Verdict.REJECTED_CI_CONFIG
+            independence = Independence.CI_CONFIG_MODIFIED
+        elif influencing:
+            independence = Independence.MODIFIED_CHECKS
+        else:
+            independence = Independence.UNCHANGED_CHECKS
+        if secrets is not None and not secrets.passed:
+            verdict = Verdict.REJECTED_CANDIDATE_SECRET  # nothing of it runs (ADR-0038)
+        elif ci:
+            verdict = Verdict.REJECTED_CI_CONFIG
         else:
             checks += self._run_candidate_checks(execution, repository, candidate, owner, run)
-            independence = (
-                Independence.MODIFIED_CHECKS if influencing else Independence.UNCHANGED_CHECKS
-            )
             if any(c.required and not c.passed for c in checks):
                 verdict = Verdict.REJECTED_CHECKS_FAILED
             elif reasons:
@@ -156,9 +186,9 @@ class Verifier:
             candidate_revision=candidate.revision,
             policy_digest=policy.digest(),
             checks=tuple(checks),
-            protected_paths=protected,
-            check_influencing_paths=influencing,
-            ci_config_paths=ci,
+            protected_paths=protected_shown,
+            check_influencing_paths=influencing_shown,
+            ci_config_paths=ci_shown,
             independence=independence,
             verdict=verdict,
             requires_human_review=bool(reasons),
@@ -176,6 +206,44 @@ class Verifier:
         self._store.append_evidence(record, fence=self._fence, context=context)
         return record
 
+    # -- the secret scan (#110) -----------------------------------------------------
+
+    def _scan_candidate(
+        self, repository: RepositoryRef, candidate: CandidateRevision, run_directory: Path
+    ) -> CheckEvidence | None:
+        """Look for the deployment's secrets in a fresh checkout of the frozen
+        candidate, before any of its code runs. ``None`` when no secret is
+        configured. The evidence names variables, encodings and paths only."""
+        if not self._scanner:
+            return None
+        checkout = run_directory / SECRET_SCAN_DIRECTORY
+        self._source_control.checkout_revision(
+            repository, revision=candidate.revision, destination=checkout
+        )
+        if directory_identity(checkout, root=self._layout.workspaces_root) is None:
+            raise ProviderError(f"secret-scan checkout {checkout} vanished")
+        findings = self._scanner.scan_candidate(checkout, candidate.changed_paths)
+        if not findings:
+            detail = (
+                f"none of {len(self._scanner.names)} configured secret(s) in "
+                f"{len(candidate.changed_paths)} changed path(s); plain encodings only"
+            )
+        else:
+            listed = "; ".join(f.describe() for f in findings)
+            detail = _printable(f"found {listed}")[:_DETAIL_LIMIT]
+        return CheckEvidence(
+            SECRET_SCAN_CHECK, CheckClass.INDEPENDENT, passed=not findings, detail=detail
+        )
+
+    def _new_run_directory(self, execution: Execution, run: int) -> Path:
+        layout = self._layout
+        run_directory = layout.verification_checkout(execution.id, execution.attempt, run)
+        if directory_identity(run_directory, root=layout.workspaces_root) is not None:
+            # A run's directories are never reused, whatever is (or is not) inside.
+            raise ProviderError(f"verification run {run} of {execution.id} already exists")
+        ensure_directory(run_directory, root=layout.workspaces_root)
+        return run_directory
+
     # -- candidate-executed checks ---------------------------------------------------
 
     def _run_candidate_checks(
@@ -186,12 +254,6 @@ class Verifier:
         owner: ResourceOwner,
         run: int,
     ) -> list[CheckEvidence]:
-        layout = self._layout
-        run_directory = layout.verification_checkout(execution.id, execution.attempt, run)
-        if directory_identity(run_directory, root=layout.workspaces_root) is not None:
-            # A run's directories are never reused, whatever is (or is not) inside.
-            raise ProviderError(f"verification run {run} of {execution.id} already exists")
-        ensure_directory(run_directory, root=layout.workspaces_root)
         results: list[CheckEvidence] = []
         for job, commands in self._policy.jobs():
             results += self._run_job(execution, repository, candidate, owner, run, job, commands)
