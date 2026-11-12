@@ -28,9 +28,10 @@ from typing import TextIO, cast
 from ilmar.adapters.registry import event_reader, store_writer
 from ilmar.config import IlmarConfig, load_config
 from ilmar.core.ownership import Ownership
+from ilmar.core.starts import StartLimits, breach_if_started, read_starts, start_log_path
 from ilmar.core.suspension import resume_blocker
 from ilmar.domain.budget import Suspension, SuspensionReason, micros_to_usd
-from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError
+from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError, StartLogError
 from ilmar.domain.events import Actor, ActorKind, EventContext
 from ilmar.domain.ledger import Commit
 from ilmar.ports.execution_store import ExecutionStore
@@ -126,6 +127,16 @@ def run(
                 print("not suspended", file=out)
                 return OK
             limits = config.budget.limits if config.budget else None
+            restart_breach = None
+            if current.reason is SuspensionReason.RESTART_LOOP:
+                try:
+                    restart_breach = breach_if_started(
+                        read_starts(start_log_path(layout.coordinator_root)),
+                        now=at,
+                        limits=StartLimits(),
+                    )
+                except StartLogError as exc:
+                    restart_breach = f"an unusable start log ({exc})"
             blocker = resume_blocker(
                 current,
                 now=at,
@@ -134,6 +145,7 @@ def run(
                 latest_update=store.latest_update(),
                 provider_cap_raised=args.provider_cap_resolved,
                 kill_switch_present=False,
+                restart_breach=restart_breach,
             )
             if blocker is not None:
                 print(f"still suspended ({current.reason.value}): {blocker}", file=err)

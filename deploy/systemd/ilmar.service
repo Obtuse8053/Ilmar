@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ilmar's supervisor unit (ADR-0033). A systemd *user* unit, shipped and
+# documented only: Ilmar never installs or edits it, and agents never see it.
+# Install as ~/.config/systemd/user/ilmar.service. `ilmar run --loop` needs
+# #91 (loop mode), which also enforces the gate records before it starts.
+#
+# Two independent bounds on restarts:
+#   * systemd's own start limits below;
+#   * Ilmar's durable start log (<state_dir>/coordinator/starts.log), written
+#     before anything else; a breach suspends with `restart-loop` and exits 78.
+
+[Unit]
+Description=Ilmar coordinator (loop mode)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1d
+StartLimitBurst=10
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/ilmar run --loop --config %h/.config/ilmar/ilmar.toml
+Restart=on-failure
+RestartSec=30s
+RestartSteps=5
+RestartMaxDelaySec=30min
+# 3: disabled or misconfigured. 78: suspended. Never restarted.
+RestartPreventExitStatus=3 78
+# The model credential and the forge token come from this file, never the unit.
+EnvironmentFile=%h/.config/ilmar/secrets.env
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

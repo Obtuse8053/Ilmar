@@ -136,6 +136,7 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "operator-suspended": "An operator suspended new work.",
         "clock-anomaly": "The clock is behind the latest persisted time.",
         "operator-resumed": "An operator resumed new work after its cause was gone.",
+        "restart-loop": "Loop mode started more often than its start limits allow (ADR-0033).",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
 )

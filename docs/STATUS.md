@@ -92,6 +92,15 @@ Hard gates that stay in force:
       runs in the gateway-compat workflow.
     - **Not yet selectable from configuration:** it waits for P5, the
       worst-case cost reservation.
+- 2026-11-12: **Supervisor part 1 submitted** (ADR-0033, stacked on #113).
+  - A durable start log (`<state_dir>/coordinator/starts.log`, fsynced
+    before anything else) with limits on the minimum interval, starts per
+    hour and starts per UTC day. A future-dated record counts as recent, and
+    any fault fails closed.
+  - A `restart-loop` suspension that `ilmar resume` lifts only without a
+    breach.
+  - A systemd user unit that never restarts exit 3 or 78.
+  - Wiring into `ilmar run --loop` comes with #91.
 - 2026-11-12: **#18 part 1 submitted: reservation ledger and suspension**
   (ADR-0029 §2, §3 and §8; schema 8).
   - **Reservations:** each attempt is charged `[budget]
