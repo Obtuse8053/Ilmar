@@ -26,8 +26,8 @@ Credential-containment requirements by gate (maintainer decisions,
   - the pinned-version compatibility test;
   - a controlled, credential-free test repository with trusted tasks and a
     capped workspace.
-- **Before Mode 2, untrusted repositories or self-hosting:** #111, the
-  credential-injecting egress proxy.
+- **Before Mode 2, untrusted repositories or self-hosting:** #111, now
+  delivered as the sidecar model gateway (ADR-0037).
 
 Epics (`type:epic`) are split into issues when their milestone starts (see
 `workflow.md`, "Milestone close-out").

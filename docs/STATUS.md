@@ -60,22 +60,36 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#18 (reservation ledger, suspension and kill switch), with #110 (candidate
-secret scan, a Gate 1 prerequisite) in parallel. #90's runtime limits and
-credential path are merged; #90 awaits its acceptance audit.
+Roadmap revision 3 (`autonomy-roadmap.md`). In parallel:
+- **#18 part 2 (P1):** after #113.
+- **#110 (P2), then #92 (P3).**
+- **Supervisor (P6):** after ADR-0033.
+- **Maintainer-run checks, as early as possible:** the pinned-version live
+  test, the pinned sealed-settings test, the gateway compatibility test and
+  the provider-cap drill.
+- **Gateway (P4, P5):** waits for ADR-0037 and a recorded compatibility run.
 
 Hard gates that stay in force:
 - the real-Podman coordinator-SIGKILL test in #90, which Gate 1 also needs;
 - a passed pinned-version live test and a reviewed, recorded stream fixture
   before Mode 1 (the synthetic fixture never counts);
-- #91 enforces the version and gate requirements before it allows loop mode.
+- #91 (P7) enforces the version and gate requirements before it allows loop
+  mode;
 - #110 (candidate secret scan) is in place before Gate 1;
 - `tests/integration/test_claude_code_pinned.py` passes on the pinned image;
-- #111 (credential-injecting proxy) lands before Mode 2, untrusted
-  repositories or self-hosting.
+- Gate 1 is recorded before the unattended Gate 2 segment begins;
+- #111, now the sidecar gateway (ADR-0037), lands before Mode 2, untrusted
+  repositories or self-hosting. The model key never enters the sandbox, and a
+  finite per-attempt dollar bound is proven.
 
 ## Change log
 
+- 2026-11-12: **Roadmap revision 3** (accelerated path to Mode 2; conditionally
+  approved with seven binding amendments). ADR-0037 (sidecar model gateway
+  with worst-case cost reservations) and ADR-0033 (systemd supervisor with
+  durable start log) are proposed. The pinned gateway compatibility test is
+  submitted. See `autonomy-roadmap.md` for PRs P0 to P8, their dependencies
+  and the Gate 2 criteria.
 - 2026-11-11: **#90 part 2 merged** (#109; ADR-0036 Proposed). #90 stays open
   until its acceptance audit.
   - **Maintainer decisions on credential containment**, recorded in

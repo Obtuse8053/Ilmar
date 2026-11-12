@@ -38,8 +38,10 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0029](0029-supervised-mode-limits-and-budget.md) | Mode 1 limits, accounting reservations, suspension and one credential path | Accepted |
 | [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Accepted |
 | [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Accepted |
+| [0033](0033-supervisor-and-restart-accounting.md) | A systemd supervisor with durable restart accounting | Proposed |
 | [0035](0035-agent-progress-and-stall-detection.md) | Agent progress from stream events, and stall detection | Accepted |
 | [0036](0036-sealed-agent-settings.md) | Seal the agent's own settings at the sandbox boundary | Proposed |
+| [0037](0037-sidecar-model-gateway.md) | A model gateway in the egress sidecar, with worst-case cost reservations | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
