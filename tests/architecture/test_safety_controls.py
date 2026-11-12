@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ADR-0031 §1 and §5 (#92): the protected list covers every safety-control
-module, and neither the list nor the verification policy has a candidate-side
-source.
+"""ADR-0031 §1 and §5 (#92): the protected list covers all code that can
+alter agent execution, credentials, sandbox policy, coordination, verification
+or publication, and neither the list nor the verification policy has a
+candidate-side source.
 
-* A new module whose name says it is a safety control (credentials, sandbox,
-  gateway, fencing, ownership, quarantine, journal, budgets, limits,
-  suspension, time, restarts, configuration, verification, gates) fails here
-  until it is added to ``ILMAR_REPOSITORY``.
+* **Fail closed by package.** Every Python file under ``src/ilmar`` must be
+  protected, unless it is in ``EXEMPT`` with a written reason that a test
+  checks. A new file is protected by its package's entry, or fails here
+  until someone classifies it.
+* **Explicit requirements.** ``REQUIRED`` names paths that must stay
+  protected whatever the list's shape. It includes the omissions found in
+  review on 2026-11-12, so they cannot recur.
 * The list is constants in a module with no file, network or environment
   access. The policy is built in exactly one place, the configuration loader,
   from the running release's list and the operator's configuration.
@@ -23,21 +27,98 @@ from ilmar.domain.safety_controls import ILMAR_REPOSITORY, safety_controls, touc
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src" / "ilmar"
 LIST_MODULE = SRC / "domain" / "safety_controls.py"
-KINDS = re.compile(
-    r"credential|secret|options|registry|sandbox|podman|container_runtime|mount|safe_fs|"
-    r"lifetime|gateway|ownership|fenc|quarantine|journal|effects|ledger|sqlite|execution_store|"
-    r"budget|limit|suspen|clock|time|start|restart|config|verification|gate|safety"
+PROTECTED = safety_controls(self_repository=True)
+
+REQUIRED = (
+    # Named by the maintainer in the review of #118 (2026-11-12).
+    "src/ilmar/adapters/claude_code/runner.py",
+    "src/ilmar/adapters/builtin.py",
+    "src/ilmar/core/worker.py",
+    "src/ilmar/core/coordinator.py",
+    "src/ilmar/adapters/github/source_control.py",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "docs/AGENTS.md",
+    "src/ilmar/core/CLAUDE.md",
+    # Found in the audit that followed.
+    "src/ilmar/adapters/claude_code/stream.py",  # progress and the result of a run
+    "src/ilmar/adapters/git/trees.py",  # freezing the candidate
+    "src/ilmar/adapters/git/runner.py",  # host-side git
+    "src/ilmar/adapters/github/client.py",  # the forge token
+    "src/ilmar/adapters/github/tasks.py",  # claims
+    "src/ilmar/adapters/memory.py",  # a store
+    "src/ilmar/core/components.py",  # wiring, the scanner
+    "src/ilmar/core/cancellation.py",
+    "src/ilmar/core/tracker.py",
+    "src/ilmar/core/layout.py",  # what is mounted
+    "src/ilmar/core/naming.py",  # owner labels and branch names
+    "src/ilmar/domain/agent.py",  # run outcomes and their classification
+    "src/ilmar/domain/errors.py",  # which failures are retried
+    "src/ilmar/domain/changes.py",  # the candidate
+    "src/ilmar/domain/events.py",
+    "src/ilmar/domain/execution.py",
+    "src/ilmar/ports/agent_runner.py",
+    "src/ilmar/ports/source_control.py",
+    "src/ilmar/ports/task_provider.py",
+    "src/ilmar/cli.py",  # where unattended operation stays disabled
+    "src/ilmar/cli_cancel.py",
+    "src/ilmar/__main__.py",
+    ".claude/settings.json",
+    ".mcp.json",
+    "tests/live_harness.py",  # runs with real credentials
+    "tests/integration/test_claude_code_live.py",
+    "tests/fixtures/claude_code_streams/recorded.json",  # gate evidence
+    # The first list (part 1).
+    ".github/workflows/ci.yml",
+    "MANIFEST.md",
+    "tests/architecture/test_safety_controls.py",
+    "tests/contracts/source_control.py",
+    "tests/conftest.py",
+    "pyproject.toml",
+    "requirements/live.txt",
+    "scripts/live_ci.py",
+    "images/claude-code/Containerfile",
+    "deploy/systemd/ilmar.service",
+    "src/ilmar/config.py",
+    "src/ilmar/domain/verification.py",
+    "src/ilmar/domain/safety_controls.py",
 )
 
+EXEMPT = {
+    "src/ilmar/__init__.py": "the package docstring and version string only; no logic",
+}
 
-def modules() -> list[str]:
+
+def python_files() -> list[str]:
     return sorted(str(p.relative_to(ROOT)) for p in SRC.rglob("*.py"))
 
 
-def test_every_safety_control_module_is_on_the_list() -> None:
-    patterns = safety_controls(self_repository=True)
-    missing = [m for m in modules() if KINDS.search(m) and not touched([m], patterns)]
-    assert missing == [], f"add these to ILMAR_REPOSITORY (ADR-0031 §1): {missing}"
+def test_every_required_path_is_protected() -> None:
+    missing = [p for p in REQUIRED if not touched([p], PROTECTED)]
+    assert missing == [], f"ADR-0031 §1: these must be protected: {missing}"
+
+
+def test_every_module_is_protected_unless_exempt_with_a_reason() -> None:
+    unclassified = [m for m in python_files() if m not in EXEMPT and not touched([m], PROTECTED)]
+    assert unclassified == [], (
+        f"protect these in ILMAR_REPOSITORY, or exempt them with a reason: {unclassified}"
+    )
+
+
+def test_exemptions_are_real_and_hold_no_logic() -> None:
+    for path, reason in EXEMPT.items():
+        assert reason
+        file = ROOT / path
+        assert file.is_file(), path
+        tree = ast.parse(file.read_text())
+        for node in tree.body:
+            docstring = isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            constant = (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and all(isinstance(t, ast.Name) for t in node.targets)
+            )
+            assert docstring or constant, f"{path} gained logic: protect it"
 
 
 def test_the_list_protects_itself_and_the_policy() -> None:

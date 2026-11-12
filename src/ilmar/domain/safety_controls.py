@@ -27,18 +27,25 @@ EVERY_TARGET: tuple[str, ...] = (
 """Protected in every target repository."""
 
 ILMAR_REPOSITORY: tuple[str, ...] = (
-    # Governance and the founding documents.
+    # Governance, the founding documents, and every instruction file or setting
+    # that steers a later agent session, at any depth.
     ".github/",
-    "AGENTS.md",
-    "CLAUDE.md",
+    "**/AGENTS.md",
+    "**/CLAUDE.md",
+    ".claude/",
+    ".mcp.json",
     "MANIFEST.md",
     "LICENSE",
     "NOTICE",
     "THIRD_PARTY_NOTICES.md",
-    # The tests that hold the rules, and what configures every test run.
+    # The tests that hold the rules, what configures every test run, and the
+    # code and recorded evidence of the live runs, which hold real credentials.
     "tests/architecture/",
     "tests/contracts/",
     "**/conftest.py",
+    "tests/live_harness.py",
+    "tests/integration/",
+    "tests/fixtures/claude_code_streams/",
     # Dependencies, tool configuration that affects verification, CI helpers,
     # the agent image and the supervisor.
     "pyproject.toml",
@@ -46,43 +53,28 @@ ILMAR_REPOSITORY: tuple[str, ...] = (
     "scripts/",
     "images/",
     "deploy/",
-    # Credentials and secrets.
-    "src/ilmar/adapters/options.py",
-    "src/ilmar/adapters/registry.py",
-    "src/ilmar/adapters/claude_code/credential_route.py",
-    "src/ilmar/adapters/claude_code/provider_errors.py",
-    "src/ilmar/core/secret_scan.py",
-    # The sandbox and container policy (ContainerRuntime and its adapters),
-    # and the gateway that will live in its egress sidecar (ADR-0037).
-    "src/ilmar/adapters/podman/",
-    "src/ilmar/ports/container_runtime.py",
-    "src/ilmar/domain/workspace.py",
-    "src/ilmar/core/mounts.py",
-    "src/ilmar/core/safe_fs.py",
-    "src/ilmar/core/lifetimes.py",
-    "src/ilmar/adapters/gateway/",
-    # Fencing, ownership, quarantine and the journal.
-    "src/ilmar/core/ownership.py",
-    "src/ilmar/core/journal.py",
-    "src/ilmar/core/effects.py",
-    "src/ilmar/domain/ledger.py",
-    "src/ilmar/ports/execution_store.py",
-    "src/ilmar/adapters/sqlite.py",
-    # Budgets, limits, suspension, time and restarts.
-    "src/ilmar/domain/budget.py",
-    "src/ilmar/core/suspension.py",
-    "src/ilmar/cli_suspend.py",
-    "src/ilmar/core/clock.py",
-    "src/ilmar/core/starts.py",
-    "src/ilmar/core/state_machine.py",
-    # Configuration validation, verification policy and gate records.
+    # Ilmar's code (audit of 2026-11-12, #118). Every package below can alter
+    # agent execution, credentials, sandbox policy, coordination, verification
+    # or publication, so each is protected whole: a new module in it is
+    # protected from its first line.
+    #   adapters/: the agent runner and its stream parser, the built-in wiring,
+    #     git (freezing), GitHub (claims and publication), Podman (the
+    #     sandbox), the stores, options and secrets.
+    #   core/: the worker, coordinator, effects, journal, ownership,
+    #     cancellation, tracker reconciliation, verification, layout, naming.
+    #   domain/: states, errors and their classification, candidates, tasks,
+    #     the ledger, events, workspace policy, verification policy, this list.
+    #   ports/: the contracts every adapter is held to.
+    "src/ilmar/adapters/",
+    "src/ilmar/core/",
+    "src/ilmar/domain/",
+    "src/ilmar/ports/",
+    # The entry points: run (where unattended operation stays disabled),
+    # cancel, suspend and resume, the read-only audit view, configuration.
+    "src/ilmar/__main__.py",
+    "src/ilmar/cli.py",
+    "src/ilmar/cli_*.py",
     "src/ilmar/config.py",
-    "src/ilmar/domain/verification.py",
-    "src/ilmar/core/verification.py",
-    "src/ilmar/core/gates.py",
-    "src/ilmar/domain/gates.py",
-    # This list.
-    "src/ilmar/domain/safety_controls.py",
 )
 """Also protected when the target is Ilmar's own repository (``self_repository``)."""
 

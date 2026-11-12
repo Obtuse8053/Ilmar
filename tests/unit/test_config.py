@@ -9,7 +9,7 @@ import pytest
 
 from ilmar.config import PORT_NAMES, Limits, load_config, parse_config
 from ilmar.domain.errors import ConfigError
-from ilmar.domain.safety_controls import safety_controls
+from ilmar.domain.safety_controls import safety_controls, touched
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASE = Path("/srv/ilmar")
@@ -222,7 +222,7 @@ def test_safety_controls_come_from_the_release_and_can_only_be_extended() -> Non
     ).verification
     assert own is not None
     assert own.safety_controls == safety_controls(self_repository=True, extra=("ops/",))
-    assert "src/ilmar/domain/safety_controls.py" in own.safety_controls
+    assert touched(["src/ilmar/domain/safety_controls.py"], own.safety_controls)
     assert own.digest() != other.digest()
 
 

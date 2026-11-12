@@ -4,6 +4,9 @@
 - Date: 2026-11-10
 - Sources: none external · Findings: F-013
 - Depends on: ADR-0010, ADR-0018
+- Amended by the maintainer on 2026-11-12, in the review of #118 (see
+  "Amendments" at the end). The decision text below keeps its original
+  wording, except the configuration key, which the maintainer renamed.
 
 ## Context and problem
 
@@ -57,7 +60,8 @@ list.
     configuration validation, verification policy and gate records;
   - the protected-list module itself.
 - **Operator additions.** The operator may add patterns
-  (`protected_paths_extra`). Nothing can remove a built-in entry.
+  (`[verification] extra_safety_controls`; named `protected_paths_extra` until
+  the 2026-11-12 amendment). Nothing can remove a built-in entry.
 
 The list names directories and modules. #92 maps it to exact paths and keeps
 an architecture test that fails when a new module of one of those kinds
@@ -219,3 +223,36 @@ Promotion of an executable version is a human command in every mode
   secrets. Pushing could then be allowed, while merging stays human.
 - F-013's condition is met (mature verification evidence). That could
   change the scope of human approval, never its existence.
+
+## Amendments
+
+### 2026-11-12: review of #118 (maintainer)
+
+1. **The configuration key** is `[verification] extra_safety_controls`. It
+   matches the existing `extra_*` keys and stays separate from
+   `extra_protected_paths`, which only flags paths for review.
+2. **Ilmar's own list covers all code that can alter agent execution,
+   credentials, sandbox policy, coordination, verification or publication.**
+   It is not limited to modules whose names sound safety-related.
+   - **Code is protected by package:** `src/ilmar/adapters/`, `core/`,
+     `domain/` and `ports/`, plus the entry points (`__main__.py`, `cli.py`,
+     `cli_*.py`) and `config.py`. This includes the agent runner, the
+     built-in wiring, the worker, the coordinator and GitHub publication,
+     all of which were missing from the first list.
+   - **Agent instruction files and settings at any depth:** `**/AGENTS.md`,
+     `**/CLAUDE.md`, `.claude/` and `.mcp.json`.
+   - **The live-run code and its recorded evidence**, which run with real
+     credentials: `tests/live_harness.py`, `tests/integration/` and the
+     recorded stream fixtures.
+3. **How the architecture test enforces this:**
+   - **Fail closed:** every Python file under `src/ilmar` must be protected,
+     or listed as exempt with a reason. An exempt file must hold no logic.
+     Today the only exemption is the version string in `__init__.py`.
+   - **Explicit requirements:** a named list of paths, including every
+     omission found in the review, must stay protected whatever shape the
+     list takes.
+
+**Consequence:** Ilmar cannot push any change to its own Python code. It may
+still prepare such changes as candidates for a maintainer, as §3 describes.
+Narrowing a package entry later needs a reviewed change to this ADR and to
+the architecture test.

@@ -87,7 +87,7 @@ def test_ilmars_own_controls_are_not_imposed_on_other_targets() -> None:
 
 
 def test_operator_additions_extend_and_never_shorten_the_list() -> None:
-    extended = safety_controls(self_repository=True, extra=("ops/", "AGENTS.md"))
+    extended = safety_controls(self_repository=True, extra=("ops/", "MANIFEST.md"))
     assert extended[: len(SELF)] == SELF
     assert "ops/" in extended
     assert len(extended) == len(SELF) + 1  # a repeated built-in is not duplicated

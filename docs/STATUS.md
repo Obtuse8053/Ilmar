@@ -75,9 +75,14 @@ Hard gates that stay in force:
 - 2026-11-12: **#110 merged** (#116) and closed after its acceptance audit.
   **#92 part 1 submitted: protected safety controls** (ADR-0031).
   - **The list** is code in the running release: CI configuration,
-    `.gitattributes` and `.gitmodules` in every target, plus Ilmar's own
-    controls when `[verification] self_repository = true`. Operators may only
-    add entries (`extra_safety_controls`).
+    `.gitattributes` and `.gitmodules` in every target. With
+    `[verification] self_repository = true` it adds Ilmar's own controls:
+    - all of `src/ilmar`, by package, failing closed for any new module;
+    - agent instruction files and settings at any depth;
+    - the live-run code.
+
+    Operators may only add entries (`extra_safety_controls`, as amended in
+    ADR-0031).
   - **The check** runs on the frozen candidate before any of its code runs,
     and again before publication. It covers changes, deletions, both sides
     of a rename, mode changes and links to protected targets.
