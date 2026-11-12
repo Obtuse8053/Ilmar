@@ -45,6 +45,10 @@ def protected_setup(tmp_path: Path, edits: dict[str, str]) -> Setup:
         "src/ilmar/config.py",  # the policy's loader
         "src/ilmar/domain/verification.py",  # the policy
         ".github/workflows/ci.yml",
+        "src/ilmar/__init__.py",  # review of #118: the whole package
+        "src/ilmar/new_top_level.py",  # a new root-level module
+        "docs/AGENTS.md",  # nested agent instructions
+        ".claude/settings.json",
     ],
 )
 def test_a_protected_candidate_is_blocked_with_its_claim_and_never_pushed(

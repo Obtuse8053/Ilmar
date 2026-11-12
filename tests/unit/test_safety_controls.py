@@ -99,9 +99,7 @@ def test_operator_additions_extend_and_never_shorten_the_list() -> None:
 
 def test_deletions_and_both_sides_of_a_rename_count() -> None:
     # A rename appears as the old path (deleted) and the new path (added).
-    assert touched(["src/ilmar/config.py", "src/ilmar/settings.py"], SELF) == (
-        "src/ilmar/config.py",
-    )
+    assert touched(["src/ilmar/config.py", "docs/config.py"], SELF) == ("src/ilmar/config.py",)
     assert touched(["docs/a.md", "src/ilmar/core/journal.py"], SELF) == (
         "src/ilmar/core/journal.py",
     )

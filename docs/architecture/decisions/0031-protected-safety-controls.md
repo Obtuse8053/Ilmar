@@ -231,28 +231,34 @@ Promotion of an executable version is a human command in every mode
 1. **The configuration key** is `[verification] extra_safety_controls`. It
    matches the existing `extra_*` keys and stays separate from
    `extra_protected_paths`, which only flags paths for review.
-2. **Ilmar's own list covers all code that can alter agent execution,
-   credentials, sandbox policy, coordination, verification or publication.**
-   It is not limited to modules whose names sound safety-related.
-   - **Code is protected by package:** `src/ilmar/adapters/`, `core/`,
-     `domain/` and `ports/`, plus the entry points (`__main__.py`, `cli.py`,
-     `cli_*.py`) and `config.py`. This includes the agent runner, the
-     built-in wiring, the worker, the coordinator and GitHub publication,
-     all of which were missing from the first list.
-   - **Agent instruction files and settings at any depth:** `**/AGENTS.md`,
-     `**/CLAUDE.md`, `.claude/` and `.mcp.json`.
+2. **All of Ilmar's code is protected.** The list covers all code that can
+   alter agent execution, credentials, sandbox policy, coordination,
+   verification or publication, not only modules whose names sound
+   safety-related.
+   - **The whole `src/ilmar/` directory is one protected entry.** That covers
+     every file at any depth, including `__init__.py` and any new top-level
+     module. The list itself guarantees this; it does not rely on a test.
+   - **Agent instruction files and settings at any depth** (`**/AGENTS.md`,
+     `**/CLAUDE.md`, `.claude/`, `.mcp.json`) are hard-blocked in Ilmar's own
+     repository. In other targets they keep their existing review-only
+     treatment.
    - **The live-run code and its recorded evidence**, which run with real
-     credentials: `tests/live_harness.py`, `tests/integration/` and the
-     recorded stream fixtures.
-3. **How the architecture test enforces this:**
-   - **Fail closed:** every Python file under `src/ilmar` must be protected,
-     or listed as exempt with a reason. An exempt file must hold no logic.
-     Today the only exemption is the version string in `__init__.py`.
-   - **Explicit requirements:** a named list of paths, including every
-     omission found in the review, must stay protected whatever shape the
-     list takes.
+     credentials, are protected: `tests/live_harness.py`, `tests/integration/`
+     and the recorded stream fixtures.
+3. **The architecture test** requires that:
+   - `src/ilmar/` is on the list;
+   - every existing file in it is protected, and so is a new file anywhere
+     in it, including new root-level modules and non-Python files;
+   - a named list of paths, including every omission found in the review,
+     stays protected whatever shape the list takes.
 
-**Consequence:** Ilmar cannot push any change to its own Python code. It may
-still prepare such changes as candidates for a maintainer, as §3 describes.
-Narrowing a package entry later needs a reviewed change to this ADR and to
-the architecture test.
+   There are no exemptions.
+4. **This is an interim policy for Modes 1 and 2.**
+   - **What it means now:** with `self_repository = true`, Ilmar cannot push
+     any change to its own code. Such changes stay frozen candidates for a
+     maintainer (§3).
+   - **Before Mode 3:** a reviewed design (an ADR) must decide how Ilmar can
+     propose improvements to itself while safety-critical changes stay under
+     human control.
+   - **Until then:** narrowing the entry needs an ADR change and a matching
+     change to the architecture test.

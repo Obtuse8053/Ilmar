@@ -707,3 +707,15 @@ def test_a_candidate_clear_of_safety_controls_is_verified_as_before(world: World
 def test_ci_configuration_in_a_target_with_safety_controls_is_protected(world: World) -> None:
     record = safety_verify(world, {".github/workflows/ci.yml": "on: push\n"})
     assert record.verdict is Verdict.REJECTED_PROTECTED_PATH  # wins over the CI rejection
+
+
+@pytest.mark.parametrize("path", ["docs/AGENTS.md", "CLAUDE.md", ".claude/settings.json"])
+def test_agent_instructions_elsewhere_stay_review_only(world: World, path: str) -> None:
+    """Hard-blocked only in Ilmar's own repository; other targets keep the review flag."""
+    execution, candidate = world.candidate({"src/app.py": "print(2)\n", path: "x\n"})
+    record = world.verifier(safety_controls=safety_controls(self_repository=False)).verify(
+        execution=execution, repository=REPO, candidate=candidate, agent_result=COMPLETED,
+        owner=OWNER,
+    )  # fmt: skip
+    assert record.verdict is Verdict.PUBLISH_FOR_REVIEW
+    assert record.protected_paths == (path,)

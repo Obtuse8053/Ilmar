@@ -4,10 +4,10 @@ alter agent execution, credentials, sandbox policy, coordination, verification
 or publication, and neither the list nor the verification policy has a
 candidate-side source.
 
-* **Fail closed by package.** Every Python file under ``src/ilmar`` must be
-  protected, unless it is in ``EXEMPT`` with a written reason that a test
-  checks. A new file is protected by its package's entry, or fails here
-  until someone classifies it.
+* **The whole package.** ``src/ilmar/`` is one protected entry, so every file
+  in it, ``__init__.py`` and any new top-level module included, is protected
+  by the list itself, not only by this test (maintainer decision, review of
+  #118). There are no exemptions.
 * **Explicit requirements.** ``REQUIRED`` names paths that must stay
   protected whatever the list's shape. It includes the omissions found in
   review on 2026-11-12, so they cannot recur.
@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+
+import pytest
 
 from ilmar.domain.safety_controls import ILMAR_REPOSITORY, safety_controls, touched
 
@@ -84,41 +86,37 @@ REQUIRED = (
     "src/ilmar/domain/safety_controls.py",
 )
 
-EXEMPT = {
-    "src/ilmar/__init__.py": "the package docstring and version string only; no logic",
-}
-
-
-def python_files() -> list[str]:
-    return sorted(str(p.relative_to(ROOT)) for p in SRC.rglob("*.py"))
-
 
 def test_every_required_path_is_protected() -> None:
     missing = [p for p in REQUIRED if not touched([p], PROTECTED)]
     assert missing == [], f"ADR-0031 §1: these must be protected: {missing}"
 
 
-def test_every_module_is_protected_unless_exempt_with_a_reason() -> None:
-    unclassified = [m for m in python_files() if m not in EXEMPT and not touched([m], PROTECTED)]
-    assert unclassified == [], (
-        f"protect these in ILMAR_REPOSITORY, or exempt them with a reason: {unclassified}"
-    )
+def test_the_whole_package_is_one_protected_entry() -> None:
+    assert "src/ilmar/" in ILMAR_REPOSITORY
 
 
-def test_exemptions_are_real_and_hold_no_logic() -> None:
-    for path, reason in EXEMPT.items():
-        assert reason
-        file = ROOT / path
-        assert file.is_file(), path
-        tree = ast.parse(file.read_text())
-        for node in tree.body:
-            docstring = isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-            constant = (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Constant)
-                and all(isinstance(t, ast.Name) for t in node.targets)
-            )
-            assert docstring or constant, f"{path} gained logic: protect it"
+def test_every_existing_file_in_the_package_is_protected() -> None:
+    files = sorted(str(p.relative_to(ROOT)) for p in SRC.rglob("*") if p.is_file())
+    assert files
+    assert [f for f in files if not touched([f], PROTECTED)] == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/ilmar/__init__.py",
+        "src/ilmar/new_top_level.py",  # a candidate's new root-level module
+        "src/ilmar/_hidden.py",
+        "src/ilmar/sitecustomize.py",
+        "src/ilmar/new_package/__init__.py",
+        "src/ilmar/core/deeper/new.py",
+        "src/ilmar/data.json",  # not only Python
+        "src/ilmar/py.typed",
+    ],
+)
+def test_a_new_file_anywhere_in_the_package_is_protected(path: str) -> None:
+    assert touched([path], PROTECTED) == (path,)
 
 
 def test_the_list_protects_itself_and_the_policy() -> None:

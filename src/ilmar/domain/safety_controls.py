@@ -53,28 +53,14 @@ ILMAR_REPOSITORY: tuple[str, ...] = (
     "scripts/",
     "images/",
     "deploy/",
-    # Ilmar's code (audit of 2026-11-12, #118). Every package below can alter
-    # agent execution, credentials, sandbox policy, coordination, verification
-    # or publication, so each is protected whole: a new module in it is
-    # protected from its first line.
-    #   adapters/: the agent runner and its stream parser, the built-in wiring,
-    #     git (freezing), GitHub (claims and publication), Podman (the
-    #     sandbox), the stores, options and secrets.
-    #   core/: the worker, coordinator, effects, journal, ownership,
-    #     cancellation, tracker reconciliation, verification, layout, naming.
-    #   domain/: states, errors and their classification, candidates, tasks,
-    #     the ledger, events, workspace policy, verification policy, this list.
-    #   ports/: the contracts every adapter is held to.
-    "src/ilmar/adapters/",
-    "src/ilmar/core/",
-    "src/ilmar/domain/",
-    "src/ilmar/ports/",
-    # The entry points: run (where unattended operation stays disabled),
-    # cancel, suspend and resume, the read-only audit view, configuration.
-    "src/ilmar/__main__.py",
-    "src/ilmar/cli.py",
-    "src/ilmar/cli_*.py",
-    "src/ilmar/config.py",
+    # All of Ilmar's code (maintainer decision, review of #118, 2026-11-12):
+    # every file under src/ilmar/, at any depth, including __init__.py and any
+    # new top-level module. Every package there can alter agent execution,
+    # credentials, sandbox policy, coordination, verification or publication.
+    # This is the interim policy for Modes 1-2 (ADR-0031, Amendments); before
+    # Mode 3, a reviewed design decides how Ilmar may propose changes to its
+    # own code while safety-critical ones stay human-controlled.
+    "src/ilmar/",
 )
 """Also protected when the target is Ilmar's own repository (``self_repository``)."""
 

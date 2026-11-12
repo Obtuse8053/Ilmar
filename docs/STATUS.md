@@ -77,7 +77,9 @@ Hard gates that stay in force:
   - **The list** is code in the running release: CI configuration,
     `.gitattributes` and `.gitmodules` in every target. With
     `[verification] self_repository = true` it adds Ilmar's own controls:
-    - all of `src/ilmar`, by package, failing closed for any new module;
+    - the whole `src/ilmar/` directory, including new root-level modules
+      (an interim policy for Modes 1–2; a self-improvement design is due
+      before Mode 3);
     - agent instruction files and settings at any depth;
     - the live-run code.
 
