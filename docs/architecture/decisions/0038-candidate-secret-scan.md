@@ -86,10 +86,27 @@ ADR-0010 §5 table, `rejected-ci-config` included, and nothing of the
 candidate runs.
 
 The execution fails without a retry, with reason code `candidate-secret`.
-The check's detail in the evidence names the variable, the encoding and the
-path, never the value; a finding in a path name does not repeat the path. The
-failure reason, which becomes the tracker note, names neither paths nor
-values.
+
+**Paths whose names hold a secret are never recorded.** Path classification
+(protected, check-influencing, CI configuration) always uses the real paths,
+so no class is lost. But each place the evidence writes a path down replaces
+such a path with `[a path withheld: its name holds <VARIABLE>]`:
+
+- the three path lists;
+- the details of the path checks and of `candidate-secrets`;
+- the review reasons.
+
+The same encodings as the scan decide what "holds" means.
+
+**What the outcome writes down.**
+- The `candidate-secrets` detail names variables, encodings and (withheld or
+  real) paths.
+- The failure reason names neither paths nor values. It becomes the
+  execution's `last_error`, its transition reason, the result detail printed
+  by `ilmar run` and the tracker note.
+
+When no secret is configured, nothing changes: there is no scan checkout and
+no check.
 
 When no secret is configured, nothing changes: there is no scan checkout and
 no check.
@@ -123,12 +140,29 @@ value; downgrading is not supported.
   is rotated between an agent run and its verification, the scan looks for
   the new value, not the old one the agent saw. Revoking the old value on
   rotation is the operator's control.
-- **Local records keep the value.** The agent's summary is kept, unredacted,
-  in the coordinator's own store: the agent-run operation and the evidence's
-  agent report. The failure reason of an `agent-failed` or `provider-refused`
-  execution, recorded locally, also keeps it. These records are on the
-  operator's machine, which already holds the secret, and nothing in them is
-  published. Redacting them is a separate change, if it is wanted.
+- **What is and is not kept free of secret values.** Precisely:
+  - **Never holds a value** (tested): everything a `candidate-secret` outcome
+    writes. That is the evidence record (path lists, check details, review
+    reasons), the events, the transitions, the execution's `last_error`, the
+    `ilmar run` result detail, the pushed branch (none), the change request
+    (none) and every tracker note.
+  - **The documented exception: the agent's own summary**, kept unredacted
+    in the coordinator's local store. It sits in:
+    - the agent-run operation's result;
+    - the evidence's agent report.
+
+    When the execution ends `agent-failed` or `provider-refused`, the
+    summary's first 200 characters are also in its local failure reason:
+    `last_error`, the transition reason, and the result detail that
+    `ilmar run` prints to the operator's terminal or service log.
+
+    These copies are on the operator's machine, which already holds the
+    secret. None of them is published: the tracker note made from such a
+    reason is withheld (§3), and the change request is scanned (§3).
+    Redacting them is a separate change, if it is wanted.
+  - **Not covered:** other local error texts, such as an unexpected
+    exception's message, are not scanned. They are recorded and printed as
+    before. A secret in an encoding outside §1 is not recognised anywhere.
 
 ## Tests required
 
@@ -146,6 +180,11 @@ value; downgrading is not supported.
   (`tests/unit/test_secret_scan_coordinator.py`).
 - Registry: every configured secret is scanned for, and a too-short secret is
   refused without its value (`tests/unit/test_registry.py`).
+- Secret-bearing file names under CI, protected and check-influencing paths:
+  - each path is still classified;
+  - no value, raw or encoded, appears in the evidence (path lists, check
+    details, review reasons), the events, the transitions, the result detail
+    or the tracker notes (`test_verifier.py`, `test_secret_scan_coordinator.py`).
 
 ## Revisit when
 

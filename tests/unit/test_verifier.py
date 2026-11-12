@@ -599,3 +599,37 @@ def test_without_configured_secrets_nothing_changes(world: World) -> None:
     record = verify(world, {"src/app.py": f"KEY = '{SECRET}'\n"})
     assert record.verdict is Verdict.PUBLISH
     assert all(c.name != "candidate-secrets" for c in record.checks)
+
+
+ENCODED = SECRET.encode().hex()
+
+
+@pytest.mark.parametrize(
+    ("leaked", "field_name", "reason"),
+    [
+        (f".github/workflows/{SECRET}.yml", "ci_config_paths", "ci-config-modified"),
+        (f".claude/{ENCODED}.json", "protected_paths", "protected-paths"),
+        (f"tests/test_{SECRET}.py", "check_influencing_paths", "modified-checks"),
+    ],
+)
+def test_a_secret_bearing_path_is_classified_but_never_recorded(
+    world: World, leaked: str, field_name: str, reason: str
+) -> None:
+    """The class still applies (the reason is there); only the name is withheld."""
+    record = scan_verify(world, {leaked: "x\n", f"src/{SECRET}.py": SECRET})
+    assert record.verdict is Verdict.REJECTED_CANDIDATE_SECRET
+    assert record.requires_human_review
+    placeholder = "[a path withheld: its name holds ANTHROPIC_API_KEY]"
+    assert getattr(record, field_name) == (placeholder,)
+    assert any(r.startswith(f"{reason}: {placeholder}") for r in record.review_reasons)
+    text = record.to_json()
+    assert SECRET not in text
+    assert ENCODED not in text
+    (scan,) = [c for c in record.checks if c.name == "candidate-secrets"]
+    assert placeholder in scan.detail  # the file's content finding names no path either
+
+
+def test_paths_without_a_secret_are_recorded_as_before(world: World) -> None:
+    record = scan_verify(world, {"tests/test_app.py": "x\n", ".claude/settings.json": "{}\n"})
+    assert record.check_influencing_paths == ("tests/test_app.py",)
+    assert record.protected_paths == (".claude/settings.json",)

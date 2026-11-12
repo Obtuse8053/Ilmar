@@ -84,7 +84,14 @@ Hard gates that stay in force:
     (`candidate-secret`).
   - The change request's text is scanned before the first push. Tracker
     notes that contain a secret are replaced by a fixed text.
-  - No value appears in evidence, events, transitions or notes.
+  - A file name holding a secret is still classified (CI, protected,
+    check-influencing). It is recorded only as a placeholder naming the
+    variable.
+  - **No value appears in anything a `candidate-secret` outcome records.**
+  - **The documented exception:** the agent's own summary stays unredacted in
+    local records. It is in the agent-run operation and the evidence's agent
+    report. For `agent-failed` and `provider-refused` it is also in the local
+    failure reason and in `ilmar run` output. It is never published.
 - 2026-11-11: **#90 part 1 merged** (#108). **Part 2 submitted: one credential
   path and provider failures** (ADR-0029 §5).
   - **Credential path:** before Claude Code starts, a fixed probe runs in the

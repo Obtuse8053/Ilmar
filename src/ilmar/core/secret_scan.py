@@ -47,8 +47,9 @@ class SecretFinding:
     """Where a secret was found. ``where`` never contains the value.
 
     ``where`` is a changed path, ``"symlink target of <path>"``, ``"a changed
-    path's name"`` (the path itself is not repeated) or a caller's label such as
-    ``"change request description"``.
+    path's name"`` or a caller's label such as ``"the change request"``. A path
+    whose own name holds a secret is never repeated: :meth:`SecretScanner.shown_path`
+    replaces it.
     """
 
     name: str
@@ -140,6 +141,15 @@ class SecretScanner:
             os.close(root_fd)
         return _unique(findings)
 
+    def shown_path(self, path: str) -> str:
+        """``path`` as it may be recorded: itself, or a placeholder naming only the
+        variables when the name holds a secret. Classification always uses the real
+        path; only what is written down changes."""
+        found = self.scan_text(path, where="")
+        if not found:
+            return path
+        return f"[a path withheld: its name holds {', '.join(sorted({f.name for f in found}))}]"
+
     # -- internals --------------------------------------------------------------------
 
     def _match(self, data: bytes, where: str) -> list[SecretFinding]:
@@ -168,12 +178,12 @@ class SecretScanner:
                 return []  # deleted by the candidate
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(leaf, dir_fd=fd)
-                return self.scan_text(target, where=f"symlink target of {path}")
+                return self.scan_text(target, where=f"symlink target of {self.shown_path(path)}")
             if not stat.S_ISREG(info.st_mode):
                 return []
             file_fd = os.open(leaf, _FILE_FLAGS, dir_fd=fd)
             with os.fdopen(file_fd, "rb") as handle:
-                return self.scan_stream(_chunks(handle.read), where=path)
+                return self.scan_stream(_chunks(handle.read), where=self.shown_path(path))
         finally:
             os.close(fd)
 

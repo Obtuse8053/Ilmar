@@ -97,3 +97,32 @@ def test_a_clean_candidate_is_published_with_the_scan_in_its_evidence(tmp_path: 
     assert execution is not None
     _, description = setup.scm.change_request_text(REPO, execution.branch or "")
     assert "candidate-secrets" in description  # listed among the checks that passed
+
+
+def test_secret_bearing_filenames_reach_no_record_and_no_tracker(tmp_path: Path) -> None:
+    """CI, protected and check-influencing paths whose names hold the secret."""
+    encoded = KEY.encode().hex()
+    setup = setup_with(
+        tmp_path,
+        {
+            "src/app.py": "print('fixed')\n",
+            f".github/workflows/{KEY}.yml": "on: push\n",
+            f".claude/{encoded}.json": "{}\n",
+            f"tests/test_{KEY}.py": "x = 1\n",
+        },
+    )
+    report = setup.coordinator().run_once()
+    assert [r.code for r in report.results] == ["candidate-secret"]
+    for detail in (r.detail for r in report.results):
+        assert KEY not in detail
+        assert encoded not in detail
+    (record,) = setup.store.evidence("e1")
+    text = record.to_json()
+    assert KEY not in text
+    assert encoded not in text
+    assert record.ci_config_paths
+    assert record.protected_paths
+    assert record.check_influencing_paths
+    assert_nothing_left(setup)
+    for update in setup.tasks.updates(TASK):
+        assert encoded not in update

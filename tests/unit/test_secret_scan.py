@@ -182,3 +182,22 @@ def test_a_large_file_is_read_in_chunks(tmp_path: Path, monkeypatch: pytest.Monk
     (root / "big.bin").write_bytes(b"\0" * 1000 + KEY.encode().hex().encode() + b"\0" * 1000)
     found = SCANNER.scan_candidate(root, ["big.bin"])
     assert [(f.name, f.encoding) for f in found] == [("ANTHROPIC_API_KEY", "hex")]
+
+
+def test_a_finding_inside_a_secret_named_file_does_not_repeat_its_name(tmp_path: Path) -> None:
+    root = checkout(tmp_path)
+    named = f"src/{TOKEN}.py"
+    (root / named).write_text(KEY)
+    os.symlink(KEY, root / "src" / f"link-{TOKEN}")
+    found = SCANNER.scan_candidate(root, [named, f"src/link-{TOKEN}"])
+    shown = " ".join(f.describe() for f in found)
+    assert TOKEN not in shown
+    assert KEY not in shown
+    assert "ANTHROPIC_API_KEY (raw) in [a path withheld: its name holds GITHUB_TOKEN]" in shown
+    assert "symlink target of [a path withheld" in shown
+
+
+def test_shown_path_keeps_ordinary_paths() -> None:
+    assert SCANNER.shown_path("src/app.py") == "src/app.py"
+    hidden = SCANNER.shown_path(f"a/{base64.b64encode(KEY.encode()).decode()}")
+    assert hidden == "[a path withheld: its name holds ANTHROPIC_API_KEY]"

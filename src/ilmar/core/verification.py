@@ -112,37 +112,44 @@ class Verifier:
         _check_inputs(execution, candidate, owner)
         policy = self._policy
         changed = candidate.changed_paths
+        # Classification uses the real paths. What is recorded never repeats a path
+        # whose name holds a configured secret (ADR-0038 §2): such a candidate is
+        # rejected, and its evidence is still kept.
+        shown = self._scanner.shown_path
         protected = matching(changed, policy.protected_paths)
         influencing = matching(changed, policy.check_influencing_paths)
         ci = matching(changed, policy.ci_config_paths)
+        protected_shown = tuple(shown(p) for p in protected)
+        influencing_shown = tuple(shown(p) for p in influencing)
+        ci_shown = tuple(shown(p) for p in ci)
 
         checks = [
             CheckEvidence(
                 "ci-config-paths",
                 CheckClass.INDEPENDENT,
                 passed=not ci,
-                detail=_paths_detail("changes CI configuration", ci),
+                detail=_paths_detail("changes CI configuration", ci_shown),
             ),
             CheckEvidence(
                 "protected-paths",
                 CheckClass.INDEPENDENT,
                 passed=True,
-                detail=_paths_detail("flags protected paths", protected),
+                detail=_paths_detail("flags protected paths", protected_shown),
             ),
             CheckEvidence(
                 "check-influencing-paths",
                 CheckClass.INDEPENDENT,
                 passed=True,
-                detail=_paths_detail("flags check-influencing paths", influencing),
+                detail=_paths_detail("flags check-influencing paths", influencing_shown),
             ),
         ]
         reasons: list[str] = []
         if ci:
-            reasons.append(f"ci-config-modified: {', '.join(ci)}")
+            reasons.append(f"ci-config-modified: {', '.join(ci_shown)}")
         if influencing:
-            reasons.append(f"modified-checks: {', '.join(influencing)}")
+            reasons.append(f"modified-checks: {', '.join(influencing_shown)}")
         if protected:
-            reasons.append(f"protected-paths: {', '.join(protected)}")
+            reasons.append(f"protected-paths: {', '.join(protected_shown)}")
 
         run_directory = self._new_run_directory(execution, run) if self._scanner or not ci else None
         secrets = (
@@ -179,9 +186,9 @@ class Verifier:
             candidate_revision=candidate.revision,
             policy_digest=policy.digest(),
             checks=tuple(checks),
-            protected_paths=protected,
-            check_influencing_paths=influencing,
-            ci_config_paths=ci,
+            protected_paths=protected_shown,
+            check_influencing_paths=influencing_shown,
+            ci_config_paths=ci_shown,
             independence=independence,
             verdict=verdict,
             requires_human_review=bool(reasons),
