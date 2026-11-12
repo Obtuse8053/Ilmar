@@ -296,6 +296,16 @@ class SourceControlContract:
         with pytest.raises(CandidateRejectedError):
             self._freeze(provider, repo, workspace)
 
+    def test_changed_paths_hold_mode_changes_and_both_sides_of_a_rename(
+        self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path
+    ) -> None:
+        """ADR-0031 §2 judges ``changed_paths`` alone: a mode-only change and both
+        sides of a rename must be in it."""
+        (workspace / "src" / "app.py").chmod(0o755)
+        (workspace / "README.md").rename(workspace / "README.rst")
+        candidate = self._freeze(provider, repo, workspace)
+        assert candidate.changed_paths == ("README.md", "README.rst", "src/app.py")
+
     def test_the_secret_scan_sees_the_candidate_exactly_as_published(
         self, provider: SourceControlProvider, repo: RepositoryRef, workspace: Path, tmp_path: Path
     ) -> None:

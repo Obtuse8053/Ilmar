@@ -9,6 +9,7 @@ import pytest
 
 from ilmar.config import PORT_NAMES, Limits, load_config, parse_config
 from ilmar.domain.errors import ConfigError
+from ilmar.domain.safety_controls import safety_controls
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASE = Path("/srv/ilmar")
@@ -210,6 +211,21 @@ def test_path_classes_can_only_be_extended() -> None:
     assert "fixtures/" in policy.check_influencing_paths
 
 
+def test_safety_controls_come_from_the_release_and_can_only_be_extended() -> None:
+    """ADR-0031 §1 (#92): built-ins always; Ilmar's own list only for itself."""
+    other = parse_config(with_verification(), base_dir=BASE).verification
+    assert other is not None
+    assert other.safety_controls == safety_controls(self_repository=False)
+    own = parse_config(
+        with_verification(self_repository=True, extra_safety_controls=["ops/"]),
+        base_dir=BASE,
+    ).verification
+    assert own is not None
+    assert own.safety_controls == safety_controls(self_repository=True, extra=("ops/",))
+    assert "src/ilmar/domain/safety_controls.py" in own.safety_controls
+    assert own.digest() != other.digest()
+
+
 @pytest.mark.parametrize(
     ("section", "message"),
     [
@@ -225,6 +241,8 @@ def test_path_classes_can_only_be_extended() -> None:
         ({"ci_config_paths": []}, "unknown"),
         ({"extra_ci_config_paths": "x"}, "list"),
         ({"extra_protected_paths": ["/abs"]}, "pattern"),
+        ({"self_repository": "yes"}, "self_repository"),
+        ({"extra_safety_controls": ["/abs"]}, "pattern"),
         ({"cpus": 0}, "cpus"),
         ({"memory_mb": -1}, "memory_mb"),
     ],

@@ -284,6 +284,7 @@ ADDED_CODES = {
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)
+    "protected-path",  # ADR-0031 (#92)
 }
 
 

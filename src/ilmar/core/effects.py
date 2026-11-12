@@ -38,7 +38,7 @@ from ilmar.core.mounts import authorize_mount
 from ilmar.core.naming import container_name, verification_container_name
 from ilmar.core.ownership import ExecutionLease
 from ilmar.core.safe_fs import directory_identity, ensure_directory, remove_directory
-from ilmar.core.verification import Verifier
+from ilmar.core.verification import SAFETY_CHECK, Verifier
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
 from ilmar.domain.changes import CandidateRevision, ChangeRequest, ChangeRequestSpec
 from ilmar.domain.errors import (
@@ -73,7 +73,7 @@ from ilmar.domain.tasks import (
     RestoreResult,
     TaskRef,
 )
-from ilmar.domain.verification import EvidenceRecord
+from ilmar.domain.verification import EvidenceRecord, Verdict
 from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
@@ -998,12 +998,17 @@ class Effects:
             )
             records.append(record)
             found = directory_identity(run_dir, root=layout.workspaces_root)
-            return {
+            result = {
                 "verdict": record.verdict.value,
                 "evidence_digest": record.digest(),
                 "candidate_revision": record.candidate_revision,
                 "checkout_identity": "" if found is None else identity_text(found),
             }
+            if record.verdict is Verdict.REJECTED_PROTECTED_PATH:  # ADR-0031 §3: named
+                result["safety_controls"] = next(
+                    c.detail for c in record.checks if c.name == SAFETY_CHECK
+                )
+            return result
 
         def after(result: Mapping[str, str]) -> Commit:
             now = self._clock()

@@ -64,6 +64,7 @@ from ilmar.core.worker import (
     ExecutionWorker,
     Outcome,
     WorkerResult,
+    blocked_for_maintainer,
     needs_attention,
 )
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
@@ -483,6 +484,8 @@ class Coordinator:
         quarantined resources, or still needs attention (its own worker releases it)."""
         for execution in self._executions_of(ref):
             if not execution.state.is_terminal or needs_attention(self._store, execution):
+                return True
+            if blocked_for_maintainer(self._store, execution):  # ADR-0031 §3
                 return True
             rows = self._store.resources(execution_id=execution.id)
             if any(r.status is ResourceStatus.QUARANTINED for r in rows):

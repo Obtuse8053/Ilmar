@@ -32,6 +32,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ilmar.domain.errors import ConfigError
+from ilmar.domain.safety_controls import safety_controls
 from ilmar.domain.verification import (
     DEFAULT_CHECK_INFLUENCING_PATHS,
     DEFAULT_CI_CONFIG_PATHS,
@@ -155,6 +156,8 @@ def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
             "extra_protected_paths",
             "extra_check_influencing_paths",
             "extra_ci_config_paths",
+            "self_repository",
+            "extra_safety_controls",
             "memory_mb",
             "cpus",
             "max_processes",
@@ -194,6 +197,9 @@ def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
             )
         except ValueError as exc:
             raise ConfigError(f"{at}: {exc}") from None
+    self_repository = raw.get("self_repository", False)
+    if not isinstance(self_repository, bool):
+        raise ConfigError(f"{where} self_repository must be true or false")
     limits: dict[str, Any] = {}
     for key in ("memory_mb", "max_processes"):
         if key in raw:
@@ -212,6 +218,10 @@ def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:
             + _patterns(raw, "extra_check_influencing_paths"),
             ci_config_paths=DEFAULT_CI_CONFIG_PATHS + _patterns(raw, "extra_ci_config_paths"),
             limits=ResourceLimits(**limits),
+            safety_controls=safety_controls(
+                self_repository=self_repository,
+                extra=_patterns(raw, "extra_safety_controls"),
+            ),
         )
     except ValueError as exc:
         raise ConfigError(f"{where}: {exc}") from None

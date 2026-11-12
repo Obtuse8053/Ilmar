@@ -19,6 +19,7 @@ from ilmar.domain.agent import AgentOutcome, AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
 from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.safety_controls import safety_controls
 from ilmar.domain.verification import (
     CheckClass,
     EvidenceRecord,
@@ -592,7 +593,7 @@ def test_only_changed_paths_are_scanned(world: World) -> None:
 def test_the_scan_checkout_is_inside_the_run_directory_and_is_not_a_job(world: World) -> None:
     scan_verify(world, {"src/app.py": "print(2)\n"})
     run = world.layout.verification_checkout("e9", 1, 1)
-    assert (run / ".secret-scan" / "src" / "app.py").read_text() == "print(2)\n"
+    assert (run / ".candidate" / "src" / "app.py").read_text() == "print(2)\n"
 
 
 def test_without_configured_secrets_nothing_changes(world: World) -> None:
@@ -633,3 +634,76 @@ def test_paths_without_a_secret_are_recorded_as_before(world: World) -> None:
     record = scan_verify(world, {"tests/test_app.py": "x\n", ".claude/settings.json": "{}\n"})
     assert record.check_influencing_paths == ("tests/test_app.py",)
     assert record.protected_paths == (".claude/settings.json",)
+
+
+# -- protected safety controls (#92, ADR-0031) ---------------------------------------
+
+SAFETY = safety_controls(self_repository=True)
+
+
+def safety_verify(
+    world: World, changes: Mapping[str, str | None], links: Mapping[str, str] = {}
+) -> EvidenceRecord:
+    workspace = world.tmp / f"agent-{len(list(world.tmp.iterdir()))}"
+    base = world.scm.checkout(REPO, base_branch="main", branch="ilmar/t", destination=workspace)
+    for path, content in changes.items():
+        target = workspace / path
+        if content is None:
+            target.unlink()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+    for link, to in links.items():
+        (workspace / link).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / link).symlink_to(to)
+    candidate = world.scm.freeze_candidate(REPO, base_revision=base, workspace=workspace,
+                                           message="m")  # fmt: skip
+    return world.verifier(safety_controls=SAFETY).verify(
+        execution=world.execution(candidate), repository=REPO, candidate=candidate,
+        agent_result=COMPLETED, owner=OWNER,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"src/ilmar/config.py": "x\n"},  # configuration validation
+        {"src/ilmar/domain/safety_controls.py": "EVERY_TARGET = ()\n"},  # the list itself
+        {"src/ilmar/domain/verification.py": "x\n"},  # the verification policy
+        {"tests/architecture/test_x.py": "x\n"},
+        {"README.md": None, "AGENTS.md": "moved\n"},  # a rename onto a control
+    ],
+)
+def test_a_candidate_touching_a_safety_control_is_rejected_and_nothing_runs(
+    world: World, changes: Mapping[str, str | None]
+) -> None:
+    record = safety_verify(world, {"src/app.py": "print(2)\n", **changes})
+    assert record.verdict is Verdict.REJECTED_PROTECTED_PATH
+    assert not record.verdict.publishable
+    assert world.runtime.started == []
+    (check,) = [c for c in record.checks if c.name == "safety-controls"]
+    assert not check.passed
+    for path in changes:
+        if changes[path] is not None:
+            assert path in check.detail
+    assert record.review_reasons[0] == check.detail
+
+
+def test_a_link_to_a_safety_control_is_rejected(world: World) -> None:
+    record = safety_verify(world, {}, links={"docs/policy.py": "../src/ilmar/config.py"})
+    assert record.verdict is Verdict.REJECTED_PROTECTED_PATH
+    (check,) = [c for c in record.checks if c.name == "safety-controls"]
+    assert "docs/policy.py" in check.detail
+
+
+def test_a_candidate_clear_of_safety_controls_is_verified_as_before(world: World) -> None:
+    record = safety_verify(world, {"src/app.py": "print(2)\n"})
+    assert record.verdict is Verdict.PUBLISH
+    (check,) = [c for c in record.checks if c.name == "safety-controls"]
+    assert check.passed
+    assert check.detail == "none"
+
+
+def test_ci_configuration_in_a_target_with_safety_controls_is_protected(world: World) -> None:
+    record = safety_verify(world, {".github/workflows/ci.yml": "on: push\n"})
+    assert record.verdict is Verdict.REJECTED_PROTECTED_PATH  # wins over the CI rejection
