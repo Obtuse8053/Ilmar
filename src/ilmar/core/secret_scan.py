@@ -161,17 +161,10 @@ class SecretScanner:
 
     def _scan_entry(self, root_fd: int, path: str) -> list[SecretFinding]:
         *parents, leaf = path.split("/")
-        fd = os.dup(root_fd)
+        fd = _open_parent(root_fd, parents)
+        if fd is None:
+            return []  # deleted, or under a symlink: nothing here to read
         try:
-            for part in parents:
-                try:
-                    child = os.open(part, _DIR_FLAGS, dir_fd=fd)
-                except OSError as exc:
-                    if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-                        return []  # deleted, or under a symlink: nothing here to read
-                    raise
-                os.close(fd)
-                fd = child
             try:
                 info = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -186,6 +179,47 @@ class SecretScanner:
                 return self.scan_stream(_chunks(handle.read), where=self.shown_path(path))
         finally:
             os.close(fd)
+
+
+def symlink_targets(root: Path, paths: Iterable[str]) -> dict[str, str]:
+    """The targets of the changed ``paths`` that are symbolic links in the checkout
+    at ``root``, read without following anything (ADR-0031 §2)."""
+    found: dict[str, str] = {}
+    root_fd = os.open(root, _DIR_FLAGS)
+    try:
+        for path in paths:
+            *parents, leaf = path.split("/")
+            fd = _open_parent(root_fd, parents)
+            if fd is None:
+                continue
+            try:
+                info = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    found[path] = os.readlink(leaf, dir_fd=fd)
+            except FileNotFoundError:
+                pass  # deleted by the candidate
+            finally:
+                os.close(fd)
+    finally:
+        os.close(root_fd)
+    return found
+
+
+def _open_parent(root_fd: int, parents: list[str]) -> int | None:
+    """A descriptor of the directory holding a path, or ``None`` when it is gone or
+    reached through a symlink. Never follows anything."""
+    fd = os.dup(root_fd)
+    for part in parents:
+        try:
+            child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                return None
+            raise
+        os.close(fd)
+        fd = child
+    return fd
 
 
 def _chunks(read: Callable[[int], bytes]) -> Iterator[bytes]:

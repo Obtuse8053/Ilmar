@@ -56,6 +56,8 @@ class Verdict(enum.Enum):
     REJECTED_CI_CONFIG = "rejected-ci-config"
     REJECTED_CANDIDATE_SECRET = "rejected-candidate-secret"  # noqa: S105 - a verdict
     """The candidate holds one of the deployment's own secrets (#110, ADR-0038)."""
+    REJECTED_PROTECTED_PATH = "rejected-protected-path"
+    """The candidate touches a protected safety control (#92, ADR-0031)."""
 
     @property
     def publishable(self) -> bool:
@@ -218,6 +220,9 @@ class VerificationPolicy:
     check_influencing_paths: tuple[str, ...] = DEFAULT_CHECK_INFLUENCING_PATHS
     ci_config_paths: tuple[str, ...] = DEFAULT_CI_CONFIG_PATHS
     limits: ResourceLimits = field(default_factory=ResourceLimits)
+    safety_controls: tuple[str, ...] = ()
+    """ADR-0031: a candidate touching these is never pushed. Set from the running
+    release's list (``ilmar.domain.safety_controls``) and the operator's additions."""
 
     def __post_init__(self) -> None:
         if not self.image:
@@ -231,6 +236,7 @@ class VerificationPolicy:
             *self.protected_paths,
             *self.check_influencing_paths,
             *self.ci_config_paths,
+            *self.safety_controls,
         ):
             _compile(pattern)
 
@@ -253,6 +259,8 @@ class VerificationPolicy:
             "ci_config_paths": list(self.ci_config_paths),
             "limits": [self.limits.cpus, self.limits.memory_mb, self.limits.max_processes],
         }
+        if self.safety_controls:  # absent before #92: earlier digests are unchanged
+            canonical["safety_controls"] = list(self.safety_controls)
         text = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
         return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 

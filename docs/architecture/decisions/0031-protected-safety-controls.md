@@ -4,6 +4,9 @@
 - Date: 2026-11-10
 - Sources: none external · Findings: F-013
 - Depends on: ADR-0010, ADR-0018
+- Amended by the maintainer on 2026-11-12, in the review of #118 (see
+  "Amendments" at the end). The decision text below keeps its original
+  wording, except the configuration key, which the maintainer renamed.
 
 ## Context and problem
 
@@ -57,7 +60,8 @@ list.
     configuration validation, verification policy and gate records;
   - the protected-list module itself.
 - **Operator additions.** The operator may add patterns
-  (`protected_paths_extra`). Nothing can remove a built-in entry.
+  (`[verification] extra_safety_controls`; named `protected_paths_extra` until
+  the 2026-11-12 amendment). Nothing can remove a built-in entry.
 
 The list names directories and modules. #92 maps it to exact paths and keeps
 an architecture test that fails when a new module of one of those kinds
@@ -219,3 +223,42 @@ Promotion of an executable version is a human command in every mode
   secrets. Pushing could then be allowed, while merging stays human.
 - F-013's condition is met (mature verification evidence). That could
   change the scope of human approval, never its existence.
+
+## Amendments
+
+### 2026-11-12: review of #118 (maintainer)
+
+1. **The configuration key** is `[verification] extra_safety_controls`. It
+   matches the existing `extra_*` keys and stays separate from
+   `extra_protected_paths`, which only flags paths for review.
+2. **All of Ilmar's code is protected.** The list covers all code that can
+   alter agent execution, credentials, sandbox policy, coordination,
+   verification or publication, not only modules whose names sound
+   safety-related.
+   - **The whole `src/ilmar/` directory is one protected entry.** That covers
+     every file at any depth, including `__init__.py` and any new top-level
+     module. The list itself guarantees this; it does not rely on a test.
+   - **Agent instruction files and settings at any depth** (`**/AGENTS.md`,
+     `**/CLAUDE.md`, `.claude/`, `.mcp.json`) are hard-blocked in Ilmar's own
+     repository. In other targets they keep their existing review-only
+     treatment.
+   - **The live-run code and its recorded evidence**, which run with real
+     credentials, are protected: `tests/live_harness.py`, `tests/integration/`
+     and the recorded stream fixtures.
+3. **The architecture test** requires that:
+   - `src/ilmar/` is on the list;
+   - every existing file in it is protected, and so is a new file anywhere
+     in it, including new root-level modules and non-Python files;
+   - a named list of paths, including every omission found in the review,
+     stays protected whatever shape the list takes.
+
+   There are no exemptions.
+4. **This is an interim policy for Modes 1 and 2.**
+   - **What it means now:** with `self_repository = true`, Ilmar cannot push
+     any change to its own code. Such changes stay frozen candidates for a
+     maintainer (§3).
+   - **Before Mode 3:** a reviewed design (an ADR) must decide how Ilmar can
+     propose improvements to itself while safety-critical changes stay under
+     human control.
+   - **Until then:** narrowing the entry needs an ADR change and a matching
+     change to the architecture test.

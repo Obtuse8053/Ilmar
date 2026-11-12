@@ -81,6 +81,13 @@ options = { path = ".ilmar/executions.sqlite3" }
 image = "localhost/ilmar-verify:pinned"
 memory_mb = 4096
 extra_protected_paths = ["docs/architecture/decisions/"]
+# Safety controls (ADR-0031): a candidate touching one is never pushed and its
+# task stays claimed and blocked for a maintainer. CI configuration,
+# .gitattributes and .gitmodules are always protected. Set self_repository when
+# the target is Ilmar's own repository to protect its safety-control code too.
+# Additions only; nothing removes a built-in entry.
+# self_repository = false
+# extra_safety_controls = []
 
 # Commands of one job share a checkout and sandbox; separate jobs are isolated.
 [[verification.commands]]

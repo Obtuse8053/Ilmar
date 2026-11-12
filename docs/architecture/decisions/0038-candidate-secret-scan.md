@@ -65,7 +65,7 @@ of the sandbox (ADR-0037) is the real control.
 
 At the start of each verification run, before any check runs, the frozen
 candidate revision is checked out with `checkout_revision` into
-`<run directory>/.secret-scan`. That name can never be a job name, and the
+`<run directory>/.candidate` (shared with the ADR-0031 safety-control check). That name can never be a job name, and the
 run directory is already a tracked, cleaned-up resource. For every changed
 path, the scanner checks:
 

@@ -72,6 +72,28 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-12: **#110 merged** (#116) and closed after its acceptance audit.
+  **#92 part 1 submitted: protected safety controls** (ADR-0031).
+  - **The list** is code in the running release: CI configuration,
+    `.gitattributes` and `.gitmodules` in every target. With
+    `[verification] self_repository = true` it adds Ilmar's own controls:
+    - the whole `src/ilmar/` directory, including new root-level modules
+      (an interim policy for Modes 1–2; a self-improvement design is due
+      before Mode 3);
+    - agent instruction files and settings at any depth;
+    - the live-run code.
+
+    Operators may only add entries (`extra_safety_controls`, as amended in
+    ADR-0031).
+  - **The check** runs on the frozen candidate before any of its code runs,
+    and again before publication. It covers changes, deletions, both sides
+    of a rename, mode changes and links to protected targets.
+  - **On a touch:** the verdict is `rejected-protected-path` and the
+    execution fails (`protected-path`). Nothing is pushed, and the task keeps
+    Ilmar's claim, blocked, across later passes.
+  - **Part 2:** `ilmar blocked list|release|abandon`, the human-release
+    record and the per-pass blocked count; then the pre-push workflow
+    inspection (§4).
 - 2026-11-12: **#110 submitted: candidate secret scan** (ADR-0038, Proposed;
   a mandatory Gate 1 prerequisite).
   - Every configured secret, the model credential included, is looked for

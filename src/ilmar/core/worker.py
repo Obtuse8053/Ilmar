@@ -85,6 +85,7 @@ from ilmar.domain.ledger import (
     operation_key,
     resource_key,
 )
+from ilmar.domain.safety_controls import touched
 from ilmar.domain.tasks import ClaimOutcome, HeldClaim, Standing, Task
 from ilmar.domain.verification import EvidenceRecord, Verdict
 from ilmar.domain.workspace import ResourceOwner
@@ -233,6 +234,10 @@ def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
         return any(
             r.attempt == execution.attempt and r.kind is ResourceKind.WORKSPACE for r in rows
         )
+    if execution.state is S.FAILED and blocked_for_maintainer(store, execution):
+        # ADR-0031 §3: the claim is kept; only the note remains to be posted.
+        return store.operation(operation_key(K.POST_UPDATE, execution.id, execution.attempt,
+                                             BLOCKED_STEP)) is None  # fmt: skip
     if execution.state is S.FAILED:  # its claim must be released
         return (
             store.operation(
@@ -249,6 +254,23 @@ def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
             )
             is None
         )
+    return False
+
+
+BLOCKED_STEP = "blocked"
+
+
+def blocked_for_maintainer(store: ExecutionStore, execution: Execution) -> bool:
+    """A FAILED execution whose candidate touched a safety control (ADR-0031 §3):
+    its task keeps Ilmar's claim and is never retried, picked or published."""
+    if execution.state is not S.FAILED:
+        return False
+    for event in reversed(store.events(execution_id=execution.id)):
+        if (
+            event.type is EventType.EXECUTION_TRANSITIONED
+            and event.data.get("to") == S.FAILED.value
+        ):
+            return event.reason == "protected-path"
     return False
 
 
@@ -683,6 +705,8 @@ class _Run:
             if verdict.publishable:
                 return self.transition_to(S.PUBLISHING, f"verified: {verdict.value}")
             reason, code = _REJECTIONS.get(verdict, _CHECKS_FAILED)
+            if verdict is Verdict.REJECTED_PROTECTED_PATH:  # the event names the paths
+                reason = f"{reason} ({r.get('safety_controls', 'paths in the evidence')})"
             return self.transition_to(S.FAILED, reason, code=code, error=reason)
 
         runs = sorted(self.ops(execution, K.VERIFY), key=lambda o: int(o.key.rsplit("run-", 1)[1]))
@@ -738,6 +762,16 @@ class _Run:
             raise _Blocked(
                 "the verification policy changed since the candidate was verified; "
                 "it is not published on the old evidence"
+            )
+        # ADR-0031 §2: checked again immediately before publication, from the running
+        # release's policy (equal to the verified one, above). Symbolic-link targets
+        # were judged on the verification checkout of this same frozen candidate.
+        hit = touched(candidate.changed_paths, c.verification.safety_controls)
+        if hit:
+            shown = ", ".join(c.secret_scanner.shown_path(p) for p in hit)
+            raise _Deterministic(
+                f"{_REJECTIONS[Verdict.REJECTED_PROTECTED_PATH][0]} (safety-controls: {shown})",
+                code="protected-path",
             )
         branch = execution.branch or branch_name(execution.task)
         task = self.require_task()
@@ -1105,6 +1139,14 @@ class _Run:
             if quarantined:  # a human must look: the claim stays
                 return self.quarantine_remains()
             reason = execution.last_error or "failed"
+            if blocked_for_maintainer(self.store, execution):  # ADR-0031 §3: claim kept
+                self.note(
+                    execution,
+                    BLOCKED_STEP,
+                    "Ilmar stopped: the change touches protected safety controls. It was not "
+                    "pushed; a maintainer must resolve this task.",
+                )
+                return WorkerResult(self.id, Outcome.FAILED, reason, code="protected-path")
             self.note(execution, "failed", f"Ilmar could not complete this: {reason}")
             effects.release(self.current(), self.lease, step="failed")  # repeatable
             code = self.recorded_code(EventType.EXECUTION_TRANSITIONED, S.FAILED)
@@ -1198,6 +1240,11 @@ _REJECTIONS = {
         "ci-config-changed",
     ),
     # The variable names and paths are in the evidence; the tracker note says only this.
+    Verdict.REJECTED_PROTECTED_PATH: (
+        "the candidate touches protected safety controls; it is never pushed, and a "
+        "maintainer must resolve the task",
+        "protected-path",
+    ),
     Verdict.REJECTED_CANDIDATE_SECRET: (
         "the candidate contains one of this deployment's secrets; it is never published",
         "candidate-secret",

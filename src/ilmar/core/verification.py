@@ -36,12 +36,13 @@ from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.lifetimes import verification_sandbox_lifetime
 from ilmar.core.naming import verification_container_name
 from ilmar.core.safe_fs import directory_identity, ensure_directory
-from ilmar.core.secret_scan import SecretScanner
+from ilmar.core.secret_scan import SecretScanner, symlink_targets
 from ilmar.domain.agent import AgentResult
 from ilmar.domain.changes import CandidateRevision, RepositoryRef
 from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import Fence
+from ilmar.domain.safety_controls import touched
 from ilmar.domain.verification import (
     AgentReport,
     CheckClass,
@@ -68,8 +69,10 @@ REVIEW_LABEL = "ilmar:needs-human-review"
 _SUMMARY_LIMIT = 2000
 _DETAIL_LIMIT = 200
 SECRET_SCAN_CHECK = "candidate-secrets"  # noqa: S105 - a check name, not a secret
-SECRET_SCAN_DIRECTORY = ".secret-scan"  # noqa: S105 - a directory name
-"""Never a job name (jobs start with a letter or digit), so never a job's checkout."""
+SAFETY_CHECK = "safety-controls"
+CANDIDATE_DIRECTORY = ".candidate"
+"""The run's own checkout for the secret scan and the safety-control check. Never
+a job name (jobs start with a letter or digit), so never a job's checkout."""
 
 
 class Verifier:
@@ -151,14 +154,22 @@ class Verifier:
         if protected:
             reasons.append(f"protected-paths: {', '.join(protected_shown)}")
 
-        run_directory = self._new_run_directory(execution, run) if self._scanner or not ci else None
-        secrets = (
-            self._scan_candidate(repository, candidate, run_directory)
-            if run_directory is not None
+        needs_checkout = bool(self._scanner) or bool(policy.safety_controls)
+        run_directory = (
+            self._new_run_directory(execution, run) if needs_checkout or not ci else None
+        )
+        checkout = (
+            self._checkout_candidate(repository, candidate, run_directory)
+            if needs_checkout and run_directory is not None
             else None
         )
-        if secrets is not None:
-            checks.insert(0, secrets)
+        secrets = self._scan_candidate(candidate, checkout) if checkout is not None else None
+        safety = self._safety_check(candidate, checkout) if checkout is not None else None
+        for check in (safety, secrets):  # first in the evidence, secrets first
+            if check is not None:
+                checks.insert(0, check)
+        if safety is not None and not safety.passed:
+            reasons.insert(0, safety.detail)
         if ci:
             independence = Independence.CI_CONFIG_MODIFIED
         elif influencing:
@@ -167,6 +178,8 @@ class Verifier:
             independence = Independence.UNCHANGED_CHECKS
         if secrets is not None and not secrets.passed:
             verdict = Verdict.REJECTED_CANDIDATE_SECRET  # nothing of it runs (ADR-0038)
+        elif safety is not None and not safety.passed:
+            verdict = Verdict.REJECTED_PROTECTED_PATH  # nothing of it runs (ADR-0031)
         elif ci:
             verdict = Verdict.REJECTED_CI_CONFIG
         else:
@@ -208,20 +221,24 @@ class Verifier:
 
     # -- the secret scan (#110) -----------------------------------------------------
 
-    def _scan_candidate(
+    def _checkout_candidate(
         self, repository: RepositoryRef, candidate: CandidateRevision, run_directory: Path
-    ) -> CheckEvidence | None:
-        """Look for the deployment's secrets in a fresh checkout of the frozen
-        candidate, before any of its code runs. ``None`` when no secret is
-        configured. The evidence names variables, encodings and paths only."""
-        if not self._scanner:
-            return None
-        checkout = run_directory / SECRET_SCAN_DIRECTORY
+    ) -> Path:
+        """A fresh checkout of the frozen candidate, exactly as it would be published."""
+        checkout = run_directory / CANDIDATE_DIRECTORY
         self._source_control.checkout_revision(
             repository, revision=candidate.revision, destination=checkout
         )
         if directory_identity(checkout, root=self._layout.workspaces_root) is None:
-            raise ProviderError(f"secret-scan checkout {checkout} vanished")
+            raise ProviderError(f"candidate checkout {checkout} vanished")
+        return checkout
+
+    def _scan_candidate(self, candidate: CandidateRevision, checkout: Path) -> CheckEvidence | None:
+        """Look for the deployment's secrets before any of the candidate's code runs.
+        ``None`` when no secret is configured. The evidence names variables,
+        encodings and paths only."""
+        if not self._scanner:
+            return None
         findings = self._scanner.scan_candidate(checkout, candidate.changed_paths)
         if not findings:
             detail = (
@@ -233,6 +250,22 @@ class Verifier:
             detail = _printable(f"found {listed}")[:_DETAIL_LIMIT]
         return CheckEvidence(
             SECRET_SCAN_CHECK, CheckClass.INDEPENDENT, passed=not findings, detail=detail
+        )
+
+    def _safety_check(self, candidate: CandidateRevision, checkout: Path) -> CheckEvidence | None:
+        """ADR-0031 §2: does the frozen candidate touch a protected safety control?
+        ``None`` when the policy protects none."""
+        patterns = self._policy.safety_controls
+        if not patterns:
+            return None
+        links = symlink_targets(checkout, candidate.changed_paths)
+        hit = touched(candidate.changed_paths, patterns, link_targets=links)
+        shown = tuple(self._scanner.shown_path(p) for p in hit)
+        return CheckEvidence(
+            SAFETY_CHECK,
+            CheckClass.INDEPENDENT,
+            passed=not hit,
+            detail=_paths_detail("safety-controls", shown),
         )
 
     def _new_run_directory(self, execution: Execution, run: int) -> Path:

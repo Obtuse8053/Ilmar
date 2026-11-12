@@ -34,6 +34,10 @@ exhausted budget always ends in a suspended state.
   for the maintainer. The protected list and the verification policy come from
   the running release and the operator's configuration, never from a
   candidate.
+  - **Interim, for Modes 1 and 2:** in Ilmar's own repository the whole of
+    `src/ilmar/` is protected (ADR-0031 amendment, 2026-11-12).
+  - **Before Mode 3:** a reviewed design must decide how Ilmar can propose
+    self-improvements while safety-critical changes stay human-controlled.
 - **Reservations are accounting, not cost limits.** In Mode 1 each execution
   is charged a fixed, conservative reservation before it starts, and the
   charge is never reduced. A reservation decides only whether new work may
