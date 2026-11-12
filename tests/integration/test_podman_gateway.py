@@ -126,6 +126,7 @@ def test_the_sandbox_reaches_the_provider_only_with_its_token_and_the_real_key(
         (None, "/v1/files"),
         (None, "/v1/messages/batches"),
     ],
+    ids=["wrong-token", "real-key", "empty", "files", "batches"],  # no value in a test ID
 )
 def test_everything_else_is_refused_by_the_sidecar(
     world: tuple[Sandbox, Provider, str], credential: str | None, path: str
