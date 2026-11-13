@@ -310,7 +310,8 @@ def test_the_policy_comes_from_json() -> None:
 
 def test_a_rewrite_that_would_grow_the_body_is_refused_and_releases_its_reservation() -> None:
     compact = json.dumps(json.loads(body()), separators=(",", ":"))
-    grown = compact.replace('"stream":true', '"temperature":1e-9,"top_p":1e-9,"top_k":1e-9,"stream":true').encode()
+    tiny = '"temperature":1e-9,"top_p":1e-9,"top_k":1e-9,'  # each re-encodes one byte longer
+    grown = compact.replace('"stream":true', tiny + '"stream":true').encode()
     assert len(json.dumps(json.loads(grown), separators=(",", ":"))) > len(grown)
     budget = Budget(limit=50 * DOLLAR, policy=POLICY)
     with pytest.raises(RequestRefused, match="re-encoded"):
