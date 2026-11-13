@@ -8,7 +8,8 @@ What the tests pin, after the #121 review:
 * input is an estimate, not a bound: a report above the reservation is charged
   in full, recorded as an overrun, and halts the attempt;
 * a missing, partial or invalid usage report keeps the whole reservation, even
-  when ``message_stop`` arrived;
+  when ``message_stop`` arrived, and halts the attempt: nothing more is
+  forwarded for it (#121 review, 2026-11-13);
 * images, unreviewed beta features and separately billed ones are refused.
 """
 
@@ -267,9 +268,7 @@ def strip(event: dict[str, Any], key: str) -> dict[str, Any]:
     return copy
 
 
-@pytest.mark.parametrize(
-    "data",
-    [
+UNTRUSTED = [
         sse(start(), delta()),  # cut off before message_stop
         sse(start(), delta())[:-30],  # cut off mid-event
         b"",
@@ -292,8 +291,11 @@ def strip(event: dict[str, Any], key: str) -> dict[str, Any]:
             STOP),
         sse(start(), {"type": "error", "error": {"type": "overloaded_error"}}, delta(), STOP),
         sse(start(), delta(), STOP) + b"data: {not json\n\n",
-    ],
-)  # fmt: skip
+    ]  # fmt: skip
+"""Usage reports that are missing, incomplete or not trusted."""
+
+
+@pytest.mark.parametrize("data", UNTRUSTED)
 def test_a_missing_partial_or_invalid_report_keeps_the_whole_reservation(data: bytes) -> None:
     settled = ga.charge(metered(data), PRICE, reservation=123_456)
     assert settled.charged == 123_456
@@ -315,6 +317,89 @@ def test_a_report_above_the_reservation_is_charged_in_full_and_halts_the_attempt
     with pytest.raises(RequestRefused, match="stopped") as refused:
         budget.admit(data)
     assert refused.value.kind == "budget_exceeded"
+
+
+@pytest.mark.parametrize("data", UNTRUSTED)
+def test_an_untrusted_report_halts_the_attempt(data: bytes) -> None:
+    request = body(max_tokens=2_000)
+    budget = Budget(limit=50 * DOLLAR, policy=POLICY)
+    ticket, admitted = budget.admit(request)
+    settled = budget.settle(ticket, ga.charge(metered(data), PRICE, admitted.reservation))
+    assert settled.charged == admitted.reservation
+    assert not settled.trusted
+    assert budget.halted
+    assert budget.halt_reason is not None
+    assert "not trusted" in budget.halt_reason
+    assert budget.spent() == admitted.reservation
+    with pytest.raises(RequestRefused, match="stopped") as refused:
+        budget.admit(request)
+    assert refused.value.kind == "budget_exceeded"
+    assert budget.in_flight == {}  # the refusal reserved nothing
+
+
+class Gateway:
+    """The gateway's request loop as P5 part 2 wires it: admit, forward, meter,
+    settle. ``forwarded`` counts what reached the provider."""
+
+    def __init__(self, budget: Budget, responses: list[bytes]) -> None:
+        self.budget = budget
+        self.responses = responses
+        self.forwarded: list[bytes] = []
+
+    def handle(self, request: bytes) -> int:
+        try:
+            ticket, admitted = self.budget.admit(request)
+        except RequestRefused as refused:
+            return refused.status
+        self.forwarded.append(admitted.body)
+        reply = self.responses[len(self.forwarded) - 1]
+        self.budget.settle(ticket, ga.charge(metered(reply), PRICE, admitted.reservation))
+        return 200
+
+
+GOOD = sse(start(), delta(), STOP)
+
+
+@pytest.mark.parametrize("bad", [UNTRUSTED[0], UNTRUSTED[3], UNTRUSTED[9], UNTRUSTED[-1]])
+def test_after_an_untrusted_report_nothing_more_is_forwarded(bad: bytes) -> None:
+    gateway = Gateway(Budget(limit=500 * DOLLAR, policy=POLICY), [GOOD, bad, GOOD, GOOD])
+    request = body(max_tokens=2_000)
+    statuses = [gateway.handle(request) for _ in range(6)]
+    assert statuses == [200, 200, 429, 429, 429, 429]
+    assert len(gateway.forwarded) == 2  # the good one, then the untrusted one: no more
+
+
+def test_after_an_overrun_nothing_more_is_forwarded() -> None:
+    request = body(max_tokens=2_000)
+    _, admitted = Budget(limit=500 * DOLLAR, policy=POLICY).admit(request)
+    over = sse(start(input_tokens=admitted.input_estimate * 3), delta(output_tokens=2_000), STOP)
+    gateway = Gateway(Budget(limit=500 * DOLLAR, policy=POLICY), [GOOD, over, GOOD])
+    statuses = [gateway.handle(request) for _ in range(4)]
+    assert statuses == [200, 200, 429, 429]
+    assert len(gateway.forwarded) == 2
+    assert gateway.budget.halt_reason == "a request cost more than its reservation"
+
+
+def test_requests_in_flight_settle_but_nothing_new_is_admitted_after_a_halt() -> None:
+    request = body(max_tokens=2_000)
+    budget = Budget(limit=500 * DOLLAR, policy=POLICY)
+    first, a = budget.admit(request)
+    second, b = budget.admit(request)  # both in flight
+    budget.settle(first, ga.charge(metered(UNTRUSTED[0]), PRICE, a.reservation))
+    with pytest.raises(RequestRefused, match="not trusted"):
+        budget.admit(request)
+    budget.settle(second, ga.charge(metered(GOOD), PRICE, b.reservation))  # still settles
+    assert budget.halted  # a good report later never lifts the halt
+    assert "not trusted" in (budget.halt_reason or "")
+    with pytest.raises(RequestRefused):
+        budget.admit(request)
+    assert budget.in_flight == {}
+
+
+def test_a_complete_valid_report_lets_the_attempt_go_on() -> None:
+    gateway = Gateway(Budget(limit=500 * DOLLAR, policy=POLICY), [GOOD] * 5)
+    assert [gateway.handle(body(max_tokens=2_000)) for _ in range(5)] == [200] * 5
+    assert not gateway.budget.halted
 
 
 def test_writes_without_a_breakdown_are_charged_at_the_one_hour_rate() -> None:
@@ -393,11 +478,25 @@ def test_spend_stays_within_the_budget_plus_the_overruns_in_flight() -> None:
     assert budget.spent() <= limit + budget.overruns
 
 
+def test_the_approved_defaults() -> None:
+    """Maintainer decision on #121 (2026-11-13): configurable estimates of 32
+    framing and 1000 tool-overhead tokens; images off; no beta allowed."""
+    assert (POLICY.message_overhead_tokens, POLICY.tool_overhead_tokens) == (32, 1_000)
+    assert POLICY.image_tokens is None
+    assert POLICY.allowed_betas == frozenset()
+    default = ga.policy_from_json(json.dumps({"prices": {MODEL: {"input": 1, "output": 2,
+        "cache_write_5m": 3, "cache_write_1h": 4, "cache_read": 1}}}))  # fmt: skip
+    assert (default.message_overhead_tokens, default.tool_overhead_tokens) == (32, 1_000)
+    assert (default.image_tokens, default.allowed_betas) == (None, frozenset())
+
+
 def test_the_policy_comes_from_json() -> None:
     rates = {"input": 1, "output": 2, "cache_write_5m": 3, "cache_write_1h": 4, "cache_read": 1}
     text = json.dumps({"prices": {MODEL: rates}, "max_output_tokens": 8_000,
-                       "allowed_betas": ["x-2025"], "image_tokens": 4_000})  # fmt: skip
+                       "allowed_betas": ["x-2025"], "image_tokens": 4_000,
+                       "message_overhead_tokens": 48, "tool_overhead_tokens": 1_500})  # fmt: skip
     policy = ga.policy_from_json(text)
+    assert (policy.message_overhead_tokens, policy.tool_overhead_tokens) == (48, 1_500)
     assert max(policy.prices[MODEL].input_rates(1)) == 4
     assert (policy.max_output_tokens, policy.image_tokens) == (8_000, 4_000)
     assert policy.allowed_betas == frozenset({"x-2025"})

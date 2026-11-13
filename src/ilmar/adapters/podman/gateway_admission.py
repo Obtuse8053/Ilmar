@@ -29,18 +29,21 @@ what the provider reported, in full, never capped at its reservation:
 * a complete, valid usage report is charged at the attested prices;
 * a missing, partial, malformed or unrecognised report, or a stream cut off
   before ``message_stop``, is charged its whole reservation, even when
-  ``message_stop`` arrived;
+  ``message_stop`` arrived, and **halts the attempt**: what the provider will
+  bill for it is unknown, so the gateway forwards nothing more for it;
 * a report that costs more than the reservation (the estimate was wrong) is
-  charged in full, recorded as an *overrun*, and **halts the attempt**: the
-  gateway forwards nothing more for it.
+  charged in full, recorded as an *overrun*, and also **halts the attempt**.
+
+Only a complete, valid report within the reservation lets the attempt go on.
 
 **The guarantee that follows.** The attempt's spend is at most ``B`` plus the
-overruns of the requests in flight when the first overrun was seen; with
-``max_in_flight`` 1, at most one request's overrun. The size of an overrun has
-no bound this gateway can prove. That is why the provider's own workspace
-spend cap stays the hard backstop (ADR-0029 §5), and why an overrun is an
-operator-visible event that also reaches the coordinator's ledger as an extra
-charge (P5 part 2).
+overruns of the requests in flight when it halted, plus whatever the provider
+bills for requests whose usage could not be trusted (at most the one that
+halted it and those then in flight); with ``max_in_flight`` 1, one request.
+Neither an overrun nor an untrusted request has a bound this gateway can prove.
+That is why the provider's own workspace spend cap stays the hard backstop
+(ADR-0029 §5), and why a halt is an operator-visible event whose charges also
+reach the coordinator's ledger (P5 part 2).
 
 **What is refused** (never forwarded): a model without an attested price; any
 top-level field outside the allow-list; server tools; documents, URL images,
@@ -69,6 +72,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 MILLION = 1_000_000
+REPORTED = "reported"
+"""The settlement reason of a complete, valid usage report."""
 
 TOP_LEVEL_FIELDS = frozenset(
     {
@@ -210,6 +215,11 @@ class Settled:
     def overrun(self) -> int:
         return max(0, self.charged - self.reservation)
 
+    @property
+    def trusted(self) -> bool:
+        """A complete, valid report: the only settlement that lets the attempt go on."""
+        return self.reason == REPORTED
+
 
 @dataclass
 class Budget:
@@ -220,6 +230,8 @@ class Budget:
     settled: int = 0
     overruns: int = 0
     halted: bool = False
+    halt_reason: str | None = None
+    """Why the attempt stopped: the first untrusted report, or an overrun."""
     in_flight: dict[int, int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _next: int = 0
@@ -240,7 +252,7 @@ class Budget:
             if self.halted:
                 raise RequestRefused(
                     "budget_exceeded",
-                    "this attempt is stopped: a request cost more than its reservation",
+                    f"this attempt is stopped: {self.halt_reason}",
                     status=429,
                 )
             room = self.limit - self.settled - sum(self.in_flight.values()) - input_cost
@@ -268,13 +280,20 @@ class Budget:
         return ticket, Admitted(body, reservation, model, granted, input_tokens, capped)
 
     def settle(self, ticket: int, settled: Settled) -> Settled:
-        """Close a request at what it cost, in full. An overrun halts the attempt."""
+        """Close a request at what it cost, in full. An overrun, or a usage report
+        that is missing, incomplete or not trusted, halts the attempt."""
         with self._lock:
             self.in_flight.pop(ticket)
             self.settled += settled.charged
             if settled.overrun:
                 self.overruns += settled.overrun
-                self.halted = True
+            reason = None
+            if not settled.trusted:
+                reason = f"the provider's usage report was not trusted ({settled.reason})"
+            elif settled.overrun:
+                reason = "a request cost more than its reservation"
+            if reason is not None and not self.halted:
+                self.halted, self.halt_reason = True, reason
         return settled
 
     def release(self, ticket: int) -> None:
@@ -578,7 +597,7 @@ def charge(meter: UsageMeter, price: ModelPrice, reservation: int) -> Settled:
     rates = price.input_rates(total_input)
     cost = sum(_cost(t, r) for t, r in zip(tokens, rates, strict=True))
     cost += _cost(meter.output_tokens, price.output_rate(total_input))
-    return Settled(cost, reservation, "reported")
+    return Settled(cost, reservation, REPORTED)
 
 
 def _count(value: object) -> bool:
