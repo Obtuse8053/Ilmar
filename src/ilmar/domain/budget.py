@@ -133,6 +133,8 @@ class SuspensionReason(enum.Enum):
     KILL_SWITCH = "kill-switch"
     OPERATOR = "operator-suspended"
     CLOCK_ANOMALY = "clock-anomaly"
+    RESTART_LOOP = "restart-loop"
+    """Loop mode started too often (ADR-0033 §3)."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -122,6 +122,11 @@ class BudgetExhaustedError(IlmarError):
         self.reason = reason
 
 
+class StartLogError(IlmarError):
+    """The durable start log cannot be read, written or parsed (ADR-0033 §4).
+    Loop mode fails closed: exit 78, nothing started."""
+
+
 class SuspendedError(IlmarError):
     """The store refused new work: a suspension is in force (ADR-0029 §3).
     Nothing was written."""

@@ -28,6 +28,7 @@ def resume_blocker(
     latest_update: datetime | None,
     provider_cap_raised: bool,
     kill_switch_present: bool,
+    restart_breach: str | None = None,
 ) -> str | None:
     """Why ``suspension`` may not be lifted now, or ``None`` if it may."""
     reason = suspension.reason
@@ -55,6 +56,9 @@ def resume_blocker(
         return None
     if reason is SuspensionReason.KILL_SWITCH:
         return "the kill-switch file still exists" if kill_switch_present else None
+    if reason is SuspensionReason.RESTART_LOOP:
+        # ADR-0033 §3: lifted only when the start log shows no breach in its windows.
+        return None if restart_breach is None else f"the start log still shows {restart_breach}"
     if reason is SuspensionReason.CLOCK_ANOMALY:
         if latest_update is not None and now < latest_update:
             return "the clock is still behind the latest persisted time"

@@ -293,6 +293,7 @@ ADDED_CODES = {
     "operator-suspended",  # ADR-0029 §2 and §3 (#18)
     "clock-anomaly",  # ADR-0029 §2 and §3 (#18)
     "operator-resumed",  # ADR-0029 §2 and §3 (#18)
+    "restart-loop",  # ADR-0033 §3
 }
 
 
