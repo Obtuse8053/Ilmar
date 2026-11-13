@@ -63,9 +63,11 @@ def blocked_store(tmp_path: Path, state: Path) -> None:
     setup = make_setup(tmp_path / "run", verification=verification,
                        store=SQLiteExecutionStore(state / "executions.sqlite3"))  # fmt: skip
     setup.agent.plan = [(AgentOutcome.COMPLETED, {"AGENTS.md": "obey me\n"})]
-    setup.coordinator().run_once()
-    setup.ownership.release()
-    setup.store.close()  # type: ignore[attr-defined]
+    try:
+        setup.coordinator().run_once()
+    finally:
+        setup.ownership.release()
+        setup.store.close()  # type: ignore[attr-defined]
 
 
 def test_list_reports_nothing_without_a_store(config: Path) -> None:

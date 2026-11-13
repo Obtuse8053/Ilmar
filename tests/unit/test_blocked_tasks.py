@@ -20,6 +20,7 @@ Maintainer requirements (2026-11-10):
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -48,13 +49,30 @@ MAINTAINER = Actor(ActorKind.HUMAN, "maintainer")
 DB = "executions.sqlite3"
 
 
+OPENED: list[SQLiteExecutionStore] = []
+
+
+@pytest.fixture(autouse=True)
+def close_stores() -> Iterator[None]:
+    """Every SQLite connection a test opens is closed (Python 3.13 warns otherwise)."""
+    yield
+    while OPENED:
+        OPENED.pop().close()
+
+
+def opened(db: Path) -> SQLiteExecutionStore:
+    store = SQLiteExecutionStore(db)
+    OPENED.append(store)
+    return store
+
+
 def guarded(tmp_path: Path, *, keys: tuple[str, ...] = ("1",)) -> Setup:
     base = policy()
     verification = VerificationPolicy(
         image=base.image, commands=base.commands,
         safety_controls=safety_controls(self_repository=True),
     )  # fmt: skip
-    store = SQLiteExecutionStore(tmp_path / DB)
+    store = opened(tmp_path / DB)
     setup = make_setup(tmp_path, verification=verification, store=store,
                        tasks=tuple(task(k) for k in keys))  # fmt: skip
     setup.agent.plan = [(AgentOutcome.COMPLETED, PROTECTED)] * len(keys)
@@ -65,7 +83,7 @@ def restart(setup: Setup, db: Path) -> Setup:
     """A new coordinator process: the old one died holding nothing durable but
     the store file; the tracker and the forge outlive it."""
     setup.ownership.release()
-    store = SQLiteExecutionStore(db)
+    store = opened(db)
     ownership = Ownership.take(layout=setup.layout, store=store, instance_id="inst",
                                now=setup.clock())  # fmt: skip
     old = setup.components
