@@ -27,6 +27,7 @@ from typing import TextIO, cast
 
 from ilmar.adapters.registry import event_reader, store_writer
 from ilmar.config import IlmarConfig, load_config
+from ilmar.core import kill_switch
 from ilmar.core.ownership import Ownership
 from ilmar.core.starts import StartLimits, breach_if_started, read_starts, start_log_path
 from ilmar.core.suspension import resume_blocker
@@ -144,7 +145,9 @@ def run(
                 limits=limits,
                 latest_update=store.latest_update(),
                 provider_cap_raised=args.provider_cap_resolved,
-                kill_switch_present=False,
+                kill_switch_present=kill_switch.checker(
+                    config.budget.kill_switch_file if config.budget else None
+                )(),
                 restart_breach=restart_breach,
             )
             if blocker is not None:

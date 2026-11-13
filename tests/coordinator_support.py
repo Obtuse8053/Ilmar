@@ -167,6 +167,7 @@ class Setup:
         retry_backoff: RetryBackoff = NO_BACKOFF,
         execution_wall_seconds: float | None = None,
         budget: BudgetLimits | None = None,
+        kill_switch: Callable[[], bool] = lambda: False,
     ) -> Coordinator:
         return Coordinator.create(
             self.components,
@@ -176,6 +177,7 @@ class Setup:
             retry_backoff=retry_backoff,
             execution_wall_seconds=execution_wall_seconds,
             budget=budget,
+            kill_switch=kill_switch,
             clock=self.clock,
             new_id=lambda: next(self.ids),
             new_token=lambda: "tok-" + next(self.ids),

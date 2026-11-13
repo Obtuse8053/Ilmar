@@ -13,6 +13,7 @@ from pathlib import Path
 from ilmar import __version__, cli_cancel, cli_events, cli_suspend
 from ilmar.adapters.registry import build, plan
 from ilmar.config import load_config
+from ilmar.core import kill_switch
 from ilmar.core.coordinator import Coordinator, ExitCode
 from ilmar.core.ownership import Ownership
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
@@ -158,6 +159,9 @@ def _run_once(path: Path) -> int:
                     stall_timeout_seconds=config.limits.stall_timeout_seconds,
                     execution_wall_seconds=config.limits.execution_wall_seconds,
                     budget=config.budget.limits if config.budget else None,
+                    kill_switch=kill_switch.checker(
+                        config.budget.kill_switch_file if config.budget else None
+                    ),
                     clock=_now,
                 )
                 report = coordinator.run_once()

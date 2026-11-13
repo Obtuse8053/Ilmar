@@ -95,6 +95,8 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "agent-failed": "The agent reported a failure.",
         "agent-timed-out": "The agent did not finish in time.",
         "agent-stalled": "The agent showed no progress for the stall timeout.",
+        "suspension-interrupted": "A suspension stopped the agent run; the attempt is "
+        "retried, with a fresh reservation, only after a resume (ADR-0029 §3).",
         "protected-path": "The candidate touches a protected safety control; it is never "
         "pushed and its task stays claimed and blocked for a maintainer (ADR-0031).",
         "candidate-secret": "The candidate or its change request contains one of the "

@@ -276,3 +276,26 @@ version merged before it.
   reconciliation in Mode 2.
 - The provider offers daily or per-key spend limits, which could replace the
   local daily allowance as the hard limit.
+
+## Amendments
+
+### 2026-11-13: what a suspension does to running work (maintainer, #18)
+
+§3 said that a running agent "is cancelled at its next safe point through the
+existing cancellation path". The maintainer decided instead:
+
+- **A system suspension interrupts the running agent but keeps its work for a
+  retry.** This covers the kill-switch file, budget exhaustion, a provider
+  refusal and `ilmar suspend`.
+  - The cancellation watcher also stops the agent when the kill-switch file
+    exists or a suspension is recorded.
+  - The attempt then ends in `RETRY_WAIT` with reason code
+    `suspension-interrupted`. Its output is never frozen.
+- **The retry follows the normal rules.**
+  - It counts as an attempt, and the existing retry limits apply.
+  - The next attempt needs a fresh reservation, which the store refuses
+    while the suspension is in force. So it starts only after `ilmar resume`.
+- **A human cancellation stays terminal**, as ADR-0025 defines it.
+
+The effects a suspension holds, and those it still allows, are in the
+journal's `HELD_WHILE_SUSPENDED` (#113).

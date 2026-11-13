@@ -141,6 +141,7 @@ class Coordinator:
         retry_backoff: RetryBackoff,
         stall_timeout_seconds: float | None = None,
         budget: BudgetLimits | None = None,
+        kill_switch: Callable[[], bool] = lambda: False,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
@@ -163,10 +164,12 @@ class Coordinator:
             retry_backoff=retry_backoff,
             stall_timeout_seconds=stall_timeout_seconds,
             budget=budget,
+            kill_switch=kill_switch,
             new_token=new_token,
             watch_interval_seconds=watch_interval_seconds,
         )
         self._budget = budget
+        self._kill_switch = kill_switch
 
     @classmethod
     def create(
@@ -181,6 +184,7 @@ class Coordinator:
         stall_timeout_seconds: float | None = None,
         execution_wall_seconds: float | None = None,
         budget: BudgetLimits | None = None,
+        kill_switch: Callable[[], bool] = lambda: False,
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
         new_pass_id: Callable[[], str] = new_pass_id,
@@ -196,6 +200,10 @@ class Coordinator:
 
         With ``budget``, every attempt is admitted against its allowances and
         charged its reservation as it starts (ADR-0029 §2).
+
+        ``kill_switch`` reports whether the kill-switch file exists (ADR-0029 §4).
+        It is checked before each claim, before each container start and between
+        passes; while it is engaged, Ilmar suspends with ``kill-switch``.
         """
         lifetime = agent_sandbox_lifetime(
             execution_wall(agent_timeout_seconds, execution_wall_seconds)
@@ -237,6 +245,7 @@ class Coordinator:
             retry_backoff=retry_backoff,
             stall_timeout_seconds=stall_timeout_seconds,
             budget=budget,
+            kill_switch=kill_switch,
             events=events,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -316,6 +325,10 @@ class Coordinator:
         current = self._store.suspension()
         if current is not None:
             return current
+        if self._kill_switch():  # ADR-0029 §4: before each claim and between passes
+            return self._suspend(
+                Suspension(SuspensionReason.KILL_SWITCH, now, detail="the kill-switch file exists")
+            )
         reason: SuspensionReason | None = None
         for result in results:
             if result.outcome is Outcome.SUSPENDED and result.code in _BUDGET_REASONS:
@@ -327,9 +340,11 @@ class Coordinator:
         if reason is None:
             return None
         period = "daily" if reason is SuspensionReason.BUDGET_DAILY else "monthly"
-        suspension = Suspension(
-            reason, now, detail=f"the next reservation would exceed the {period} allowance"
-        )
+        detail = f"the next reservation would exceed the {period} allowance"
+        return self._suspend(Suspension(reason, now, detail=detail))
+
+    def _suspend(self, suspension: Suspension) -> Suspension | None:
+        """Write ``suspension`` unless one is already in force; the one in force."""
         fence = self._effects.fence
         try:
             self._store.commit(

@@ -281,6 +281,7 @@ ADDED_CODES = {
     "claim-changed",
     "stray-label",  # ADR-0027 (#87)
     "agent-stalled",  # ADR-0035 (#13)
+    "suspension-interrupted",  # ADR-0029 §3 (#18 part 2)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)

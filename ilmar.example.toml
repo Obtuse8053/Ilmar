@@ -122,3 +122,6 @@ timeout_seconds = 1200
 # monthly_usd = 300
 # reserve_per_execution_usd = 5
 # provider_cap_attested_usd = 300
+# While this file exists, Ilmar suspends with kill-switch (ADR-0029 §4). Keep it
+# outside the state directory's workspaces and repositories.
+# kill_switch_file = "/etc/ilmar/KILL"
