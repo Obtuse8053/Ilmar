@@ -305,11 +305,19 @@ journal's `HELD_WHILE_SUSPENDED` (#113).
 - The watcher's two checks are independent. A failing cancellation-inbox
   read, whatever it raises, never skips the kill-switch and suspension check.
 - A suspension check that fails stops the agent (fail closed), because
-  whether it may go on is unknown.
-  - The attempt ends with reason code `suspension-check-failed`. Its output
-    is never frozen.
-  - It is retried under the existing limits. Every later start checks the
-    kill switch and the suspension again first.
+  whether it may go on is unknown, and **durably suspends the whole
+  instance** with the reason `suspension-check-failed`; the pass exits 78
+  (maintainer decision on #122, 2026-11-13).
+  - The suspension is written before the attempt is ended. The attempt ends
+    as `suspension-interrupted`, like any run a suspension interrupts: its
+    output is never frozen, its claim and charged reservation are kept, and
+    it is retried with a fresh reservation only after resume. Nothing is
+    retried automatically.
+  - `ilmar resume` lifts it only with the operator's
+    `--check-fault-resolved` confirmation **and** a check that succeeds now:
+    the store answers and the kill switch reads clear.
+  - If even the suspension cannot be written, the error stops the pass
+    (exit 2, "a human must look") without ending the attempt.
 - Both checks are guarded on the watcher thread, which is a boundary: an
   exception that escaped would end the thread silently, and every later
   check with it.

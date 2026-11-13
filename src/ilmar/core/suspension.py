@@ -29,6 +29,7 @@ def resume_blocker(
     provider_cap_raised: bool,
     kill_switch_present: bool,
     restart_breach: str | None = None,
+    check_fault_resolved: bool = False,
 ) -> str | None:
     """Why ``suspension`` may not be lifted now, or ``None`` if it may."""
     reason = suspension.reason
@@ -56,6 +57,17 @@ def resume_blocker(
         return None
     if reason is SuspensionReason.KILL_SWITCH:
         return "the kill-switch file still exists" if kill_switch_present else None
+    if reason is SuspensionReason.SUSPENSION_CHECK_FAILED:
+        # Operator intervention, then the check itself: the store answered (the
+        # caller read this suspension from it) and the kill switch reads clear.
+        if not check_fault_resolved:
+            return (
+                "the suspension check failed while an agent ran; find and fix the cause "
+                "(see the event log), then confirm with --check-fault-resolved"
+            )
+        if kill_switch_present:
+            return "the kill switch is engaged or cannot be checked"
+        return None
     if reason is SuspensionReason.RESTART_LOOP:
         # ADR-0033 §3: lifted only when the start log shows no breach in its windows.
         return None if restart_breach is None else f"the start log still shows {restart_breach}"

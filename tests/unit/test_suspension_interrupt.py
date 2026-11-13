@@ -27,6 +27,7 @@ from ilmar.core import kill_switch
 from ilmar.core.cancel_inbox import Reading
 from ilmar.core.cancellation import Cancellations
 from ilmar.core.coordinator import ExitCode
+from ilmar.core.suspension import resume_blocker
 from ilmar.domain.budget import BudgetLimits, ChargeKind, Suspension, SuspensionReason
 from ilmar.domain.events import Actor, ActorKind, EventContext, EventType
 from ilmar.domain.execution import ExecutionState
@@ -143,35 +144,81 @@ def on_watcher_thread() -> bool:
     return threading.current_thread().name.startswith("ilmar-watch-")
 
 
-def test_a_failing_suspension_check_stops_the_agent_and_freezes_nothing(
+def test_a_failing_suspension_check_suspends_the_instance_and_exits_78(
     setup: Setup, agent: WaitingAgent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#122 review: a suspension check that fails while the agent runs stops it
-    (fail closed). Nothing is frozen; the attempt is retried under the limits."""
+    and durably suspends the whole instance; the pass exits 78. The task and its
+    charged reservation are kept; nothing is retried before an operator resumes
+    and the check succeeds again."""
     real = setup.store.suspension
+    failing = [True]
 
     def suspension() -> Suspension | None:
-        if on_watcher_thread():
+        if failing[0] and on_watcher_thread():
             raise sqlite3.OperationalError("database is locked")
         return real()
 
     monkeypatch.setattr(setup.store, "suspension", suspension)
-    setup.coordinator(budget=LIMITS, watch_interval_seconds=0.05).run_once()
+    coordinator = setup.coordinator(budget=LIMITS, watch_interval_seconds=0.05)
+    report = coordinator.run_once()
+    assert report.code is ExitCode.SUSPENDED
     assert agent.stops[0] is not None
     assert agent.stops[0].is_set()
     assert agent.stopped_at - agent.submitted_at < agent.patience  # stopped, not finished
-    # Every attempt is stopped the same way and retried under the existing
-    # limits; none is frozen, and the last one fails the execution closed.
+    held = setup.store.suspension()
+    assert held is not None
+    assert held.reason is SuspensionReason.SUSPENSION_CHECK_FAILED
+    assert "OperationalError" in held.detail
+    interrupted_retry(setup)  # RETRY_WAIT at attempt 1, nothing frozen, claim kept
+    assert agent.runs == 1  # no automatic retry
+    assert [c.attempt for c in setup.store.charges("e1")] == [1]  # kept, never refunded
+    suspended = [e for e in setup.store.events() if e.type is EventType.INSTANCE_SUSPENDED]
+    assert [e.reason for e in suspended] == ["suspension-check-failed"]
+
+    # Later passes start nothing and reserve nothing while it is in force.
+    assert coordinator.run_once().code is ExitCode.SUSPENDED
+    assert agent.runs == 1
+    assert [c.attempt for c in setup.store.charges("e1")] == [1]
+
+    # Only an operator lifts it, once the check succeeds; then the task is
+    # retried with a fresh reservation under the usual limits.
+    blocked = resume_blocker(held, now=setup.clock(), totals=setup.store.budget_totals(
+        setup.clock()), limits=LIMITS, latest_update=None, provider_cap_raised=False,
+        kill_switch_present=False)  # fmt: skip
+    assert blocked is not None
+    assert "--check-fault-resolved" in blocked
+    failing[0] = False
+    setup.store.commit(setup.ownership.fence, Commit(resume=setup.clock()),
+                       context=operator(setup))  # fmt: skip
+    agent.patience = 0.0
+    report = coordinator.run_once()
+    assert report.code is ExitCode.SUCCESS, report.summary
     execution = setup.store.get("e1")
     assert execution is not None
-    assert execution.state is S.FAILED
-    assert agent.runs == execution.attempt
-    retries = [e.reason for e in setup.store.events(execution_id="e1")
-               if e.type is EventType.EXECUTION_TRANSITIONED
-               and e.data.get("to") == S.RETRY_WAIT.value]  # fmt: skip
-    assert retries == ["suspension-check-failed"] * (execution.attempt - 1)
-    assert K.FREEZE_CANDIDATE not in [o.kind for o in setup.store.operations("e1")]
-    assert setup.tasks.held_claims() == ()  # released only by the final failure
+    assert (execution.state, execution.attempt) == (S.SUCCEEDED, 2)
+    assert [c.attempt for c in setup.store.charges("e1")] == [1, 2]
+
+
+def test_a_failing_check_suspends_even_with_one_attempt_left(
+    setup: Setup, agent: WaitingAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check failure suspends; it never consumes retries until the task fails."""
+    real = setup.store.suspension
+
+    def suspension() -> Suspension | None:
+        if on_watcher_thread():
+            raise RuntimeError("unexpected")
+        return real()
+
+    monkeypatch.setattr(setup.store, "suspension", suspension)
+    report = setup.coordinator(budget=LIMITS, watch_interval_seconds=0.05,
+                               max_attempts=3).run_once()  # fmt: skip
+    assert report.code is ExitCode.SUSPENDED
+    assert agent.runs == 1
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is S.RETRY_WAIT
 
 
 def test_a_failing_inbox_read_never_hides_the_kill_switch(
@@ -199,3 +246,32 @@ def test_a_failing_inbox_read_never_hides_the_kill_switch(
     assert agent.stops[0].is_set()
     assert report.code is ExitCode.SUSPENDED
     interrupted_retry(setup)
+
+
+def test_a_suspension_that_cannot_be_written_stops_the_pass_and_ends_nothing(
+    setup: Setup, agent: WaitingAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed when even the suspension fails: the pass stops and the
+    attempt is not ended, so nothing is retried, frozen or published."""
+    real_suspension, real_commit = setup.store.suspension, setup.store.commit
+
+    def suspension() -> Suspension | None:
+        if on_watcher_thread():
+            raise sqlite3.OperationalError("database is locked")
+        return real_suspension()
+
+    def commit(*args: object, **kwargs: object) -> object:
+        change = args[1] if len(args) > 1 else kwargs.get("commit")
+        if isinstance(change, Commit) and change.suspend is not None:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_commit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(setup.store, "suspension", suspension)
+    monkeypatch.setattr(setup.store, "commit", commit)
+    report = setup.coordinator(budget=LIMITS, watch_interval_seconds=0.05).run_once()
+    assert report.code is ExitCode.BLOCKED
+    assert agent.runs == 1
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is S.RUNNING_AGENT  # not ended: the journal shows where it stopped
+    assert K.FREEZE_CANDIDATE not in [o.kind for o in setup.store.operations("e1")]

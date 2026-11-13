@@ -330,7 +330,7 @@ class _Run:
         """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
         self.watch_failure: str | None = None
         """Set when the watcher stopped the agent because its suspension check
-        failed. Lost on a crash, when the stopped run fails closed instead."""
+        failed; the ``suspension-check-failed`` suspension is then written."""
 
     # -- durable state --------------------------------------------------------------
 
@@ -449,16 +449,22 @@ class _Run:
 
     def record_kill_switch(self) -> None:
         """Write the ``kill-switch`` suspension unless one is already in force."""
-        if self.store.suspension() is None:
-            suspension = Suspension(SuspensionReason.KILL_SWITCH, self.w.clock(),
-                                    detail="the kill-switch file exists")  # fmt: skip
-            try:
-                self.w.effects.journal.record(
-                    Commit(suspend=suspension), lease=self.lease, execution_id=self.id
-                )
-            except LedgerIntegrityError:
-                if self.store.suspension() is None:  # not a concurrent suspension: a real fault
-                    raise
+        self.record_suspension(SuspensionReason.KILL_SWITCH, "the kill-switch file exists")
+
+    def record_suspension(self, reason: SuspensionReason, detail: str) -> None:
+        """Write a suspension unless one is already in force.
+
+        The store refuses a second suspension, so a refusal with one in force is
+        a concurrent suspension, not a fault. Any other failure propagates: the
+        attempt is not ended, and the pass stops (fail closed)."""
+        suspension = Suspension(reason, self.w.clock(), detail=detail)
+        try:
+            self.w.effects.journal.record(
+                Commit(suspend=suspension), lease=self.lease, execution_id=self.id
+            )
+        except LedgerIntegrityError:
+            if self.store.suspension() is None:  # not a concurrent suspension: a real fault
+                raise
 
     # -- the loop -------------------------------------------------------------------
 
@@ -676,15 +682,11 @@ class _Run:
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted
-        if result.outcome is AgentOutcome.CANCELLED and self.watch_failure is not None:
-            # The watcher could not tell whether a suspension is in force and
-            # stopped the agent (fail closed). Not frozen; retried under the
-            # existing limits, and every later start checks again first.
-            raise TransientError(
-                f"the suspension check failed while the agent ran: {self.watch_failure}",
-                code=SUSPENSION_CHECK_FAILED,
-            )
-        if result.outcome is AgentOutcome.CANCELLED and self.suspension_reason() is not None:
+        if result.outcome is AgentOutcome.CANCELLED and (
+            # The watcher's check failed: the suspension it wrote is in force, and
+            # the check is not trusted to say so again.
+            self.watch_failure is not None or self.suspension_reason() is not None
+        ):
             # Stopped while a suspension is in force, and no human cancellation is
             # pending or recorded (the safe point above would have ended it). Not
             # frozen; retried, with a fresh reservation, only after ``ilmar resume``.
@@ -729,7 +731,13 @@ class _Run:
             elif watcher.suspended_by == SuspensionReason.KILL_SWITCH.value:
                 self.record_kill_switch()  # durable before the attempt is ended
             elif watcher.suspended_by == SUSPENSION_CHECK_FAILED:
+                # #122 review: the whole instance is suspended, durably, before the
+                # attempt is ended; it is preserved for a retry after resume.
                 self.watch_failure = type(watcher.check_error).__name__
+                self.record_suspension(
+                    SuspensionReason.SUSPENSION_CHECK_FAILED,
+                    f"the suspension check failed while an agent ran ({self.watch_failure})",
+                )
 
     def freeze(self, execution: Execution, name: str) -> None:
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)

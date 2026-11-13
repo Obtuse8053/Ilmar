@@ -66,6 +66,12 @@ def add_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         action="store_true",
         help="for a provider-cap suspension: you confirm the provider's cause is resolved",
     )
+    resume.add_argument(
+        "--check-fault-resolved",
+        action="store_true",
+        help="for a suspension-check-failed suspension: you confirm its cause is fixed; "
+        "the check must also succeed now",
+    )
     budget = commands.add_parser("budget", help="show charges, allowances and any suspension")
     budget.add_argument("--config", required=True, help="the configuration file")
 
@@ -145,6 +151,7 @@ def run(
                 limits=limits,
                 latest_update=store.latest_update(),
                 provider_cap_raised=args.provider_cap_resolved,
+                check_fault_resolved=args.check_fault_resolved,
                 kill_switch_present=kill_switch.checker(
                     config.budget.kill_switch_file if config.budget else None
                 )(),
