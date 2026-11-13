@@ -81,7 +81,14 @@ Hard gates that stay in force:
     refunded.
   - **Suspension:** a durable suspension (budget-daily, budget-monthly,
     provider-cap, operator and the rest) refuses every admission in the
-    store. The pass exits 78.
+    store. The pass exits 78, including the pass whose own reservation used
+    up the allowance.
+  - **What a suspension holds:** recovery runs before the suspension check,
+    so the journal holds new work for executions it resumes too. Claiming,
+    starting containers, agent runs, verification runs and publication wait
+    where they are, writing nothing. Cleanup still runs: releasing claims,
+    notes, stopping containers, freezing a finished agent's output, deleting
+    workspaces and cancellation.
   - **Provider refusals:** a provider refusal fails its execution and
     suspends with `provider-cap` in the same commit.
   - **Commands:** `ilmar suspend|resume --as NAME` and `ilmar budget`.

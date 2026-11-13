@@ -72,23 +72,27 @@ def test_without_a_budget_nothing_is_charged(setup: Setup) -> None:
     assert reserved(setup) == []
 
 
-def test_exhaustion_exactly_at_the_limit_suspends_before_any_claim(setup: Setup) -> None:
-    """Two reservations fill the daily allowance exactly; the third pass suspends
-    with ``budget-daily``, claims and starts nothing, and exits 78."""
+def test_the_pass_that_consumes_the_last_reservation_exits_78(setup: Setup) -> None:
+    """#113 review: two reservations fill the daily allowance exactly. The second
+    pass finishes its execution, suspends with ``budget-daily`` and exits 78 in
+    that same pass. Later passes claim and start nothing, and also exit 78."""
     setup.agent.plan = [(AgentOutcome.COMPLETED, FIXED)]
     coordinator = setup.coordinator(budget=LIMITS)
     assert coordinator.run_once().code is ExitCode.SUCCESS
-    assert coordinator.run_once().code is ExitCode.SUCCESS
+    assert setup.store.suspension() is None  # one more reservation still fits
+    second = coordinator.run_once()
+    assert second.code is ExitCode.SUSPENDED
+    assert [r.outcome for r in second.results] == [Outcome.PUBLISHED, Outcome.SUSPENDED]
+    assert "suspended (budget-daily)" in second.summary
     assert setup.store.budget_totals(setup.clock.now).day_micros == LIMITS.daily_micros
-    report = coordinator.run_once()
-    assert report.code is ExitCode.SUSPENDED
-    assert "suspended (budget-daily)" in report.summary
     suspension = setup.store.suspension()
     assert suspension is not None
     assert suspension.reason is SuspensionReason.BUDGET_DAILY
+    third = coordinator.run_once()
+    assert third.code is ExitCode.SUSPENDED
     assert len(setup.store.list_in_states(set(S))) == 2  # no third execution was created
     assert len(reserved(setup)) == 2
-    # Later passes stay suspended: a budget suspension never lifts by itself.
+    # A budget suspension never lifts by itself.
     assert coordinator.run_once().code is ExitCode.SUSPENDED
 
 
@@ -144,7 +148,8 @@ def test_a_provider_refusal_fails_and_suspends_in_one_commit(setup: Setup) -> No
     assert suspended.seq == failed.seq + 1  # the same commit, in order
     assert suspended.reason == "provider-cap"
     assert setup.coordinator(budget=LIMITS).run_once().code is ExitCode.SUSPENDED
-    assert report.code in (ExitCode.FAILURE, ExitCode.SUSPENDED)
+    assert report.code is ExitCode.SUSPENDED  # in the pass that suspended (#113 review)
+    assert [r.outcome for r in report.results].count(Outcome.SUSPENDED) == 1
 
 
 def blocker(

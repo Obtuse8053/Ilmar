@@ -291,7 +291,13 @@ class Coordinator:
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)
-                self.suspend_if_exhausted([result], self._clock())
+                after = self.suspend_if_exhausted([result], self._clock())
+                if after is not None and result.outcome is not Outcome.SUSPENDED:
+                    # Suspended by this attempt's own reservation, or by the provider
+                    # refusing it: the pass still ends with 78 (ADR-0030).
+                    results.append(WorkerResult("admission", Outcome.SUSPENDED,
+                                                f"new work is suspended ({after.reason.value})",
+                                                code=after.reason.value))  # fmt: skip
         orphans = f"released {released} orphaned claim(s)" if released else ""
         if not results:
             summary = orphans or "no eligible task"
