@@ -1,49 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Worst-case spending control for the model gateway (ADR-0037 §2, #111 P5).
+"""Spending control for the model gateway (ADR-0037 §2, #111 P5).
 
 Like ``model_gateway.py``, this module runs inside the gateway sidecar, so it
 uses only the standard library and never imports ``ilmar``.
 
-**The guarantee.** One sandbox attempt has a budget ``B`` in micro-dollars, its
-ledger reservation. The gateway forwards a request only if
+**What is hard and what is estimated.** One sandbox attempt has a budget ``B``
+in micro-dollars, its ledger reservation.
 
-    settled + in flight + worst case(request) <= B
+* *Output is bounded by the provider.* A response never has more output
+  tokens than the request's ``max_tokens``; thinking counts within it. The
+  gateway sets ``max_tokens`` itself (below), so the output term of every
+  forwarded request is a hard bound, at the output rate.
+* *Input is only estimated.* What the provider bills as input is not a
+  function of the request's bytes that anyone outside the provider can prove:
+  it adds its own system and tool prompts and message framing, and tokenizes
+  in its own way. So the input term is an **estimate**: the body's bytes, plus
+  per-message, tool-prompt and (when allowed) per-image allowances, at the
+  dearest input-side rate (input, either cache write or cache read; scaled to
+  the long-context rates above the model's threshold).
 
-and settles each finished request at no more than the worst case it reserved.
-So the attempt's provider spend is at most ``B``, whatever the agent sends.
+**The rule.** A request is forwarded only if
 
-**A request's worst case** (``worst_case``):
+    settled + in flight + this request's reservation <= B
 
-* *Input:* every token of input is bounded by the request body's size in bytes
-  (a token is at least one byte of the JSON text that carries it), plus a fixed
-  allowance per image block and one per request for the provider's hidden
-  tool prompt. That bound is charged at the highest input-side rate of the
-  model: input, 5-minute cache write, 1-hour cache write or cache read. When
-  the bound passes the model's long-context threshold, every input-side rate
-  is scaled by the long-context input rate over the standard one, as in
-  settlement; a price table without long-context rates refuses such a request.
-* *Output:* ``max_tokens`` at the output rate (at the long-context output rate
-  where that applies). Thinking is billed as output and counts against
-  ``max_tokens``, so it is inside this term.
+and only while the attempt is not *halted*. Each finished request is charged
+what the provider reported, in full, never capped at its reservation:
+
+* a complete, valid usage report is charged at the attested prices;
+* a missing, partial, malformed or unrecognised report, or a stream cut off
+  before ``message_stop``, is charged its whole reservation, even when
+  ``message_stop`` arrived;
+* a report that costs more than the reservation (the estimate was wrong) is
+  charged in full, recorded as an *overrun*, and **halts the attempt**: the
+  gateway forwards nothing more for it.
+
+**The guarantee that follows.** The attempt's spend is at most ``B`` plus the
+overruns of the requests in flight when the first overrun was seen; with
+``max_in_flight`` 1, at most one request's overrun. The size of an overrun has
+no bound this gateway can prove. That is why the provider's own workspace
+spend cap stays the hard backstop (ADR-0029 §5), and why an overrun is an
+operator-visible event that also reaches the coordinator's ledger as an extra
+charge (P5 part 2).
 
 **What is refused** (never forwarded): a model without an attested price; any
-top-level field outside the allow-list; server tools (any tool with a ``type``
-other than ``custom``); documents, URL images, search results and every other
-content type outside the allow-list; a ``service_tier`` other than
-``standard_only``; ``mcp_servers`` and ``container``; a thinking budget that is
-not below ``max_tokens``; and a body that is not one JSON object.
+top-level field outside the allow-list; server tools; documents, URL images,
+search results and every other content type outside the allow-list; images
+unless the operator attested a per-image token bound; a ``service_tier`` other
+than ``standard_only``; ``mcp_servers`` and ``container``; a thinking budget
+not below ``max_tokens``; a body that is not one JSON object; and any
+``anthropic-beta`` feature not on the operator's allow-list, or in a family
+known to be billed separately (``BILLED_BETA_FAMILIES``).
 
-**What is constrained.** ``max_tokens`` is first lowered to the operator's
-``max_output_tokens``. If the request still does not fit the budget, it is
-lowered to the largest value that does, but never below ``min_output_tokens``.
-Below that it is refused (``RequestRefused``, kind ``budget_exceeded``). Every
-lowering is reported in ``Admitted.capped_from``, for the gateway to log.
-
-**Settlement** (``settle``) charges the usage the provider reported, at the
-rates of the request's model, and never more than the request's reservation. A
-response without a complete usage report (a stream cut off before
-``message_stop``, an unreadable body, an error after billing began) keeps its
-full reservation.
+**What is constrained.** ``max_tokens`` is lowered to ``max_output_tokens``,
+then, if needed, to the largest value that fits ``B``, never below
+``min_output_tokens``; below that, the request is refused
+(``budget_exceeded``). Every lowering is reported in ``Admitted.capped_from``.
 
 Prices are integers: micro-dollars per million tokens. Costs are integers in
 micro-dollars, always rounded up.
@@ -53,7 +64,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +84,25 @@ CONTENT_TYPES = frozenset(
 """``document``, ``search_result``, server-tool blocks and anything new are refused."""
 TOOL_RESULT_TYPES = frozenset({"text", "image"})
 THINKING_TYPES = frozenset({"enabled", "disabled", "adaptive"})
+BILLED_BETA_FAMILIES = (
+    "context-1m",  # long-context pricing
+    "code-execution",  # billed container time
+    "web-search",
+    "web-fetch",
+    "mcp-client",  # remote tools
+    "files-api",  # stored files read by the provider
+    "computer-use",  # a hidden tool prompt and screenshots
+    "skills",
+)
+"""Refused even when the operator allows them: priced outside this module's model."""
+USAGE_KEYS = frozenset(
+    {
+        "input_tokens", "output_tokens", "cache_creation_input_tokens",
+        "cache_read_input_tokens", "cache_creation", "server_tool_use", "service_tier",
+    }
+)  # fmt: skip
+"""A usage report with any other key is not understood and keeps the reservation."""
+CACHE_CREATION_KEYS = frozenset({"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,19 +122,32 @@ class ModelPrice:
     def __post_init__(self) -> None:
         rates = (self.input, self.output, self.cache_write_5m, self.cache_write_1h,
                  self.cache_read)  # fmt: skip
-        if not all(isinstance(r, int) and r > 0 for r in rates):
+        if not all(_count(r) and r > 0 for r in rates):
             raise ValueError("every rate is a positive integer")
         long = (self.long_context_threshold, self.long_context_input, self.long_context_output)
-        if any(v is not None for v in long) and not all(isinstance(v, int) and v > 0 for v in long):
+        if any(v is not None for v in long) and not all(
+            isinstance(v, int) and _count(v) and v > 0 for v in long
+        ):
             raise ValueError("long-context pricing needs a threshold and both rates")
-
-    @property
-    def top_input(self) -> int:
-        return max(self.input, self.cache_write_5m, self.cache_write_1h, self.cache_read)
 
     def long_context(self, input_tokens: int) -> bool:
         threshold = self.long_context_threshold
         return threshold is not None and input_tokens > threshold
+
+    def input_rates(self, input_tokens: int) -> tuple[int, int, int, int]:
+        """Input, 5-minute write, 1-hour write and read rates at this input size:
+        above the threshold, each scaled by long-context input / input, rounded up."""
+        rates = (self.input, self.cache_write_5m, self.cache_write_1h, self.cache_read)
+        if not self.long_context(input_tokens) or self.long_context_input is None:
+            return rates
+        scale = self.long_context_input
+        first, second, third, fourth = (-(-r * scale // self.input) for r in rates)
+        return first, second, third, fourth
+
+    def output_rate(self, input_tokens: int) -> int:
+        if not self.long_context(input_tokens) or self.long_context_output is None:
+            return self.output
+        return max(self.output, self.long_context_output)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,18 +155,27 @@ class AdmissionPolicy:
     prices: Mapping[str, ModelPrice]
     max_output_tokens: int = 32_000
     min_output_tokens: int = 1_024
-    image_tokens: int = 2_000
-    """An allowance per image block, above what its base64 bytes already count."""
     tool_overhead_tokens: int = 1_000
-    """The provider's hidden system prompt for tool use, per request."""
+    """The provider's hidden tool-use prompt, per request with tools (an estimate)."""
+    message_overhead_tokens: int = 32
+    """Framing per message, content block and system block (an estimate)."""
+    image_tokens: int | None = None
+    """An attested bound per image block; ``None`` refuses images."""
+    allowed_betas: frozenset[str] = frozenset()
+    """``anthropic-beta`` values the operator reviewed; any other is refused."""
 
     def __post_init__(self) -> None:
         if not self.prices:
             raise ValueError("at least one priced model is needed")
         if not 1 <= self.min_output_tokens <= self.max_output_tokens:
             raise ValueError("need 1 <= min_output_tokens <= max_output_tokens")
-        if self.image_tokens < 0 or self.tool_overhead_tokens < 0:
+        if self.tool_overhead_tokens < 0 or self.message_overhead_tokens < 0:
             raise ValueError("allowances must not be negative")
+        if self.image_tokens is not None and self.image_tokens < 1:
+            raise ValueError("image_tokens must be positive, or None to refuse images")
+        billed = sorted(b for b in self.allowed_betas if _billed_beta(b))
+        if billed:
+            raise ValueError(f"beta features billed separately cannot be allowed: {billed}")
 
 
 class RequestRefused(Exception):  # noqa: N818 - a refusal, answered to the client
@@ -141,9 +193,22 @@ class Admitted:
     """The body to forward: the original bytes, or re-encoded with a lower ``max_tokens``."""
     reservation: int
     model: str
+    max_tokens: int
+    input_estimate: int
     capped_from: int | None = None
     """The ``max_tokens`` the client asked for, when it was lowered."""
-    max_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Settled:
+    charged: int
+    reservation: int
+    reason: str
+    """``reported``, or why the whole reservation was kept (``incomplete``, a usage problem)."""
+
+    @property
+    def overrun(self) -> int:
+        return max(0, self.charged - self.reservation)
 
 
 @dataclass
@@ -153,6 +218,8 @@ class Budget:
     limit: int
     policy: AdmissionPolicy
     settled: int = 0
+    overruns: int = 0
+    halted: bool = False
     in_flight: dict[int, int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _next: int = 0
@@ -161,19 +228,28 @@ class Budget:
         if self.limit < 1:
             raise ValueError("the attempt's budget must be positive")
 
-    def admit(self, body: bytes) -> tuple[int, Admitted]:
+    def admit(self, body: bytes, betas: Iterable[str] = ()) -> tuple[int, Admitted]:
         """Check, constrain and reserve; ``(ticket, admitted)``, or ``RequestRefused``."""
+        _check_betas(betas, self.policy)
         request = parse(body)
-        model, _price, input_cost, output_rate, requested = assess(request, len(body), self.policy)
+        model, price, input_tokens, requested = assess(request, len(body), self.policy)
+        input_cost = _cost(input_tokens, max(price.input_rates(input_tokens)))
+        output_rate = price.output_rate(input_tokens)
         wanted = min(requested, self.policy.max_output_tokens)
         with self._lock:
+            if self.halted:
+                raise RequestRefused(
+                    "budget_exceeded",
+                    "this attempt is stopped: a request cost more than its reservation",
+                    status=429,
+                )
             room = self.limit - self.settled - sum(self.in_flight.values()) - input_cost
             affordable = room * MILLION // output_rate if room > 0 else 0
             granted = min(wanted, affordable)
             if granted < self.policy.min_output_tokens:
                 raise RequestRefused(
                     "budget_exceeded",
-                    "this attempt's model budget cannot cover the request's worst case",
+                    "this attempt's model budget cannot cover the request's reservation",
                     status=429,
                 )
             _check_thinking(request, granted)
@@ -184,20 +260,27 @@ class Budget:
         if granted != requested:
             request["max_tokens"] = granted
             rewritten = json.dumps(request, separators=(",", ":"), ensure_ascii=False).encode()
-            if len(rewritten) > len(body):  # the input bound was taken from the original
-                self.settle(ticket, 0)
+            if len(rewritten) > len(body):  # the estimate was taken from the original
+                self.release(ticket)
                 raise RequestRefused("invalid_request_error", "the request cannot be re-encoded")
             body = rewritten
         capped = requested if granted != requested else None
-        return ticket, Admitted(body, reservation, model, capped, granted)
+        return ticket, Admitted(body, reservation, model, granted, input_tokens, capped)
 
-    def settle(self, ticket: int, charge: int) -> int:
-        """Close a request at ``charge``, never above its reservation. Returns the charge."""
+    def settle(self, ticket: int, settled: Settled) -> Settled:
+        """Close a request at what it cost, in full. An overrun halts the attempt."""
         with self._lock:
-            reserved = self.in_flight.pop(ticket)
-            charged = min(max(charge, 0), reserved)
-            self.settled += charged
-            return charged
+            self.in_flight.pop(ticket)
+            self.settled += settled.charged
+            if settled.overrun:
+                self.overruns += settled.overrun
+                self.halted = True
+        return settled
+
+    def release(self, ticket: int) -> None:
+        """Drop the reservation of a request that was never sent."""
+        with self._lock:
+            self.in_flight.pop(ticket)
 
     def spent(self) -> int:
         with self._lock:
@@ -205,6 +288,17 @@ class Budget:
 
 
 # -- checking a request ---------------------------------------------------------------
+
+
+def _billed_beta(beta: str) -> bool:
+    return any(beta.startswith(family) for family in BILLED_BETA_FAMILIES)
+
+
+def _check_betas(betas: Iterable[str], policy: AdmissionPolicy) -> None:
+    for value in betas:
+        for beta in (b.strip() for b in value.split(",")):
+            if beta and (_billed_beta(beta) or beta not in policy.allowed_betas):
+                raise RequestRefused("invalid_request_error", f"beta feature not allowed: {beta}")
 
 
 def parse(body: bytes) -> dict[str, Any]:
@@ -219,8 +313,8 @@ def parse(body: bytes) -> dict[str, Any]:
 
 def assess(
     request: Mapping[str, Any], body_bytes: int, policy: AdmissionPolicy
-) -> tuple[str, ModelPrice, int, int, int]:
-    """Validate; return model, price, worst input cost, output rate and requested max."""
+) -> tuple[str, ModelPrice, int, int]:
+    """Validate; return the model, its price, the input estimate and the requested max."""
     unknown = sorted(set(request) - TOP_LEVEL_FIELDS)
     if unknown:
         raise RequestRefused("invalid_request_error", f"field not allowed here: {unknown[0]}")
@@ -229,35 +323,26 @@ def assess(
     if price is None or not isinstance(model, str):
         raise RequestRefused("permission_error", "model not allowed by this gateway", 403)
     requested = request.get("max_tokens")
-    if not isinstance(requested, int) or isinstance(requested, bool) or requested < 1:
+    if not isinstance(requested, int) or not _count(requested) or requested < 1:
         raise RequestRefused("invalid_request_error", "max_tokens must be a positive integer")
     if request.get("service_tier", "standard_only") != "standard_only":
         raise RequestRefused("invalid_request_error", "only the standard service tier")
-    images = _images(request)
+    images, units = _content(request)
+    if images and policy.image_tokens is None:
+        raise RequestRefused("invalid_request_error", "images are not allowed by this gateway")
     tools = request.get("tools")
     if tools is not None:
         _check_tools(tools)
     _check_thinking_shape(request.get("thinking"))
     input_tokens = (
-        body_bytes + images * policy.image_tokens + (policy.tool_overhead_tokens if tools else 0)
+        body_bytes
+        + units * policy.message_overhead_tokens
+        + images * (policy.image_tokens or 0)
+        + (policy.tool_overhead_tokens if tools else 0)
     )
-    if price.long_context(input_tokens):
-        assert price.long_context_input is not None  # noqa: S101 - checked in ModelPrice
-        assert price.long_context_output is not None  # noqa: S101
-        # Settlement scales every input-side rate by long-context input / input;
-        # the reservation must use the dearest of them, scaled the same way.
-        in_rate = -(-price.top_input * price.long_context_input // price.input)
-        out_rate = max(price.output, price.long_context_output)
-    elif price.long_context_threshold is None and _over_any_threshold(input_tokens):
+    if price.long_context_threshold is None and input_tokens > 200_000:
         raise RequestRefused("request_too_large", "too large for this model's attested prices", 413)
-    else:
-        in_rate, out_rate = price.top_input, price.output
-    return model, price, _cost(input_tokens, in_rate), out_rate, requested
-
-
-def _over_any_threshold(input_tokens: int) -> bool:
-    """Without long-context prices, nothing above the standard window is priced."""
-    return input_tokens > 200_000
+    return model, price, input_tokens, requested
 
 
 def _check_tools(tools: object) -> None:
@@ -276,7 +361,7 @@ def _check_thinking_shape(thinking: object) -> None:
     if not isinstance(thinking, dict) or thinking.get("type") not in THINKING_TYPES:
         raise RequestRefused("invalid_request_error", "thinking type not allowed")
     budget = thinking.get("budget_tokens")
-    if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool)):
+    if budget is not None and not _count(budget):
         raise RequestRefused("invalid_request_error", "thinking budget must be an integer")
 
 
@@ -290,13 +375,18 @@ def _check_thinking(request: Mapping[str, Any], max_tokens: int) -> None:
         )
 
 
-def _images(request: Mapping[str, Any]) -> int:
-    """Count image blocks; refuse any content type outside the allow-list."""
-    count = 0
+def _content(request: Mapping[str, Any]) -> tuple[int, int]:
+    """(image blocks, framing units); refuse anything outside the allow-list.
+    A framing unit is a system block, a message or a content block."""
+    images = 0
+    units = 0
     system = request.get("system")
     if isinstance(system, list):
-        count += _blocks(system)
-    elif system is not None and not isinstance(system, str):
+        images += _blocks(system)
+        units += len(system)
+    elif isinstance(system, str):
+        units += 1
+    elif system is not None:
         raise RequestRefused("invalid_request_error", "system must be text or blocks")
     messages = request.get("messages")
     if not isinstance(messages, list):
@@ -304,12 +394,14 @@ def _images(request: Mapping[str, Any]) -> int:
     for message in messages:
         if not isinstance(message, dict):
             raise RequestRefused("invalid_request_error", "a message must be an object")
+        units += 1
         content = message.get("content")
         if isinstance(content, list):
-            count += _blocks(content)
+            images += _blocks(content)
+            units += len(content)
         elif not isinstance(content, str):
             raise RequestRefused("invalid_request_error", "content must be text or blocks")
-    return count
+    return images, units
 
 
 def _blocks(blocks: list[Any], allowed: frozenset[str] = CONTENT_TYPES) -> int:
@@ -337,8 +429,20 @@ def _blocks(blocks: list[Any], allowed: frozenset[str] = CONTENT_TYPES) -> int:
 
 @dataclass
 class UsageMeter:
-    """Reads the usage a response reports, streamed or not. ``complete`` only
-    once the provider has said the message ended."""
+    """Reads the usage a response reports, streamed or not.
+
+    A report is *valid* only when it is complete and every field is understood:
+
+    * streamed: ``message_start`` with a usage that has integer ``input_tokens``
+      and ``output_tokens``, at least one ``message_delta`` with an integer
+      ``output_tokens``, then ``message_stop``;
+    * plain: a ``message`` with a ``stop_reason`` and such a usage.
+
+    Anything else makes it invalid: a missing or partial usage, a count that is
+    not a non-negative integer, an unknown usage field, server-tool use, a tier
+    other than ``standard``, cache writes that do not add up, an ``error``
+    event, or an unreadable event or body.
+    """
 
     streamed: bool
     input_tokens: int = 0
@@ -346,10 +450,16 @@ class UsageMeter:
     cache_write_1h: int = 0
     cache_read: int = 0
     output_tokens: int = 0
-    server_tool_use: bool = False
-    complete: bool = False
+    started: bool = False
+    delta: bool = False
+    stopped: bool = False
+    invalid: str = ""
     _buffer: bytes = b""
     _plain: bytearray = field(default_factory=bytearray)
+
+    @property
+    def valid(self) -> bool:
+        return not self.invalid and self.started and self.delta and self.stopped
 
     def feed(self, chunk: bytes) -> None:
         if not self.streamed:
@@ -367,77 +477,112 @@ class UsageMeter:
         try:
             message = json.loads(bytes(self._plain))
         except ValueError:
+            self._bad("body unreadable")
             return
-        if isinstance(message, dict) and message.get("type") == "message":
-            self._usage(message.get("usage"))
-            self.complete = message.get("stop_reason") is not None
+        if not isinstance(message, dict) or message.get("type") != "message":
+            self._bad("not a message")
+            return
+        self._usage(message.get("usage"), start=True)
+        self.delta = self.started  # a plain message reports its final usage at once
+        self.stopped = message.get("stop_reason") is not None
+
+    def _bad(self, why: str) -> None:
+        self.invalid = self.invalid or why
 
     def _event(self, data: bytes) -> None:
         try:
             event = json.loads(data)
         except ValueError:
+            self._bad("event unreadable")
             return
         if not isinstance(event, dict):
+            self._bad("event unreadable")
             return
         kind = event.get("type")
-        if kind == "message_start" and isinstance(event.get("message"), dict):
-            self._usage(event["message"].get("usage"))
+        if kind == "message_start":
+            message = event.get("message")
+            self._usage(message.get("usage") if isinstance(message, dict) else None, start=True)
         elif kind == "message_delta":
-            self._usage(event.get("usage"))
+            self._usage(event.get("usage"), start=False)
         elif kind == "message_stop":
-            self.complete = True
+            self.stopped = True
+        elif kind == "error":
+            self._bad("error event")
 
-    def _usage(self, usage: object) -> None:
+    def _usage(self, usage: object, *, start: bool) -> None:
         if not isinstance(usage, dict):
+            self._bad("usage missing")
             return
-
-        def number(key: str) -> int | None:
-            value = usage.get(key)
-            return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-        if (value := number("input_tokens")) is not None:
-            self.input_tokens = max(self.input_tokens, value)
-        if (value := number("cache_read_input_tokens")) is not None:
-            self.cache_read = max(self.cache_read, value)
-        if (value := number("output_tokens")) is not None:
-            self.output_tokens = max(self.output_tokens, value)  # cumulative in deltas
-        creation = usage.get("cache_creation")
-        if isinstance(creation, dict):
-            five = creation.get("ephemeral_5m_input_tokens")
-            hour = creation.get("ephemeral_1h_input_tokens")
-            self.cache_write_5m = max(self.cache_write_5m, five if isinstance(five, int) else 0)
-            self.cache_write_1h = max(self.cache_write_1h, hour if isinstance(hour, int) else 0)
-        elif (value := number("cache_creation_input_tokens")) is not None:
-            # No breakdown: charge every write at the dearer, 1-hour rate.
-            self.cache_write_1h = max(self.cache_write_1h, value)
+        unknown = sorted(set(usage) - USAGE_KEYS)
+        if unknown:
+            self._bad(f"usage field not understood: {unknown[0]}")
+            return
+        required = ("input_tokens", "output_tokens") if start else ("output_tokens",)
+        if not all(_count(usage.get(key)) for key in required):
+            self._bad("usage counts missing or invalid")
+            return
+        counts = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                  "cache_read_input_tokens")  # fmt: skip
+        if not all(usage.get(k) is None or _count(usage.get(k)) for k in counts):
+            self._bad("usage counts invalid")
+            return
+        if usage.get("service_tier") not in (None, "standard"):
+            self._bad("service tier not standard")
         tools = usage.get("server_tool_use")
-        if isinstance(tools, dict) and any(isinstance(v, int) and v > 0 for v in tools.values()):
-            self.server_tool_use = True
+        if tools is not None and (
+            not isinstance(tools, dict) or any(v != 0 for v in tools.values())
+        ):
+            self._bad("server tool use")
+
+        def number(key: str) -> int:
+            value = usage.get(key)
+            return value if isinstance(value, int) else 0
+
+        self.input_tokens = max(self.input_tokens, number("input_tokens"))
+        self.cache_read = max(self.cache_read, number("cache_read_input_tokens"))
+        self.output_tokens = max(self.output_tokens, number("output_tokens"))  # cumulative
+        writes = number("cache_creation_input_tokens")
+        creation = usage.get("cache_creation")
+        if creation is not None:
+            if (
+                not isinstance(creation, dict)
+                or set(creation) - CACHE_CREATION_KEYS
+                or not all(_count(v) for v in creation.values())
+            ):
+                self._bad("cache_creation invalid")
+                return
+            five = creation.get("ephemeral_5m_input_tokens", 0)
+            hour = creation.get("ephemeral_1h_input_tokens", 0)
+            if usage.get("cache_creation_input_tokens") is not None and writes != five + hour:
+                self._bad("cache writes do not add up")
+            self.cache_write_5m = max(self.cache_write_5m, five)
+            self.cache_write_1h = max(self.cache_write_1h, hour)
+        elif writes:
+            # No breakdown: charge every write at the dearer, 1-hour rate.
+            self.cache_write_1h = max(self.cache_write_1h, writes)
+        if start:
+            self.started = True
+        else:
+            self.delta = True
 
 
-def charge(meter: UsageMeter, price: ModelPrice, reservation: int) -> int:
-    """The cost of what the provider reported, or the full reservation when the
-    report is incomplete or shows something that was never allowed."""
-    if not meter.complete or meter.server_tool_use:
-        return reservation
+def charge(meter: UsageMeter, price: ModelPrice, reservation: int) -> Settled:
+    """What the request cost: its reported usage in full (above its reservation
+    too), or its whole reservation when the report is not complete and valid."""
+    if not meter.stopped:
+        return Settled(reservation, reservation, "incomplete")
+    if not meter.valid:
+        return Settled(reservation, reservation, meter.invalid or "usage incomplete")
     tokens = (meter.input_tokens, meter.cache_write_5m, meter.cache_write_1h, meter.cache_read)
     total_input = sum(tokens)
-    rates: tuple[int, ...] = (
-        price.input,
-        price.cache_write_5m,
-        price.cache_write_1h,
-        price.cache_read,
-    )
-    output_rate = price.output
-    if price.long_context(total_input):
-        assert price.long_context_input is not None  # noqa: S101 - checked in ModelPrice
-        assert price.long_context_output is not None  # noqa: S101
-        # Every input-side rate scales with the long-context input rate, rounded up.
-        rates = tuple(-(-r * price.long_context_input // price.input) for r in rates)
-        output_rate = price.long_context_output
+    rates = price.input_rates(total_input)
     cost = sum(_cost(t, r) for t, r in zip(tokens, rates, strict=True))
-    cost += _cost(meter.output_tokens, output_rate)
-    return min(cost, reservation)
+    cost += _cost(meter.output_tokens, price.output_rate(total_input))
+    return Settled(cost, reservation, "reported")
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _cost(tokens: int, rate: int) -> int:
@@ -448,4 +593,6 @@ def policy_from_json(text: str) -> AdmissionPolicy:
     """The policy the coordinator passes to the sidecar, as JSON."""
     data = json.loads(text)
     prices = {name: ModelPrice(**rates) for name, rates in data.pop("prices").items()}
+    if "allowed_betas" in data:
+        data["allowed_betas"] = frozenset(data["allowed_betas"])
     return AdmissionPolicy(prices=prices, **data)
