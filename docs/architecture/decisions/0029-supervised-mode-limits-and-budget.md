@@ -299,3 +299,17 @@ existing cancellation path". The maintainer decided instead:
 
 The effects a suspension holds, and those it still allows, are in the
 journal's `HELD_WHILE_SUSPENDED` (#113).
+
+**Failure handling in the watcher (maintainer review of #122, 2026-11-13).**
+
+- The watcher's two checks are independent. A failing cancellation-inbox
+  read, whatever it raises, never skips the kill-switch and suspension check.
+- A suspension check that fails stops the agent (fail closed), because
+  whether it may go on is unknown.
+  - The attempt ends with reason code `suspension-check-failed`. Its output
+    is never frozen.
+  - It is retried under the existing limits. Every later start checks the
+    kill switch and the suspension again first.
+- Both checks are guarded on the watcher thread, which is a boundary: an
+  exception that escaped would end the thread silently, and every later
+  check with it.

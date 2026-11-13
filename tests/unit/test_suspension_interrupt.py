@@ -14,6 +14,8 @@ resume (ADR-0029 §3 and §4; maintainer decision on #18, 2026-11-13).
 
 from __future__ import annotations
 
+import sqlite3
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -22,6 +24,8 @@ import pytest
 from coordinator_support import Setup, make_setup, task
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.core import kill_switch
+from ilmar.core.cancel_inbox import Reading
+from ilmar.core.cancellation import Cancellations
 from ilmar.core.coordinator import ExitCode
 from ilmar.domain.budget import BudgetLimits, ChargeKind, Suspension, SuspensionReason
 from ilmar.domain.events import Actor, ActorKind, EventContext, EventType
@@ -133,3 +137,65 @@ def test_the_existing_retry_limits_apply(setup: Setup, agent: WaitingAgent, tmp_
     execution = setup.store.get("e1")
     assert execution is not None
     assert execution.state is S.FAILED  # no attempt left: as for any interrupted attempt
+
+
+def on_watcher_thread() -> bool:
+    return threading.current_thread().name.startswith("ilmar-watch-")
+
+
+def test_a_failing_suspension_check_stops_the_agent_and_freezes_nothing(
+    setup: Setup, agent: WaitingAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#122 review: a suspension check that fails while the agent runs stops it
+    (fail closed). Nothing is frozen; the attempt is retried under the limits."""
+    real = setup.store.suspension
+
+    def suspension() -> Suspension | None:
+        if on_watcher_thread():
+            raise sqlite3.OperationalError("database is locked")
+        return real()
+
+    monkeypatch.setattr(setup.store, "suspension", suspension)
+    setup.coordinator(budget=LIMITS, watch_interval_seconds=0.05).run_once()
+    assert agent.stops[0] is not None
+    assert agent.stops[0].is_set()
+    assert agent.stopped_at - agent.submitted_at < agent.patience  # stopped, not finished
+    # Every attempt is stopped the same way and retried under the existing
+    # limits; none is frozen, and the last one fails the execution closed.
+    execution = setup.store.get("e1")
+    assert execution is not None
+    assert execution.state is S.FAILED
+    assert agent.runs == execution.attempt
+    retries = [e.reason for e in setup.store.events(execution_id="e1")
+               if e.type is EventType.EXECUTION_TRANSITIONED
+               and e.data.get("to") == S.RETRY_WAIT.value]  # fmt: skip
+    assert retries == ["suspension-check-failed"] * (execution.attempt - 1)
+    assert K.FREEZE_CANDIDATE not in [o.kind for o in setup.store.operations("e1")]
+    assert setup.tasks.held_claims() == ()  # released only by the final failure
+
+
+def test_a_failing_inbox_read_never_hides_the_kill_switch(
+    setup: Setup, agent: WaitingAgent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#122 review: the watcher's inbox read fails on every tick; the kill
+    switch still stops the agent."""
+    kill = tmp_path / "KILL"
+    real = Cancellations.read
+
+    def read(self: Cancellations, execution_id: str) -> Reading:
+        if on_watcher_thread():
+            raise RuntimeError("the inbox is unreadable")
+        return real(self, execution_id)
+
+    monkeypatch.setattr(Cancellations, "read", read)
+
+    def engage() -> None:
+        kill.write_text("")
+
+    agent.before = engage
+    report = setup.coordinator(budget=LIMITS, kill_switch=kill_switch.checker(kill),
+                               watch_interval_seconds=0.05).run_once()  # fmt: skip
+    assert agent.stops[0] is not None
+    assert agent.stops[0].is_set()
+    assert report.code is ExitCode.SUSPENDED
+    interrupted_retry(setup)

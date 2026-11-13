@@ -39,7 +39,7 @@ from typing import NoReturn
 
 from ilmar.core import tracker
 from ilmar.core.cancel_inbox import CancelRequest
-from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS, Watcher
+from ilmar.core.cancel_watcher import SUSPENSION_CHECK_FAILED, WATCH_INTERVAL_SECONDS, Watcher
 from ilmar.core.cancellation import Cancellations, cancellation_accepted
 from ilmar.core.clock import not_before
 from ilmar.core.components import Components
@@ -328,6 +328,9 @@ class _Run:
         self.read_at_pass_start = False
         self.notices: list[str] = []
         """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
+        self.watch_failure: str | None = None
+        """Set when the watcher stopped the agent because its suspension check
+        failed. Lost on a crash, when the stopped run fails closed instead."""
 
     # -- durable state --------------------------------------------------------------
 
@@ -673,6 +676,14 @@ class _Run:
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted
+        if result.outcome is AgentOutcome.CANCELLED and self.watch_failure is not None:
+            # The watcher could not tell whether a suspension is in force and
+            # stopped the agent (fail closed). Not frozen; retried under the
+            # existing limits, and every later start checks again first.
+            raise TransientError(
+                f"the suspension check failed while the agent ran: {self.watch_failure}",
+                code=SUSPENSION_CHECK_FAILED,
+            )
         if result.outcome is AgentOutcome.CANCELLED and self.suspension_reason() is not None:
             # Stopped while a suspension is in force, and no human cancellation is
             # pending or recorded (the safe point above would have ended it). Not
@@ -717,6 +728,8 @@ class _Run:
                 self.apply_inbox(validated=watcher.request)
             elif watcher.suspended_by == SuspensionReason.KILL_SWITCH.value:
                 self.record_kill_switch()  # durable before the attempt is ended
+            elif watcher.suspended_by == SUSPENSION_CHECK_FAILED:
+                self.watch_failure = type(watcher.check_error).__name__
 
     def freeze(self, execution: Execution, name: str) -> None:
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)
