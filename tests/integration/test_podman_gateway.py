@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway_policy import BUDGET, POLICY
 from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
@@ -56,7 +57,8 @@ OWNER = ResourceOwner(instance_id="it", execution_id="gateway", attempt=1, token
 REAL_KEY = "sk-ant-it-real-key-" + secrets.token_hex(16)
 ASK = sh(
     'wget -q -O - -T 10 --header "x-api-key: $1" --header "content-type: application/json" '
-    '--post-data \'{"model":"m","max_tokens":1,"stream":false,"messages":[]}\' "$2"; '
+    '--post-data \'{"model":"claude-opus-5-5","max_tokens":2000,"stream":false,'
+    '"messages":[{"role":"user","content":"Reply with OK."}]}\' "$2"; '
     'echo " exit=$?"',
 )
 
@@ -76,7 +78,8 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     runtime = PodmanRuntime(
         layout=layout,
         gateway=GatewaySettings(
-            image=str(PROXY_IMAGE), key=REAL_KEY, upstream=f"http://{host}:{provider.port}",
+            image=str(PROXY_IMAGE), key=REAL_KEY, policy=POLICY, budget=BUDGET,
+            upstream=f"http://{host}:{provider.port}",
             allow_plain_http_upstream=True,
         ),
     )  # fmt: skip

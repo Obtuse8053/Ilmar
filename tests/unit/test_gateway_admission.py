@@ -411,6 +411,7 @@ def test_writes_without_a_breakdown_are_charged_at_the_one_hour_rate() -> None:
 
 def test_a_plain_response_is_settled_from_its_body() -> None:
     message = {"type": "message", "stop_reason": "end_turn",
+               "content": [{"type": "text", "text": "hi"}],
                "usage": {"input_tokens": 10, "output_tokens": 5}}  # fmt: skip
     settled = ga.charge(metered(json.dumps(message).encode(), streamed=False), PRICE, DOLLAR)
     assert settled.charged == ga._cost(10, PRICE.input) + ga._cost(5, PRICE.output)

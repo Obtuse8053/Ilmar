@@ -14,6 +14,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -25,6 +26,29 @@ import pytest
 
 from ilmar.adapters.podman import model_gateway as mg
 
+MODEL = "claude-opus-5-5"
+POLICY = json.dumps({
+    "prices": {MODEL: {"input": 5_000_000, "output": 25_000_000, "cache_write_5m": 6_250_000,
+                       "cache_write_1h": 10_000_000, "cache_read": 500_000}},
+    "allowed_betas": ["claude-code-20250219"],
+})  # fmt: skip
+BUDGET = 10_000_000  # ten dollars
+USER = {"role": "user", "content": "Reply with OK."}
+BODY = json.dumps(
+    {"model": MODEL, "max_tokens": 2_000, "stream": True, "messages": [USER]}
+).encode()
+
+
+def sse(*events: dict[str, object]) -> bytes:
+    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+
+
+GOOD = sse(
+    {"type": "message_start", "message": {"usage": {"input_tokens": 12, "output_tokens": 1}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "message_delta", "usage": {"output_tokens": 3}},
+    {"type": "message_stop"},
+)
 TOKEN = "ilmar-throwaway-token-0123456789abcdef"
 KEY = "sk-ant-real-key-never-in-the-sandbox-42"
 LOOPBACK = (ipaddress.ip_network("127.0.0.0/8"),)
@@ -36,6 +60,8 @@ class Provider:
 
     seen: list[dict[str, object]] = field(default_factory=list)
     hold: threading.Event | None = None
+    payload: bytes = GOOD
+    status: int = 200
     entered: threading.Event = field(default_factory=threading.Event)
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
@@ -49,14 +75,15 @@ class Provider:
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers["content-length"]))
-                provider.seen.append(
-                    {"path": self.path, "headers": dict(self.headers.items()), "body": body}
-                )
+                provider.seen.append({
+                    "path": self.path, "headers": dict(self.headers.items()), "body": body,
+                    "betas": self.headers.get_all("anthropic-beta") or [],
+                })  # fmt: skip
                 provider.entered.set()
                 if provider.hold is not None:
                     provider.hold.wait(5)
-                payload = b"event: message_stop\ndata: {}\n\n"
-                self.send_response(200)
+                payload = provider.payload
+                self.send_response(provider.status)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("request-id", "req_1")
                 self.send_header("anthropic-ratelimit-requests-remaining", "9")
@@ -78,22 +105,31 @@ class Running:
         self,
         path: str = "/v1/messages?beta=true",
         *,
-        body: bytes = b'{"model":"m","max_tokens":1}',
+        body: bytes = BODY,
         headers: dict[str, str] | None = None,
         method: str = "POST",
+        betas: tuple[str, ...] = (),
     ) -> tuple[int, dict[str, str], bytes]:
         host, port = self.gateway.address
         connection = http.client.HTTPConnection(host, port, timeout=10)
         sent = {"x-api-key": TOKEN, "content-type": "application/json"}
         sent.update(headers or {})
-        connection.request(method, path, body=body, headers=sent)
+        connection.putrequest(method, path, skip_accept_encoding=True)
+        for name, value in sent.items():
+            connection.putheader(name, value)
+        for beta in betas:  # each its own header line, as a client may send
+            connection.putheader("anthropic-beta", beta)
+        connection.putheader("content-length", str(len(body)))
+        connection.endheaders(body)
         response = connection.getresponse()
         data = response.read()
         connection.close()
         return response.status, {k.lower(): v for k, v in response.getheaders()}, data
 
 
-def start(provider: Provider, **limits: int) -> Iterator[Running]:
+def start(
+    provider: Provider, *, policy: str = POLICY, budget: int = BUDGET, **limits: int
+) -> Iterator[Running]:
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), provider.handler())
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     config = mg.GatewayConfig(
@@ -101,6 +137,8 @@ def start(provider: Provider, **limits: int) -> Iterator[Running]:
         key=KEY,
         upstream=mg.Upstream("http", "127.0.0.1", upstream.server_address[1]),
         clients=LOOPBACK,
+        policy=policy,
+        budget=budget,
         **limits,
     )
     log = io.StringIO()
@@ -123,7 +161,7 @@ def test_a_request_is_forwarded_with_the_real_key_and_never_the_token(running: R
     status, headers, data = running.post(
         headers={
             "anthropic-version": "2023-06-01",
-            "anthropic-beta": "x",
+            "anthropic-beta": "claude-code-20250219",
             "x-stainless-lang": "js",
             "cookie": "c=1",
             "proxy-authorization": "Basic Zm9v",
@@ -131,12 +169,13 @@ def test_a_request_is_forwarded_with_the_real_key_and_never_the_token(running: R
         }
     )
     assert status == 200
-    assert data == b"event: message_stop\ndata: {}\n\n"
+    assert data == GOOD
     (seen,) = running.provider.seen
     sent = {k.lower(): v for k, v in seen["headers"].items()}  # type: ignore[attr-defined]
     assert sent["x-api-key"] == KEY
     assert seen["path"] == "/v1/messages?beta=true"
-    assert seen["body"] == b'{"model":"m","max_tokens":1}'
+    assert seen["body"] == BODY
+    assert seen["betas"] == ["claude-code-20250219"]
     for dropped in ("authorization", "cookie", "proxy-authorization", "x-forwarded-for"):
         assert dropped not in sent
     assert sent["anthropic-version"] == "2023-06-01"
@@ -152,7 +191,7 @@ def test_a_bearer_token_is_accepted_too(running: Running) -> None:
     assert status == 401  # an empty x-api-key next to it is a wrong credential
     host, port = running.gateway.address
     connection = http.client.HTTPConnection(host, port, timeout=10)
-    connection.request("POST", "/v1/messages", body=b"{}",
+    connection.request("POST", "/v1/messages", body=BODY,
                        headers={"authorization": f"Bearer {TOKEN}"})  # fmt: skip
     assert connection.getresponse().status == 200
 
@@ -205,11 +244,11 @@ def test_count_tokens_is_served(running: Running) -> None:
 
 
 def test_an_oversized_body_is_refused() -> None:
-    for running in start(Provider(), max_request_bytes=10):
-        status, _, data = running.post(body=b"x" * 11)
+    for running in start(Provider(), max_request_bytes=len(BODY)):
+        status, _, data = running.post(body=BODY + b" ")
         assert status == 413
         assert json.loads(data)["error"]["type"] == "request_too_large"
-        assert running.post(body=b"x" * 10)[0] == 200
+        assert running.post(body=BODY)[0] == 200
         assert len(running.provider.seen) == 1
 
 
@@ -258,19 +297,29 @@ def test_an_unreachable_provider_is_a_local_502() -> None:
         key=KEY,
         upstream=mg.Upstream("http", "127.0.0.1", 9),  # discard: nothing listens
         clients=LOOPBACK,
+        policy=POLICY,
+        budget=BUDGET,
     )
-    gateway = mg.Gateway(("127.0.0.1", 0), config, log=io.StringIO())
+    log = io.StringIO()
+    gateway = mg.Gateway(("127.0.0.1", 0), config, log=log)
     threading.Thread(target=gateway.serve_forever, daemon=True).start()
     try:
-        status, _, data = Running(gateway, Provider(), io.StringIO()).post()
+        client = Running(gateway, Provider(), log)
+        status, _, data = client.post()
         assert status == 502
         assert json.loads(data)["error"]["type"] == "api_error"
+        # It may have reached the provider: the whole reservation is charged and
+        # the attempt halts (fail closed on unknown billing).
+        assert "reason=provider_unreachable" in log.getvalue()
+        assert gateway.budget.halted
+        status, _, data = client.post()
+        assert (status, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
     finally:
         gateway.shutdown()
 
 
 def test_the_log_holds_no_credential_header_or_body(running: Running) -> None:
-    running.post(body=b'{"secret-prompt":"hello"}')
+    running.post(body=BODY.replace(b"Reply with OK.", b"secret-prompt hello"))
     running.post(headers={"x-api-key": "wrong"})
     text = running.log.getvalue()
     assert "ilmar-gateway READY" in text
@@ -333,7 +382,7 @@ def test_a_bad_key_is_refused_and_the_fifo_still_removed(tmp_path: Path, content
 def test_the_gateway_is_given_a_digest_never_the_token() -> None:
     with pytest.raises(ValueError, match="token_sha256"):
         mg.GatewayConfig(token_sha256=TOKEN, key=KEY, upstream=mg.Upstream("https", "h", 443),
-                         clients=LOOPBACK)  # fmt: skip
+                         clients=LOOPBACK, policy=POLICY, budget=BUDGET)  # fmt: skip
 
 
 def test_no_configuration_can_route_an_agent_through_the_gateway_yet() -> None:
@@ -343,3 +392,135 @@ def test_no_configuration_can_route_an_agent_through_the_gateway_yet() -> None:
     for module in ("config.py", "adapters/builtin.py", "adapters/registry.py", "cli.py"):
         assert "GATEWAY" not in (src / module).read_text(), module
         assert "GatewaySettings" not in (src / module).read_text(), module
+
+
+# -- spending controls (P5 part 2) ----------------------------------------------------
+
+
+def request_body(**fields: object) -> bytes:
+    base: dict[str, object] = json.loads(BODY)
+    base.update(fields)
+    return json.dumps(base).encode()
+
+
+def charges(log: io.StringIO) -> list[str]:
+    return [line for line in log.getvalue().splitlines() if line.startswith("CHARGE ")]
+
+
+def test_max_tokens_is_lowered_to_the_policy_before_forwarding(running: Running) -> None:
+    status, _, _ = running.post(body=request_body(max_tokens=128_000))
+    assert status == 200
+    (seen,) = running.provider.seen
+    assert json.loads(seen["body"])["max_tokens"] == 32_000  # type: ignore[arg-type]
+    assert "max_tokens_from=128000" in running.log.getvalue()
+
+
+def test_max_tokens_is_lowered_to_what_the_budget_affords() -> None:
+    provider = Provider()
+    for running in start(provider, budget=200_000):  # twenty cents
+        assert running.post(body=request_body(max_tokens=32_000))[0] == 200
+        sent = json.loads(provider.seen[0]["body"])["max_tokens"]  # type: ignore[arg-type]
+        assert 1_024 <= sent < 8_000  # 25 dollars per million output tokens
+        (line,) = charges(running.log)
+        assert "reason=reported" in line
+        assert "halted=false" in line
+
+
+def test_a_request_the_budget_cannot_cover_is_never_forwarded() -> None:
+    provider = Provider()
+    for running in start(provider, budget=20_000):  # two cents: below 1024 tokens
+        status, _, data = running.post()
+        assert (status, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert provider.seen == []
+
+
+def test_a_good_report_is_charged_from_usage_and_the_attempt_goes_on(running: Running) -> None:
+    for _ in range(3):
+        assert running.post()[0] == 200
+    lines = charges(running.log)
+    assert len(lines) == 3
+    assert all("reason=reported" in line and "halted=false" in line for line in lines)
+    assert "charged=135 " in lines[0]  # 12 input and 3 output tokens, rounded up
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        (sse({"type": "message_start", "message": {"usage": {"input_tokens": 1}}},
+             {"type": "message_stop"}), 200),
+        (GOOD.replace(b'"type": "text"', b'"type": "server_tool_use"'), 200),
+        (GOOD.replace(b'"output_tokens": 3}', b'"output_tokens": 3, "new_thing": 1}'), 200),
+        (b'{"type": "error", "error": {"type": "overloaded_error"}}', 529),
+        (b'{"type": "error", "error": {"type": "invalid_request_error"}}', 400),
+    ],
+)  # fmt: skip
+def test_untrusted_usage_or_an_error_halts_and_nothing_more_is_forwarded(
+    payload: bytes, status: int
+) -> None:
+    provider = Provider(payload=payload, status=status)
+    for running in start(provider):
+        assert running.post()[0] == status
+        (line,) = charges(running.log)
+        assert "halted=true" in line
+        assert "reason=reported" not in line
+        for _ in range(3):
+            code, _, data = running.post()
+            assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == 1
+
+
+def test_every_beta_header_is_read_and_one_refused_value_refuses_the_request(
+    running: Running,
+) -> None:
+    status, _, data = running.post(betas=("claude-code-20250219", "web-search-2025-03-05"))
+    assert status == 400
+    assert "web-search" in json.loads(data)["error"]["message"]
+    assert running.provider.seen == []
+
+
+def test_kept_betas_are_rebuilt_into_one_header_and_unused_denied_ones_dropped(
+    running: Running,
+) -> None:
+    betas = ("claude-code-20250219", "advanced-tool-use-2025-11-20", "claude-code-20250219")
+    assert running.post(betas=betas)[0] == 200
+    (seen,) = running.provider.seen
+    assert seen["betas"] == ["claude-code-20250219"]
+    assert "dropped_betas=advanced-tool-use-2025-11-20" in running.log.getvalue()
+
+
+def test_a_server_tool_is_refused_before_anything_is_sent(running: Running) -> None:
+    body = request_body(tools=[{"type": "web_search_20250305", "name": "web_search"}])
+    assert running.post(body=body)[0] == 400
+    assert running.provider.seen == []
+    assert charges(running.log) == []
+
+
+def test_counting_tokens_is_checked_but_never_charged(running: Running) -> None:
+    body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "x"}]})
+    assert running.post("/v1/messages/count_tokens", body=body.encode())[0] == 200
+    assert charges(running.log) == []
+    assert running.gateway.budget.spent() == 0
+    bad = json.dumps({"model": MODEL, "messages": [], "tools": [{"type": "web_search_x"}]})
+    assert running.post("/v1/messages/count_tokens", body=bad.encode())[0] == 400
+
+
+def test_the_gateway_refuses_to_start_without_a_valid_policy() -> None:
+    with pytest.raises((ValueError, KeyError)):
+        mg.Gateway(("127.0.0.1", 0), mg.GatewayConfig(
+            token_sha256=hashlib.sha256(TOKEN.encode()).hexdigest(), key=KEY,
+            upstream=mg.Upstream("https", "h", 443), clients=LOOPBACK,
+            policy=json.dumps({"prices": {}}), budget=BUDGET))  # fmt: skip
+    with pytest.raises(ValueError, match="positive"):
+        mg.GatewayConfig(token_sha256=hashlib.sha256(TOKEN.encode()).hexdigest(), key=KEY,
+                         upstream=mg.Upstream("https", "h", 443), clients=LOOPBACK,
+                         policy=POLICY, budget=0)  # fmt: skip
+
+
+def test_the_charge_log_holds_no_body_or_provider_text() -> None:
+    payload = GOOD.replace(b'"output_tokens": 3}', b'"output_tokens": 3, "x y\\u00e9<z>": 1}')
+    for running in start(Provider(payload=payload)):
+        running.post(body=request_body(messages=[{"role": "user", "content": "secret-prompt"}]))
+        (line,) = charges(running.log)
+        assert "secret-prompt" not in running.log.getvalue()
+        reason = line.split("reason=")[1].split(" ")[0]
+        assert re.fullmatch(r"[A-Za-z0-9.:_-]+", reason)

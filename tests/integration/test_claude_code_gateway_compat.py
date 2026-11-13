@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway_policy import BUDGET, POLICY
 from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
 from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
 from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
@@ -177,7 +178,8 @@ def test_pinned_claude_code_works_through_a_separate_gateway_sidecar(tmp_path: P
         layout=layout,
         gateway=GatewaySettings(
             image=os.environ.get("ILMAR_TEST_PODMAN_PROXY_IMAGE") or IMAGE,  # needs python3
-            key=REAL_KEY, upstream=f"http://{host}:{provider.port}",
+            key=REAL_KEY, policy=POLICY, budget=BUDGET,
+            upstream=f"http://{host}:{provider.port}",
             allow_plain_http_upstream=True,
         ),
     )  # fmt: skip

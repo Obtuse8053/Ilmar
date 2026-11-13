@@ -92,6 +92,20 @@ Hard gates that stay in force:
       runs in the gateway-compat workflow.
     - **Not yet selectable from configuration:** it waits for P5, the
       worst-case cost reservation.
+- 2026-11-13: **P5 part 2a submitted: spending controls in the gateway** (#111).
+  - The sidecar admits every request against the attempt's budget before
+    forwarding: strict request shapes, every `anthropic-beta` header read,
+    `max_tokens` lowered, a reservation taken, the reported usage charged.
+  - Untrusted usage, an error response or an unreachable provider charges
+    the whole reservation and halts the attempt.
+  - Beta candidates approved 2026-11-13 are listed, but none is allowed by
+    default. `advanced-tool-use` and separately billed betas can never be
+    allowed.
+  - Real-API tests (`tests/integration/test_gateway_live_api.py`) need a key
+    with a small spend cap and run by hand.
+  - Next, part 2b: the coordinator passes each attempt's budget and records
+    the charges in its ledger. Gateway-backed autonomy stays disabled until
+    its acceptance gate passes.
 - 2026-11-12: **Supervisor part 1 submitted** (ADR-0033, stacked on #113).
   - A durable start log (`<state_dir>/coordinator/starts.log`, fsynced
     before anything else) with limits on the minimum interval, starts per
