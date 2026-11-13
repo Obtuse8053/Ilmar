@@ -1281,15 +1281,28 @@ def test_the_gateway_sidecar_is_hardened_and_holds_the_only_route(
     assert sidecar.labels["io.ilmar.role"] == "egress-proxy"
 
 
-def test_the_real_key_reaches_the_sidecar_once_and_nowhere_else(
-    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+def test_the_real_key_reaches_the_sidecar_once_on_stdin_and_never_a_file(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, tmp_path: Path
 ) -> None:
+    """#120 review: no file holds the key at any moment, so no crash can leave one."""
+    before = set(Path(tempfile.gettempdir()).iterdir())
     rt = runtime(layout, podman, gateway=GATEWAY)
     handle = rt.start(gateway_spec(workspace))
-    ((source, content),) = podman.gateway_keys
-    assert content == REAL_KEY
-    assert not Path(source).exists()  # deleted once the sidecar was ready
-    assert not Path(source).parent.exists()
+    sidecar = podman.by_name("ilmar-exec-1-1-egress")
+    assert sidecar is not None
+    ((target, content),) = podman.gateway_keys
+    assert (target, content) == (sidecar.id, REAL_KEY)
+    (handoff,) = [c for c in podman.calls if c.stdin == REAL_KEY.encode()]
+    assert handoff.argv[1:5] == ["exec", "--interactive", "--user", "65534:65534"]
+    assert handoff.argv[5] == sidecar.id  # the sidecar only, never the sandbox
+    assert handoff.argv[-1] == "/run/ilmar-gateway/key"
+    for call in podman.calls:  # no key mount, no key file, no secret option
+        assert not any("ilmar-gateway-key" in a or a == "--secret" for a in call.argv)
+    assert set(Path(tempfile.gettempdir()).iterdir()) == before
+    tmpfs = sidecar.run_args[sidecar.run_args.index("--tmpfs") + 1]
+    assert tmpfs.startswith("/run/ilmar-gateway:rw,noexec,nosuid,nodev,size=64k")
+    command = sidecar.run_args[sidecar.run_args.index("localhost/ilmar-proxy:1") :]
+    assert command[command.index("--key-fifo") + 1] == "/run/ilmar-gateway/key"
     access = rt.model_access(handle)
     assert access is not None
     assert access.token != REAL_KEY
@@ -1334,7 +1347,18 @@ def test_a_gateway_that_never_becomes_ready_leaves_nothing_and_no_key(
         rt.start(gateway_spec(workspace))
     assert podman.containers == {}
     assert sidecars(podman) == (False, False)
-    assert not list(Path(tempfile.gettempdir()).glob("ilmar-gateway-*"))
+    assert podman.gateway_keys == []  # never handed over to a gateway that did not ask
+
+
+def test_a_gateway_that_refuses_the_key_leaves_nothing(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.gateway_takes_key = False
+    with pytest.raises(ProviderError, match="did not take its key") as caught:
+        runtime(layout, podman, gateway=GATEWAY).start(gateway_spec(workspace))
+    assert REAL_KEY not in str(caught.value)
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
 
 
 def test_gateway_settings_are_validated() -> None:

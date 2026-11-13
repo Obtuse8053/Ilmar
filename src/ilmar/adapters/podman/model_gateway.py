@@ -15,8 +15,10 @@ What it does, for each request from the sandbox:
   ``Authorization: Bearer``), compared by SHA-256 digest in constant time. The
   gateway is given the digest, never the token;
 * forwards an allow-listed set of headers, drops every credential the sandbox
-  sent, and adds the real key, which it read once from ``--key-file`` and
-  holds only in memory;
+  sent, and adds the real key, which it holds only in memory. It receives the
+  key through a FIFO in its own tmpfs (``--key-fifo``): the coordinator writes
+  it there with ``podman exec`` on standard input, so the key never exists in
+  a file, on the host or in the container, at any moment;
 * allows at most ``--max-in-flight`` requests at once;
 * streams the response back unchanged, with an allow-listed set of headers,
   then closes the connection.
@@ -38,6 +40,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
@@ -287,11 +290,36 @@ class _Handler(BaseHTTPRequestHandler):
         self.owner.log(line + (f" refused={refused}" if refused else ""))
 
 
+AWAITING_KEY = "ilmar-gateway AWAITING-KEY"
+_MAX_KEY_BYTES = 4096
+
+
 def read_key(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
-        key = handle.read().strip()
+    """Read the key handed over through the FIFO at ``path``, then remove it.
+
+    The FIFO is created here (mode 0600) and the gateway announces
+    ``AWAITING_KEY``; opening it blocks until the coordinator's writer opens the
+    other end. A pipe holds data only in the kernel's buffer: nothing is ever
+    written to a file system."""
+    os.mkfifo(path, 0o600)
+    try:
+        print(AWAITING_KEY, flush=True)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            chunks: list[bytes] = []
+            size = 0
+            while chunk := os.read(fd, 1024):
+                size += len(chunk)
+                if size > _MAX_KEY_BYTES:
+                    raise ValueError("the key is too long")
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+    finally:
+        os.unlink(path)
+    key = b"".join(chunks).decode("utf-8").strip()
     if not key or any(c in key for c in "\r\n\0"):
-        raise ValueError("the key file must hold one non-empty line")
+        raise ValueError("the key must be one non-empty line")
     return key
 
 
@@ -299,7 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
     parser.add_argument("--listen", default="0.0.0.0:8080")
     parser.add_argument("--token-sha256", required=True)
-    parser.add_argument("--key-file", required=True)
+    parser.add_argument("--key-fifo", required=True)
     parser.add_argument("--upstream", default="https://api.anthropic.com")
     parser.add_argument("--allow-plain-http-upstream", action="store_true")
     parser.add_argument("--clients", required=True, help="comma-separated client networks")
@@ -308,7 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = GatewayConfig(
         token_sha256=args.token_sha256,
-        key=read_key(args.key_file),
+        key=read_key(args.key_fifo),
         upstream=Upstream.parse(args.upstream, allow_plain_http=args.allow_plain_http_upstream),
         clients=tuple(ipaddress.ip_network(n, strict=False) for n in args.clients.split(",")),
         max_request_bytes=args.max_request_bytes,

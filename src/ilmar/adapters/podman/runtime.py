@@ -57,11 +57,9 @@ import math
 import os
 import re
 import secrets
-import shutil
 import signal
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -114,7 +112,17 @@ EGRESS_PROXY_SUFFIX = "-egress"
 EGRESS_NETWORK_SUFFIX = "-net"
 _PROXY_SCRIPT = "/ilmar-egress-proxy.py"
 _GATEWAY_SCRIPT = "/ilmar-model-gateway.py"
-_GATEWAY_KEY = "/run/ilmar-gateway-key"
+_GATEWAY_RUN = "/run/ilmar-gateway"
+_GATEWAY_KEY_FIFO = _GATEWAY_RUN + "/key"
+_KEY_WRITER = (
+    "import os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NOFOLLOW)\n"
+    "data = sys.stdin.buffer.read()\n"
+    "while data:\n"
+    "    data = data[os.write(fd, data):]\n"
+    "os.close(fd)\n"
+)
+"""Copies standard input into the gateway's FIFO; the key passes only through pipes."""
 _MAX_ALLOWLIST_NAME = 120
 
 PODMAN_ENVIRONMENT = (
@@ -475,9 +483,9 @@ class GatewaySettings:
 
     ``image`` must provide ``python3`` (3.11 or later); the gateway code is
     mounted read-only from this package. ``key`` is the real model credential:
-    it reaches only the sidecar, through a file that exists on the host until
-    the sidecar has read it, and never appears in a command line, an
-    environment, a log or ``repr``. ``upstream`` is the provider;
+    it reaches only the sidecar, on the standard input of a ``podman exec`` into
+    a FIFO in the sidecar's tmpfs, and never exists in a file, a command line,
+    an environment, a log or ``repr``. ``upstream`` is the provider;
     ``allow_plain_http_upstream`` exists for tests with a stand-in provider.
     ``extra_hosts`` pins hostnames in the sidecar's ``/etc/hosts``.
     """
@@ -1153,10 +1161,13 @@ class PodmanRuntime:
     def _start_gateway(self, spec: ContainerSpec) -> ModelAccess:
         """Create the private network and the model gateway; return the route.
 
-        The real key is written to a file in a fresh 0700 directory, bind-mounted
-        read-only into the sidecar alone, and deleted once the sidecar has read it
-        (or failed). The sidecar is given the SHA-256 digest of the throwaway
-        token, never the token, which only ``model_access`` returns.
+        The real key never exists in a file, on the host or in a container, at
+        any moment, so no crash can leave it behind. The gateway makes a FIFO in
+        its own tmpfs and announces it; the key is then written into it by a
+        ``podman exec`` in the sidecar alone, on standard input, and the
+        gateway removes the FIFO once it has read the key. The sidecar is given
+        the SHA-256 digest of the throwaway token, never the token, which only
+        ``model_access`` returns.
         """
         settings = self._gateway
         if settings is None:
@@ -1166,55 +1177,57 @@ class PodmanRuntime:
         labels = _owner_labels(spec.owner)
         subnets = self._create_private_network(network, labels)
         script = Path(model_gateway.__file__).resolve()
+        if _UNSAFE_IN_MOUNT.search(str(script)):
+            raise ProviderError(f"path not usable in a mount option: {script}")
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
-        holder = Path(tempfile.mkdtemp(prefix="ilmar-gateway-"))
-        try:
-            key_file = holder / "key"
-            descriptor = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
-            with os.fdopen(descriptor, "w") as handle:
-                handle.write(settings.key)
-            for path in (script, key_file):
-                if _UNSAFE_IN_MOUNT.search(str(path)):
-                    raise ProviderError(f"path not usable in a mount option: {path}")
-            args = [
-                "run", "--detach", "--name", sidecar, "--pull=never",
-                "--user", "65534:65534", "--cap-drop=all",
-                "--security-opt=no-new-privileges", "--read-only",
-                "--read-only-tmpfs=false", "--env-host=false", "--http-proxy=false",
-                "--network", network, "--network", settings.egress_network,
-                "--mount", f"type=bind,source={script},destination={_GATEWAY_SCRIPT},ro=true",
-                "--mount", f"type=bind,source={key_file},destination={_GATEWAY_KEY},ro=true",
-                "--pids-limit", "256", "--memory", "256m",
-                "--log-driver=k8s-file", "--init",
-                *_lifetime_arguments(spec),  # the gateway never outlives its sandbox
-            ]  # fmt: skip
-            for host, address in sorted(settings.extra_hosts.items()):
-                args += ["--add-host", f"{host}:{address}"]
-            for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_PROXY}).items():
-                args += ["--label", f"{key}={value}"]
-            args += [
-                settings.image, "python3", "-I", _GATEWAY_SCRIPT,
-                "--listen", f"0.0.0.0:{settings.port}",
-                "--token-sha256", digest,
-                "--key-file", _GATEWAY_KEY,
-                "--upstream", settings.upstream,
-                "--clients", ",".join(subnets),
-                "--max-request-bytes", str(settings.max_request_bytes),
-                "--max-in-flight", str(settings.max_in_flight),
-            ]  # fmt: skip
-            if settings.allow_plain_http_upstream:
-                args.append("--allow-plain-http-upstream")
-            started = self._podman_call(args)
-            self._expect_success(started, "run (model gateway)")
-            sidecar_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
-            if not _CONTAINER_ID.match(sidecar_id):
-                raise ProviderError("podman run did not report the model gateway's ID")
-            address = self._wait_for_proxy(
-                sidecar_id, network, settings.ready_timeout, marker="ilmar-gateway READY"
-            )
-        finally:
-            shutil.rmtree(holder, ignore_errors=True)  # read once, or never needed
+        args = [
+            "run", "--detach", "--name", sidecar, "--pull=never",
+            "--user", "65534:65534", "--cap-drop=all",
+            "--security-opt=no-new-privileges", "--read-only",
+            "--read-only-tmpfs=false", "--env-host=false", "--http-proxy=false",
+            "--network", network, "--network", settings.egress_network,
+            "--mount", f"type=bind,source={script},destination={_GATEWAY_SCRIPT},ro=true",
+            # Memory only, for the handoff FIFO; the key itself never lands here.
+            "--tmpfs", f"{_GATEWAY_RUN}:rw,noexec,nosuid,nodev,size=64k,mode=1777",
+            "--pids-limit", "256", "--memory", "256m",
+            "--log-driver=k8s-file", "--init",
+            *_lifetime_arguments(spec),  # the gateway never outlives its sandbox
+        ]  # fmt: skip
+        for host, address in sorted(settings.extra_hosts.items()):
+            args += ["--add-host", f"{host}:{address}"]
+        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_PROXY}).items():
+            args += ["--label", f"{key}={value}"]
+        args += [
+            settings.image, "python3", "-I", _GATEWAY_SCRIPT,
+            "--listen", f"0.0.0.0:{settings.port}",
+            "--token-sha256", digest,
+            "--key-fifo", _GATEWAY_KEY_FIFO,
+            "--upstream", settings.upstream,
+            "--clients", ",".join(subnets),
+            "--max-request-bytes", str(settings.max_request_bytes),
+            "--max-in-flight", str(settings.max_in_flight),
+        ]  # fmt: skip
+        if settings.allow_plain_http_upstream:
+            args.append("--allow-plain-http-upstream")
+        started = self._podman_call(args)
+        self._expect_success(started, "run (model gateway)")
+        sidecar_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
+        if not _CONTAINER_ID.match(sidecar_id):
+            raise ProviderError("podman run did not report the model gateway's ID")
+        self._wait_for_proxy(
+            sidecar_id, network, settings.ready_timeout, marker=model_gateway.AWAITING_KEY
+        )
+        handed = self._executor(
+            [self._podman, "exec", "--interactive", "--user", "65534:65534", sidecar_id,
+             "python3", "-I", "-c", _KEY_WRITER, _GATEWAY_KEY_FIFO],
+            self._environ, _CONTROL_TIMEOUT, stdin=settings.key.encode(),
+        )  # fmt: skip
+        if handed.timed_out or handed.returncode != 0:
+            raise ProviderError("the model gateway did not take its key")  # no output: no echo
+        address = self._wait_for_proxy(
+            sidecar_id, network, settings.ready_timeout, marker="ilmar-gateway READY"
+        )
         return ModelAccess(f"http://{address}:{settings.port}", token)
 
     def _wait_for_proxy(

@@ -13,7 +13,9 @@ import http.client
 import io
 import ipaddress
 import json
+import os
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -293,16 +295,39 @@ def test_the_upstream_must_be_https_unless_plain_http_is_allowed_for_tests() -> 
             mg.Upstream.parse(bad, allow_plain_http=True)
 
 
-@pytest.mark.parametrize("content", ["", "\n", "two\nlines\n", "nul\0"])
-def test_a_bad_key_file_is_refused(tmp_path: Path, content: str) -> None:
-    (tmp_path / "key").write_text(content)
-    with pytest.raises(ValueError, match="one non-empty line"):
-        mg.read_key(str(tmp_path / "key"))
+def hand_over(fifo: Path, data: bytes) -> threading.Thread:
+    """The coordinator's side: once the gateway announces the FIFO, write into it."""
+
+    def write() -> None:
+        while not fifo.exists():
+            time.sleep(0.01)
+        descriptor = os.open(fifo, os.O_WRONLY)
+        os.write(descriptor, data)
+        os.close(descriptor)
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    return writer
 
 
-def test_the_key_file_is_read_as_one_line(tmp_path: Path) -> None:
-    (tmp_path / "key").write_text(KEY + "\n")
-    assert mg.read_key(str(tmp_path / "key")) == KEY
+def test_the_key_comes_through_a_fifo_that_is_removed_after(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fifo = tmp_path / "key"
+    writer = hand_over(fifo, (KEY + "\n").encode())
+    assert mg.read_key(str(fifo)) == KEY
+    writer.join(5)
+    assert not fifo.exists()  # gone once read: nothing is left to find
+    assert capsys.readouterr().out == mg.AWAITING_KEY + "\n"
+
+
+@pytest.mark.parametrize("content", [b"", b"\n", b"two\nlines\n", b"nul\0", b"x" * 5000])
+def test_a_bad_key_is_refused_and_the_fifo_still_removed(tmp_path: Path, content: bytes) -> None:
+    fifo = tmp_path / "key"
+    hand_over(fifo, content)
+    with pytest.raises(ValueError, match="key"):
+        mg.read_key(str(fifo))
+    assert not fifo.exists()
 
 
 def test_the_gateway_is_given_a_digest_never_the_token() -> None:

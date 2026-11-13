@@ -80,9 +80,11 @@ Hard gates that stay in force:
     (ADR-0037 §1).
     - A `GATEWAY` network policy: the sandbox shares a private
       `--internal` network with its gateway sidecar alone.
-    - The sidecar holds the real key, read once from a host file that is
-      deleted after start. It accepts only a per-sandbox throwaway token,
-      checked by digest, and only on the messages endpoints.
+    - The sidecar holds the real key in memory only. It receives the key
+      through `podman exec` standard input into a FIFO in its tmpfs, so the
+      key is never in a file, and a crash leaves no copy.
+    - It accepts only a per-sandbox throwaway token, checked by digest, and
+      only on the messages endpoints.
     - The runner gives the sandbox the token and the runtime-provided
       `http://` address.
     - A real-Podman test checks separate-sidecar connectivity, and that no

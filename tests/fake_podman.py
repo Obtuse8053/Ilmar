@@ -85,7 +85,8 @@ class FakePodman:
     rootless: bool = True
     rm_behaviour: str = "ok"  # "ok", "fail" (exit 125, container stays) or "hang"
     proxy_ready: bool = True
-    gateway_keys: list[tuple[str, str]] = field(default_factory=list)  # (host path, content)
+    gateway_keys: list[tuple[str, str]] = field(default_factory=list)  # (sidecar, stdin)
+    gateway_takes_key: bool = True
     fail_rm_names: set[str] = field(default_factory=set)  # containers whose rm fails
     network_rm_fails: bool = False
     after_network_inspect: Callable[[str], None] | None = None  # to race a removal
@@ -263,11 +264,7 @@ class FakePodman:
             base = fake.subnet.split("/")[0].rsplit(".", 1)[0]
             container.networks[network] = f"{base}.{fake.hosts}"
         if self.proxy_ready and "/ilmar-model-gateway.py" in rest:
-            container.logs = "ilmar-gateway READY\n"
-            for arg in rest:  # what the sidecar would read from its key mount, at start
-                if arg.endswith("destination=/run/ilmar-gateway-key,ro=true"):
-                    source = arg.split("source=", 1)[1].split(",destination=", 1)[0]
-                    self.gateway_keys.append((source, Path(source).read_text()))
+            container.logs = "ilmar-gateway AWAITING-KEY\n"  # READY once the key is in
         elif self.proxy_ready and "python3" in rest:
             container.logs = "ilmar-egress READY listen=0.0.0.0:3128\n"
         return Completed(0, container.id + "\n", "")
@@ -321,6 +318,17 @@ class FakePodman:
         recorded = "podman records exec environments on disk: values must go through stdin"
         assert "--env-file" not in rest, recorded
         assert "--env" not in rest, recorded
+        if rest[:3] == ["--interactive", "--user", "65534:65534"] and "-c" in rest:
+            # The gateway's key handoff (#120): the key arrives on stdin only.
+            sidecar = self.containers.get(rest[3])
+            assert sidecar is not None
+            assert "/ilmar-model-gateway.py" in sidecar.run_args
+            assert call.stdin is not None
+            self.gateway_keys.append((rest[3], call.stdin.decode()))
+            if self.gateway_takes_key:
+                sidecar.logs += "ilmar-gateway READY\n"
+                return Completed(0, "", "")
+            return Completed(1, "", "BrokenPipeError\n")
         if rest[0] == "--interactive":
             rest = rest[1:]
             container_id, loader = rest[0], rest[1:5]
