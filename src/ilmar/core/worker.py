@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
 
-from ilmar.core import tracker
+from ilmar.core import blocked, tracker
 from ilmar.core.cancel_inbox import CancelRequest
 from ilmar.core.cancel_watcher import SUSPENSION_CHECK_FAILED, WATCH_INTERVAL_SECONDS, Watcher
 from ilmar.core.cancellation import Cancellations, cancellation_accepted
@@ -251,6 +251,9 @@ def needs_attention(store: ExecutionStore, execution: Execution) -> bool:
         return any(
             r.attempt == execution.attempt and r.kind is ResourceKind.WORKSPACE for r in rows
         )
+    if blocked.failed_for_protected_path(store, execution) and blocked.resolution(store, execution):
+        # A maintainer resolved it (ADR-0031 §3): its claim release must succeed.
+        return not blocked.release_settled(store, execution)
     if execution.state is S.FAILED and blocked_for_maintainer(store, execution):
         # ADR-0031 §3: the claim is kept; only the note remains to be posted.
         return store.operation(operation_key(K.POST_UPDATE, execution.id, execution.attempt,
@@ -278,17 +281,12 @@ BLOCKED_STEP = "blocked"
 
 
 def blocked_for_maintainer(store: ExecutionStore, execution: Execution) -> bool:
-    """A FAILED execution whose candidate touched a safety control (ADR-0031 §3):
-    its task keeps Ilmar's claim and is never retried, picked or published."""
-    if execution.state is not S.FAILED:
-        return False
-    for event in reversed(store.events(execution_id=execution.id)):
-        if (
-            event.type is EventType.EXECUTION_TRANSITIONED
-            and event.data.get("to") == S.FAILED.value
-        ):
-            return event.reason == "protected-path"
-    return False
+    """A FAILED execution whose candidate touched a safety control (ADR-0031 §3),
+    not yet resolved by a maintainer: its task keeps Ilmar's claim and is never
+    retried, picked or published."""
+    return blocked.failed_for_protected_path(store, execution) and (
+        blocked.resolution(store, execution) is None
+    )
 
 
 def held_claim(store: ExecutionStore, execution_id: str) -> bool:
@@ -1234,6 +1232,12 @@ class _Run:
             if quarantined:  # a human must look: the claim stays
                 return self.quarantine_remains()
             reason = execution.last_error or "failed"
+            decision = blocked.resolution(self.store, execution)
+            if decision is not None and blocked.failed_for_protected_path(self.store, execution):
+                # A maintainer's release or abandon (ADR-0031 §3): the claim release
+                # its command journaled is performed, or repeated, here.
+                effects.release(self.current(), self.lease, step=blocked.step(decision))
+                return WorkerResult(self.id, Outcome.FAILED, reason, code=blocked.REASONS[decision])
             if blocked_for_maintainer(self.store, execution):  # ADR-0031 §3: claim kept
                 self.note(
                     execution,

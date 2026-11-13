@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 
-from ilmar.core import tracker
+from ilmar.core import blocked, tracker
 from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS
 from ilmar.core.cancellation import cancellation_accepted
 from ilmar.core.clock import NonDecreasingClock
@@ -660,14 +660,19 @@ class Coordinator:
         was lost or the task vanished (ADR-0026 §3). Releasing such a task's
         claim makes it eligible on the tracker, but running it again would undo
         a decision: a failure classified as not retryable (ADR-0021), or a
-        person's cancellation. A human decides.
+        person's cancellation. A human decides: ``ilmar blocked release`` marks a
+        blocked FAILED execution as released, and only that one is ignored here.
 
         A task cancelled because the tracker made it ineligible or claimed by
         someone else may be picked again, as a new execution, once the tracker
         lists it as eligible again; but never while an earlier execution of it
         still needs attention, such as an unfinished claim release (ADR-0026 §5).
         """
-        finished = {e.task for e in self._store.list_in_states({S.SUCCEEDED, S.FAILED})}
+        done = self._store.list_in_states({S.SUCCEEDED, S.FAILED})
+        released = blocked.released(self._store, [e for e in done if e.state is S.FAILED])
+        # A FAILED execution a maintainer released, its claim release done, no
+        # longer finishes its task (ADR-0031 §3); every other reason still holds.
+        finished = {e.task for e in done if e.id not in released}
         terminal = self._store.list_in_states({s for s in ExecutionState if s.is_terminal})
         finished |= {e.task for e in terminal if needs_attention(self._store, e)}
         for execution in self._store.list_in_states({S.CANCELLED}):

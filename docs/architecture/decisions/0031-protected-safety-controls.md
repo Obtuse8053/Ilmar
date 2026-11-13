@@ -262,3 +262,31 @@ Promotion of an executable version is a human command in every mode
      human control.
    - **Until then:** narrowing the entry needs an ADR change and a matching
      change to the architecture test.
+
+### 2026-11-13: how the human resolution is recorded (#92 part 2)
+
+This records the implementation of §3; the decision is unchanged.
+
+- **The record.** `ilmar blocked release|abandon` writes one fenced commit
+  with two parts:
+  - an `execution.block_resolved` event by the maintainer (`--as`), with
+    `decision` `release` or `abandon` and reason `maintainer-released` or
+    `maintainer-abandoned`;
+  - the journaled intent of the claim release, keyed
+    `release-task:<execution>:<attempt>:blocked-<decision>`.
+  The command takes the instance lock, so it cannot run beside a coordinator,
+  and a stale fence cannot write the commit.
+- **The tracker call.** It is a separate external effect, never in the
+  command. The execution's worker performs it in the next pass through the
+  journal: `release-task` is repeatable and the release is idempotent, so a
+  crash, a failure or an ambiguous outcome is repeated until it succeeds.
+- **Eligibility.**
+  - Until that release succeeds, the execution needs attention, so its task is
+    never picked while the claim may still be held.
+  - After it succeeds, the pick ignores a *released* FAILED execution, and the
+    task is picked again as a new execution.
+  - An *abandoned* execution still finishes its task, so the task stays out of
+    the backlog.
+- **Still to come in #92:**
+  - the per-pass event with the number of blocked tasks;
+  - the pre-push workflow inspection (§4).
