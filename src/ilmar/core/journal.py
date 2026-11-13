@@ -59,6 +59,7 @@ from ilmar.domain.errors import (
     ConcurrencyConflictError,
     FencingError,
     LedgerIntegrityError,
+    SuspendedError,
 )
 from ilmar.domain.events import OBSERVATIONS, EventContext, is_failure_code
 from ilmar.domain.execution import Execution
@@ -76,6 +77,22 @@ from ilmar.ports.execution_store import ExecutionStore
 
 Result = Mapping[str, str]
 _NOTE_LIMIT = 500
+
+
+HELD_WHILE_SUSPENDED = frozenset(
+    {
+        OperationKind.CLAIM_TASK,
+        OperationKind.START_CONTAINER,
+        OperationKind.RUN_AGENT,
+        OperationKind.VERIFY,
+        OperationKind.PUBLISH_REVISION,
+        OperationKind.UPSERT_CHANGE_REQUEST,
+    }
+)
+"""ADR-0029 §3: the effects a suspension holds, whether new or repeated after an
+unknown outcome. Every other kind is cleanup or local bookkeeping and still
+runs: releasing claims, notes, stopping containers, freezing a finished
+agent's output, deleting workspaces and reconciling labels."""
 
 
 class Journal:
@@ -142,6 +159,15 @@ class Journal:
         if kind.instance_scoped:
             raise LedgerIntegrityError(f"{kind.value} is instance-scoped; use perform_instance")
         lease.check(execution.id)
+        if kind in HELD_WHILE_SUSPENDED and (held := self._store.suspension()) is not None:
+            # ADR-0029 §3: no new claim, container, agent run, verification run or
+            # publication while suspended, also for executions resumed by recovery.
+            # Nothing is written; cleanup kinds still run.
+            raise SuspendedError(
+                f"{kind.value} for {execution.id} is held: new work is suspended "
+                f"({held.reason.value})",
+                reason=held.reason.value,
+            )
         _check_scope(before, execution.id)
         definitive = (*definitive, *self._always_definitive)
         fence = self._ownership.fence

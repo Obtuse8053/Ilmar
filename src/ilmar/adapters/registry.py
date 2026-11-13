@@ -214,6 +214,29 @@ def event_reader(
     return store_plan.read_only
 
 
+def store_writer(
+    config: IlmarConfig, *, registry: Registry = DEFAULT_REGISTRY
+) -> tuple[WorkspaceLayout, Callable[[], object]]:
+    """The layout, and how to open ``config``'s execution store for writing, with
+    nothing else planned or built: no tracker, no forge, no container runtime and
+    no secret (``ilmar suspend`` and ``ilmar resume``). Raises ``ConfigError``."""
+    context = _context(config)
+    port = "execution_store"
+    adapter = config.adapters[port]
+    where = f"[adapters.{port}] options"
+    options = Options(adapter.options, where)
+    try:
+        store_plan = registry.parser(port, adapter.kind)(options, context)
+    except ValueError as error:
+        if isinstance(error, ConfigError):
+            raise
+        raise ConfigError(f"{where}: {error}") from None
+    options.finish()
+    if not isinstance(store_plan, Plan) or store_plan.environment:
+        raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
+    return context.layout, lambda: store_plan.create(Secrets({}))
+
+
 def build(
     config: IlmarConfig,
     *,

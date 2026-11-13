@@ -31,6 +31,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ilmar.domain.budget import BudgetLimits, usd_to_micros
 from ilmar.domain.errors import ConfigError
 from ilmar.domain.safety_controls import safety_controls
 from ilmar.domain.verification import (
@@ -88,12 +89,28 @@ class Limits:
 
 
 @dataclass(frozen=True, slots=True)
+class Budget:
+    """``[budget]`` (ADR-0029 §2): accounting allowances, not cost limits.
+
+    Each attempt is charged ``reserve_per_execution_usd`` as it starts and is
+    admitted only within ``daily_usd`` and ``monthly_usd`` (UTC). The provider's
+    workspace spend limit is the hard cost limit; ``provider_cap_attested_usd``
+    is the operator's statement of it and may not exceed ``monthly_usd``.
+    """
+
+    limits: BudgetLimits
+    provider_cap_attested_micros: int
+
+
+@dataclass(frozen=True, slots=True)
 class IlmarConfig:
     state_dir: Path
     limits: Limits
     adapters: Mapping[str, AdapterConfig]
     verification: VerificationPolicy | None = None
     """``None`` when the file has no ``[verification]``; nothing can be verified then."""
+    budget: Budget | None = None
+    """``None`` without ``[budget]``: no reservations (manual operation only)."""
     instance_id: str = DEFAULT_INSTANCE_ID
     base_dir: Path | None = None
     """The directory relative option paths resolve against (the file's directory)."""
@@ -117,7 +134,7 @@ def parse_config(
     data: Mapping[str, Any], *, base_dir: Path, source: Path | None = None
 ) -> IlmarConfig:
     """Validate already-parsed configuration data."""
-    _reject_unknown(data, {"ilmar", "limits", "adapters", "verification"}, "top level")
+    _reject_unknown(data, {"ilmar", "limits", "adapters", "verification", "budget"}, "top level")
 
     general = _table(data, "ilmar", "[ilmar]")
     _reject_unknown(general, {"state_dir", "instance_id"}, "[ilmar]")
@@ -140,10 +157,50 @@ def parse_config(
             if "verification" in data
             else None
         ),
+        budget=_parse_budget(_table(data, "budget", "[budget]")) if "budget" in data else None,
         instance_id=instance_id,
         base_dir=base_dir,
         source=source,
     )
+
+
+_BUDGET_KEYS = (
+    "daily_usd",
+    "monthly_usd",
+    "reserve_per_execution_usd",
+    "provider_cap_attested_usd",
+)
+
+
+def _parse_budget(raw: Mapping[str, Any]) -> Budget:
+    """Every key is required and positive: a missing or zero value fails closed."""
+    _reject_unknown(raw, set(_BUDGET_KEYS), "[budget]")
+    micros: dict[str, int] = {}
+    for key in _BUDGET_KEYS:
+        if key not in raw:
+            raise ConfigError(f"[budget] {key} is required")
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ConfigError(f"[budget] {key} must be a number of US dollars")
+        try:
+            micros[key] = usd_to_micros(value)
+        except ValueError as exc:
+            raise ConfigError(f"[budget] {key}: {exc}") from None
+        if micros[key] <= 0:
+            raise ConfigError(f"[budget] {key} must be greater than zero")
+    try:
+        limits = BudgetLimits(
+            daily_micros=micros["daily_usd"],
+            monthly_micros=micros["monthly_usd"],
+            reserve_micros=micros["reserve_per_execution_usd"],
+        )
+    except ValueError:
+        raise ConfigError(
+            "[budget] needs reserve_per_execution_usd <= daily_usd <= monthly_usd"
+        ) from None
+    if micros["provider_cap_attested_usd"] > limits.monthly_micros:
+        raise ConfigError("[budget] provider_cap_attested_usd must not exceed monthly_usd")
+    return Budget(limits, micros["provider_cap_attested_usd"])
 
 
 def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:

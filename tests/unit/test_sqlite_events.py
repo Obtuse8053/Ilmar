@@ -29,6 +29,7 @@ import pytest
 from event_store_support import MACHINE, PATHS, digest, dump, populate
 from ilmar.adapters import sqlite as sqlite_adapter
 from ilmar.adapters.sqlite import MIGRATIONS, SCHEMA_V1, SCHEMA_VERSION, SQLiteExecutionStore
+from ilmar.domain.budget import BudgetTotals
 from ilmar.domain.errors import FencingError, LedgerIntegrityError
 from ilmar.domain.event_history import FindingClass, Report, verify_lines
 from ilmar.domain.events import CorruptEventError, EventType
@@ -42,6 +43,7 @@ from recovery_support import (
     to_schema_4,
     to_schema_5,
     to_schema_6,
+    to_schema_7,
 )
 
 from contracts.execution_store import evidence_record
@@ -541,7 +543,7 @@ def test_a_covered_store_migrates_to_5_without_a_new_baseline(schema_4: Path) ->
         assert store.instance_operations() == ()  # readable before the migration
         fence = store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(schema_4) == SCHEMA_VERSION == 7
+    assert version(schema_4) == SCHEMA_VERSION == 8
     assert operation_rows(schema_4) == rows  # every row, byte for byte, in order
     assert event_rows(schema_4)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]  # no baseline
@@ -641,7 +643,7 @@ def test_a_covered_store_migrates_to_6_without_a_new_baseline(tmp_path: Path, st
     with SQLiteExecutionStore(path) as store:
         store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(path) == SCHEMA_VERSION == 7
+    assert version(path) == SCHEMA_VERSION == 8
     assert operation_rows(path) == rows
     assert event_rows(path)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]
@@ -730,7 +732,7 @@ def test_a_schema_6_store_migrates_to_7_keeping_every_row(tmp_path: Path) -> Non
     with SQLiteExecutionStore(path) as store:
         store.claim_instance("inst", now=at(10))
         waiting = store.list_in_states({S.RETRY_WAIT})
-    assert version(path) == SCHEMA_VERSION == 7
+    assert version(path) == SCHEMA_VERSION == 8
     # Every row keeps its values; the new column is empty: an old wait is due at once.
     assert [(*row, None) for row in before] == execution_rows(path)
     assert event_rows(path)[: len(events)] == events
@@ -751,3 +753,66 @@ def test_a_failed_migration_to_7_changes_nothing(
         store.claim_instance("inst", now=at(10))
     assert dump(path) == before
     assert version(path) == 6
+
+
+# -- schema 8: budget_ledger and suspension (#18) --------------------------------------------
+
+
+def test_a_schema_7_store_migrates_to_8_keeping_every_row(tmp_path: Path) -> None:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_7(path)
+    assert version(path) == 7
+    before, events = execution_rows(path), event_rows(path)
+    with SQLiteExecutionStore(path) as store:
+        assert store.suspension() is None  # readable before the migration
+        store.claim_instance("inst", now=at(10))
+        assert store.suspension() is None
+        assert store.budget_totals(at(10)) == BudgetTotals()
+    assert version(path) == SCHEMA_VERSION == 8
+    assert before == execution_rows(path)
+    assert event_rows(path)[: len(events)] == events
+    with closing(sqlite3.connect(path)) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"budget_ledger", "suspension"} <= tables
+    assert report(path).exit_code == 0
+
+
+def test_a_failed_migration_to_8_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "executions.sqlite3"
+    with SQLiteExecutionStore(path) as store:
+        populate(store)
+    to_schema_7(path)
+    before = dump(path)
+    monkeypatch.setitem(MIGRATIONS, 7, MIGRATIONS[7] + "\nSELECT no_such_function();\n")
+    with SQLiteExecutionStore(path) as store, pytest.raises(sqlite3.OperationalError):
+        store.claim_instance("inst", now=at(10))
+    assert dump(path) == before
+    assert version(path) == 7
+
+
+def test_charges_cannot_be_changed_or_removed_in_the_database(tmp_path: Path) -> None:
+    """ADR-0029 §2: nothing is refunded, not even by editing the file's rows."""
+    from ilmar.domain.budget import BudgetLimits, Charge, ChargeKind
+
+    path = tmp_path / "executions.sqlite3"
+    limits = BudgetLimits(daily_micros=5, monthly_micros=5, reserve_micros=5)
+    with SQLiteExecutionStore(path) as store:
+        fence = store.claim_instance("inst", now=at(0))
+        execution, created = MACHINE.start(TaskRef("fake", "A"), execution_id="e1", now=at(1))
+        store.commit(fence, Commit(created=((execution, created),)))
+        claimed, step = MACHINE.advance(execution, S.CLAIMED, now=at(2), reason="r")
+        store.commit(fence, Commit(applied=((claimed, step),)))
+        started, step = MACHINE.advance(claimed, S.PROVISIONING, now=at(3), reason="r")
+        charge = Charge("e1", 1, ChargeKind.RESERVATION, 5, step.at)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=limits))
+    with closing(sqlite3.connect(path)) as conn:
+        for statement in (
+            "DELETE FROM budget_ledger",
+            "UPDATE budget_ledger SET amount_micros = 1",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(statement)

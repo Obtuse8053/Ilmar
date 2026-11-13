@@ -25,6 +25,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from ilmar.domain.budget import BudgetLimits, Charge, ChargeKind, Suspension
 from ilmar.domain.execution import Execution, Transition
 
 if TYPE_CHECKING:  # events imports this module; the store validates extra events
@@ -455,6 +456,14 @@ class Commit:
       ``execution.cancel_requested`` (ADR-0025). The store validates them and
       appends them after the commit's mandatory events, in the same
       transaction; they change no row.
+    * ``charges``: accounting charges (ADR-0029 §2). A reservation is written
+      with the transition that starts its attempt, never alone.
+    * ``budget``: the allowances that attempts started by this commit are
+      admitted against. The store checks them in the same transaction as the
+      write, so two coordinators can never admit beyond them together.
+    * ``suspend`` / ``resume``: set or clear the instance's suspension
+      (ADR-0029 §3). A suspension in force refuses every commit that admits new
+      work (an execution created, claimed or starting an attempt).
     """
 
     created: tuple[tuple[Execution, Transition], ...] = ()
@@ -464,8 +473,19 @@ class Commit:
     expected: tuple[tuple[str, int], ...] = ()
     reasons: Mapping[str, str] = field(default_factory=dict)
     extra_events: tuple[Event, ...] = ()
+    charges: tuple[Charge, ...] = ()
+    budget: BudgetLimits | None = None
+    suspend: Suspension | None = None
+    resume: datetime | None = None
+    """When the suspension is cleared (set only to resume)."""
 
     def __post_init__(self) -> None:
+        if self.suspend is not None and self.resume is not None:
+            raise ValueError("a commit suspends or resumes, not both")
+        reservations = [(c.execution_id, c.attempt) for c in self.charges
+                        if c.kind is ChargeKind.RESERVATION]  # fmt: skip
+        if len(set(reservations)) != len(reservations):
+            raise ValueError("one reservation per attempt")
         keys = [o.key for o in self.operations] + [r.key for r in self.resources]
         ids = [e.id for e, _ in (*self.created, *self.applied)]
         if len(set(keys)) != len(keys) or len(set(ids)) != len(ids):
@@ -477,7 +497,14 @@ class Commit:
     @property
     def empty(self) -> bool:
         return not (
-            self.created or self.applied or self.operations or self.resources or self.extra_events
+            self.created
+            or self.applied
+            or self.operations
+            or self.resources
+            or self.extra_events
+            or self.charges
+            or self.suspend is not None
+            or self.resume is not None
         )
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
+from ilmar.domain.budget import Suspension
 from ilmar.domain.errors import LedgerIntegrityError
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import (
@@ -33,9 +34,11 @@ from ilmar.domain.events import (
     EventContext,
     EventEnvelopeError,
     EventType,
+    accounting_events,
     baseline_events,
     derive_events,
     resource_ref,
+    resumed_event,
 )
 from ilmar.domain.execution import Execution
 from ilmar.domain.ledger import Commit, Fence, Operation, Resource
@@ -72,6 +75,11 @@ def default_context(fence: Fence, changes: Commit) -> EventContext:
         datetime.strptime(e.at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
         for e in changes.extra_events
     ]
+    times += [c.at for c in changes.charges]
+    if changes.suspend is not None:
+        times.append(changes.suspend.since)
+    if changes.resume is not None:
+        times.append(changes.resume)
     if not times:
         raise ValueError("an empty commit has no events")
     return EventContext(at=max(times), instance=fence.instance_id, epoch=fence.epoch)
@@ -85,8 +93,11 @@ def commit_events(
     execution: Callable[[str], Execution | None],
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
+    suspended: Suspension | None = None,
 ) -> tuple[Event, ...]:
     """The events ``changes`` must be committed with, ``data.from`` filled and paired.
+
+    ``suspended`` is the stored suspension, if any (named by ``instance.resumed``).
 
     The lookups return the **stored** rows, before this commit. Raises
     ``LedgerIntegrityError`` for a context that does not belong to ``fence``,
@@ -115,7 +126,15 @@ def commit_events(
         raise LedgerIntegrityError(f"an event of this commit is invalid: {error}") from None
     events = tuple(derived)
     check_pairing(changes, events, execution=execution, operation=operation, resource=resource)
-    return events + extras
+    try:
+        accounting = accounting_events(changes, context)
+        if changes.resume is not None:
+            if suspended is None:
+                raise LedgerIntegrityError("there is no suspension to resume")
+            accounting += (resumed_event(suspended.reason.value, context),)
+    except EventEnvelopeError as error:
+        raise LedgerIntegrityError(f"an event of this commit is invalid: {error}") from None
+    return events + accounting + extras
 
 
 def check_extra_events(

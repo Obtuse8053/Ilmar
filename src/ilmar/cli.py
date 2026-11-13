@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ilmar import __version__, cli_cancel, cli_events
+from ilmar import __version__, cli_cancel, cli_events, cli_suspend
 from ilmar.adapters.registry import build, plan
 from ilmar.config import load_config
 from ilmar.core.coordinator import Coordinator, ExitCode
@@ -40,6 +40,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cli_events.run(args)
     if args.command == "cancel":
         return cli_cancel.run(args)
+    if args.command in ("suspend", "resume", "budget"):
+        return cli_suspend.run(args)
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
@@ -74,6 +76,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     cli_events.add_parser(commands)
     cli_cancel.add_parser(commands)
+    cli_suspend.add_parsers(commands)
     validate.add_argument(
         "--check-environment",
         action="store_true",
@@ -154,6 +157,7 @@ def _run_once(path: Path) -> int:
                     ),
                     stall_timeout_seconds=config.limits.stall_timeout_seconds,
                     execution_wall_seconds=config.limits.execution_wall_seconds,
+                    budget=config.budget.limits if config.budget else None,
                     clock=_now,
                 )
                 report = coordinator.run_once()

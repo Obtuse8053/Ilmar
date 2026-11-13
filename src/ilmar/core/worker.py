@@ -58,9 +58,17 @@ from ilmar.core.ownership import ExecutionLease, ExecutionLeases
 from ilmar.core.safe_fs import directory_identity
 from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, attempt_wait_reason
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.budget import (
+    BudgetLimits,
+    Charge,
+    ChargeKind,
+    Suspension,
+    SuspensionReason,
+)
 from ilmar.domain.changes import ChangeRequestSpec
 from ilmar.domain.errors import (
     AmbiguousOperationError,
+    BudgetExhaustedError,
     CandidateRejectedError,
     ClockBehindError,
     ConcurrencyConflictError,
@@ -71,6 +79,7 @@ from ilmar.domain.errors import (
     OwnershipConflictError,
     PolicyViolationError,
     ProviderError,
+    SuspendedError,
 )
 from ilmar.domain.events import Event, EventContext, EventType, reason_for_claim, reason_for_error
 from ilmar.domain.execution import Execution, ExecutionState
@@ -127,6 +136,9 @@ class Outcome(enum.Enum):
     WAITING = "waiting"
     """Waiting to retry: the backoff has not ended yet (ADR-0028, #13). A later
     pass starts the next attempt; nothing is wrong."""
+    SUSPENDED = "suspended"
+    """No new work may start: a suspension is in force, or the store refused the
+    attempt's reservation (ADR-0029 §3). Nothing was written for the attempt."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +193,7 @@ class ExecutionWorker:
         agent_timeout_seconds: float,
         retry_backoff: RetryBackoff,
         stall_timeout_seconds: float | None = None,
+        budget: BudgetLimits | None = None,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
@@ -194,6 +207,7 @@ class ExecutionWorker:
         self.agent_timeout = agent_timeout_seconds
         self.retry_backoff = retry_backoff
         self.stall_timeout = stall_timeout_seconds
+        self.budget = budget
         self.new_token = new_token
         self.watch_interval = watch_interval_seconds
         self.cancellations = Cancellations(
@@ -390,10 +404,25 @@ class _Run:
         cleared: tuple[Event, ...] = ()
         if target.is_terminal:  # a terminal execution closes its open observation (§3a)
             cleared = self.clearing(observed=None)
+        charges: tuple[Charge, ...] = ()
+        if target is S.PROVISIONING and self.w.budget is not None:
+            # ADR-0029 §2: the reservation is committed with the attempt's start,
+            # before any container exists; the store admits it or refuses both.
+            charges = (Charge(self.id, updated.attempt, ChargeKind.RESERVATION,
+                              self.w.budget.reserve_micros, transition.at),)  # fmt: skip
+        suspend = None
+        if code == "provider-refused" and self.store.suspension() is None:
+            # ADR-0029 §5: a spend-limit, billing or authentication refusal
+            # suspends all new work, in the same commit as the failure.
+            suspend = Suspension(SuspensionReason.PROVIDER_CAP, now, detail="the model provider "
+                                 f"refused execution {self.id}")  # fmt: skip
         return Commit(
             applied=((updated, transition),),
             reasons={self.id: code} if code is not None else {},
             extra_events=cleared,
+            charges=charges,
+            budget=self.w.budget if charges else None,
+            suspend=suspend,
         )
 
     # -- the loop -------------------------------------------------------------------
@@ -427,6 +456,8 @@ class _Run:
                 return WorkerResult(self.id, Outcome.WAITING, waiting.reason)
             except ClockBehindError as behind:  # the store refused the attempt: nothing written
                 return WorkerResult(self.id, Outcome.WAITING, str(behind))
+            except (BudgetExhaustedError, SuspendedError) as refused:  # nothing written
+                return WorkerResult(self.id, Outcome.SUSPENDED, str(refused), code=refused.reason)
             except _DETERMINISTIC as error:
                 ended = self.fail(f"{type(error).__name__}: {error}", code=reason_for_error(error))
                 if ended is not None:

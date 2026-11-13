@@ -285,6 +285,14 @@ ADDED_CODES = {
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)
     "protected-path",  # ADR-0031 (#92)
+    "budget-reserved",  # ADR-0029 §2 and §3 (#18)
+    "budget-daily",  # ADR-0029 §2 and §3 (#18)
+    "budget-monthly",  # ADR-0029 §2 and §3 (#18)
+    "provider-cap",  # ADR-0029 §2 and §3 (#18)
+    "kill-switch",  # ADR-0029 §2 and §3 (#18)
+    "operator-suspended",  # ADR-0029 §2 and §3 (#18)
+    "clock-anomaly",  # ADR-0029 §2 and §3 (#18)
+    "operator-resumed",  # ADR-0029 §2 and §3 (#18)
 }
 
 

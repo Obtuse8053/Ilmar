@@ -67,6 +67,7 @@ from ilmar.core.worker import (
     blocked_for_maintainer,
     needs_attention,
 )
+from ilmar.domain.budget import BudgetLimits, Suspension, SuspensionReason, exhausted
 from ilmar.domain.changes import ChangeRequest, ChangeRequestState
 from ilmar.domain.errors import (
     ClockBehindError,
@@ -74,6 +75,7 @@ from ilmar.domain.errors import (
     FencingError,
     LedgerIntegrityError,
     ProviderError,
+    SuspendedError,
 )
 from ilmar.domain.events import Event, EventType
 from ilmar.domain.execution import Execution, ExecutionState
@@ -102,7 +104,11 @@ class ExitCode(enum.IntEnum):
     """Manual intervention is needed (ambiguous effect, quarantine, unfinished journal)."""
     CONFIGURATION = 3
     """The configuration is invalid or this coordinator does not own the instance."""
+    SUSPENDED = 78
+    """No new work may start: a suspension is in force (ADR-0029 §3, ADR-0030)."""
 
+
+_BUDGET_REASONS = frozenset({"budget-daily", "budget-monthly"})
 
 _CODES = {
     Outcome.PUBLISHED: ExitCode.SUCCESS,
@@ -110,6 +116,7 @@ _CODES = {
     Outcome.FAILED: ExitCode.FAILURE,
     Outcome.BLOCKED: ExitCode.BLOCKED,
     Outcome.WAITING: ExitCode.SUCCESS,
+    Outcome.SUSPENDED: ExitCode.SUSPENDED,
 }
 
 
@@ -133,6 +140,7 @@ class Coordinator:
         agent_timeout_seconds: float,
         retry_backoff: RetryBackoff,
         stall_timeout_seconds: float | None = None,
+        budget: BudgetLimits | None = None,
         new_id: Callable[[], str] = lambda: "x" + secrets.token_hex(6),
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         events: PassEvents | None = None,
@@ -154,9 +162,11 @@ class Coordinator:
             agent_timeout_seconds=agent_timeout_seconds,
             retry_backoff=retry_backoff,
             stall_timeout_seconds=stall_timeout_seconds,
+            budget=budget,
             new_token=new_token,
             watch_interval_seconds=watch_interval_seconds,
         )
+        self._budget = budget
 
     @classmethod
     def create(
@@ -170,6 +180,7 @@ class Coordinator:
         clock: Callable[[], datetime],
         stall_timeout_seconds: float | None = None,
         execution_wall_seconds: float | None = None,
+        budget: BudgetLimits | None = None,
         new_id: Callable[[], str] | None = None,
         new_token: Callable[[], str] | None = None,
         new_pass_id: Callable[[], str] = new_pass_id,
@@ -182,6 +193,9 @@ class Coordinator:
         Every agent sandbox gets a finite, runtime-enforced lifetime (ADR-0029
         §1): ``execution_wall_seconds`` plus a grace period. The wall time must
         be at least ``agent_timeout_seconds``; omitted, it is derived from it.
+
+        With ``budget``, every attempt is admitted against its allowances and
+        charged its reservation as it starts (ADR-0029 §2).
         """
         lifetime = agent_sandbox_lifetime(
             execution_wall(agent_timeout_seconds, execution_wall_seconds)
@@ -222,6 +236,7 @@ class Coordinator:
             agent_timeout_seconds=agent_timeout_seconds,
             retry_backoff=retry_backoff,
             stall_timeout_seconds=stall_timeout_seconds,
+            budget=budget,
             events=events,
             watch_interval_seconds=watch_interval_seconds,
         )
@@ -243,7 +258,13 @@ class Coordinator:
         completed = self.follow_up_change_requests(results)
         now = self._clock()
         behind = clock_behind(now, self._store.latest_update())
-        task = self._pick(not_now=cleared) if behind is None else None
+        suspended = self.suspend_if_exhausted(results, now)
+        task = self._pick(not_now=cleared) if behind is None and suspended is None else None
+        if suspended is not None:
+            # ADR-0029 §3: no new claim and no new container while suspended.
+            results.append(WorkerResult("admission", Outcome.SUSPENDED,
+                                        f"new work is suspended ({suspended.reason.value})",
+                                        code=suspended.reason.value))  # fmt: skip
         if behind is not None and self._pick(not_now=cleared) is not None:
             # ADR-0028 §3: no new execution while the clock is behind the store.
             results.append(WorkerResult("admission", Outcome.WAITING, behind))
@@ -262,10 +283,21 @@ class Coordinator:
             except ClockBehindError as refused:  # the store's own check: nothing written
                 results.append(WorkerResult("admission", Outcome.WAITING, str(refused)))
                 task = None
+            except SuspendedError as refused:  # suspended since the check above
+                results.append(WorkerResult("admission", Outcome.SUSPENDED, str(refused),
+                                            code=refused.reason))  # fmt: skip
+                task = None
         if task is not None:
             result = self._isolated(execution.id, lambda: self.dispatch(execution.id, task))
             if result is not None:
                 results.append(result)
+                after = self.suspend_if_exhausted([result], self._clock())
+                if after is not None and result.outcome is not Outcome.SUSPENDED:
+                    # Suspended by this attempt's own reservation, or by the provider
+                    # refusing it: the pass still ends with 78 (ADR-0030).
+                    results.append(WorkerResult("admission", Outcome.SUSPENDED,
+                                                f"new work is suspended ({after.reason.value})",
+                                                code=after.reason.value))  # fmt: skip
         orphans = f"released {released} orphaned claim(s)" if released else ""
         if not results:
             summary = orphans or "no eligible task"
@@ -273,6 +305,40 @@ class Coordinator:
         code = max(_CODES[r.outcome] for r in results)
         summary = "; ".join([*(r.line() for r in results), *([orphans] if orphans else [])])
         return PassReport(code, summary, tuple(results), completed)
+
+    def suspend_if_exhausted(self, results: list[WorkerResult], now: datetime) -> Suspension | None:
+        """The suspension in force after this check (ADR-0029 §2 and §3).
+
+        A budget refusal from the store (a result with a ``budget-*`` code), or
+        allowances that cannot take one more reservation, write a durable
+        suspension, unless one is already in force. A crash before the write
+        loses nothing: the next pass is refused again and suspends then."""
+        current = self._store.suspension()
+        if current is not None:
+            return current
+        reason: SuspensionReason | None = None
+        for result in results:
+            if result.outcome is Outcome.SUSPENDED and result.code in _BUDGET_REASONS:
+                reason = SuspensionReason(result.code)
+        if reason is None and self._budget is not None:
+            reason = exhausted(
+                self._budget, self._store.budget_totals(now), self._budget.reserve_micros
+            )
+        if reason is None:
+            return None
+        period = "daily" if reason is SuspensionReason.BUDGET_DAILY else "monthly"
+        suspension = Suspension(
+            reason, now, detail=f"the next reservation would exceed the {period} allowance"
+        )
+        fence = self._effects.fence
+        try:
+            self._store.commit(
+                fence, Commit(suspend=suspension), context=self._events.context(fence)
+            )
+        except LedgerIntegrityError:
+            if self._store.suspension() is None:  # not a concurrent suspension: a real fault
+                raise
+        return self._store.suspension()
 
     def recover(self) -> tuple[WorkerResult, ...]:
         """Drive every execution that still has work, from its durable state (ADR-0022)."""

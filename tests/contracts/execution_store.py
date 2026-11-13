@@ -17,13 +17,23 @@ from typing import Any
 import pytest
 
 from ilmar.core.state_machine import ExecutionStateMachine
+from ilmar.domain.budget import (
+    BudgetLimits,
+    BudgetTotals,
+    Charge,
+    ChargeKind,
+    Suspension,
+    SuspensionReason,
+)
 from ilmar.domain.errors import (
+    BudgetExhaustedError,
     ClockBehindError,
     ConcurrencyConflictError,
     DuplicateExecutionError,
     ExecutionNotFoundError,
     FencingError,
     LedgerIntegrityError,
+    SuspendedError,
 )
 from ilmar.domain.event_history import StoredState, verify
 from ilmar.domain.events import Actor, ActorKind, Event, EventContext, EventType, derive_events
@@ -58,6 +68,8 @@ MACHINE = ExecutionStateMachine(max_attempts=3)
 TASK_A = TaskRef("fake", "A")
 TASK_B = TaskRef("fake", "B")
 BASE, CANDIDATE = "a" * 40, "b" * 40
+LIMITS = BudgetLimits(daily_micros=3_000_000, monthly_micros=100_000_000, reserve_micros=1_000_000)
+DAY = 86_400
 
 
 def evidence_record(execution_id: str, attempt: int = 1, seconds: float = 10) -> EvidenceRecord:
@@ -1028,6 +1040,184 @@ class ExecutionStoreContract(FencingContract, EventLogContract):
         started, step = MACHINE.advance(claimed_e2, S.PROVISIONING, now=at(20), reason="r")
         store.commit(fence, Commit(applied=((started, step),)))
         assert store.get("e2") == started
+
+    # -- accounting reservations and suspension (ADR-0029 §2 and §3, #18) ----------------
+
+    def _claimed_execution(
+        self, store: ExecutionStore, fence: Fence, execution_id: str, task: TaskRef, second: float
+    ) -> Execution:
+        execution, created = MACHINE.start(task, execution_id=execution_id, now=at(second))
+        store.commit(fence, Commit(created=((execution, created),)))
+        claimed_execution, step = MACHINE.advance(execution, S.CLAIMED, now=at(second), reason="r")
+        store.commit(fence, Commit(applied=((claimed_execution, step),)))
+        return claimed_execution
+
+    @staticmethod
+    def _start(execution: Execution, second: float) -> tuple[Execution, Any, Charge]:
+        started, step = MACHINE.advance(execution, S.PROVISIONING, now=at(second), reason="r")
+        charge = Charge(
+            execution.id, started.attempt, ChargeKind.RESERVATION, LIMITS.reserve_micros, step.at
+        )
+        return started, step, charge
+
+    def test_an_attempt_starts_with_its_reservation(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        execution = self._claimed_execution(store, fence, "e1", TASK_A, 10)
+        started, step, charge = self._start(execution, 11)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=LIMITS))
+        assert store.get("e1") == started
+        assert tuple(store.charges("e1")) == (charge,)
+        assert store.budget_totals(at(11)) == BudgetTotals(LIMITS.reserve_micros,
+                                                           LIMITS.reserve_micros)  # fmt: skip
+        reserved = [e for e in store.events() if e.type is EventType.BUDGET_RESERVED]
+        assert len(reserved) == 1
+        assert (reserved[0].execution, reserved[0].attempt) == ("e1", 1)
+        assert reserved[0].data["amount_micros"] == LIMITS.reserve_micros
+        assert reserved[0].data["day"] == charge.day
+
+    def test_the_daily_allowance_admits_exactly_up_to_its_limit(
+        self, store: ExecutionStore
+    ) -> None:
+        """Three reservations fit the daily allowance exactly; the fourth is refused
+        atomically: neither the transition, the charge nor an event is written."""
+        fence = claimed(store)
+        for n in range(3):
+            execution = self._claimed_execution(store, fence, f"e{n}", TaskRef("fake", f"t{n}"),
+                                                10 * n + 1)  # fmt: skip
+            started, step, charge = self._start(execution, 10 * n + 2)
+            store.commit(fence, Commit(applied=((started, step),), charges=(charge,),
+                                       budget=LIMITS))  # fmt: skip
+        assert store.budget_totals(at(30)).day_micros == LIMITS.daily_micros
+        last = self._claimed_execution(store, fence, "e3", TaskRef("fake", "t3"), 30)
+        events = len(store.events())
+        started, step, charge = self._start(last, 31)
+        with pytest.raises(BudgetExhaustedError) as refused:
+            store.commit(fence, Commit(applied=((started, step),), charges=(charge,),
+                                       budget=LIMITS))  # fmt: skip
+        assert refused.value.reason == "budget-daily"
+        assert store.get("e3") == last
+        assert tuple(store.charges("e3")) == ()
+        assert len(store.events()) == events
+
+    def test_the_monthly_allowance_is_checked_across_days(self, store: ExecutionStore) -> None:
+        monthly = BudgetLimits(daily_micros=2_000_000, monthly_micros=3_000_000,
+                               reserve_micros=1_000_000)  # fmt: skip
+        fence = claimed(store)
+        for n in range(3):
+            execution = self._claimed_execution(store, fence, f"e{n}", TaskRef("fake", f"t{n}"),
+                                                DAY * n + 10)  # fmt: skip
+            started, step = MACHINE.advance(execution, S.PROVISIONING, now=at(DAY * n + 11),
+                                            reason="r")  # fmt: skip
+            charge = Charge(execution.id, 1, ChargeKind.RESERVATION, 1_000_000, step.at)
+            store.commit(fence, Commit(applied=((started, step),), charges=(charge,),
+                                       budget=monthly))  # fmt: skip
+        last = self._claimed_execution(store, fence, "e3", TaskRef("fake", "t3"), DAY * 3 + 10)
+        started, step = MACHINE.advance(last, S.PROVISIONING, now=at(DAY * 3 + 11), reason="r")
+        charge = Charge("e3", 1, ChargeKind.RESERVATION, 1_000_000, step.at)
+        with pytest.raises(BudgetExhaustedError) as refused:
+            store.commit(fence, Commit(applied=((started, step),), charges=(charge,),
+                                       budget=monthly))  # fmt: skip
+        assert refused.value.reason == "budget-monthly"
+
+    @pytest.mark.parametrize(
+        "problem", ["missing", "wrong-amount", "other-time", "alone", "no-budget"]
+    )
+    def test_a_reservation_is_written_only_with_its_attempt_start(
+        self, store: ExecutionStore, problem: str
+    ) -> None:
+        fence = claimed(store)
+        execution = self._claimed_execution(store, fence, "e1", TASK_A, 10)
+        started, step, charge = self._start(execution, 11)
+        commits = {
+            "missing": Commit(applied=((started, step),), budget=LIMITS),
+            "wrong-amount": Commit(applied=((started, step),), budget=LIMITS,
+                                   charges=(dataclasses.replace(charge, amount_micros=1),)),
+            "other-time": Commit(applied=((started, step),), budget=LIMITS,
+                                 charges=(dataclasses.replace(charge, at=at(12)),)),
+            "alone": Commit(charges=(charge,), budget=LIMITS),
+            "no-budget": Commit(applied=((started, step),), charges=(charge,)),
+        }  # fmt: skip
+        with pytest.raises(LedgerIntegrityError):
+            store.commit(fence, commits[problem])
+        assert store.get("e1") == execution
+        assert tuple(store.charges("e1")) == ()
+
+    def test_a_suspension_refuses_every_admission_and_nothing_else(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = self._claimed_execution(store, fence, "e1", TASK_A, 10)
+        queued, created = MACHINE.start(TASK_B, execution_id="e2", now=at(11))
+        store.commit(fence, Commit(created=((queued, created),)))
+        suspension = Suspension(SuspensionReason.OPERATOR, at(12), "maintenance")
+        store.commit(fence, Commit(suspend=suspension))
+        assert store.suspension() == suspension
+        started, step, charge = self._start(execution, 13)
+        claim_e2, claim_step = MACHINE.advance(queued, S.CLAIMED, now=at(13), reason="r")
+        new, new_step = MACHINE.start(TaskRef("fake", "C"), execution_id="e3", now=at(13))
+        for commit in (
+            Commit(applied=((started, step),), charges=(charge,), budget=LIMITS),
+            Commit(applied=((started, step),)),
+            Commit(applied=((claim_e2, claim_step),)),
+            Commit(created=((new, new_step),)),
+        ):
+            with pytest.raises(SuspendedError) as refused:
+                store.commit(fence, commit)
+            assert refused.value.reason == "operator-suspended"
+        assert (store.get("e1"), store.get("e2"), store.get("e3")) == (execution, queued, None)
+        # Work that admits nothing new still goes on: here, ending an execution.
+        failed, fail_step = MACHINE.advance(execution, S.FAILED, now=at(14), reason="r",
+                                            error="stopped")  # fmt: skip
+        store.commit(fence, Commit(applied=((failed, fail_step),),
+                                   reasons={"e1": "operator-suspended"}))  # fmt: skip
+        assert store.get("e1") == failed
+
+    def test_resuming_lifts_the_suspension_and_records_what_it_cleared(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = self._claimed_execution(store, fence, "e1", TASK_A, 10)
+        store.commit(fence, Commit(suspend=Suspension(SuspensionReason.BUDGET_DAILY, at(11))))
+        with pytest.raises(LedgerIntegrityError, match="already in force"):
+            store.commit(fence, Commit(suspend=Suspension(SuspensionReason.OPERATOR, at(12))))
+        store.commit(fence, Commit(resume=at(13)))
+        assert store.suspension() is None
+        with pytest.raises(LedgerIntegrityError, match="no suspension"):
+            store.commit(fence, Commit(resume=at(14)))
+        wanted = (EventType.INSTANCE_SUSPENDED, EventType.INSTANCE_RESUMED)
+        kinds = [(e.type, e.reason, dict(e.data)) for e in store.events() if e.type in wanted]
+        assert kinds == [
+            (EventType.INSTANCE_SUSPENDED, "budget-daily", {}),
+            (EventType.INSTANCE_RESUMED, "operator-resumed", {"cleared": "budget-daily"}),
+        ]
+        started, step, charge = self._start(execution, 15)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=LIMITS))
+
+    def test_a_suspension_and_a_refused_start_in_one_commit_write_nothing(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        execution = self._claimed_execution(store, fence, "e1", TASK_A, 10)
+        started, step, charge = self._start(execution, 11)
+        suspend = Suspension(SuspensionReason.OPERATOR, at(11))
+        both = Commit(applied=((started, step),), charges=(charge,), budget=LIMITS, suspend=suspend)
+        with pytest.raises(SuspendedError):
+            store.commit(fence, both)
+        assert store.suspension() is None
+        assert store.get("e1") == execution
+
+    def test_the_budget_day_is_the_utc_day_of_the_start(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        late = at(0).replace(hour=23, minute=59, second=59)
+        execution, created = MACHINE.start(TASK_A, execution_id="e1", now=late)
+        store.commit(fence, Commit(created=((execution, created),)))
+        claimed_e1, step = MACHINE.advance(execution, S.CLAIMED, now=late, reason="r")
+        store.commit(fence, Commit(applied=((claimed_e1, step),)))
+        started, step = MACHINE.advance(claimed_e1, S.PROVISIONING, now=late, reason="r")
+        charge = Charge("e1", 1, ChargeKind.RESERVATION, LIMITS.reserve_micros, step.at)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=LIMITS))
+        assert store.budget_totals(late).day_micros == LIMITS.reserve_micros
+        assert store.budget_totals(late + timedelta(seconds=1)).day_micros == 0
 
     def test_evidence_is_appended_in_order_and_round_trips(self, store: ExecutionStore) -> None:
         _create(store, "e1", TASK_A, 0)
