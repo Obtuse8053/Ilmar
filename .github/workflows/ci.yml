@@ -100,6 +100,8 @@ jobs:
           tests/integration/test_podman_credentials.py
           tests/integration/test_sigkill_podman.py
           tests/integration/test_sealed_paths_podman.py
+          tests/integration/test_podman_gateway.py
+          tests/integration/test_podman_gateway_crash.py
 
   licenses:
     name: Dependency licenses

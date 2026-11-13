@@ -33,6 +33,8 @@ READS = {
     # ADR-0035 §3: StreamConsumer, which a runtime adapter feeds with the
     # command's stdout; validating it changes nothing outside Ilmar.
     "feed", "close",
+    # ADR-0037 §1: the in-memory route of a GATEWAY sandbox.
+    "model_access",
 }  # fmt: skip
 
 

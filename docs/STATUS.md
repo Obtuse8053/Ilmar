@@ -72,6 +72,26 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-12: **#118 merged** (#92 part 1).
+  - **C0 passed** on Claude Code 2.1.318 (run 43181484162). The recorded
+    request shape is on #111: `claude-opus-5-5`, `max_tokens` 128000, about
+    46 KB, streaming, custom tools only. That shape drives P5.
+  - **P4 part 1 submitted:** the model gateway as a separate sidecar
+    (ADR-0037 §1).
+    - A `GATEWAY` network policy: the sandbox shares a private
+      `--internal` network with its gateway sidecar alone.
+    - The sidecar holds the real key in memory only. It receives the key
+      through `podman exec` standard input into a FIFO in its tmpfs, so the
+      key is never in a file, and a crash leaves no copy.
+    - It accepts only a per-sandbox throwaway token, checked by digest, and
+      only on the messages endpoints.
+    - The runner gives the sandbox the token and the runtime-provided
+      `http://` address.
+    - A real-Podman test checks separate-sidecar connectivity, and that no
+      direct route exists. C1, the same test with the pinned Claude Code,
+      runs in the gateway-compat workflow.
+    - **Not yet selectable from configuration:** it waits for P5, the
+      worst-case cost reservation.
 - 2026-11-12: **#18 part 1 submitted: reservation ledger and suspension**
   (ADR-0029 §2, §3 and §8; schema 8).
   - **Reservations:** each attempt is charged `[budget]

@@ -13,7 +13,14 @@ from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
 from ilmar.adapters.claude_code.runner import REDACTED
 from ilmar.adapters.claude_code.stream import StreamValidator
 from ilmar.domain.agent import AgentOutcome, AgentRequest
-from ilmar.domain.workspace import CommandResult, ContainerHandle, ContainerSpec, ResourceOwner
+from ilmar.domain.errors import PolicyViolationError
+from ilmar.domain.workspace import (
+    CommandResult,
+    ContainerHandle,
+    ContainerSpec,
+    NetworkPolicy,
+    ResourceOwner,
+)
 
 from claude_code_support import (
     API_RETRY,
@@ -118,6 +125,54 @@ def test_gateway_url_is_passed_when_configured(tmp_path: Path) -> None:
     settings = ClaudeCodeSettings(base_url="https://llm-gateway.example.com")
     ClaudeCodeRunner(api_key=KEY, settings=settings).run(runtime, handle, request())
     assert script.calls[0][1]["ANTHROPIC_BASE_URL"] == "https://llm-gateway.example.com"
+
+
+def gateway_setup(
+    tmp_path: Path, *results: CommandResult
+) -> tuple[FakeContainerRuntime, ContainerHandle, Scripted]:
+    runtime = FakeContainerRuntime()
+    script = Scripted(*results)
+    runtime.register("claude", script)
+    allow_probe(runtime)
+    spec = ContainerSpec(image="img", host_workspace=tmp_path, name="agent", owner=OWNER,
+                         workspace_identity=identity_of(tmp_path),
+                         network=NetworkPolicy.GATEWAY)  # fmt: skip
+    return runtime, runtime.start(spec), script
+
+
+def test_a_gateway_sandbox_gets_the_token_and_never_the_real_key(tmp_path: Path) -> None:
+    """ADR-0037 §1: the runtime's route replaces the key and sets the base URL."""
+    runtime, handle, script = gateway_setup(tmp_path, ok())
+    result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, request())
+    assert result.outcome is AgentOutcome.COMPLETED
+    route = runtime.model_access(handle)
+    assert route is not None
+    for _argv, env in script.calls:  # the probe and the run alike
+        assert KEY not in env.values()
+    _, env = script.calls[-1]
+    assert env["ANTHROPIC_API_KEY"] == route.token
+    assert env["ANTHROPIC_BASE_URL"] == route.base_url == "http://10.89.0.2:8080"
+
+
+def test_a_gateway_sandbox_refuses_a_second_base_url(tmp_path: Path) -> None:
+    runtime, handle, script = gateway_setup(tmp_path, ok())
+    runner = ClaudeCodeRunner(
+        api_key=KEY, settings=ClaudeCodeSettings(base_url="https://other.example.com")
+    )
+    with pytest.raises(PolicyViolationError, match="ADR-0037"):
+        runner.run(runtime, handle, request())
+    assert script.calls == []
+
+
+def test_the_gateway_token_is_redacted_from_summaries(tmp_path: Path) -> None:
+    runtime, handle, _ = gateway_setup(tmp_path)
+    route = runtime.model_access(handle)
+    assert route is not None
+    leaked = stream(result_json(subtype="success", is_error=False, text=f"tok {route.token}"))
+    runtime.register("claude", Scripted(ok(leaked)))
+    result = ClaudeCodeRunner(api_key=KEY).run(runtime, handle, request())
+    assert route.token not in result.summary
+    assert REDACTED in result.summary
 
 
 def test_the_credential_is_redacted_from_summaries(tmp_path: Path) -> None:

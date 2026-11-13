@@ -14,6 +14,10 @@ It shows that:
   through it, with the settings locations sealed;
 * every request carries the throwaway token and nothing else as its credential.
 
+A second test (C1) runs the real topology: the gateway in a separate sidecar
+container on the sandbox's private network, the provider on the host. A pass
+of the first test alone shows loopback compatibility only.
+
 It also records the shape of every request (paths, models, ``max_tokens``,
 thinking budgets, tool and content-block types, sizes and beta headers; never
 prompt text). ADR-0037's request limits and model allow-list are set from that
@@ -37,14 +41,22 @@ import pytest
 
 from ilmar.adapters.claude_code import ClaudeCodeRunner, ClaudeCodeSettings
 from ilmar.adapters.claude_code.credential_route import SEALED_PATHS
-from ilmar.adapters.podman import PodmanRuntime
+from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.domain.agent import AgentOutcome, AgentRequest
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
 from live_harness import LiveGuardError, Secret, pinned_claude_version, write_report
 
 from helpers import task
-from integration.podman_support import PODMAN, identity_of, make_workspace, remove_everything
+from integration.gateway_support import Provider
+from integration.podman_support import (
+    PODMAN,
+    host_ipv4,
+    identity_of,
+    make_workspace,
+    podman,
+    remove_everything,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -137,3 +149,76 @@ def test_pinned_claude_code_works_through_a_plain_http_gateway(tmp_path: Path) -
     assert all(r["auth_ok"] for r in requests), "a request without the throwaway token"
     assert result.outcome is AgentOutcome.COMPLETED, result.summary
     assert any(r["path"].split("?")[0] == "/v1/messages" for r in requests)
+
+
+# -- C1: the same, through a separate gateway sidecar (ADR-0037 §1, P4) ----------------
+
+SIDECAR_NAME = "ilmar-it-gateway-sidecar"
+REAL_KEY = "sk-ant-c1-stand-in-real-key-" + "5" * 24  # what only the sidecar may hold
+
+
+def test_pinned_claude_code_works_through_a_separate_gateway_sidecar(tmp_path: Path) -> None:
+    """The real topology: Claude Code in a ``GATEWAY`` sandbox, the gateway in its
+    own sidecar container on the sandbox's private network, and the stand-in
+    provider on the host, outside both. The sandbox gets only the throwaway token;
+    the provider must see the real key on every request."""
+    pinned = version()
+    assert pinned is not None
+    host = host_ipv4()
+    if host is None:
+        pytest.fail("the stand-in provider needs a non-loopback host IPv4 address")
+    remove_everything(SIDECAR_NAME)
+    provider = Provider(host, tmp_path / "provider.jsonl", REAL_KEY)
+    layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
+    layout.workspaces_root.mkdir(parents=True)
+    workspace = make_workspace(layout, "sidecar")
+    owner = ResourceOwner(instance_id="it", execution_id="gws", attempt=1, token="tok-gws")
+    runtime = PodmanRuntime(
+        layout=layout,
+        gateway=GatewaySettings(
+            image=os.environ.get("ILMAR_TEST_PODMAN_PROXY_IMAGE") or IMAGE,  # needs python3
+            key=REAL_KEY, upstream=f"http://{host}:{provider.port}",
+            allow_plain_http_upstream=True,
+        ),
+    )  # fmt: skip
+    try:
+        handle = runtime.start(
+            ContainerSpec(image=IMAGE, host_workspace=workspace, name=SIDECAR_NAME, owner=owner,
+                          workspace_identity=identity_of(workspace),
+                          network=NetworkPolicy.GATEWAY, sealed_paths=SEALED_PATHS,
+                          lifetime_seconds=900)
+        )  # fmt: skip
+        try:
+            access = runtime.model_access(handle)
+            assert access is not None
+            runner = ClaudeCodeRunner(
+                api_key=REAL_KEY,  # replaced by the token: it must never reach the sandbox
+                settings=ClaudeCodeSettings(max_turns=2, expected_version=pinned),
+            )
+            result = runner.run(
+                runtime, handle,
+                AgentRequest(task=task("gateway"), instructions="Reply with OK.",
+                             timeout_seconds=180, stall_timeout_seconds=120),
+            )  # fmt: skip
+            gateway_log = podman("logs", f"{SIDECAR_NAME}-egress", check=False)
+        finally:
+            runtime.stop(handle, owner=owner)
+    finally:
+        provider.stop()
+        remove_everything(SIDECAR_NAME)
+    requests = provider.requests()
+    directory = os.environ.get("ILMAR_LIVE_REPORT_DIR")
+    if directory:
+        write_report(Path(directory), "issue-111-gateway-sidecar", {
+            "provenance": "recorded", "claude_code_version": pinned, "image": IMAGE,
+            "at": datetime.now(UTC).isoformat(), "outcome": result.outcome.value,
+            "summary": result.summary[:300], "requests": requests,
+            "gateway_log": (gateway_log.stdout + gateway_log.stderr).splitlines()[-50:],
+        }, [Secret("stand-in real key", REAL_KEY),
+            Secret("throwaway token", access.token)])  # fmt: skip
+    assert requests, f"nothing reached the provider through the sidecar: {result.summary}"
+    assert all(r["auth_ok"] for r in requests), "a request reached the provider without the key"
+    assert result.outcome is AgentOutcome.COMPLETED, result.summary
+    assert any(str(r["path"]).split("?")[0] == "/v1/messages" for r in requests)
+    assert REAL_KEY not in gateway_log.stdout + gateway_log.stderr
+    assert access.token not in gateway_log.stdout + gateway_log.stderr

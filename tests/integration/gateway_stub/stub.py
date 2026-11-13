@@ -6,7 +6,9 @@ answers every request with a short valid reply and records each request's
 shape (never its prompt text) as one JSON line, so the test can check what
 pinned Claude Code sends through a plain-HTTP ``ANTHROPIC_BASE_URL``.
 
-Usage: ``python3 stub.py <port> <log file> <expected token>``.
+Usage: ``python3 stub.py <port> <log file> <expected token> [<bind address>]``.
+The bind address defaults to ``127.0.0.1``; the separate-sidecar test runs it
+on the host's own address, as the provider the gateway forwards to.
 Standard library only.
 """
 
@@ -18,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 PORT, LOG, TOKEN = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+BIND = sys.argv[4] if len(sys.argv) > 4 else "127.0.0.1"
 SERVER_TOOL_PREFIXES = ("web_search", "web_fetch", "code_execution", "bash_2", "text_editor_2")
 
 
@@ -182,4 +185,4 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

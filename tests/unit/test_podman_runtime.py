@@ -3,18 +3,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
 
 import pytest
 
-from ilmar.adapters.podman import EgressSettings, PodmanRuntime, SandboxProfile
+from ilmar.adapters.podman import EgressSettings, GatewaySettings, PodmanRuntime, SandboxProfile
 from ilmar.adapters.podman.runtime import (
     LABEL_MANAGED,
     PODMAN_ENVIRONMENT,
@@ -1219,3 +1222,151 @@ def test_a_directory_the_sandbox_needs_is_never_sealed(
 ) -> None:
     with pytest.raises(ProviderError, match="cannot seal"):
         runtime(layout, podman).start(spec(workspace, sealed_paths=(SealedPath(path),)))
+
+
+# -- GATEWAY: the model gateway sidecar (#111 P4, ADR-0037 §1) ------------------------
+
+REAL_KEY = "sk-ant-real-key-only-for-the-sidecar-0001"
+GATEWAY = GatewaySettings(image="localhost/ilmar-proxy:1", key=REAL_KEY)
+
+
+def gateway_spec(workspace: Workspace, **kwargs: object) -> ContainerSpec:
+    return spec(workspace, network=NetworkPolicy.GATEWAY, **kwargs)
+
+
+def test_gateway_needs_gateway_settings(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    with pytest.raises(ProviderError, match="GatewaySettings"):
+        runtime(layout, podman, egress=EGRESS).start(gateway_spec(workspace))
+    assert "run" not in podman.commands()
+
+
+def test_the_gateway_sidecar_is_hardened_and_holds_the_only_route(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, gateway=GATEWAY)
+    handle = rt.start(gateway_spec(workspace))
+    sidecar = podman.by_name("ilmar-exec-1-1-egress")
+    sandbox = podman.by_name("ilmar-exec-1-1")
+    assert sidecar is not None
+    assert sandbox is not None
+    args = sidecar.run_args
+    for option in ("--cap-drop=all", "--security-opt=no-new-privileges", "--read-only",
+                   "--env-host=false", "--http-proxy=false", "--pull=never"):  # fmt: skip
+        assert option in args
+    assert args[args.index("--user") + 1] == "65534:65534"
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--network"] == [
+        "ilmar-exec-1-1-net",
+        "podman",
+    ]
+    # The sandbox: only the private network, no DNS, no hosts file, no IPv6.
+    sandbox_args = sandbox.run_args
+    networks = [sandbox_args[i + 1] for i, a in enumerate(sandbox_args) if a == "--network"]
+    assert networks == ["ilmar-exec-1-1-net"]
+    for option in ("--dns=none", "--no-hosts"):
+        assert option in sandbox_args
+    assert "HTTPS_PROXY" not in sandbox.env
+    # The route: the sidecar's address on that network, and a throwaway token.
+    access = rt.model_access(handle)
+    assert access is not None
+    assert access.base_url == f"http://{sidecar.networks['ilmar-exec-1-1-net']}:8080"
+    command = args[args.index("localhost/ilmar-proxy:1") :]
+    assert command[command.index("--token-sha256") + 1] == (
+        hashlib.sha256(access.token.encode()).hexdigest()
+    )
+    assert command[command.index("--clients") + 1] == podman.networks["ilmar-exec-1-1-net"].subnet
+    assert command[command.index("--upstream") + 1] == "https://api.anthropic.com"
+    assert "--allow-plain-http-upstream" not in command
+    assert sidecar.labels["io.ilmar.role"] == "egress-proxy"
+
+
+def test_the_real_key_reaches_the_sidecar_once_on_stdin_and_never_a_file(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace, tmp_path: Path
+) -> None:
+    """#120 review: no file holds the key at any moment, so no crash can leave one."""
+    before = set(Path(tempfile.gettempdir()).iterdir())
+    rt = runtime(layout, podman, gateway=GATEWAY)
+    handle = rt.start(gateway_spec(workspace))
+    sidecar = podman.by_name("ilmar-exec-1-1-egress")
+    assert sidecar is not None
+    ((target, content),) = podman.gateway_keys
+    assert (target, content) == (sidecar.id, REAL_KEY)
+    (handoff,) = [c for c in podman.calls if c.stdin == REAL_KEY.encode()]
+    assert handoff.argv[1:5] == ["exec", "--interactive", "--user", "65534:65534"]
+    assert handoff.argv[5] == sidecar.id  # the sidecar only, never the sandbox
+    assert handoff.argv[-1] == "/run/ilmar-gateway/key"
+    for call in podman.calls:  # no key mount, no key file, no secret option
+        assert not any("ilmar-gateway-key" in a or a == "--secret" for a in call.argv)
+    assert set(Path(tempfile.gettempdir()).iterdir()) == before
+    tmpfs = sidecar.run_args[sidecar.run_args.index("--tmpfs") + 1]
+    assert tmpfs.startswith("/run/ilmar-gateway:rw,noexec,nosuid,nodev,size=64k")
+    command = sidecar.run_args[sidecar.run_args.index("localhost/ilmar-proxy:1") :]
+    assert command[command.index("--key-fifo") + 1] == "/run/ilmar-gateway/key"
+    access = rt.model_access(handle)
+    assert access is not None
+    assert access.token != REAL_KEY
+    shown = repr(GATEWAY) + repr(access) + json.dumps([c.argv for c in podman.calls])
+    for container in podman.containers.values():
+        shown += json.dumps(container.env)
+    assert REAL_KEY not in shown
+    assert access.token not in shown  # only its digest is on a command line
+
+
+def test_each_sandbox_gets_its_own_token(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, gateway=GATEWAY)
+    first = rt.model_access(rt.start(gateway_spec(workspace)))
+    rt2 = runtime(layout, podman, gateway=GATEWAY)
+    assert rt2.model_access(rt2.start(gateway_spec(workspace))) != first
+
+
+def test_the_route_is_gone_with_the_sandbox_and_unknown_elsewhere(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    rt = runtime(layout, podman, gateway=GATEWAY)
+    handle = rt.start(gateway_spec(workspace))
+    assert runtime(layout, podman, gateway=GATEWAY).model_access(handle) is None  # in memory only
+    rt.stop(handle, owner=OWNER)
+    assert rt.model_access(handle) is None
+    assert sidecars(podman) == (False, False)
+    none = runtime(layout, podman, gateway=GATEWAY)
+    assert none.model_access(none.start(spec(workspace))) is None
+
+
+def test_a_gateway_that_never_becomes_ready_leaves_nothing_and_no_key(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.proxy_ready = False
+    ticks = iter(range(1000))
+    rt = runtime(
+        layout, podman, gateway=GATEWAY, clock=lambda: float(next(ticks)), sleep=lambda _s: None
+    )
+    with pytest.raises(ProviderError, match="did not become ready"):
+        rt.start(gateway_spec(workspace))
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+    assert podman.gateway_keys == []  # never handed over to a gateway that did not ask
+
+
+def test_a_gateway_that_refuses_the_key_leaves_nothing(
+    layout: WorkspaceLayout, podman: FakePodman, workspace: Workspace
+) -> None:
+    podman.gateway_takes_key = False
+    with pytest.raises(ProviderError, match="did not take its key") as caught:
+        runtime(layout, podman, gateway=GATEWAY).start(gateway_spec(workspace))
+    assert REAL_KEY not in str(caught.value)
+    assert podman.containers == {}
+    assert sidecars(podman) == (False, False)
+
+
+def test_gateway_settings_are_validated() -> None:
+    with pytest.raises(ValueError, match="https"):
+        GatewaySettings(image="localhost/p:1", key=REAL_KEY, upstream="http://h")
+    with pytest.raises(ValueError, match="one non-empty line"):
+        GatewaySettings(image="localhost/p:1", key="a\nb")
+    assert REAL_KEY not in repr(GatewaySettings(image="localhost/p:1", key=REAL_KEY))
+    tests_only = GatewaySettings(image="localhost/p:1", key=REAL_KEY, upstream="http://10.0.0.1:9",
+                                 allow_plain_http_upstream=True)  # fmt: skip
+    assert tests_only.upstream == "http://10.0.0.1:9"

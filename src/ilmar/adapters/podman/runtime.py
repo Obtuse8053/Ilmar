@@ -25,6 +25,10 @@ short, every sandbox:
   ``--internal`` network without DNS, IPv6 or hosts entries, whose only other
   member is an egress proxy sidecar (:mod:`egress_proxy`) that allows
   ``CONNECT <listed-host>:443`` only; ``HTTPS_PROXY`` points at it.
+  Under ``GATEWAY`` (ADR-0037) the same private network holds a model
+  gateway sidecar (:mod:`model_gateway`) instead: the sandbox reaches the
+  model only through it, with a per-sandbox throwaway token, and never holds
+  the real key, which goes to the sidecar alone.
   ``UNRESTRICTED`` is refused unless the runtime was constructed with
   ``allow_unrestricted_network=True`` (a trusted or development deployment),
   and is then logged as a warning.
@@ -45,12 +49,14 @@ to go (after a command timeout, or to be replaced) cannot be confirmed gone,
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -61,7 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Protocol
 
-from ilmar.adapters.podman import egress_proxy
+from ilmar.adapters.podman import egress_proxy, model_gateway
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.mounts import authorize_mount
 from ilmar.domain.errors import (
@@ -77,6 +83,7 @@ from ilmar.domain.workspace import (
     ContainerInfo,
     ContainerSpec,
     DirectoryIdentity,
+    ModelAccess,
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
@@ -104,6 +111,18 @@ ROLE_EGRESS_NETWORK = "egress-network"
 EGRESS_PROXY_SUFFIX = "-egress"
 EGRESS_NETWORK_SUFFIX = "-net"
 _PROXY_SCRIPT = "/ilmar-egress-proxy.py"
+_GATEWAY_SCRIPT = "/ilmar-model-gateway.py"
+_GATEWAY_RUN = "/run/ilmar-gateway"
+_GATEWAY_KEY_FIFO = _GATEWAY_RUN + "/key"
+_KEY_WRITER = (
+    "import os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NOFOLLOW)\n"
+    "data = sys.stdin.buffer.read()\n"
+    "while data:\n"
+    "    data = data[os.write(fd, data):]\n"
+    "os.close(fd)\n"
+)
+"""Copies standard input into the gateway's FIFO; the key passes only through pipes."""
 _MAX_ALLOWLIST_NAME = 120
 
 PODMAN_ENVIRONMENT = (
@@ -458,6 +477,51 @@ class EgressSettings:
         object.__setattr__(self, "extra_hosts", pinned)
 
 
+@dataclass(frozen=True, slots=True)
+class GatewaySettings:
+    """How ``GATEWAY`` sandboxes reach the model (ADR-0037 §1).
+
+    ``image`` must provide ``python3`` (3.11 or later); the gateway code is
+    mounted read-only from this package. ``key`` is the real model credential:
+    it reaches only the sidecar, on the standard input of a ``podman exec`` into
+    a FIFO in the sidecar's tmpfs, and never exists in a file, a command line,
+    an environment, a log or ``repr``. ``upstream`` is the provider;
+    ``allow_plain_http_upstream`` exists for tests with a stand-in provider.
+    ``extra_hosts`` pins hostnames in the sidecar's ``/etc/hosts``.
+    """
+
+    image: str
+    key: str = field(repr=False)
+    upstream: str = "https://api.anthropic.com"
+    egress_network: str = "podman"
+    port: int = 8080
+    max_request_bytes: int = 4 * 1024 * 1024
+    max_in_flight: int = 4
+    ready_timeout: float = 20.0
+    allow_plain_http_upstream: bool = False
+    extra_hosts: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not _IMAGE.match(self.image):
+            raise ValueError(f"invalid gateway image reference: {self.image!r}")
+        if not self.key or any(c in self.key for c in "\r\n\0"):
+            raise ValueError("the gateway key must be one non-empty line")
+        model_gateway.Upstream.parse(self.upstream, allow_plain_http=self.allow_plain_http_upstream)
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", self.egress_network):
+            raise ValueError(f"invalid network name: {self.egress_network!r}")
+        if not 1024 <= self.port <= 65535:
+            raise ValueError("port must be an unprivileged port")
+        if self.max_request_bytes < 1 or self.max_in_flight < 1:
+            raise ValueError("gateway limits must be positive")
+        pinned = {}
+        for host, address in self.extra_hosts.items():
+            name = egress_proxy.hostname(host)
+            if name is None:
+                raise ValueError(f"extra_hosts: not a hostname: {host!r}")
+            pinned[name] = str(ipaddress.ip_address(address))
+        object.__setattr__(self, "extra_hosts", pinned)
+
+
 def _lifetime_arguments(spec: ContainerSpec) -> list[str]:
     """``--timeout``: conmon, the per-container monitor, kills the container this
     many seconds after it starts, whether or not Ilmar is still running
@@ -508,6 +572,7 @@ class PodmanRuntime:
         clock: Callable[[], float] = time.monotonic,
         allow_unrestricted_network: bool = False,
         egress: EgressSettings | None = None,
+        gateway: GatewaySettings | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._layout = layout
@@ -520,6 +585,8 @@ class PodmanRuntime:
         self._mount_probe = mount_probe
         self._clock = clock
         self._rootless_checked = False
+        self._gateway = gateway
+        self._routes: dict[str, ModelAccess] = {}  # GATEWAY sandboxes, by container id
         self._allow_unrestricted = allow_unrestricted_network
         self._egress = egress
         self._sleep = sleep
@@ -553,6 +620,7 @@ class PodmanRuntime:
             self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
 
         network_args = self._network_arguments(spec.network, spec.name)
+        route: ModelAccess | None = None
         if spec.network is NetworkPolicy.ALLOWLIST:
             try:
                 proxy_url = self._start_egress(spec)
@@ -560,6 +628,12 @@ class PodmanRuntime:
                 self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
                 raise
             env |= {"HTTPS_PROXY": proxy_url, "https_proxy": proxy_url}
+        elif spec.network is NetworkPolicy.GATEWAY:
+            try:
+                route = self._start_gateway(spec)
+            except BaseException:
+                self._discharge(spec.workspace_identity, [_Cleanup.egress(spec)], spec.name)
+                raise
 
         try:
             # Immediately before the mount: the actual directory, not just the path.
@@ -582,7 +656,12 @@ class PodmanRuntime:
         except BaseException:
             self._remove_sandbox(container_id, spec.name)
             raise
+        if route is not None:
+            self._routes[container_id] = route
         return ContainerHandle(runtime=self._name, id=container_id, name=spec.name)
+
+    def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
+        return self._routes.get(handle.id)
 
     def find(self, name: str) -> ContainerInfo | None:
         listed = self._podman_call(
@@ -737,6 +816,7 @@ class PodmanRuntime:
         if container is not None:
             self._remove(container.handle.id, name)
             self._mounted.pop(container.handle.id, None)
+            self._routes.pop(container.handle.id, None)
         if proxy is not None:
             self._remove(proxy.handle.id, proxy.handle.name)
         if network_exists:
@@ -812,7 +892,7 @@ class PodmanRuntime:
         no_icmp = ["--sysctl", "net.ipv4.ping_group_range=1 0"]
         if network is NetworkPolicy.NONE:
             return ["--network=none", "--no-hosts", *no_icmp]
-        if network is NetworkPolicy.ALLOWLIST:
+        if network in (NetworkPolicy.ALLOWLIST, NetworkPolicy.GATEWAY):
             return [
                 "--network",
                 name + EGRESS_NETWORK_SUFFIX,
@@ -877,6 +957,12 @@ class PodmanRuntime:
                 raise ProviderError("ALLOWLIST needs EgressSettings for this runtime")
             if len(spec.name) > _MAX_ALLOWLIST_NAME:
                 raise ValueError(f"container name too long for ALLOWLIST: {spec.name}")
+            return
+        if network is NetworkPolicy.GATEWAY:
+            if self._gateway is None:
+                raise ProviderError("GATEWAY needs GatewaySettings for this runtime")
+            if len(spec.name) > _MAX_ALLOWLIST_NAME:
+                raise ValueError(f"container name too long for GATEWAY: {spec.name}")
             return
         if network is NetworkPolicy.UNRESTRICTED:
             if not self._allow_unrestricted:
@@ -970,6 +1056,7 @@ class PodmanRuntime:
                     if cleanup.kind == "container":
                         self._remove(cleanup.ref, cleanup.name)
                         self._mounted.pop(cleanup.ref, None)
+                        self._routes.pop(cleanup.ref, None)
                     elif cleanup.owner is not None:
                         self._remove_sidecars(cleanup.ref, cleanup.owner)
                 except ContainmentError:
@@ -997,17 +1084,7 @@ class PodmanRuntime:
         proxy_name = spec.name + EGRESS_PROXY_SUFFIX
         labels = _owner_labels(spec.owner)
 
-        create = ["network", "create", "--internal", "--disable-dns"]
-        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_NETWORK}).items():
-            create += ["--label", f"{key}={value}"]
-        self._expect_success(self._podman_call([*create, network]), "network create")
-        subnets = [
-            str(entry.get("subnet", ""))
-            for entry in self._network(network).get("subnets") or []
-            if ":" not in str(entry.get("subnet", ""))
-        ]
-        if not subnets or not all(subnets):
-            raise ProviderError(f"network {network} has no IPv4 subnet")
+        subnets = self._create_private_network(network, labels)
 
         script = Path(egress_proxy.__file__).resolve()
         if _UNSAFE_IN_MOUNT.search(str(script)):
@@ -1064,11 +1141,102 @@ class PodmanRuntime:
         address = self._wait_for_proxy(proxy_id, network, settings.ready_timeout)
         return f"http://{address}:{settings.proxy_port}"
 
-    def _wait_for_proxy(self, proxy_id: str, network: str, timeout: float) -> str:
+    def _create_private_network(self, network: str, labels: Mapping[str, str]) -> list[str]:
+        """An ``--internal`` network without DNS; returns its IPv4 subnets."""
+        create = ["network", "create", "--internal", "--disable-dns"]
+        for key, value in (dict(labels) | {LABEL_ROLE: ROLE_EGRESS_NETWORK}).items():
+            create += ["--label", f"{key}={value}"]
+        self._expect_success(self._podman_call([*create, network]), "network create")
+        subnets = [
+            str(entry.get("subnet", ""))
+            for entry in self._network(network).get("subnets") or []
+            if ":" not in str(entry.get("subnet", ""))
+        ]
+        if not subnets or not all(subnets):
+            raise ProviderError(f"network {network} has no IPv4 subnet")
+        return subnets
+
+    # -- GATEWAY sidecar (ADR-0037) ---------------------------------------------
+
+    def _start_gateway(self, spec: ContainerSpec) -> ModelAccess:
+        """Create the private network and the model gateway; return the route.
+
+        The real key never exists in a file, on the host or in a container, at
+        any moment, so no crash can leave it behind. The gateway makes a FIFO in
+        its own tmpfs and announces it; the key is then written into it by a
+        ``podman exec`` in the sidecar alone, on standard input, and the
+        gateway removes the FIFO once it has read the key. The sidecar is given
+        the SHA-256 digest of the throwaway token, never the token, which only
+        ``model_access`` returns.
+        """
+        settings = self._gateway
+        if settings is None:
+            raise ProviderError("GATEWAY needs GatewaySettings for this runtime")
+        network = spec.name + EGRESS_NETWORK_SUFFIX
+        sidecar = spec.name + EGRESS_PROXY_SUFFIX
+        labels = _owner_labels(spec.owner)
+        subnets = self._create_private_network(network, labels)
+        script = Path(model_gateway.__file__).resolve()
+        if _UNSAFE_IN_MOUNT.search(str(script)):
+            raise ProviderError(f"path not usable in a mount option: {script}")
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        args = [
+            "run", "--detach", "--name", sidecar, "--pull=never",
+            "--user", "65534:65534", "--cap-drop=all",
+            "--security-opt=no-new-privileges", "--read-only",
+            "--read-only-tmpfs=false", "--env-host=false", "--http-proxy=false",
+            "--network", network, "--network", settings.egress_network,
+            "--mount", f"type=bind,source={script},destination={_GATEWAY_SCRIPT},ro=true",
+            # Memory only, for the handoff FIFO; the key itself never lands here.
+            "--tmpfs", f"{_GATEWAY_RUN}:rw,noexec,nosuid,nodev,size=64k,mode=1777",
+            "--pids-limit", "256", "--memory", "256m",
+            "--log-driver=k8s-file", "--init",
+            *_lifetime_arguments(spec),  # the gateway never outlives its sandbox
+        ]  # fmt: skip
+        for host, address in sorted(settings.extra_hosts.items()):
+            args += ["--add-host", f"{host}:{address}"]
+        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_PROXY}).items():
+            args += ["--label", f"{key}={value}"]
+        args += [
+            settings.image, "python3", "-I", _GATEWAY_SCRIPT,
+            "--listen", f"0.0.0.0:{settings.port}",
+            "--token-sha256", digest,
+            "--key-fifo", _GATEWAY_KEY_FIFO,
+            "--upstream", settings.upstream,
+            "--clients", ",".join(subnets),
+            "--max-request-bytes", str(settings.max_request_bytes),
+            "--max-in-flight", str(settings.max_in_flight),
+        ]  # fmt: skip
+        if settings.allow_plain_http_upstream:
+            args.append("--allow-plain-http-upstream")
+        started = self._podman_call(args)
+        self._expect_success(started, "run (model gateway)")
+        sidecar_id = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
+        if not _CONTAINER_ID.match(sidecar_id):
+            raise ProviderError("podman run did not report the model gateway's ID")
+        self._wait_for_proxy(
+            sidecar_id, network, settings.ready_timeout, marker=model_gateway.AWAITING_KEY
+        )
+        handed = self._executor(
+            [self._podman, "exec", "--interactive", "--user", "65534:65534", sidecar_id,
+             "python3", "-I", "-c", _KEY_WRITER, _GATEWAY_KEY_FIFO],
+            self._environ, _CONTROL_TIMEOUT, stdin=settings.key.encode(),
+        )  # fmt: skip
+        if handed.timed_out or handed.returncode != 0:
+            raise ProviderError("the model gateway did not take its key")  # no output: no echo
+        address = self._wait_for_proxy(
+            sidecar_id, network, settings.ready_timeout, marker="ilmar-gateway READY"
+        )
+        return ModelAccess(f"http://{address}:{settings.port}", token)
+
+    def _wait_for_proxy(
+        self, proxy_id: str, network: str, timeout: float, *, marker: str = "ilmar-egress READY"
+    ) -> str:
         deadline = self._clock() + timeout
         while True:
             logs = self._podman_call(["logs", proxy_id])
-            ready = "ilmar-egress READY" in logs.stdout + logs.stderr
+            ready = marker in logs.stdout + logs.stderr
             details = self._inspect(proxy_id)
             if details is None or not details.get("State", {}).get("Running"):
                 raise ProviderError("the egress proxy exited during start")
