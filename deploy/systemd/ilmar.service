@@ -9,6 +9,14 @@
 #   * systemd's own start limits below;
 #   * Ilmar's durable start log (<state_dir>/coordinator/starts.log), written
 #     before anything else; a breach suspends with `restart-loop` and exits 78.
+#
+# The two agree: systemd alone never restarts faster than the start log allows
+# (defaults: 60 s apart, 6 an hour, 20 a UTC day), so every restart systemd
+# makes is one Ilmar accepts. A fixed RestartSec of 12 minutes gives at most 5
+# starts in any hour even when every run fails at once, and StartLimitBurst
+# stops systemd after 10 starts in a day. tests/unit/test_starts.py simulates
+# this schedule against the start log's rules. If you change RestartSec or the
+# start limits, keep that property.
 
 [Unit]
 Description=Ilmar coordinator (loop mode)
@@ -21,13 +29,14 @@ StartLimitBurst=10
 Type=exec
 ExecStart=%h/.local/bin/ilmar run --loop --config %h/.config/ilmar/ilmar.toml
 Restart=on-failure
-RestartSec=30s
-RestartSteps=5
-RestartMaxDelaySec=30min
+RestartSec=12min
 # 3: disabled or misconfigured. 78: suspended. Never restarted.
 RestartPreventExitStatus=3 78
-# The model credential and the forge token come from this file, never the unit.
-EnvironmentFile=%h/.config/ilmar/secrets.env
+# Credentials are never in this unit, and never in a plaintext file it reads.
+# Proposed delivery (not yet implemented; see docs/operations/supervisor.md):
+# systemd user-scoped encrypted credentials, decrypted only into the service's
+# private $CREDENTIALS_DIRECTORY at start, for example
+#   LoadCredentialEncrypted=github-token:%h/.config/ilmar/credentials/github-token.cred
 NoNewPrivileges=yes
 
 [Install]

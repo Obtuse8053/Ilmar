@@ -204,8 +204,6 @@ def test_the_unit_never_restarts_a_suspension_or_a_configuration_error() -> None
     assert service["Restart"] == "on-failure"
     assert set(service["RestartPreventExitStatus"].split()) == {"3", "78"}
     assert "--loop" in service["ExecStart"].split()
-    assert "RestartMaxDelaySec" in service
-    assert "RestartSteps" in service
 
 
 def test_the_unit_bounds_restarts_by_itself() -> None:
@@ -214,8 +212,73 @@ def test_the_unit_bounds_restarts_by_itself() -> None:
     assert 1 <= int(section["StartLimitBurst"]) <= 20
 
 
+def directives(text: str) -> list[str]:
+    """The unit's active lines: comments and blank lines dropped."""
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", ";"))]  # fmt: skip
+
+
 def test_the_unit_holds_no_secret() -> None:
     text = UNIT.read_text()
     assert "Environment=" not in text.replace("EnvironmentFile=", "")
     assert "TOKEN" not in text
     assert "KEY" not in text
+
+
+def test_the_unit_reads_no_plaintext_credential_file() -> None:
+    """#117 review: no plaintext secrets file at rest. ``EnvironmentFile=`` and
+    plaintext ``LoadCredential=``/``SetCredential=`` are refused; encrypted
+    credentials are the proposed delivery."""
+    active = directives(UNIT.read_text())
+    keys = {line.split("=", 1)[0].strip() for line in active if "=" in line}
+    assert not keys & {"EnvironmentFile", "Environment", "LoadCredential", "SetCredential",
+                       "PassEnvironment"}  # fmt: skip
+    assert not any("secrets.env" in line for line in active)
+    assert "secrets.env" not in (UNIT.parents[2] / "docs/operations/supervisor.md").read_text()
+
+
+def seconds(span: str) -> float:
+    """A systemd time span in the forms the unit uses: ``90s``, ``12min``, ``1h``, ``1d``."""
+    for suffix, factor in (("min", 60), ("s", 1), ("h", 3600), ("d", 86400)):
+        if span.endswith(suffix) and span[: -len(suffix)].isdigit():
+            return int(span[: -len(suffix)]) * factor
+    raise AssertionError(f"unexpected time span {span!r}")
+
+
+def test_every_restart_systemd_makes_is_one_the_start_log_accepts(tmp_path: Path) -> None:
+    """#117 review: the unit's own timing stays inside the start log's default
+    limits, so a permitted restart is never itself a restart loop.
+
+    Worst case: every run fails the instant it starts, so systemd restarts it
+    after exactly ``RestartSec``, until ``StartLimitBurst`` starts in
+    ``StartLimitIntervalSec``. Each of those starts must be accepted. Delays
+    that do not grow keep this a fixed schedule we can check.
+    """
+    parsed = unit()
+    service, section = parsed["Service"], parsed["Unit"]
+    assert "RestartSteps" not in service
+    assert "RestartMaxDelaySec" not in service
+    delay = timedelta(seconds=seconds(service["RestartSec"]))
+    burst = int(section["StartLimitBurst"])
+    window = timedelta(seconds=seconds(section["StartLimitIntervalSec"]))
+    limits = StartLimits()  # the defaults loop mode uses
+    assert delay.total_seconds() > limits.min_interval_seconds
+    for first in (T0, datetime(2026, 11, 12, 23, 30, tzinfo=UTC)):  # also across midnight
+        root = tmp_path / first.strftime("%H%M")
+        now = first
+        starts: list[datetime] = []
+        while True:
+            if sum(1 for s in starts if now - s < window) >= burst:
+                break  # systemd refuses further starts within its window
+            starts.append(now)
+            found = account_start(root, now=now, boot_id="boot-1", limits=limits)
+            assert found is None, f"start {len(starts)} at {now}: {found}"
+            now += delay
+        assert len(starts) == burst
+        assert burst <= limits.per_day
+
+
+def test_a_restart_inside_the_minimum_interval_would_be_refused(tmp_path: Path) -> None:
+    """Why the old ``RestartSec=30s`` was wrong: the first restart breached."""
+    assert start(tmp_path, 0, StartLimits()) is None
+    assert start(tmp_path, 0.5, StartLimits()) is not None
