@@ -119,6 +119,30 @@ def test_a_provider_cap_suspension_needs_the_operator_to_confirm(config: Path, s
     assert code == 0
 
 
+def test_a_failed_suspension_check_needs_the_operator_and_a_clean_check(
+    config: Path, state: Path, tmp_path: Path
+) -> None:
+    """#122 review: operator intervention, then a check that succeeds."""
+    kill = tmp_path / "KILL"
+    config.write_text(config.read_text() + f'kill_switch_file = "{kill}"\n')
+    suspend_with(state, SuspensionReason.SUSPENSION_CHECK_FAILED)
+    code, _, err = ilmar("resume", "--config", str(config), "--as", "bob")
+    assert code == 78
+    assert "--check-fault-resolved" in err
+    kill.write_text("")  # the check does not pass: the kill switch reads engaged
+    code, _, err = ilmar("resume", "--config", str(config), "--as", "bob",
+                         "--check-fault-resolved")  # fmt: skip
+    assert code == 78
+    assert "kill switch" in err
+    kill.unlink()
+    code, out, _ = ilmar("resume", "--config", str(config), "--as", "bob",
+                         "--check-fault-resolved")  # fmt: skip
+    assert code == 0
+    assert "suspension-check-failed suspension is lifted" in out
+    with store(state) as opened:
+        assert opened.suspension() is None
+
+
 def test_a_budget_suspension_lifts_only_when_a_reservation_fits(config: Path, state: Path) -> None:
     """With nothing charged the allowance fits again at once; the rule itself
     (charges filling the day) is covered with the coordinator."""

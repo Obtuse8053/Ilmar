@@ -27,6 +27,7 @@ from typing import TextIO, cast
 
 from ilmar.adapters.registry import event_reader, store_writer
 from ilmar.config import IlmarConfig, load_config
+from ilmar.core import kill_switch
 from ilmar.core.ownership import Ownership
 from ilmar.core.starts import StartLimits, breach_if_started, read_starts, start_log_path
 from ilmar.core.suspension import resume_blocker
@@ -64,6 +65,12 @@ def add_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         "--provider-cap-resolved",
         action="store_true",
         help="for a provider-cap suspension: you confirm the provider's cause is resolved",
+    )
+    resume.add_argument(
+        "--check-fault-resolved",
+        action="store_true",
+        help="for a suspension-check-failed suspension: you confirm its cause is fixed; "
+        "the check must also succeed now",
     )
     budget = commands.add_parser("budget", help="show charges, allowances and any suspension")
     budget.add_argument("--config", required=True, help="the configuration file")
@@ -144,7 +151,10 @@ def run(
                 limits=limits,
                 latest_update=store.latest_update(),
                 provider_cap_raised=args.provider_cap_resolved,
-                kill_switch_present=False,
+                check_fault_resolved=args.check_fault_resolved,
+                kill_switch_present=kill_switch.checker(
+                    config.budget.kill_switch_file if config.budget else None
+                )(),
                 restart_breach=restart_breach,
             )
             if blocker is not None:

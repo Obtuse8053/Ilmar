@@ -101,6 +101,15 @@ Hard gates that stay in force:
     breach.
   - A systemd user unit that never restarts exit 3 or 78.
   - Wiring into `ilmar run --loop` comes with #91.
+- 2026-11-13: **#113 merged.** **#18 part 2a submitted: kill switch and
+  interrupting running work** (ADR-0029 §3 and §4, amended).
+  - `[budget] kill_switch_file`, outside every workspace and coordinator
+    repository. It is checked before each claim, before each container start,
+    between passes, and by the watcher while an agent runs.
+  - A system suspension stops the running agent. The attempt goes to
+    `RETRY_WAIT` (`suspension-interrupted`) and is retried with a fresh
+    reservation only after `ilmar resume`. A human cancellation stays
+    terminal.
 - 2026-11-12: **#18 part 1 submitted: reservation ledger and suspension**
   (ADR-0029 §2, §3 and §8; schema 8).
   - **Reservations:** each attempt is charged `[budget]

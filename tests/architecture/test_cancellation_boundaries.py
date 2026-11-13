@@ -118,6 +118,7 @@ def test_the_watcher_calls_no_port_method_and_no_filesystem_function() -> None:
     tree = _tree(WATCHER)
     allowed = {
         "Event", "Thread", "ValueError", "start", "set", "join", "wait", "_read",
+        "_suspended",  # the injected read-only check below (ADR-0029 §3 amendment, #18)
     }  # fmt: skip
     called = {name for name, _ in _called(tree)}
     assert called <= allowed, called - allowed
@@ -147,3 +148,16 @@ def test_only_the_validation_routine_reads_the_inbox() -> None:
             if name in READERS:
                 readers.append((path.name, name))
     assert readers == []
+
+
+def test_the_watchers_suspension_check_only_reads() -> None:
+    """ADR-0029 §3 (amended 2026-11-13): the worker hands the watcher
+    ``suspension_reason``, which may only read the kill-switch file and the
+    store's suspension; it writes nothing."""
+    worker = _tree(WATCHER.parent / "worker.py")
+    (method,) = [
+        node for node in ast.walk(worker)
+        if isinstance(node, ast.FunctionDef) and node.name == "suspension_reason"
+    ]  # fmt: skip
+    called = {name for name, _ in _called(method)}
+    assert called <= {"kill_switch", "suspension"}, called

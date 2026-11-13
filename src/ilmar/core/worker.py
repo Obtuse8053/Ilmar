@@ -35,10 +35,11 @@ import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from typing import NoReturn
 
 from ilmar.core import tracker
 from ilmar.core.cancel_inbox import CancelRequest
-from ilmar.core.cancel_watcher import WATCH_INTERVAL_SECONDS, Watcher
+from ilmar.core.cancel_watcher import SUSPENSION_CHECK_FAILED, WATCH_INTERVAL_SECONDS, Watcher
 from ilmar.core.cancellation import Cancellations, cancellation_accepted
 from ilmar.core.clock import not_before
 from ilmar.core.components import Components
@@ -194,6 +195,7 @@ class ExecutionWorker:
         retry_backoff: RetryBackoff,
         stall_timeout_seconds: float | None = None,
         budget: BudgetLimits | None = None,
+        kill_switch: Callable[[], bool] = lambda: False,
         new_token: Callable[[], str] = lambda: secrets.token_hex(16),
         watch_interval_seconds: float = WATCH_INTERVAL_SECONDS,
     ) -> None:
@@ -208,6 +210,7 @@ class ExecutionWorker:
         self.retry_backoff = retry_backoff
         self.stall_timeout = stall_timeout_seconds
         self.budget = budget
+        self.kill_switch = kill_switch
         self.new_token = new_token
         self.watch_interval = watch_interval_seconds
         self.cancellations = Cancellations(
@@ -325,6 +328,9 @@ class _Run:
         self.read_at_pass_start = False
         self.notices: list[str] = []
         """Inbox entries moved aside during this run, for the operator (ADR-0025 §1a)."""
+        self.watch_failure: str | None = None
+        """Set when the watcher stopped the agent because its suspension check
+        failed; the ``suspension-check-failed`` suspension is then written."""
 
     # -- durable state --------------------------------------------------------------
 
@@ -385,6 +391,8 @@ class _Run:
         Entering RETRY_WAIT records when the next attempt may start: the
         backoff after this attempt, from the same ``now`` as the transition."""
         current = self.current()
+        if target is S.PROVISIONING and self.w.kill_switch():
+            self.suspend_for_kill_switch()  # ADR-0029 §4: before each container start
         # Starting an attempt admits new work: its time is the clock's own, never
         # raised to the execution's last update, so the store can refuse it if the
         # clock stepped back (ADR-0028 §3). Every other move keeps time monotonic.
@@ -424,6 +432,39 @@ class _Run:
             budget=self.w.budget if charges else None,
             suspend=suspend,
         )
+
+    def suspension_reason(self) -> str | None:
+        """Why new work must stop now, if it must: for the watcher (ADR-0029 §3, §4)."""
+        if self.w.kill_switch():
+            return SuspensionReason.KILL_SWITCH.value
+        held = self.store.suspension()
+        return None if held is None else held.reason.value
+
+    def suspend_for_kill_switch(self) -> NoReturn:
+        """Record the ``kill-switch`` suspension (unless one is in force) and stop:
+        nothing of the new attempt is written (ADR-0029 §4)."""
+        self.record_kill_switch()
+        reason = SuspensionReason.KILL_SWITCH.value
+        raise SuspendedError("the kill switch is engaged", reason=reason)
+
+    def record_kill_switch(self) -> None:
+        """Write the ``kill-switch`` suspension unless one is already in force."""
+        self.record_suspension(SuspensionReason.KILL_SWITCH, "the kill-switch file exists")
+
+    def record_suspension(self, reason: SuspensionReason, detail: str) -> None:
+        """Write a suspension unless one is already in force.
+
+        The store refuses a second suspension, so a refusal with one in force is
+        a concurrent suspension, not a fault. Any other failure propagates: the
+        attempt is not ended, and the pass stops (fail closed)."""
+        suspension = Suspension(reason, self.w.clock(), detail=detail)
+        try:
+            self.w.effects.journal.record(
+                Commit(suspend=suspension), lease=self.lease, execution_id=self.id
+            )
+        except LedgerIntegrityError:
+            if self.store.suspension() is None:  # not a concurrent suspension: a real fault
+                raise
 
     # -- the loop -------------------------------------------------------------------
 
@@ -641,6 +682,18 @@ class _Run:
         if result.outcome is AgentOutcome.FAILED:
             raise _Deterministic(f"the agent failed: {result.summary[:200]}", code="agent-failed")
         self.cancel_point(tracker=True)  # never frozen once a cancellation is accepted
+        if result.outcome is AgentOutcome.CANCELLED and (
+            # The watcher's check failed: the suspension it wrote is in force, and
+            # the check is not trusted to say so again.
+            self.watch_failure is not None or self.suspension_reason() is not None
+        ):
+            # Stopped while a suspension is in force, and no human cancellation is
+            # pending or recorded (the safe point above would have ended it). Not
+            # frozen; retried, with a fresh reservation, only after ``ilmar resume``.
+            # A stop with neither still fails closed below.
+            raise TransientError(
+                "the agent run was interrupted by a suspension", code="suspension-interrupted"
+            )
         if result.outcome is not AgentOutcome.COMPLETED:
             # A cancelled run's output never becomes a candidate (ADR-0025 §2). A
             # stopped run whose request was not recorded fails closed.
@@ -662,7 +715,8 @@ class _Run:
         handle = effects.start_agent_sandbox(
             execution, self.lease, owner=owner, workspace=workspace, identity=identity
         )
-        watcher = Watcher(self.w.cancellations.read, self.id, interval=self.w.watch_interval)
+        watcher = Watcher(self.w.cancellations.read, self.id, interval=self.w.watch_interval,
+                          suspended=self.suspension_reason)  # fmt: skip
         try:
             self.cancel_point()  # a started sandbox is removed; the agent never runs
             with watcher:  # writes nothing; sets the stop signal for a valid request only
@@ -674,6 +728,16 @@ class _Run:
                 effects.remove_sandbox(self.current(), self.lease, resource=sandbox)
             if watcher.request is not None:  # recorded as validated, right after the run
                 self.apply_inbox(validated=watcher.request)
+            elif watcher.suspended_by == SuspensionReason.KILL_SWITCH.value:
+                self.record_kill_switch()  # durable before the attempt is ended
+            elif watcher.suspended_by == SUSPENSION_CHECK_FAILED:
+                # #122 review: the whole instance is suspended, durably, before the
+                # attempt is ended; it is preserved for a retry after resume.
+                self.watch_failure = type(watcher.check_error).__name__
+                self.record_suspension(
+                    SuspensionReason.SUSPENSION_CHECK_FAILED,
+                    f"the suspension check failed while an agent ran ({self.watch_failure})",
+                )
 
     def freeze(self, execution: Execution, name: str) -> None:
         sandbox = self.row(execution, ResourceKind.CONTAINER, name)

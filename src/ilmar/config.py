@@ -23,6 +23,7 @@ environment variable" (ADR-0007).
 from __future__ import annotations
 
 import math
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -100,6 +101,10 @@ class Budget:
 
     limits: BudgetLimits
     provider_cap_attested_micros: int
+    kill_switch_file: Path | None = None
+    """ADR-0029 §4: while this file exists, Ilmar suspends with ``kill-switch``.
+    Outside the workspaces and coordinator repositories, so no sandbox can
+    create or remove it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +162,13 @@ def parse_config(
             if "verification" in data
             else None
         ),
-        budget=_parse_budget(_table(data, "budget", "[budget]")) if "budget" in data else None,
+        budget=(
+            _parse_budget(
+                _table(data, "budget", "[budget]"), base_dir=base_dir, state_dir=state_dir
+            )
+            if "budget" in data
+            else None
+        ),
         instance_id=instance_id,
         base_dir=base_dir,
         source=source,
@@ -170,11 +181,12 @@ _BUDGET_KEYS = (
     "reserve_per_execution_usd",
     "provider_cap_attested_usd",
 )
+_OPTIONAL_BUDGET_KEYS = ("kill_switch_file",)
 
 
-def _parse_budget(raw: Mapping[str, Any]) -> Budget:
-    """Every key is required and positive: a missing or zero value fails closed."""
-    _reject_unknown(raw, set(_BUDGET_KEYS), "[budget]")
+def _parse_budget(raw: Mapping[str, Any], *, base_dir: Path, state_dir: Path) -> Budget:
+    """Every allowance is required and positive: a missing or zero value fails closed."""
+    _reject_unknown(raw, {*_BUDGET_KEYS, *_OPTIONAL_BUDGET_KEYS}, "[budget]")
     micros: dict[str, int] = {}
     for key in _BUDGET_KEYS:
         if key not in raw:
@@ -200,7 +212,28 @@ def _parse_budget(raw: Mapping[str, Any]) -> Budget:
         ) from None
     if micros["provider_cap_attested_usd"] > limits.monthly_micros:
         raise ConfigError("[budget] provider_cap_attested_usd must not exceed monthly_usd")
-    return Budget(limits, micros["provider_cap_attested_usd"])
+    kill = _kill_switch_file(raw.get("kill_switch_file"), base_dir=base_dir, state_dir=state_dir)
+    return Budget(limits, micros["provider_cap_attested_usd"], kill)
+
+
+def _kill_switch_file(raw: object, *, base_dir: Path, state_dir: Path) -> Path | None:
+    """ADR-0029 §4: outside every workspace, repository and sandbox mount.
+
+    Checked lexically on normalised absolute paths: the file may not lie under
+    the workspaces root or the coordinator's repositories (both under the
+    state directory, ``WorkspaceLayout.under``)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw:
+        raise ConfigError("[budget] kill_switch_file must be a non-empty path")
+    path = Path(os.path.normpath(raw if os.path.isabs(raw) else base_dir / raw))
+    state = Path(os.path.normpath(state_dir))
+    for forbidden in (state / "workspaces", state / "coordinator" / "repos"):
+        if path == forbidden or forbidden in path.parents:
+            raise ConfigError(
+                f"[budget] kill_switch_file must be outside {forbidden}: a sandbox could reach it"
+            )
+    return path
 
 
 def _parse_verification(raw: Mapping[str, Any]) -> VerificationPolicy:

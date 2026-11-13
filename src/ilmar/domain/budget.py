@@ -135,6 +135,10 @@ class SuspensionReason(enum.Enum):
     CLOCK_ANOMALY = "clock-anomaly"
     RESTART_LOOP = "restart-loop"
     """Loop mode started too often (ADR-0033 §3)."""
+    SUSPENSION_CHECK_FAILED = "suspension-check-failed"
+    """The kill-switch and suspension check failed while an agent ran (ADR-0029 §4):
+    whether work may go on was unknown, so all of it stopped. Lifted only by an
+    operator, and only once the check succeeds again."""
 
 
 @dataclass(frozen=True, slots=True)
