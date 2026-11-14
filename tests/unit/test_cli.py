@@ -92,16 +92,19 @@ def test_run_needs_an_explicit_configuration(capsys: pytest.CaptureFixture[str])
     capsys.readouterr()
 
 
-def test_unattended_operation_is_disabled(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """#11d: without --once nothing is read or started, whatever the configuration."""
+def test_run_needs_once_or_loop(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#11d, #91: without --once or --loop nothing is read or started."""
     missing = tmp_path / "never-read.toml"
     assert main(["run", "--config", str(missing)]) == 3
     error = capsys.readouterr().err
-    assert "unattended operation is disabled" in error
-    assert "issue 44" in error
+    assert "--once" in error
+    assert "--loop" in error
     assert not missing.exists()
+
+
+def test_once_and_loop_exclude_each_other(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(["run", "--once", "--loop", "--config", str(tmp_path / "x.toml")])
 
 
 def test_run_with_an_invalid_configuration_exits_3(

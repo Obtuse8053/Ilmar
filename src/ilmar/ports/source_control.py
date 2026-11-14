@@ -29,6 +29,13 @@ class SourceControlProvider(Protocol):
     @property
     def name(self) -> str: ...
 
+    def repository_id(self, repository: RepositoryRef) -> int:
+        """The repository's immutable identifier at the provider, read live
+        (ADR-0040). A rename keeps it; a fork, a transfer to another repository
+        or a re-created repository has another. Raises ``ProviderError`` when it
+        cannot be read. Changes nothing."""
+        ...
+
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         """The revision ``branch`` points at on the platform, or ``None`` if it does not exist."""
         ...

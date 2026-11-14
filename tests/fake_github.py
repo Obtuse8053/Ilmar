@@ -73,6 +73,7 @@ class FakeGitHub:
         self.transferred: dict[int, str] = {}  # issue number -> new repository
         self.deleted: set[int] = set()  # answered 410 Gone
         self.repository_readable = True
+        self.repository_id: object = 987654321
         # (method, path regex) -> HTTP status, answered instead (403, 429, 5xx ...)
         self.failures: dict[tuple[str, str], int] = {}
 
@@ -142,7 +143,7 @@ class FakeGitHub:
         if url.path == prefix and request.method == "GET":
             if not self.repository_readable:
                 return _json(404, {"message": "Not Found"})
-            return _json(200, {"full_name": self.repository})
+            return _json(200, {"full_name": self.repository, "id": self.repository_id})
         if not url.path.startswith(prefix + "/"):
             return _json(404, {"message": "Not Found"})
         path = url.path[len(prefix) :]

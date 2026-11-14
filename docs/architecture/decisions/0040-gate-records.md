@@ -99,19 +99,27 @@ mode, and refuses a revocation with nothing active. It derives
 this, and no coordinator code path can pass the person check anyway.
 `ilmar gate show` lists every record, revoked ones included.
 
-### 4. What the loop will check (part 3)
+### 4. What the loop checks (#91 part 3)
 
-Before each pass, the loop requires all of these:
+`ilmar run --loop` first refuses (exit 3) without `supervised`, before it
+writes anything. Then it records its start (ADR-0033), takes the instance
+lock for the whole loop (a second loop exits 3), and before each pass
+requires all of these:
 
 - the active `supervised` record;
 - its `repository_id` equal to `[autonomy] repository_id`;
 - the live repository's ID, read from the forge at start and before each
   pass, equal to both. A rename keeps the ID; a fork, a transfer to another
   repository or a re-created repository does not.
-- its `agent_version` equal to the configured `expected_version`.
+- its `agent_version` equal to the configured `expected_version`;
+- no kill switch, no suspension in force, and a clock not behind the latest
+  persisted time (exit 78). Uncertain gateway spend (ADR-0039) always leaves
+  a suspension in force until it is reviewed.
 
 Any mismatch, or a revoked record, stops the loop at the next check
-(ADR-0030 §4).
+(ADR-0030 §4). Passes run one at a time, `poll_interval_seconds` apart. A
+pass that exits 2, 3 or 78 ends the loop; SIGTERM or SIGINT ends it with 0.
+The loop never restarts itself.
 
 ## Consequences
 

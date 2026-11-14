@@ -1,7 +1,10 @@
 # Running Ilmar under systemd (ADR-0033)
 
-> Loop mode (`ilmar run --loop`) arrives with #91. Until then this unit is
-> shipped for review only; autonomous operation stays disabled.
+> `ilmar run --loop` (#91) runs only with `[autonomy] mode = "supervised"`,
+> `[autonomy] repository_id`, and an active gate record written by a person
+> with `ilmar gate record` (ADR-0040). No such record may exist before Gate 1
+> (#93) passes, so the loop stays refused (exit 3) until then. Credentials
+> for the unit come with their own PR; until then, do not enable it.
 
 ## Install
 
