@@ -358,6 +358,8 @@ class Gateway:
 
 class _Handler(BaseHTTPRequestHandler):
     owner: Gateway
+    _settled: bool = False
+    """Whether this request has been charged (or, counting, halted on)."""
     protocol_version = "HTTP/1.1"
     server_version = "ilmar-gateway"
     sys_version = ""
@@ -413,8 +415,17 @@ class _Handler(BaseHTTPRequestHandler):
             gateway.budget.release(ticket)  # closed meanwhile: never sent, never on record
             gateway.release()
             return self._refuse(503, "overloaded_error", "the gateway is closed")
+        self._settled = False
         try:  # from here on it may reach the provider: on record
             self._forward(path, query, admitted, ticket)
+        except BaseException:
+            # An error in the gateway itself, after the request may have reached
+            # the provider: its cost is unknown. Fail closed exactly like an
+            # untrusted report (the whole reservation, and the attempt halts),
+            # then let the error propagate to the server's own error report.
+            if not self._settled:
+                self._settle(ticket, admitted, None, "gateway error")
+            raise
         finally:
             gateway.release()
             if ticket is not None:
@@ -490,21 +501,27 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _settle(
-        self, ticket: int | None, admitted: ga.Admitted, meter: ga.UsageMeter, failure: str | None
+        self,
+        ticket: int | None,
+        admitted: ga.Admitted,
+        meter: ga.UsageMeter | None,
+        failure: str | None,
     ) -> None:
-        """Charge a metered request and log it. A counting request is not billed;
-        its provider failing, or being unreachable, still halts the attempt."""
+        """Charge a metered request and log it, once. A counting request is not
+        billed; its provider failing, or being unreachable, still halts the
+        attempt. Without a ``meter`` there is no report: the whole reservation."""
         gateway = self.owner
         if ticket is None:
             if failure is not None:
                 gateway.budget.halt(failure)
                 reason = _REASON.sub("_", failure)[:80]
                 gateway.log(f"HALT counting reason={reason} charged=0 halted=true")
+            self._settled = True
             return
         admission = gateway.admission
         reservation = admitted.reservation
-        if failure is not None:
-            settled = admission.Settled(reservation, reservation, failure)
+        if failure is not None or meter is None:
+            settled = admission.Settled(reservation, reservation, failure or "no report")
         else:
             price = gateway.budget.policy.prices[admitted.model]
             settled = admission.charge(meter, price, reservation)
@@ -516,6 +533,7 @@ class _Handler(BaseHTTPRequestHandler):
             f"overrun={settled.overrun} reason={reason} "
             f"spent={gateway.budget.spent()} halted={str(gateway.budget.halted).lower()}",
         )  # fmt: skip
+        self._settled = True
 
     def _refuse(self, status: int, kind: str, message: str) -> None:
         payload = json.dumps(

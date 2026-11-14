@@ -8,6 +8,7 @@ network) is tested in ``tests/integration/test_podman_gateway.py``.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import io
@@ -17,7 +18,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -743,3 +744,58 @@ def test_an_empty_or_cut_off_record_is_never_complete() -> None:
     assert mg.parse_spend([R, A, C])["closed"] is False
     complete = mg.parse_spend([R, A, C, "CLOSED admitted=1 settled=1 charged=100 open=0"])
     assert (complete["closed"], complete["charged"], complete["uncertain"]) == (True, 100, None)
+
+
+# -- an error in the gateway itself fails closed --------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_an_error_inside_the_gateway_charges_the_reservation_and_halts(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the request may have reached the provider, a fault in the gateway's
+    own code leaves the cost unknown: it is settled like an untrusted report, the
+    attempt halts, and nothing more is forwarded."""
+    admission = mg.load_admission()
+
+    def broken(self: object, chunk: bytes) -> None:
+        raise RuntimeError("a bug in the meter")
+
+    monkeypatch.setattr(admission.UsageMeter, "feed", broken)
+    monkeypatch.setattr(mg, "load_admission", lambda path=None: admission)
+    monkeypatch.setattr(mg._Handler, "handle_one_request", _quiet(mg._Handler.handle_one_request))
+    provider = Provider()
+    for running in start(provider):
+        body = BODY if path == "/v1/messages" else COUNT
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            running.post(path, body=body)  # the response is cut off
+        assert len(provider.seen) == 1
+        if path == "/v1/messages":
+            (line,) = charges(running.log)
+            assert "reason=gateway_error" in line
+            assert "halted=true" in line
+            reservation = re.search(r"reservation=(\d+)", line)
+            assert reservation is not None
+            assert f"charged={reservation[1]} " in line
+        else:
+            assert charges(running.log) == []
+            assert halts(running.log) == [
+                "HALT counting reason=gateway_error charged=0 halted=true"
+            ]
+        code, _, data = running.post()
+        assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == 1
+        spend = mg.parse_spend(running.log.getvalue().splitlines())
+        assert spend["unsettled"] == 0
+
+
+def _quiet(handle: Callable[[mg._Handler], None]) -> Callable[[mg._Handler], None]:
+    """The server prints the error's traceback; keep test output clean."""
+
+    def wrapped(self: mg._Handler) -> None:
+        try:
+            handle(self)
+        except RuntimeError:
+            self.close_connection = True
+
+    return wrapped
