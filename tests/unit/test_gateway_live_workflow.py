@@ -10,9 +10,11 @@ execs into our script, and records checked for credentials before upload.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
+import subprocess
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import Any
@@ -156,3 +158,90 @@ def test_the_run_needs_a_key_and_the_checked_dependencies(tmp_path: Path) -> Non
         gl.run_tests({"ANTHROPIC_API_KEY": "x"}, run)
     with pytest.raises(RunError, match="hash-checked"):
         gl.run_tests({"ANTHROPIC_API_KEY": KEY, "ILMAR_LIVE_SITE": str(tmp_path)}, run)
+
+
+# -- the upload gate: fail closed (#126 review) ----------------------------------------
+
+
+def raw_records(tmp_path: Path, *texts: str) -> Path:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for n, text in enumerate(texts):
+        name = "issue-111-gateway-live-api.json" if n == 0 else f"extra-{n}.json"
+        (raw / name).write_text(text)
+    return raw
+
+
+def test_publish_copies_only_checked_records_then_marks_the_step(tmp_path: Path) -> None:
+    raw = raw_records(tmp_path, json.dumps({"log": ["CHARGE charged=1"]}), "{}")
+    outputs = tmp_path / "outputs"
+    with redirect_stderr(io.StringIO()):
+        copies = gl.publish(raw, tmp_path / "upload", KEY, str(outputs))
+    assert [p.name for p in copies] == ["issue-111-gateway-live-api.json"]
+    assert sorted(p.name for p in (tmp_path / "upload").iterdir()) == [
+        "issue-111-gateway-live-api.json"
+    ]
+    assert outputs.read_text() == "sanitized=true\n"
+
+
+def test_a_record_holding_the_key_is_never_copied(tmp_path: Path) -> None:
+    raw = raw_records(tmp_path, json.dumps({"x": KEY}))
+    outputs = tmp_path / "outputs"
+    with redirect_stderr(io.StringIO()):
+        assert gl.publish(raw, tmp_path / "upload", KEY, str(outputs)) == []
+    assert list((tmp_path / "upload").iterdir()) == []
+    assert KEY not in "".join(p.read_text() for p in tmp_path.rglob("*") if p.is_file())
+
+
+def run_env(tmp_path: Path, site: Path) -> dict[str, str]:
+    return {
+        "ANTHROPIC_API_KEY": KEY, "ILMAR_LIVE_SITE": str(site),
+        "ILMAR_LIVE_REPORT_DIR": str(tmp_path / "raw"),
+        "ILMAR_LIVE_UPLOAD_DIR": str(tmp_path / "upload"),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+    }  # fmt: skip
+
+
+@pytest.fixture
+def site(tmp_path: Path) -> Path:
+    import live_ci
+
+    site = tmp_path / "site"
+    site.mkdir()
+    marker = hashlib.sha256(live_ci.LOCK.read_text().encode()).hexdigest()
+    (site / live_ci.SITE_MARKER).write_text(marker + "\n")
+    return site
+
+
+def test_a_crash_before_sanitizing_uploads_nothing(tmp_path: Path, site: Path) -> None:
+    """The test runner dies after writing a raw record holding the key: no
+    upload directory and no ``sanitized`` output, so the upload step is skipped."""
+
+    def crash(*args: Any, **kwargs: Any) -> Any:
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        (raw / "issue-111-gateway-live-api.json").write_text(json.dumps({"x": KEY}))
+        raise KeyboardInterrupt  # the runner is killed mid-run
+
+    with pytest.raises(KeyboardInterrupt):
+        gl.run_tests(run_env(tmp_path, site), crash)
+    assert not (tmp_path / "upload").exists()
+    assert not (tmp_path / "outputs").exists()
+
+
+def test_failed_tests_still_publish_only_checked_records(tmp_path: Path, site: Path) -> None:
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        (raw / "issue-111-gateway-live-api.json").write_text(json.dumps({"log": []}))
+        return subprocess.CompletedProcess(args, 1)
+
+    assert gl.run_tests(run_env(tmp_path, site), failing) == 1
+    assert [p.name for p in (tmp_path / "upload").iterdir()] == ["issue-111-gateway-live-api.json"]
+    assert (tmp_path / "outputs").read_text() == "sanitized=true\n"
+
+
+def test_the_raw_and_upload_directories_must_differ(tmp_path: Path, site: Path) -> None:
+    env = {**run_env(tmp_path, site), "ILMAR_LIVE_UPLOAD_DIR": str(tmp_path / "raw")}
+    with pytest.raises(RunError, match="distinct"):
+        gl.run_tests(env, lambda *a, **k: None)

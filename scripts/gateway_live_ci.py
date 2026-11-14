@@ -13,8 +13,12 @@ workspace with a **small spend cap**.
   and the checked-out tree again, and main again.
 * ``--run`` (the one step with the secret): checks the hash-locked
   dependencies, runs ``tests/integration/test_gateway_live_api.py`` with
-  ``ILMAR_LIVE_REQUIRED=1``, then keeps only records that are checked to hold
-  no credential: the key itself, or anything shaped like one.
+  ``ILMAR_LIVE_REQUIRED=1``, then copies only records that are checked to hold
+  no credential (the key itself, or anything shaped like one) into a fresh
+  upload directory, and only then writes ``sanitized=true`` to the step's
+  outputs. The upload step runs only on that output and reads only that
+  directory: if anything crashes before the check, nothing is uploaded
+  (fail closed).
 
 Standard library only.
 """
@@ -113,6 +117,24 @@ def checked_records(directory: Path, key: str) -> list[Path]:
     return kept
 
 
+def publish(raw: Path, upload: Path, key: str, outputs: str) -> list[Path]:
+    """Copy the checked records from ``raw`` into a new ``upload`` directory,
+    then mark the step as sanitized. Raw records are never uploaded."""
+    if upload.exists():
+        raise RunError(f"{upload} already exists")
+    kept = checked_records(raw, key)
+    upload.mkdir(parents=True)
+    copies = []
+    for record in kept:
+        target = upload / record.name
+        target.write_bytes(record.read_bytes())
+        copies.append(target)
+    if outputs:
+        with open(outputs, "a", encoding="utf-8") as handle:
+            handle.write("sanitized=true\n")
+    return copies
+
+
 def run_tests(env: Mapping[str, str], run: Callable[..., Any]) -> int:
     key = env.get(KEY_ENV, "")
     if not KEY_SHAPE.fullmatch(key):
@@ -120,8 +142,10 @@ def run_tests(env: Mapping[str, str], run: Callable[..., Any]) -> int:
     site = Path(env.get("ILMAR_LIVE_SITE", ""))
     live_ci.check_site(site, live_ci.LOCK.read_text())
     records = Path(env.get("ILMAR_LIVE_REPORT_DIR", ""))
-    if not records.is_absolute():
-        raise RunError("ILMAR_LIVE_REPORT_DIR must be an absolute path")
+    upload = Path(env.get("ILMAR_LIVE_UPLOAD_DIR", ""))
+    if not records.is_absolute() or not upload.is_absolute() or upload == records:
+        raise RunError("ILMAR_LIVE_REPORT_DIR and ILMAR_LIVE_UPLOAD_DIR must be distinct "
+                       "absolute paths")  # fmt: skip
     child = {
         "PATH": env.get("PATH", "/usr/bin:/bin"),
         "HOME": env.get("HOME", "/tmp"),  # noqa: S108 - a fallback only
@@ -136,7 +160,7 @@ def run_tests(env: Mapping[str, str], run: Callable[..., Any]) -> int:
     # -s: no user site. A minimal environment: only the checked dependencies on
     # the path (pytest adds the repository's own from pyproject), and the key.
     done = run(command, cwd=str(live_ci.ROOT), env=child, check=False)
-    checked_records(records, key)
+    publish(records, upload, key, env.get("GITHUB_OUTPUT", ""))
     return int(done.returncode)
 
 

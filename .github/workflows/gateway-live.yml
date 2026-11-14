@@ -16,7 +16,9 @@ name: Gateway real-API run (manual)
 #    one step with the secret: a model API key from a workspace with a SMALL
 #    SPEND CAP. Nothing is installed or fetched after it.
 # 4. The records are checked for the key and anything shaped like a
-#    credential before the upload; one that fails is deleted.
+#    credential, and only the sound ones are copied to a separate upload
+#    directory. The upload runs only when the script has said so
+#    (`sanitized`): if anything crashed before the check, nothing is uploaded.
 # Nothing runs on push or pull_request. Unattended operation stays disabled.
 
 on:
@@ -104,15 +106,18 @@ jobs:
       - name: Install the locked wheels (digests checked, nothing resolved)
         run: python3 scripts/live_ci.py --install-wheels "$RUNNER_TEMP/wheels" "$RUNNER_TEMP/site"
       - name: Real-API gateway tests
+        id: tests
         timeout-minutes: 10
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ILMAR_GATEWAY_LIVE_API_KEY }}
           ILMAR_LIVE_SITE: ${{ runner.temp }}/site
-          ILMAR_LIVE_REPORT_DIR: ${{ runner.temp }}/gateway-live-records
+          ILMAR_LIVE_REPORT_DIR: ${{ runner.temp }}/gateway-live-raw
+          ILMAR_LIVE_UPLOAD_DIR: ${{ runner.temp }}/gateway-live-records
         # exec: no shell keeps the secret in its environment.
         run: exec python3 scripts/gateway_live_ci.py --run
       - name: Keep the checked records (no credentials)
-        if: always()
+        # Fail closed: only after the script checked them and said so.
+        if: always() && steps.tests.outputs.sanitized == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gateway-live-records
