@@ -54,6 +54,7 @@ from integration.podman_support import (
 )
 
 pytestmark = pytest.mark.integration
+LAYOUT: list[WorkspaceLayout] = []
 
 NAME = "ilmar-it-gateway"
 OWNER = ResourceOwner(instance_id="it", execution_id="gateway", attempt=1, token="tok-gateway")
@@ -68,6 +69,8 @@ ASK = sh(
 
 @pytest.fixture(scope="module")
 def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, Provider, str]]:
+    """The runtime, one GATEWAY sandbox, the stand-in provider and the host
+    address. The layout is kept in ``LAYOUT`` for tests that start another."""
     require(("podman", PODMAN), ("ILMAR_TEST_PODMAN_IMAGE", IMAGE))
     require(("ILMAR_TEST_PODMAN_PROXY_IMAGE", PROXY_IMAGE))
     host = host_ipv4()
@@ -77,6 +80,7 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     provider = Provider(host, root / "provider.jsonl", REAL_KEY)
     layout = WorkspaceLayout.under(root.resolve() / "state")
     layout.workspaces_root.mkdir(parents=True)
+    LAYOUT[:] = [layout]
     workspace = make_workspace(layout, "gateway")
     runtime = PodmanRuntime(
         layout=layout,
@@ -172,15 +176,13 @@ def test_the_real_key_is_in_neither_container_nor_the_sandbox(
 
 
 def test_closing_stops_the_agent_and_leaves_a_complete_record(
-    world: tuple[Sandbox, Provider, str], tmp_path: Path
+    world: tuple[Sandbox, Provider, str],
 ) -> None:
     """ADR-0039: the agent is stopped (kept), the gateway closed, and the
     record read back complete, consistent and with every request in it."""
     (runtime, _), _, _ = world
     name, owner = f"{NAME}-close", ResourceOwner("it", "gateway-close", 1, "tok-close")
-    layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
-    layout.workspaces_root.mkdir(parents=True)
-    workspace = make_workspace(layout, "gateway-close")
+    workspace = make_workspace(LAYOUT[0], "gateway-close")
     remove_everything(name)
     handle = runtime.start(
         ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=name, owner=owner,
