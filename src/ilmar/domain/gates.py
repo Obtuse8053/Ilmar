@@ -6,14 +6,21 @@ A gate record binds a mode to the evidence it rests on:
 * the approved target, by its **immutable** repository ID (a rename keeps it;
   a fork has another), with the name it had when recorded, for people;
 * the one agent version the evidence is for (an exact ``x.y.z``);
-* the merged pull request that holds the gate evidence;
-* the passed pinned-version live test run;
-* the reviewed, *recorded* stream fixture for that same version, by path and
-  SHA-256 (ADR-0035: a synthetic fixture never counts);
+* the merged pull request that holds the gate evidence, and the immutable
+  commit SHA a person reviewed it at (a URL alone can change meaning);
+* the pinned-version live test run a person verified as passed;
+* the *recorded* stream fixture for that same version, by path and SHA-256
+  (ADR-0035: a synthetic fixture never counts);
 * the Gate 1 record (#93).
 
 Only a person writes one, with ``ilmar gate record``; nothing in the
 coordinator does. A revocation is recorded, never a deletion.
+
+**What Ilmar checks and what a person must.** Ilmar checks the *form* of every
+field and, on the host, the fixture's provenance, version and digest. It does
+not check that the live run passed, that Gate 1 passed, that the evidence PR
+says what it should, or that the commit is the reviewed one: the person who
+records the gate verifies those, and the record says who did.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ RUN_URL = re.compile(_GITHUB + r"actions/runs/\d{1,20}(/attempts/\d{1,4})?$")
 GATE1_URL = re.compile(_GITHUB + r"(issues|pull)/\d{1,9}(#issuecomment-\d{1,20})?$")
 FIXTURE_PATH = re.compile(r"^tests/fixtures/[A-Za-z0-9_./-]{1,200}\.json$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +54,7 @@ class GateEvidence:
     repository: str
     agent_version: str
     evidence: str
+    evidence_commit: str
     live_test: str
     fixture: str
     fixture_sha256: str
@@ -60,6 +69,7 @@ class GateEvidence:
             ("repository", _REPOSITORY, "owner/name"),
             ("agent_version", _VERSION, "an exact x.y.z"),
             ("evidence", PULL_URL, "a GitHub pull request URL"),
+            ("evidence_commit", COMMIT, "a full 40-character lower-case commit SHA"),
             ("live_test", RUN_URL, "a GitHub Actions run URL"),
             ("fixture", FIXTURE_PATH, "a JSON file under tests/fixtures/"),
             ("fixture_sha256", SHA256, "64 lower-case hex digits"),

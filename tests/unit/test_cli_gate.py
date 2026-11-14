@@ -26,6 +26,7 @@ RECORD = [
     "--mode", "supervised", "--repository-id", "987654321",
     "--repository", "someone/ilmar-disposable", "--agent-version", "2.1.318",
     "--evidence", "https://github.com/Obtuse8053/Ilmar/pull/130",
+    "--evidence-commit", "0123456789abcdef0123456789abcdef01234567",
     "--live-test", "https://github.com/Obtuse8053/Ilmar/actions/runs/43567969214",
     "--fixture", FIXTURE, "--gate1", "https://github.com/Obtuse8053/Ilmar/issues/93",
 ]  # fmt: skip
@@ -64,11 +65,13 @@ def test_a_person_records_shows_and_revokes_a_gate(config: Path, checkout: Path)
                            checkout=checkout)  # fmt: skip
     assert (code, err) == (0, "")
     assert "recorded: the supervised gate, for repository 987654321" in out
+    assert "checked the form and the fixture only" in out  # never claims more
     code, out, _ = ilmar("gate", "show", "--config", str(config), checkout=checkout)
     digest = hashlib.sha256((checkout / FIXTURE).read_bytes()).hexdigest()
     assert code == 0
     assert out.startswith("#1 supervised active: repository 987654321")
     assert f"sha256:{digest}" in out
+    assert "pull/130 at 0123456789abcdef0123456789abcdef01234567" in out
     code, _, err = ilmar("gate", "record", "--config", str(config), "--as", "alice", *RECORD,
                          checkout=checkout)  # fmt: skip
     assert (code, "already active" in err) == (3, True)
@@ -121,6 +124,8 @@ def test_the_fixture_must_be_recorded_for_the_same_version(
         ("--fixture", "tests/fixtures/missing.json", "cannot be read"),
         ("--agent-version", "2.1", "another agent version"),
         ("--evidence", "https://example.com/pull/1", "pull request URL"),
+        ("--evidence-commit", "0123456", "40-character"),
+        ("--evidence-commit", "0123456789ABCDEF0123456789ABCDEF01234567", "40-character"),
         ("--live-test", "https://github.com/o/r/pull/1", "Actions run URL"),
         ("--repository", "not a repository", "owner/name"),
         ("--repository-id", "0", "positive integer"),

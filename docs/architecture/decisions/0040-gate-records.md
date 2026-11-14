@@ -12,7 +12,10 @@
     `gate-revoked`.
 - Asked for by the maintainer on 2026-11-14 (#91, part 2): durable
   record/revoke/show, version-bound evidence, explicit revocation, and the
-  approved target bound to its immutable GitHub repository ID.
+  approved target bound to its immutable GitHub repository ID. Accepted in
+  principle the same day with manual evidence review, the evidence bound to
+  an immutable reviewed commit SHA, and an explicit statement of what Ilmar
+  checks and what a person must.
 
 ## Context and problem
 
@@ -47,17 +50,34 @@ contents open. Two later decisions constrain them:
 - `repository_id`: the approved target's immutable GitHub repository ID;
   `repository`: its owner/name when recorded, for people;
 - `agent_version`: an exact `x.y.z`;
-- `evidence`: the merged pull request URL that holds the gate evidence;
+- `evidence`: the merged pull request URL that holds the gate evidence, and
+  `evidence_commit`: the full commit SHA the person reviewed it at. A URL can
+  change what it shows; a commit SHA cannot;
 - `live_test`: the passed pinned-version live test run (a GitHub Actions run
   URL);
 - `fixture` and `fixture_sha256`: the recorded stream fixture's path under
   `tests/fixtures/` and its SHA-256;
 - `gate1`: the Gate 1 record (an issue, pull request or comment URL).
 
-`ilmar gate record` reads the fixture from the current checkout. It must say
+`supervised` now requires `[autonomy] repository_id`.
+
+**What Ilmar checks.** `ilmar gate record` checks the form of every field. It
+reads the fixture from the current checkout: the fixture must say
 `"provenance": "recorded"` and name the same `claude_code_version`, and its
 digest is recorded. `--repository-id` must equal `[autonomy] repository_id`
-when that is set. `supervised` now requires `[autonomy] repository_id`.
+when that is set.
+
+**What a person must verify, before recording.** Ilmar does not check any of
+these:
+
+- that the live run passed, for that version;
+- that Gate 1 passed;
+- that the evidence PR at `evidence_commit` holds the evidence;
+- that the fixture was reviewed.
+
+The person recording the gate checks each by hand, and the record and its
+event name who did. The command's own output says what it checked and what
+it did not.
 
 ### 2. Storage
 
@@ -95,14 +115,16 @@ Any mismatch, or a revoked record, stops the loop at the next check
 
 ## Consequences
 
-- No record can exist before a person writes one with real, version-matched
-  evidence. A fork or a lookalike repository never inherits an approval.
+- No record can exist unless a person writes one. Ilmar ensures its fields
+  are well formed and its fixture is recorded for the same version. Whether
+  the evidence is real and sufficient is that person's verification, not
+  Ilmar's. A fork or a lookalike repository never inherits an approval.
 - A changed agent version, a new fixture or a new target needs a revocation
   and a new record.
 - The repository name and `self_repository` checks of #128 stay as defence in
   depth.
-- The fixture digest proves which file was reviewed, not that the review
-  happened: that is the evidence PR's role.
+- The fixture digest and the evidence commit fix *what* was reviewed. They
+  do not prove that a review happened.
 
 ## Revisit when
 

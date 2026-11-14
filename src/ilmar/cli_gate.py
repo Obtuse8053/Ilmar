@@ -7,13 +7,17 @@ fenced commit as the person named by ``--as``; the store refuses any other
 writer. They open only the execution store: no tracker, forge, container
 runtime or secret. ``show`` only reads.
 
-``record`` checks what it can on the host before writing:
+``record`` checks the form of every field, and what it can on the host:
 
 * the stream fixture is read from ``--fixture`` (a path inside this checkout,
   under ``tests/fixtures/``): it must say ``"provenance": "recorded"`` and be
   for the same ``--agent-version``; its SHA-256 is recorded;
 * ``--repository-id`` must equal ``[autonomy] repository_id`` when the
   configuration sets one.
+
+It does **not** verify that the live run passed, that Gate 1 passed, or what
+the evidence PR and ``--evidence-commit`` contain. The person recording the
+gate verifies those by hand, before recording; the record names them.
 
 Exit codes: 0 done; 3 configuration problem, refused input or the instance in
 use.
@@ -71,6 +75,8 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         "--agent-version", required=True, help="the exact x.y.z the evidence is for"
     )
     record.add_argument("--evidence", required=True, help="the merged PR with the gate evidence")
+    record.add_argument("--evidence-commit", required=True,
+                        help="the full commit SHA you reviewed that evidence at")  # fmt: skip
     record.add_argument("--live-test", required=True, help="the passed pinned-version live run")
     record.add_argument(
         "--fixture",
@@ -148,7 +154,9 @@ def run(
             close()
     if isinstance(gate, GateRecorded):
         print(f"recorded: the {args.mode} gate, for repository {gate.evidence.repository_id} "
-              f"and agent {gate.evidence.agent_version}", file=out)  # fmt: skip
+              f"and agent {gate.evidence.agent_version}, by {args.actor}. Ilmar checked the "
+              "form and the fixture only; the live run and Gate 1 are as you verified them.",
+              file=out)  # fmt: skip
     else:
         print(f"revoked: the {args.mode} gate record; the mode is off at the next check",
               file=out)  # fmt: skip
@@ -179,7 +187,8 @@ def _evidence(args: argparse.Namespace, *, root: Path) -> GateEvidence:
         raise ValueError("--fixture is for another agent version than --agent-version")
     return GateEvidence(
         mode=args.mode, repository_id=args.repository_id, repository=args.repository,
-        agent_version=args.agent_version, evidence=args.evidence, live_test=args.live_test,
+        agent_version=args.agent_version, evidence=args.evidence,
+        evidence_commit=args.evidence_commit, live_test=args.live_test,
         fixture=relative.as_posix(), fixture_sha256=hashlib.sha256(content).hexdigest(),
         gate1=args.gate1,
     )  # fmt: skip
@@ -207,7 +216,8 @@ def _show(config: IlmarConfig, *, out: TextIO, err: TextIO) -> int:
         e = r.evidence
         print(f"#{r.seq} {e.mode} {state}: repository {e.repository_id} ({e.repository}), "
               f"agent {e.agent_version}, recorded {r.recorded_at.isoformat()} by "
-              f"{r.recorded_by}; evidence {e.evidence}; live test {e.live_test}; "
+              f"{r.recorded_by}; evidence {e.evidence} at {e.evidence_commit}; "
+              f"live test {e.live_test}; "
               f"fixture {e.fixture} sha256:{e.fixture_sha256}; gate 1 {e.gate1}",
               file=out)  # fmt: skip
     return OK

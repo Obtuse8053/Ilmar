@@ -818,6 +818,7 @@ def cancel_event(fence: Fence, *, execution: str = "e1", request: str = "q-" + "
 GATE_EVIDENCE = GateEvidence(
     mode="supervised", repository_id=987654321, repository="someone/ilmar-disposable",
     agent_version="2.1.318", evidence="https://github.com/Obtuse8053/Ilmar/pull/130",
+    evidence_commit="0123456789abcdef0123456789abcdef01234567",
     live_test="https://github.com/Obtuse8053/Ilmar/actions/runs/43567969214",
     fixture="tests/fixtures/claude_code_streams/2.1.318-recorded.json",
     fixture_sha256="a" * 64, gate1="https://github.com/Obtuse8053/Ilmar/issues/93",

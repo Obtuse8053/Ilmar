@@ -47,6 +47,7 @@ from ilmar.domain.errors import (
 )
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.gates import (
+    COMMIT,
     FIXTURE_PATH,
     GATE1_URL,
     GATED_MODES,
@@ -561,6 +562,7 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
             "repository": (_pattern(_GATE_REPOSITORY), True),
             "agent_version": (_pattern(_GATE_VERSION), True),
             "evidence": (_pattern(PULL_URL), True),
+            "evidence_commit": (_pattern(COMMIT), True),
             "live_test": (_pattern(RUN_URL), True),
             "fixture": (_pattern(FIXTURE_PATH), True),
             "fixture_sha256": (_pattern(SHA256), True),
