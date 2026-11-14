@@ -54,7 +54,10 @@ from ilmar.domain.gates import (
     PULL_URL,
     RUN_URL,
     SHA256,
+    TRIAL_MAX_EXECUTIONS,
     GateRecorded,
+    TrialAuthorized,
+    TrialRevoked,
 )
 from ilmar.domain.ledger import (
     Commit,
@@ -168,6 +171,10 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "(ADR-0040).",
         "gate-revoked": "A person revoked a mode's gate record; the mode is off at the "
         "next check (ADR-0040).",
+        "trial-authorized": "A person authorized a bounded, expiring supervised-loop trial "
+        "on one disposable repository, for the Gate 1 live run (ADR-0041).",
+        "trial-revoked": "A person revoked a trial authorization; the trial loop stops at "
+        "the next check (ADR-0041).",
         "restart-loop": "Loop mode started more often than its start limits allow (ADR-0033).",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
@@ -318,6 +325,7 @@ _TASK = re.compile(r"^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._/#-]{1,200}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GATE_REPOSITORY = re.compile(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+_ISO_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00:00$")
 _GATE_VERSION = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,6}$")
 _REF = re.compile(r"^r-[0-9a-f]{24}$")
 _ERROR_CLASS = re.compile(r"^[A-Z][A-Za-z]{0,63}Error$")
@@ -447,6 +455,8 @@ class EventType(enum.Enum):
     RESOURCE_RESOLVED = "resource.resolved"
     INSTANCE_GATE_RECORDED = "instance.gate_recorded"
     INSTANCE_GATE_REVOKED = "instance.gate_revoked"
+    INSTANCE_TRIAL_AUTHORIZED = "instance.trial_authorized"
+    INSTANCE_TRIAL_REVOKED = "instance.trial_revoked"
     EXECUTION_BLOCK_RESOLVED = "execution.block_resolved"
     EXECUTION_MODEL_SPEND = "execution.model_spend"
     EXECUTION_SPEND_REVIEWED = "execution.spend_reviewed"
@@ -585,6 +595,19 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
         },
         EventType.INSTANCE_GATE_REVOKED: {  # ADR-0040: which record
             "mode": (_one_of(GATED_MODES), True),
+            "record_seq": (_integer(1), True),
+        },
+        EventType.INSTANCE_TRIAL_AUTHORIZED: {  # ADR-0041: the trial's terms
+            "repository_id": (_integer(1), True),
+            "repository": (_pattern(_GATE_REPOSITORY), True),
+            "agent_version": (_pattern(_GATE_VERSION), True),
+            "max_executions": (_integer(1, TRIAL_MAX_EXECUTIONS), True),
+            "max_spend_micros": (_integer(1), True),
+            "starts_at": (_pattern(_ISO_TIME), True),
+            "expires_at": (_pattern(_ISO_TIME), True),
+            "purpose": (_pattern(GATE1_URL), True),
+        },
+        EventType.INSTANCE_TRIAL_REVOKED: {  # ADR-0041: which trial
             "record_seq": (_integer(1), True),
         },
         EventType.EXECUTION_BLOCK_RESOLVED: {  # ADR-0031 §3: a maintainer's decision
@@ -1141,8 +1164,14 @@ def gate_events(
     if isinstance(gate, GateRecorded):
         recorded = json.loads(gate.evidence.to_json())
         return (new(EventType.INSTANCE_GATE_RECORDED, "gate-recorded", recorded),)
+    if isinstance(gate, TrialAuthorized):  # ADR-0041
+        terms = json.loads(gate.terms.to_json())
+        return (new(EventType.INSTANCE_TRIAL_AUTHORIZED, "trial-authorized", terms),)
     if revoked_seq is None:
         raise EventEnvelopeError("a revocation names the record it revokes")
+    if isinstance(gate, TrialRevoked):
+        trial = {"record_seq": revoked_seq}
+        return (new(EventType.INSTANCE_TRIAL_REVOKED, "trial-revoked", trial),)
     data = {"mode": gate.mode, "record_seq": revoked_seq}
     return (new(EventType.INSTANCE_GATE_REVOKED, "gate-revoked", data),)
 

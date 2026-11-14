@@ -25,12 +25,27 @@ from ilmar.domain.errors import (
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
-from ilmar.domain.gates import GateRecord, GateRecorded, active_gate
+from ilmar.domain.gates import (
+    GateRecord,
+    GateRecorded,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+    active_gate,
+    trial_in_force,
+    unrevoked_trial,
+)
 from ilmar.domain.ledger import Commit, Fence, Operation, OperationStatus, Resource, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
-from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+from ilmar.ports.execution_store import (
+    check_apply,
+    check_commit,
+    check_create,
+    check_fence,
+    check_trial,
+)
 
 FROM_SCHEMA_VERSION = 0
 """What the baseline records as the version migrated from: this store has no schema."""
@@ -44,6 +59,7 @@ class InMemoryExecutionStore:
         self._charges: list[Charge] = []
         self._suspension: Suspension | None = None
         self._gates: list[GateRecord] = []
+        self._trials: list[TrialRecord] = []
         self._executions: dict[str, Execution] = {}
         self._history: dict[str, list[Transition]] = {}
         self._evidence: dict[str, list[str]] = {}  # serialised, so stored copies cannot change
@@ -161,6 +177,14 @@ class InMemoryExecutionStore:
                 suspension=self._suspension,
                 totals=self._totals,
             )
+            check_trial(
+                changes,
+                trial=lambda seq: next((t for t in self._trials if t.seq == seq), None),
+                created_since=lambda at: sum(
+                    1 for e in self._executions.values() if e.created_at >= at
+                ),
+                charged_since=lambda at: sum(c.amount_micros for c in self._charges if c.at >= at),
+            )
             events = event_log.commit_events(
                 fence,
                 changes,
@@ -211,13 +235,31 @@ class InMemoryExecutionStore:
         with self._lock:
             return tuple(self._gates)
 
-    def _active_gate(self, changes: Commit) -> GateRecord | None:
+    def trial_records(self) -> Sequence[TrialRecord]:
+        with self._lock:
+            return tuple(self._trials)
+
+    def _active_gate(self, changes: Commit) -> GateRecord | TrialRecord | None:
+        gate = changes.gate
+        if isinstance(gate, TrialAuthorized):
+            return trial_in_force(self._trials, gate.at)
+        if isinstance(gate, TrialRevoked):
+            return unrevoked_trial(self._trials)
         mode = event_log.gate_mode(changes)
         return None if mode is None else active_gate(self._gates, mode)
 
     def _write_gate(self, changes: Commit, context: EventContext | None) -> None:
         gate = changes.gate
         if gate is None or context is None:  # checked: a gate change has a person's context
+            return
+        who = context.actor.ref or ""
+        if isinstance(gate, TrialAuthorized):
+            self._trials.append(TrialRecord(len(self._trials) + 1, gate.terms, who))
+            return
+        if isinstance(gate, TrialRevoked):
+            trial = unrevoked_trial(self._trials)
+            if trial is not None:
+                self._trials[trial.seq - 1] = replace(trial, revoked_at=gate.at, revoked_by=who)
             return
         if isinstance(gate, GateRecorded):
             self._gates.append(GateRecord(len(self._gates) + 1, gate.evidence, gate.at,

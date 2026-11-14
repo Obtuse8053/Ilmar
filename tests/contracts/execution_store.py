@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,15 @@ from ilmar.domain.events import (
     derive_events,
 )
 from ilmar.domain.execution import Execution, ExecutionState
-from ilmar.domain.gates import GateEvidence, GateRecorded, GateRevoked
+from ilmar.domain.gates import (
+    GateEvidence,
+    GateRecorded,
+    GateRevoked,
+    TrialAuthorized,
+    TrialCap,
+    TrialRevoked,
+    TrialTerms,
+)
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -946,7 +955,61 @@ class GateRecordContract:
             Commit(gate=GateRevoked("supervised", at(1)), resume=at(1))
 
 
-class ExecutionStoreContract(FencingContract, EventLogContract, GateRecordContract):
+TRIAL = TrialTerms(
+    repository_id=987654321, repository="someone/ilmar-disposable", agent_version="2.1.318",
+    max_executions=3, max_spend_micros=5_000_000, starts_at=at(1), expires_at=at(3600),
+    purpose="https://github.com/Obtuse8053/Ilmar/issues/93",
+)  # fmt: skip
+
+
+class TrialAuthorizationContract:
+    """ADR-0041: only a person authorizes or revokes a trial; one in force at a
+    time; expiry needs no one; revoked, never removed; kept apart from gates."""
+
+    def test_a_person_authorizes_and_revokes_a_trial(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=person(fence, 1))
+        (trial,) = store.trial_records()
+        assert (trial.terms, trial.authorized_by, trial.in_force(at(2))) == (TRIAL, "alice", True)
+        assert store.gate_records() == ()  # never a gate record
+        with pytest.raises(LedgerIntegrityError, match="already in force"):
+            store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(2))),
+                         context=person(fence, 2))  # fmt: skip
+        store.commit(fence, Commit(gate=TrialRevoked(at(3))), context=person(fence, 3, "bob"))
+        (revoked,) = store.trial_records()
+        assert (revoked.revoked_by, revoked.in_force(at(4))) == ("bob", False)
+        with pytest.raises(LedgerIntegrityError, match="no unrevoked trial"):
+            store.commit(fence, Commit(gate=TrialRevoked(at(5))), context=person(fence, 5))
+        kinds = [(e.type, e.reason) for e in store.events() if "trial" in e.type.value]
+        assert kinds == [
+            (EventType.INSTANCE_TRIAL_AUTHORIZED, "trial-authorized"),
+            (EventType.INSTANCE_TRIAL_REVOKED, "trial-revoked"),
+        ]
+
+    def test_an_expired_trial_is_out_of_force_and_may_be_followed(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=person(fence, 1))
+        (trial,) = store.trial_records()
+        assert not trial.in_force(at(3600))  # expired on its own
+        later = replace(TRIAL, starts_at=at(4000), expires_at=at(8000))
+        store.commit(fence, Commit(gate=TrialAuthorized(later, at(4000))),
+                     context=person(fence, 4000))  # fmt: skip
+        assert [t.seq for t in store.trial_records()] == [1, 2]
+
+    def test_nothing_but_a_person_authorizes_a_trial(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        context = EventContext(at=at(1), instance=fence.instance_id, epoch=fence.epoch,
+                               actor=COORDINATOR, pass_id="p-0123456789")  # fmt: skip
+        with pytest.raises(LedgerIntegrityError, match="only a person"):
+            store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=context)
+        assert store.trial_records() == ()
+
+
+class ExecutionStoreContract(
+    FencingContract, EventLogContract, GateRecordContract, TrialAuthorizationContract
+):
     def make_store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
         raise NotImplementedError
 
@@ -1387,3 +1450,82 @@ class ExecutionStoreContract(FencingContract, EventLogContract, GateRecordContra
         returned = store.evidence("e1")
         assert isinstance(returned, tuple)
         assert store.evidence("e1") == returned
+
+    # -- the trial cap at every admission (ADR-0041 §5, #132 review) --------------------
+
+    def _trial(self, store: ExecutionStore, fence: Fence, **terms: Any) -> TrialCap:
+        store.commit(fence, Commit(gate=TrialAuthorized(replace(TRIAL, **terms), at(1))),
+                     context=person(fence, 1))  # fmt: skip
+        (record,) = store.trial_records()
+        return TrialCap.of(record)
+
+    def _admit(
+        self, store: ExecutionStore, fence: Fence, cap: TrialCap, execution_id: str, second: float
+    ) -> Execution:
+        execution, created = MACHINE.start(TASK_A if execution_id == "e1" else TASK_B,
+                                           execution_id=execution_id, now=at(second))  # fmt: skip
+        store.commit(fence, Commit(created=((execution, created),), trial=cap))
+        claimed_execution, step = MACHINE.advance(execution, S.CLAIMED, now=at(second), reason="r")
+        store.commit(fence, Commit(applied=((claimed_execution, step),), trial=cap))
+        return claimed_execution
+
+    def test_a_trial_cap_admits_within_its_bounds(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        cap = self._trial(store, fence)
+        execution = self._admit(store, fence, cap, "e1", 10)
+        started, step, charge = self._start(execution, 11)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=LIMITS,
+                                   trial=cap))  # fmt: skip
+        assert store.get("e1") == started
+
+    def test_a_trial_cap_refuses_executions_beyond_its_count(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        cap = self._trial(store, fence, max_executions=1)
+        self._admit(store, fence, cap, "e1", 10)
+        with pytest.raises(SuspendedError, match="execution\\(s\\) are used up") as refused:
+            self._admit(store, fence, cap, "e2", 11)
+        assert refused.value.reason == "trial-limit"
+        assert store.get("e2") is None
+
+    def test_a_trial_cap_refuses_a_restarted_attempt_beyond_its_spending(
+        self, store: ExecutionStore
+    ) -> None:
+        """A recovered or retried execution starts a new attempt: its reservation
+        is checked against the trial's cap like any other."""
+        fence = claimed(store)
+        cap = self._trial(store, fence, max_spend_micros=1_500_000)
+        execution = self._admit(store, fence, cap, "e1", 10)
+        started, step, charge = self._start(execution, 11)
+        store.commit(fence, Commit(applied=((started, step),), charges=(charge,), budget=LIMITS,
+                                   trial=cap))  # fmt: skip
+        waiting, back = MACHINE.advance(
+            started, S.RETRY_WAIT, now=at(12), reason="r", error="interrupted"
+        )
+        store.commit(fence, Commit(applied=((waiting, back),)))
+        again, step2 = MACHINE.advance(waiting, S.PROVISIONING, now=at(13), reason="r")
+        charge2 = Charge("e1", again.attempt, ChargeKind.RESERVATION, LIMITS.reserve_micros,
+                         step2.at)  # fmt: skip
+        with pytest.raises(SuspendedError, match="spending cap"):
+            store.commit(fence, Commit(applied=((again, step2),), charges=(charge2,),
+                                       budget=LIMITS, trial=cap))  # fmt: skip
+        assert store.get("e1") == waiting
+
+    @pytest.mark.parametrize("change", ["revoked", "forged", "expired", "early"])
+    def test_a_trial_cap_refuses_a_revoked_forged_or_out_of_window_trial(
+        self, store: ExecutionStore, change: str
+    ) -> None:
+        fence = claimed(store)
+        cap = self._trial(store, fence)
+        second = 10.0
+        if change == "revoked":
+            store.commit(fence, Commit(gate=TrialRevoked(at(5))), context=person(fence, 5))
+        elif change == "forged":
+            cap = replace(cap, max_executions=20, max_spend_micros=10**12)
+        elif change == "expired":
+            second = 3600.0
+        else:
+            cap = replace(cap, since=at(100))
+        execution, created = MACHINE.start(TASK_A, execution_id="e1", now=at(second))
+        with pytest.raises(SuspendedError, match="outside the trial authorization"):
+            store.commit(fence, Commit(created=((execution, created),), trial=cap))
+        assert store.get("e1") is None

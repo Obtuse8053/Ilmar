@@ -26,6 +26,7 @@ from ilmar.domain.changes import (
     ChangeRequestState,
     ChecksSummary,
     CheckState,
+    RepositoryIdentity,
     RepositoryRef,
 )
 from ilmar.domain.errors import (
@@ -685,7 +686,7 @@ class FakeSourceControl:
 
     def __init__(self, *, name: str = "fake") -> None:
         self._name = name
-        self.repository_ids: dict[str, int] | Exception = {}
+        self.repository_ids: dict[str, int | RepositoryIdentity] | Exception = {}
         """``repository_id`` by slug; an exception is raised instead."""
         self._revisions: dict[str, Tree] = {}
         self._parents: dict[str, str | None] = {}
@@ -740,13 +741,13 @@ class FakeSourceControl:
 
     # -- SourceControlProvider -------------------------------------------
 
-    def repository_id(self, repository: RepositoryRef) -> int:
+    def repository_identity(self, repository: RepositoryRef) -> RepositoryIdentity:
         if isinstance(self.repository_ids, Exception):
             raise self.repository_ids
         found = self.repository_ids.get(repository.slug)
         if found is None:
             raise ProviderError(f"unknown repository: {repository.slug}")
-        return found
+        return found if isinstance(found, RepositoryIdentity) else RepositoryIdentity(found)
 
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         return self._branches.get((repository, branch))

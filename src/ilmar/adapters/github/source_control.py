@@ -46,6 +46,7 @@ from ilmar.domain.changes import (
     CheckResult,
     ChecksSummary,
     CheckState,
+    RepositoryIdentity,
     RepositoryRef,
 )
 from ilmar.domain.errors import (
@@ -101,12 +102,23 @@ class GitHubSourceControl:
     def name(self) -> str:
         return self._name
 
-    def repository_id(self, repository: RepositoryRef) -> int:
+    def repository_identity(self, repository: RepositoryRef) -> RepositoryIdentity:
         found = self._client.request("GET", f"/repos/{self._slug(repository)}")
         value = found.get("id")
         if type(value) is not int or value < 1:
             raise ProviderError(f"{repository.slug} has no repository ID")
-        return value
+        fork = found.get("fork")
+        if type(fork) is not bool:
+            raise ProviderError(f"{repository.slug} does not say whether it is a fork")
+        lineage: list[int] = []
+        for key in ("parent", "source"):
+            if not fork:
+                break
+            linked = (found.get(key) or {}).get("id")
+            if type(linked) is not int or linked < 1:
+                raise ProviderError(f"{repository.slug} is a fork without a readable {key}")
+            lineage.append(linked)
+        return RepositoryIdentity(value, tuple(dict.fromkeys(lineage)))
 
     # -- git side ------------------------------------------------------------
 

@@ -256,11 +256,21 @@ def test_an_oversized_body_is_refused() -> None:
 
 
 def test_a_chunked_body_is_refused(running: Running) -> None:
+    """Refused on the header alone, before any body is read. The headers are sent
+    without a body: a client still writing chunks after the refusal would race
+    the gateway's close (a broken pipe), which says nothing about the gateway."""
     host, port = running.gateway.address
     connection = http.client.HTTPConnection(host, port, timeout=10)
-    connection.request("POST", "/v1/messages", body=iter([b"{}"]),
-                       headers={"x-api-key": TOKEN})  # fmt: skip  # chunked
-    assert connection.getresponse().status == 400
+    try:
+        connection.putrequest("POST", "/v1/messages", skip_accept_encoding=True)
+        connection.putheader("x-api-key", TOKEN)
+        connection.putheader("transfer-encoding", "chunked")
+        connection.endheaders()
+        response = connection.getresponse()
+        assert response.status == 400
+        assert b"chunked bodies are refused" in response.read()
+    finally:
+        connection.close()
     assert running.provider.seen == []
 
 

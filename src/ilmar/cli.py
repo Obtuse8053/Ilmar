@@ -59,8 +59,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
+        if args.trial and not args.loop:
+            print("error: --trial runs only with --loop", file=sys.stderr)
+            return int(ExitCode.CONFIGURATION)
         if args.loop:
-            return cli_loop.run(Path(args.config))
+            return cli_loop.run(Path(args.config), trial=args.trial)
         if not args.once:
             print(f"error: {RUN_MODE_REQUIRED}", file=sys.stderr)
             return int(ExitCode.CONFIGURATION)
@@ -86,6 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--loop",
         action="store_true",
         help="passes until stopped, suspended or refused (Mode 1 only; ADR-0030)",
+    )
+    run.add_argument(
+        "--trial",
+        action="store_true",
+        help="with --loop: run under a bounded, expiring trial authorization instead of a "
+        "gate record, on the disposable repository only (ADR-0041)",
     )
     run.add_argument(
         "--config",
