@@ -30,12 +30,14 @@ Rules for every step:
 ## 1. The Anthropic workspace (you)
 
 1. In the Anthropic Console, create a **dedicated, non-default workspace** for
-   Ilmar with a **monthly spend limit**, for example USD 30.
+   Ilmar with a **monthly spend limit of USD 10** (or lower).
 2. Create **one** API key scoped to that workspace. Keep it in your password
    manager only.
 3. Record the limit on #93: the amount and the workspace name. Never record the
    key.
-4. In step 5, set `provider_cap_attested_usd` to that limit or lower.
+4. The shipped configuration assumes USD 10: `monthly_usd = 10` and
+   `provider_cap_attested_usd = 10`. If your limit is lower, lower both (and
+   `daily_usd`) to it. Ilmar refuses a cap above `monthly_usd`.
 
 ## 2. The provider cap drill (you; before any trial)
 
@@ -168,7 +170,7 @@ Run the repository check (3.4) again, then:
 
     ilmar gate trial --config ~/.config/ilmar/ilmar.gate1.toml --as <you> \
       --repository-id <ID> --repository Obtuse8053/ilmar-disposable \
-      --agent-version 2.1.318 --max-executions 3 --max-spend-usd 6 --hours 8 \
+      --agent-version 2.1.318 --max-executions 3 --max-spend-usd 5 --hours 8 \
       --purpose https://github.com/Obtuse8053/Ilmar/issues/93 --disposable
     ilmar gate show --config ~/.config/ilmar/ilmar.gate1.toml
 

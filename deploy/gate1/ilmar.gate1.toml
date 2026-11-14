@@ -61,8 +61,11 @@ argv = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
 timeout_seconds = 300
 
 [budget]
-daily_usd = 10
-monthly_usd = 30
+# The maintainer's Anthropic workspace limit is USD 10 a month: Ilmar's own
+# monthly allowance matches it and may never exceed it. If the workspace limit
+# is lower, lower all three figures to it.
+daily_usd = 5
+monthly_usd = 10
 reserve_per_execution_usd = 2
-provider_cap_attested_usd = 30       # REPLACE with the workspace's real monthly limit
+provider_cap_attested_usd = 10       # the workspace's real monthly limit, at most monthly_usd
 kill_switch_file = "/var/tmp/ilmar-gate1-KILL"

@@ -31,6 +31,11 @@ def test_with_the_repository_id_it_is_a_valid_mode_1_configuration(
     assert config.limits.max_concurrent_executions == 1
     assert config.budget is not None
     assert config.budget.kill_switch_file is not None
+    # The maintainer's Anthropic workspace limit is USD 10 a month (#93).
+    limits = config.budget.limits
+    assert limits.monthly_micros <= 10_000_000
+    assert config.budget.provider_cap_attested_micros <= limits.monthly_micros
+    assert limits.reserve_micros <= limits.daily_micros <= limits.monthly_micros
     for port in ("task_provider", "source_control"):
         assert config.adapters[port].options["repository"] == "Obtuse8053/ilmar-disposable"
     assert main(["config", "validate", str(path)]) == 0, capsys.readouterr().err
