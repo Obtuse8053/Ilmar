@@ -44,6 +44,7 @@ REPO_ID = 987654321
 EVIDENCE = GateEvidence(
     mode="supervised", repository_id=REPO_ID, repository="someone/ilmar-disposable",
     agent_version="2.1.318", evidence="https://github.com/Obtuse8053/Ilmar/pull/130",
+    evidence_commit="0123456789abcdef0123456789abcdef01234567",
     live_test="https://github.com/Obtuse8053/Ilmar/actions/runs/43567969214",
     fixture="tests/fixtures/claude_code_streams/2.1.318-recorded.json",
     fixture_sha256="a" * 64, gate1="https://github.com/Obtuse8053/Ilmar/issues/93",
@@ -53,7 +54,8 @@ GATE = GateRecord(1, EVIDENCE, NOW, "alice")
 
 def facts(**changes: Any) -> LoopFacts:
     base = LoopFacts(
-        mode="supervised", expected_version="2.1.318", repository_id=REPO_ID,
+        configuration="sha256:aa", started_with="sha256:aa", mode="supervised",
+        expected_version="2.1.318", repository_id=REPO_ID,
         live_repository_id=REPO_ID, gates=(GATE,), kill_switch_engaged=False,
         suspension=None, latest_update=NOW, now=NOW,
     )  # fmt: skip
@@ -70,6 +72,8 @@ def test_every_condition_holding_allows_a_pass() -> None:
 @pytest.mark.parametrize(
     ("changes", "code", "reason"),
     [
+        ({"configuration": "sha256:bb"}, 3, "configuration changed"),
+        ({"configuration": "unreadable: No such file or directory"}, 3, "configuration changed"),
         ({"mode": "manual"}, 3, "needs \"supervised\""),
         ({"gates": ()}, 3, "no active supervised gate record"),
         ({"gates": (replace(GATE, revoked_at=NOW, revoked_by="bob"),)}, 3, "no active"),
@@ -214,13 +218,18 @@ ANY_RATE = StartLimits(min_interval_seconds=0)
 
 
 def loop(world: dict[str, Any], *, passes: int = 1, mode: str = "supervised",
-         limits: StartLimits = ANY_RATE) -> tuple[int, str]:  # fmt: skip
+         limits: StartLimits = ANY_RATE,
+         between: Callable[[Path], None] | None = None) -> tuple[int, str]:  # fmt: skip
+    """``between(config)`` runs right before the second check, after one pass."""
     stop = threading.Event()
     seen = [0]
     real = world["scm"].repository_id
+    path = world["tmp"] / "ilmar.toml"
 
     def counting(repository: Any) -> int:  # stops the loop after ``passes`` checks
         seen[0] += 1
+        if seen[0] == 2 and between is not None:
+            between(path)
         if seen[0] > passes:
             stop.set()
         return int(real(repository))
@@ -300,3 +309,98 @@ def test_two_loops_on_one_store_have_one_owner(world: dict[str, Any]) -> None:
     with Ownership.take(layout=layout, store=world["store"], instance_id="inst", now=NOW):
         code, err = loop(world)
     assert (code, "is another loop running" in err) == (3, True)
+
+
+def _to_manual(path: Path) -> None:
+    path.write_text(path.read_text().replace('mode = "supervised"', 'mode = "manual"'))
+
+
+def _corrupt(path: Path) -> None:
+    path.write_text("[autonomy\n")
+
+
+def _remove(path: Path) -> None:
+    path.unlink()
+
+
+def _same_meaning(path: Path) -> None:  # even a harmless edit is never applied live
+    path.write_text(path.read_text() + "\n# a comment\n")
+
+
+@pytest.mark.parametrize("change", [_to_manual, _corrupt, _remove, _same_meaning])
+def test_a_configuration_change_while_running_stops_before_the_next_pass(
+    world: dict[str, Any], change: Callable[[Path], None]
+) -> None:
+    gate(world, GateRecorded(EVIDENCE, NOW))
+    code, err = loop(world, passes=3, between=change)
+    assert code == 3
+    assert "configuration changed, vanished or cannot be read" in err
+    created = [e for e in world["store"].events() if e.type.value == "execution.created"]
+    assert len(created) == 1  # the first pass ran; no pass after the change
+
+
+# -- uncertain spend cannot be bypassed (ADR-0039 with ADR-0040) -------------------------
+
+
+def uncertain_spend(world: dict[str, Any], *, also: SuspensionReason | None) -> None:
+    """An uncertain settlement, as the worker records it, while ``also`` (another
+    suspension) may already be in force."""
+    from ilmar.domain.events import COORDINATOR, Event, EventType
+    from ilmar.domain.execution import Execution, ExecutionState, Transition
+    from ilmar.domain.tasks import TaskRef
+
+    store = world["store"]
+    layout = WorkspaceLayout.under(world["tmp"] / "state")
+    with Ownership.take(layout=layout, store=store, instance_id="inst", now=NOW) as owner:
+        queued = Execution("x1", TaskRef("fake", "9"), ExecutionState.QUEUED, 1, 1, NOW, NOW)
+        store.commit(owner.fence, Commit(created=(
+            (queued, Transition("x1", None, ExecutionState.QUEUED, NOW, "queued")),)))  # fmt: skip
+        if also is not None:
+            store.commit(owner.fence, Commit(suspend=Suspension(also, NOW)))
+        spend = Event.create(
+            EventType.EXECUTION_MODEL_SPEND, at=NOW, instance="inst", epoch=owner.fence.epoch,
+            actor=COORDINATOR, pass_id="p-0123456789", execution="x1", attempt=1,
+            reason="spend-uncertain",
+            data={"requests": 1, "charged_micros": 0, "unsettled_micros": 1,
+                  "overrun_micros": 0, "extra_micros": 0},
+        )  # fmt: skip
+        suspend = None if also else Suspension(SuspensionReason.SPEND_UNCERTAIN, NOW)
+        store.commit(owner.fence, Commit(extra_events=(spend,), suspend=suspend))
+
+
+@pytest.mark.parametrize(
+    "also", [None, SuspensionReason.OPERATOR, SuspensionReason.KILL_SWITCH,
+             SuspensionReason.RESTART_LOOP, SuspensionReason.CLOCK_ANOMALY],
+)  # fmt: skip
+def test_unreviewed_uncertain_spend_keeps_the_loop_stopped_whatever_the_suspension(
+    world: dict[str, Any], also: SuspensionReason | None
+) -> None:
+    """The loop relies on the suspension. Every way to clear one is
+    ``ilmar resume`` (see the architecture test), and it refuses, whatever the
+    suspension's reason, until the spend is reviewed: so the loop never runs
+    another pass over unreviewed uncertain spend."""
+    from ilmar.core.suspension import resume_blocker, unreviewed_spend
+    from ilmar.domain.budget import BudgetTotals
+
+    gate(world, GateRecorded(EVIDENCE, NOW))
+    uncertain_spend(world, also=also)
+    held = world["store"].suspension()
+    assert held is not None
+    pending = unreviewed_spend(world["store"].events())
+    assert len(pending) == 1
+    for flags in ({}, {"provider_cap_raised": True, "check_fault_resolved": True}):
+        blocker = resume_blocker(
+            held, now=NOW + timedelta(days=2), totals=BudgetTotals(), limits=None,
+            latest_update=NOW, kill_switch_present=False, restart_breach=None,
+            unreviewed=len(pending), **{"provider_cap_raised": False, **flags},
+        )  # fmt: skip
+        assert blocker is not None
+        assert "--provider-spend-reviewed" in blocker
+    code, err = loop(world)
+    assert (code, "suspended" in err) == (78, True)
+    assert not worked_beyond(world, "x1")
+
+
+def worked_beyond(world: dict[str, Any], *known: str) -> bool:
+    return any(e.type.value == "execution.created" and e.execution not in known
+               for e in world["store"].events())  # fmt: skip

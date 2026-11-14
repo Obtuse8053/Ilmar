@@ -5,7 +5,9 @@
 :func:`loop_blocker` decides, from facts read fresh before each pass, whether
 the loop may run another pass. It answers ``None`` or ``(exit code, reason)``:
 
-* **3, not enabled:** the mode is not ``supervised``; there is no active
+* **3, not enabled:** the configuration file changed, vanished or cannot be
+  read since the loop started (it is never reloaded: restart the loop to
+  apply a change); the mode is not ``supervised``; there is no active
   ``supervised`` gate record; the record is for another repository or another
   agent version than the configuration; the live repository's immutable ID is
   not the approved one (a rename keeps it, a fork does not); the ID cannot be
@@ -38,6 +40,10 @@ NOT_ENABLED, SUSPENDED, STOPPED = 3, 78, 0
 class LoopFacts:
     """Everything one check reads, gathered just before it."""
 
+    configuration: str
+    """The configuration file's digest now, or why it cannot be read."""
+    started_with: str
+    """Its digest when the loop started."""
     mode: str
     expected_version: str | None
     repository_id: int | None
@@ -53,6 +59,11 @@ class LoopFacts:
 
 def loop_blocker(facts: LoopFacts) -> tuple[int, str] | None:
     """Why the loop may not run a pass now, or ``None`` if it may."""
+    if facts.configuration != facts.started_with:
+        return NOT_ENABLED, (
+            "the configuration changed, vanished or cannot be read since the loop started "
+            f"({facts.configuration[:120]}); restart the loop to apply a change"
+        )
     if facts.mode != "supervised":
         return NOT_ENABLED, f'[autonomy] mode is "{facts.mode}": loop mode needs "supervised"'
     gate = active_gate(facts.gates, "supervised")

@@ -11,7 +11,9 @@ Order, each step fail closed:
    exits 78.
 3. Build the deployment and take the instance lock once, for the whole loop.
    A second loop on the same store is refused here (exit 3).
-4. Before every pass, read the facts fresh: the active gate record, the live
+4. Before every pass, read the facts fresh: the configuration file's digest
+   (any change, removal or unreadable file stops the loop: it is never
+   reloaded), the active gate record, the live
    repository ID, the kill switch, the suspension and the clock
    (:func:`ilmar.core.loop.loop_blocker`). Any refusal ends the loop with its
    code.
@@ -22,6 +24,7 @@ Order, each step fail closed:
 
 from __future__ import annotations
 
+import hashlib
 import signal
 import sys
 import threading
@@ -95,10 +98,14 @@ def run(
 ) -> int:
     out = out or sys.stdout
     err = err or sys.stderr
+    started_with = configuration_digest(path)
     try:
         config = load_config(path)
     except ConfigError as exc:
         print(f"error: {exc}", file=err)
+        return int(ExitCode.CONFIGURATION)
+    if configuration_digest(path) != started_with:  # changed while it was read
+        print("error: the configuration changed while it was read", file=err)
         return int(ExitCode.CONFIGURATION)
     if config.autonomy.mode != "supervised":
         print(f'error: loop mode needs [autonomy] mode = "supervised" (it is '
@@ -145,6 +152,7 @@ def run(
                 runner = config.adapters.get("agent_runner")
                 version = runner.options.get("expected_version") if runner else None
                 return loop_blocker(LoopFacts(
+                    configuration=configuration_digest(path), started_with=started_with,
                     mode=config.autonomy.mode,
                     expected_version=version if isinstance(version, str) else None,
                     repository_id=config.autonomy.repository_id, live_repository_id=live,
@@ -170,6 +178,15 @@ def run(
                 check=check, run_pass=run_pass, poll_interval=config.autonomy.poll_interval_seconds,
                 stop=stop, report=lambda line: print(line, file=err),
             )  # fmt: skip
+
+
+def configuration_digest(path: Path) -> str:
+    """``sha256:<hex>`` of the configuration file's bytes, or why it cannot be read.
+    The loop never reloads its configuration: any difference stops it."""
+    try:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable: {exc.strerror or type(exc).__name__}"
 
 
 def _suspend_restart_loop(store: Any, ownership: Ownership, breach: str, at: datetime) -> None:
