@@ -22,6 +22,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -795,7 +797,110 @@ def _quiet(handle: Callable[[mg._Handler], None]) -> Callable[[mg._Handler], Non
     def wrapped(self: mg._Handler) -> None:
         try:
             handle(self)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             self.close_connection = True
 
     return wrapped
+
+
+# -- faults during settlement itself and while writing the record (#138 review) -------
+
+
+def _gateway_with(admission: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mg, "load_admission", lambda path=None: admission)
+    monkeypatch.setattr(mg._Handler, "handle_one_request", _quiet(mg._Handler.handle_one_request))
+
+
+def _attempt(running: Running) -> None:
+    with contextlib.suppress(http.client.HTTPException, OSError):
+        running.post(body=BODY)
+
+
+def _nothing_more_is_forwarded(running: Running) -> None:
+    code, _, data = running.post()
+    assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+    code, _, data = running.post("/v1/messages/count_tokens", body=COUNT)
+    assert code == 429
+    assert len(running.provider.seen) == 1
+
+
+def _closed_record(running: Running) -> dict[str, Any]:
+    running.gateway.close(1.0)
+    return mg.parse_spend(running.log.getvalue().splitlines())
+
+
+def test_a_fault_computing_the_charge_charges_the_reservation_and_halts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = mg.load_admission()
+
+    def broken(*_args: object) -> object:
+        raise RuntimeError("a bug in charge()")
+
+    monkeypatch.setattr(admission, "charge", broken)
+    _gateway_with(admission, monkeypatch)
+    for running in start(Provider()):
+        _attempt(running)
+        (line,) = charges(running.log)
+        assert "reason=gateway_error" in line
+        assert "halted=true" in line
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)
+        assert spend["uncertain"] is not None  # not a trusted report
+        assert spend["unsettled"] == 0
+
+
+@pytest.mark.parametrize("halt_breaks_too", [False, True])
+def test_a_fault_inside_budget_settlement_stops_forwarding_and_leaves_spend_uncertain(
+    monkeypatch: pytest.MonkeyPatch, halt_breaks_too: bool
+) -> None:
+    """The budget itself cannot settle (and, worse, cannot halt): the gateway's own
+    flag still stops every later request, and the record shows a request admitted
+    but never settled."""
+    admission = mg.load_admission()
+
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in Budget.settle")
+
+    monkeypatch.setattr(admission.Budget, "settle", broken)
+    if halt_breaks_too:
+        monkeypatch.setattr(admission.Budget, "halt", broken)
+    _gateway_with(admission, monkeypatch)
+    for running in start(Provider()):
+        _attempt(running)
+        assert charges(running.log) == []
+        assert running.gateway.failed == "gateway error"
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)
+        assert spend["unsettled"] > 0
+        assert "admitted but never settled" in spend["uncertain"]
+
+
+def test_a_charge_line_that_cannot_be_written_stops_forwarding_and_leaves_spend_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget took the charge but the log did not: the request must not be
+    charged twice, nothing more is forwarded, and the record (whose totals stay
+    consistent) shows the request admitted but never settled."""
+    _gateway_with(mg.load_admission(), monkeypatch)
+    for running in start(Provider()):
+        write = running.gateway.log
+        failures: list[str] = []
+
+        def flaky(line: str, write: Callable[[str], None] = write,
+                  failures: list[str] = failures) -> None:  # fmt: skip
+            if line.startswith("CHARGE") and not failures:
+                failures.append(line)
+                raise OSError("disk full")
+            write(line)
+
+        monkeypatch.setattr(running.gateway, "log", flaky)
+        _attempt(running)
+        assert len(failures) == 1  # tried once; never retried or re-charged
+        assert charges(running.log) == []
+        assert running.gateway.failed == "gateway error"
+        assert running.gateway.budget.halted
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)  # CLOSED totals agree with the lines
+        assert spend["unsettled"] > 0
+        assert "admitted but never settled" in spend["uncertain"]

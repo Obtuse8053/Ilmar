@@ -259,6 +259,7 @@ class Gateway:
         self._closing = False
         self._open: set[int] = set()
         self._admits = self._settled = self._charged = 0
+        self._failed: str | None = None
         gateway = self
 
         class Handler(_Handler):
@@ -326,10 +327,27 @@ class Gateway:
             return True
 
     def record_charge(self, ticket: int, charged: int, line: str) -> None:
+        """Put a settlement on record. The totals move only once the line is
+        written, so ``CLOSED`` never claims a ``CHARGE`` the log does not hold:
+        a line that could not be written leaves the request admitted but never
+        settled, which makes the spend uncertain (ADR-0039)."""
         with self._state:
+            self.log(line)
             self._settled += 1
             self._charged += charged
-            self.log(line)
+
+    @property
+    def failed(self) -> str | None:
+        """Why this gateway stopped forwarding after a fault of its own, if it did."""
+        return self._failed
+
+    def fail(self, reason: str) -> None:
+        """Forward nothing more. Set before anything that could itself fail, and
+        independent of the budget, so a fault inside settlement still stops the
+        attempt; then the budget is halted too, if it still can be."""
+        if self._failed is None:
+            self._failed = reason
+        self.budget.halt(reason)
 
     def finished(self, ticket: int) -> None:
         """The request's handling has ended, charged or not."""
@@ -359,7 +377,9 @@ class Gateway:
 class _Handler(BaseHTTPRequestHandler):
     owner: Gateway
     _settled: bool = False
-    """Whether this request has been charged (or, counting, halted on)."""
+    """Whether this request's settlement is on record (or, counting, halted on)."""
+    _charged_in_budget: bool = False
+    """Whether the budget holds this request's charge, on record or not."""
     protocol_version = "HTTP/1.1"
     server_version = "ilmar-gateway"
     sys_version = ""
@@ -397,6 +417,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._refuse(400, "invalid_request_error", "incomplete body")
         if gateway.closing:
             return self._refuse(503, "overloaded_error", "the gateway is closed")
+        if gateway.failed is not None:  # checked apart from the budget: see fail()
+            return self._refuse(429, "budget_exceeded", "the attempt is halted")
         betas = self.headers.get_all("anthropic-beta") or []
         admission = gateway.admission
         ticket: int | None = None
@@ -415,15 +437,20 @@ class _Handler(BaseHTTPRequestHandler):
             gateway.budget.release(ticket)  # closed meanwhile: never sent, never on record
             gateway.release()
             return self._refuse(503, "overloaded_error", "the gateway is closed")
-        self._settled = False
+        self._settled = self._charged_in_budget = False
         try:  # from here on it may reach the provider: on record
             self._forward(path, query, admitted, ticket)
         except BaseException:
-            # An error in the gateway itself, after the request may have reached
-            # the provider: its cost is unknown. Fail closed exactly like an
-            # untrusted report (the whole reservation, and the attempt halts),
-            # then let the error propagate to the server's own error report.
-            if not self._settled:
+            # A fault in the gateway itself (forwarding, metering, settling or
+            # writing the record), after the request may have reached the
+            # provider: its cost is unknown. First, forward nothing more,
+            # whatever fails next. Then, unless the budget already holds this
+            # request's charge, charge the whole reservation. A charge the log
+            # could not take stays off the record: the request reads as admitted
+            # but never settled, so the spend is uncertain and needs a person's
+            # review (ADR-0039). The error then propagates; it is not silenced.
+            gateway.fail("gateway error")
+            if not self._charged_in_budget:
                 self._settle(ticket, admitted, None, "gateway error")
             raise
         finally:
@@ -526,6 +553,7 @@ class _Handler(BaseHTTPRequestHandler):
             price = gateway.budget.policy.prices[admitted.model]
             settled = admission.charge(meter, price, reservation)
         gateway.budget.settle(ticket, settled)
+        self._charged_in_budget = True
         reason = _REASON.sub("_", settled.reason)[:80]
         gateway.record_charge(
             ticket, settled.charged,
