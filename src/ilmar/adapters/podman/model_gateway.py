@@ -99,6 +99,8 @@ def parse_spend(lines: list[str]) -> dict[str, Any]:
     * ``READY`` appears more than once (the gateway restarted and lost its
       state) or an ``ADMIT`` comes before it;
     * a ticket is admitted twice, or charged without its admission;
+    * a ``CHARGE`` names another reservation than its ``ADMIT``, or its
+      overrun is not ``max(0, charged - reservation)``;
     * a ``CLOSED`` line's totals differ from the lines before it (lines are
       missing), it appears twice, or an ``ADMIT`` follows it.
 
@@ -126,8 +128,16 @@ def parse_spend(lines: list[str]) -> dict[str, Any]:
             admits += 1
         elif line.startswith("CHARGE"):
             match = _CHARGE.fullmatch(line)
-            if match is None or admitted.pop(int(match[1]), None) is None:
+            if match is None:
                 raise ValueError("a gateway CHARGE line is not understood")
+            reserved = admitted.pop(int(match[1]), None)
+            if reserved is None:
+                raise ValueError("a gateway CHARGE line has no admission")
+            line_charged, line_reserved, line_overrun = int(match[2]), int(match[3]), int(match[4])
+            if line_reserved != reserved:
+                raise ValueError("a gateway CHARGE line names another reservation")
+            if line_overrun != max(0, line_charged - line_reserved):
+                raise ValueError("a gateway CHARGE line's overrun does not add up")
             settled += 1
             charged += int(match[2])
             overrun += int(match[4])

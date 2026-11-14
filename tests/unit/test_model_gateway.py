@@ -720,11 +720,22 @@ C = ("CHARGE ticket=1 charged=100 reservation=500 overrun=0 reason=reported "
         [R, "ADMIT ticket=x reservation=1"],  # not understood
         [R, "CLOSED admitted=0"],
         ["ilmar-gateway READY again"],
+        [R, A, C.replace("reservation=500", "reservation=400")],  # not its admission's
+        [R, A, C.replace("overrun=0", "overrun=5")],  # an overrun that is not there
+        [R, "ADMIT ticket=1 reservation=50", C.replace("reservation=500", "reservation=50")
+         .replace("overrun=0", "overrun=0")],  # charged 100 over 50: overrun must be 50
     ],
 )  # fmt: skip
 def test_an_inconsistent_record_is_not_trusted(lines: list[str]) -> None:
     with pytest.raises(ValueError, match="gateway"):
         mg.parse_spend(lines)
+
+
+def test_a_charge_beyond_its_reservation_carries_exactly_the_overrun() -> None:
+    over = ("CHARGE ticket=1 charged=130 reservation=100 overrun=30 reason=reported "
+            "spent=130 halted=false")  # fmt: skip
+    found = mg.parse_spend([R, "ADMIT ticket=1 reservation=100", over])
+    assert (found["charged"], found["overrun"], found["uncertain"]) == (130, 30, None)
 
 
 def test_an_empty_or_cut_off_record_is_never_complete() -> None:
