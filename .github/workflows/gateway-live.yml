@@ -1,0 +1,121 @@
+name: Gateway real-API run (manual)
+
+# P5 (#111): the gateway's spending controls against the real model API,
+# tests/integration/test_gateway_live_api.py. A few tiny requests, well under
+# one US cent in total.
+#
+# The same boundaries as live.yml (ADR-0023), with its own environment:
+# 1. `guard` (no secrets): started by hand on main, main still at expected_sha,
+#    and the protected `gateway-live` environment and main's rules as
+#    docs/operations/live-testing.md says. Runs main's own code.
+# 2. `prepare` (no secrets, no environment): downloads the hash-locked test
+#    dependencies (requirements/live.txt).
+# 3. `run` (the `gateway-live` environment, after a required reviewer
+#    approves): checks out expected_sha, checks the context, the tree and main
+#    again, unpacks the wheels after checking every digest, and only then has
+#    one step with the secret: a model API key from a workspace with a SMALL
+#    SPEND CAP. Nothing is installed or fetched after it.
+# 4. The records are checked for the key and anything shaped like a
+#    credential before the upload; one that fails is deleted.
+# Nothing runs on push or pull_request. Unattended operation stays disabled.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "The full commit SHA on main that you reviewed and want to run"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: gateway-live
+  cancel-in-progress: false
+
+env:
+  # Untrusted input: only ever expanded from the environment, never in `run:`.
+  ILMAR_EXPECTED_SHA: ${{ inputs.expected_sha }}
+
+jobs:
+  guard:
+    name: Guard (no secrets)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the context, main and the gateway-live environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/gateway_live_ci.py --guard
+
+  prepare:
+    name: Download the locked test dependencies (no secrets)
+    needs: guard
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.ILMAR_EXPECTED_SHA }}
+          persist-credentials: false
+      - name: Download the wheels against their hashes
+        run: >-
+          python3 -m pip download --require-hashes --no-deps --only-binary=:all:
+          --no-cache-dir --dest "$RUNNER_TEMP/wheels" --requirement requirements/live.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gateway-live-wheels
+          path: ${{ runner.temp }}/wheels
+          if-no-files-found: error
+          retention-days: 1
+
+  run:
+    name: Real-API gateway tests
+    needs: [guard, prepare]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: gateway-live
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.ILMAR_EXPECTED_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: gateway-live-wheels
+          path: ${{ runner.temp }}/wheels
+      - name: Check the context and the commit again (before any secret)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/gateway_live_ci.py --guard-context
+      - name: Install the locked wheels (digests checked, nothing resolved)
+        run: python3 scripts/live_ci.py --install-wheels "$RUNNER_TEMP/wheels" "$RUNNER_TEMP/site"
+      - name: Real-API gateway tests
+        timeout-minutes: 10
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ILMAR_GATEWAY_LIVE_API_KEY }}
+          ILMAR_LIVE_SITE: ${{ runner.temp }}/site
+          ILMAR_LIVE_REPORT_DIR: ${{ runner.temp }}/gateway-live-records
+        # exec: no shell keeps the secret in its environment.
+        run: exec python3 scripts/gateway_live_ci.py --run
+      - name: Keep the checked records (no credentials)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gateway-live-records
+          path: ${{ runner.temp }}/gateway-live-records/*.json
+          if-no-files-found: ignore
+          retention-days: 7

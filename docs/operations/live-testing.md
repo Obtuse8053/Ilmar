@@ -270,6 +270,50 @@ fixed by the archive's digest):
 They run with the Anthropic key inside the sandbox, as the agent always
 does.
 
+## Gateway real-API run (#111, P5)
+
+`.github/workflows/gateway-live.yml` runs only
+`tests/integration/test_gateway_live_api.py`. It checks the gateway's
+spending controls against the real model API:
+- a lowered `max_tokens` is honoured;
+- real usage reports are understood and settle with no overrun;
+- the reviewed betas and request shapes are accepted;
+- thinking-token estimates are never charged;
+- counting tokens is free.
+
+It sends a few tiny requests, well under one US cent in total.
+
+Its boundaries are the same as the live workflow's:
+1. **Guard, with no secrets.** The run must be started by hand on main, at the
+   commit you name, while main still points at it. The guard also checks
+   main's rules and the environment below.
+2. **Prepare, with no secrets.** It downloads the hash-locked test
+   dependencies.
+3. **Run, in the protected environment, after a required reviewer approves.**
+   - Before the secret, it checks the context, the checked-out tree and main
+     again, then unpacks the dependencies after checking every digest.
+   - Only one step gets the secret. It execs into
+     `scripts/gateway_live_ci.py --run`, with a minimal environment.
+   - Nothing is installed or fetched after that step.
+4. **Records.** They are checked for the key and anything shaped like a
+   credential before the upload; a record that fails is deleted.
+
+**One-time setup (a maintainer):**
+1. Create a **separate model API key** in a workspace with a **small spend
+   cap**, for example US$1 a month. Use it for nothing else.
+2. Create the environment `gateway-live`, set up exactly like `live`
+   (see "GitHub settings" above):
+   - required reviewers, with "Prevent self-review";
+   - no administrator bypass;
+   - deployments from `main` only.
+3. Add the environment secret `ILMAR_GATEWAY_LIVE_API_KEY` there. Never add
+   it as a repository secret, and never paste it into an issue or a chat.
+
+**Each run:** under Actions → "Gateway real-API run (manual)", run the
+workflow with `expected_sha` set to main's full commit, then approve the
+`gateway-live` deployment. The checked record is uploaded as
+`gateway-live-records`.
+
 ## One-time setup
 
 You need:
