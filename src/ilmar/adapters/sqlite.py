@@ -64,6 +64,7 @@ from ilmar.domain.errors import (
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import CorruptEventError, Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
+from ilmar.domain.gates import GateEvidence, GateRecord, GateRecorded, active_gate
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -79,7 +80,7 @@ from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
 from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
@@ -405,7 +406,35 @@ CREATE TABLE suspension (
     detail  TEXT NOT NULL
 ) STRICT;
 """,
+    # ADR-0030 §2, ADR-0040 (#91): gate records, written only by a person.
+    8: """
+CREATE TABLE gate_record (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode         TEXT NOT NULL CHECK (mode IN ('supervised')),
+    evidence     TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    recorded_by  TEXT NOT NULL,
+    revoked_at   TEXT,
+    revoked_by   TEXT,
+    CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
+) STRICT;
+
+CREATE UNIQUE INDEX gate_record_one_active_per_mode
+    ON gate_record (mode) WHERE revoked_at IS NULL;
+
+CREATE TRIGGER gate_record_cannot_be_removed BEFORE DELETE ON gate_record
+BEGIN SELECT RAISE(ABORT, 'gate records cannot be removed'); END;
+CREATE TRIGGER gate_record_only_revoked_once BEFORE UPDATE ON gate_record
+WHEN OLD.revoked_at IS NOT NULL
+  OR NEW.seq IS NOT OLD.seq OR NEW.mode IS NOT OLD.mode
+  OR NEW.evidence IS NOT OLD.evidence OR NEW.recorded_at IS NOT OLD.recorded_at
+  OR NEW.recorded_by IS NOT OLD.recorded_by OR NEW.revoked_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'a gate record is only ever revoked, once'); END;
+""",
 }
+
+GATE_SCHEMA_VERSION = 9
+"""The first version with ``gate_record`` (#91, ADR-0040)."""
 
 BUDGET_SCHEMA_VERSION = 8
 """The first version with ``budget_ledger`` and ``suspension`` (#18)."""
@@ -524,6 +553,10 @@ class SQLiteExecutionStore:
     def latest_update(self) -> datetime | None:
         with self._reading() as conn:
             return _latest_update(conn)
+
+    def gate_records(self) -> Sequence[GateRecord]:
+        with self._reading() as conn:
+            return _gate_records(conn)
 
     def suspension(self) -> Suspension | None:
         with self._reading(any_version=True) as conn:
@@ -704,6 +737,7 @@ class SQLiteExecutionStore:
                 operation=lambda key: _get_operation(conn, key),
                 resource=lambda key: _get_resource(conn, key),
                 suspended=_suspension(conn),
+                gated=_active_gate(conn, changes),
             )
             for execution, transition in changes.created:
                 _insert_execution(conn, execution, transition)
@@ -714,6 +748,7 @@ class SQLiteExecutionStore:
             for resource in changes.resources:
                 _write_resource(conn, resource, fence)
             _write_accounting(conn, changes)
+            _write_gate(conn, changes, context)
             _append_events(conn, events)
 
     def events(
@@ -1402,6 +1437,55 @@ def _insert_transition(conn: sqlite3.Connection, transition: Transition) -> None
             _encode_time(transition.at),
             transition.reason,
         ),
+    )
+
+
+# -- gate records (ADR-0040) -----------------------------------------------------------
+
+
+def _gate_records(conn: sqlite3.Connection) -> tuple[GateRecord, ...]:
+    if _version(conn) < GATE_SCHEMA_VERSION:
+        return ()
+    rows = conn.execute(
+        "SELECT seq, mode, evidence, recorded_at, recorded_by, revoked_at, revoked_by "
+        "FROM gate_record ORDER BY seq"
+    ).fetchall()
+    records = []
+    for seq, mode, evidence, recorded_at, recorded_by, revoked_at, revoked_by in rows:
+        stated = GateEvidence.from_json(_text(evidence))
+        if stated.mode != _text(mode):
+            raise LedgerIntegrityError(f"gate record {seq} was altered")
+        records.append(GateRecord(
+            _integer(seq), stated, _decode_time(_text(recorded_at)), _text(recorded_by),
+            None if revoked_at is None else _decode_time(_text(revoked_at)),
+            None if revoked_by is None else _text(revoked_by),
+        ))  # fmt: skip
+    return tuple(records)
+
+
+def _active_gate(conn: sqlite3.Connection, changes: Commit) -> GateRecord | None:
+    mode = event_log.gate_mode(changes)
+    return None if mode is None else active_gate(_gate_records(conn), mode)
+
+
+def _write_gate(conn: sqlite3.Connection, changes: Commit, context: EventContext | None) -> None:
+    gate = changes.gate
+    if gate is None:
+        return
+    if _version(conn) < GATE_SCHEMA_VERSION or context is None:  # pragma: no cover - checked
+        raise LedgerIntegrityError("this store cannot hold gate records yet")
+    who = context.actor.ref or ""
+    if isinstance(gate, GateRecorded):
+        conn.execute(
+            "INSERT INTO gate_record (mode, evidence, recorded_at, recorded_by) "
+            "VALUES (?, ?, ?, ?)",
+            (gate.evidence.mode, gate.evidence.to_json(), _encode_time(gate.at), who),
+        )
+        return
+    conn.execute(
+        "UPDATE gate_record SET revoked_at = ?, revoked_by = ? "
+        "WHERE mode = ? AND revoked_at IS NULL",
+        (_encode_time(gate.at), who, gate.mode),
     )
 
 

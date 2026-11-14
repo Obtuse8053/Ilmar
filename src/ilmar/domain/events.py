@@ -46,6 +46,15 @@ from ilmar.domain.errors import (
     PolicyViolationError,
 )
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.gates import (
+    FIXTURE_PATH,
+    GATE1_URL,
+    GATED_MODES,
+    PULL_URL,
+    RUN_URL,
+    SHA256,
+    GateRecorded,
+)
 from ilmar.domain.ledger import (
     Commit,
     Operation,
@@ -152,6 +161,10 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "operator-suspended": "An operator suspended new work.",
         "clock-anomaly": "The clock is behind the latest persisted time.",
         "operator-resumed": "An operator resumed new work after its cause was gone.",
+        "gate-recorded": "A person recorded that a mode's gate passed, with its evidence "
+        "(ADR-0040).",
+        "gate-revoked": "A person revoked a mode's gate record; the mode is off at the "
+        "next check (ADR-0040).",
         "restart-loop": "Loop mode started more often than its start limits allow (ADR-0033).",
         "unclassified": "No code was given. Never expected: tests assert it never occurs.",
     }
@@ -294,6 +307,8 @@ _OPERATION_KEY = re.compile(r"^[a-z-]+:[A-Za-z0-9][A-Za-z0-9_-]{0,63}:[1-9][0-9]
 _TASK = re.compile(r"^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._/#-]{1,200}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_GATE_REPOSITORY = re.compile(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+_GATE_VERSION = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,6}$")
 _REF = re.compile(r"^r-[0-9a-f]{24}$")
 _ERROR_CLASS = re.compile(r"^[A-Z][A-Za-z]{0,63}Error$")
 
@@ -419,6 +434,8 @@ class EventType(enum.Enum):
     BUDGET_CHARGED = "budget.charged"
     INSTANCE_SUSPENDED = "instance.suspended"
     INSTANCE_RESUMED = "instance.resumed"
+    INSTANCE_GATE_RECORDED = "instance.gate_recorded"
+    INSTANCE_GATE_REVOKED = "instance.gate_revoked"
     EXECUTION_BLOCK_RESOLVED = "execution.block_resolved"
     EXECUTION_MODEL_SPEND = "execution.model_spend"
     EXECUTION_SPEND_REVIEWED = "execution.spend_reviewed"
@@ -537,6 +554,21 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
         },
         EventType.EXECUTION_SPEND_REVIEWED: {  # ADR-0039: which uncertain settlement
             "spend_seq": (_integer(1), True),
+        },
+        EventType.INSTANCE_GATE_RECORDED: {  # ADR-0040: what the gate record states
+            "mode": (_one_of(GATED_MODES), True),
+            "repository_id": (_integer(1), True),
+            "repository": (_pattern(_GATE_REPOSITORY), True),
+            "agent_version": (_pattern(_GATE_VERSION), True),
+            "evidence": (_pattern(PULL_URL), True),
+            "live_test": (_pattern(RUN_URL), True),
+            "fixture": (_pattern(FIXTURE_PATH), True),
+            "fixture_sha256": (_pattern(SHA256), True),
+            "gate1": (_pattern(GATE1_URL), True),
+        },
+        EventType.INSTANCE_GATE_REVOKED: {  # ADR-0040: which record
+            "mode": (_one_of(GATED_MODES), True),
+            "record_seq": (_integer(1), True),
         },
         EventType.EXECUTION_BLOCK_RESOLVED: {  # ADR-0031 §3: a maintainer's decision
             "decision": (_one_of(BLOCK_DECISIONS), True),
@@ -1072,6 +1104,29 @@ def accounting_events(commit: Commit, context: EventContext) -> tuple[Event, ...
     if commit.suspend is not None:
         events.append(new(EventType.INSTANCE_SUSPENDED, reason=commit.suspend.reason.value))
     return tuple(events)
+
+
+def gate_events(
+    commit: Commit, context: EventContext, *, revoked_seq: int | None
+) -> tuple[Event, ...]:
+    """The event of a gate record written or revoked (ADR-0040). ``revoked_seq``
+    is the stored record a revocation ends; the store supplies it."""
+    gate = commit.gate
+    if gate is None:
+        return ()
+
+    def new(kind: EventType, reason: str, data: Mapping[str, Any]) -> Event:
+        return Event.create(kind, at=context.at, instance=context.instance,
+                            epoch=context.epoch, actor=context.actor,
+                            pass_id=context.pass_id, reason=reason, data=data)  # fmt: skip
+
+    if isinstance(gate, GateRecorded):
+        recorded = json.loads(gate.evidence.to_json())
+        return (new(EventType.INSTANCE_GATE_RECORDED, "gate-recorded", recorded),)
+    if revoked_seq is None:
+        raise EventEnvelopeError("a revocation names the record it revokes")
+    data = {"mode": gate.mode, "record_seq": revoked_seq}
+    return (new(EventType.INSTANCE_GATE_REVOKED, "gate-revoked", data),)
 
 
 def resumed_event(cleared: str, context: EventContext) -> Event:

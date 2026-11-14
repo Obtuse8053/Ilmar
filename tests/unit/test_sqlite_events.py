@@ -543,7 +543,7 @@ def test_a_covered_store_migrates_to_5_without_a_new_baseline(schema_4: Path) ->
         assert store.instance_operations() == ()  # readable before the migration
         fence = store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(schema_4) == SCHEMA_VERSION == 8
+    assert version(schema_4) == SCHEMA_VERSION == 9
     assert operation_rows(schema_4) == rows  # every row, byte for byte, in order
     assert event_rows(schema_4)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]  # no baseline
@@ -643,7 +643,7 @@ def test_a_covered_store_migrates_to_6_without_a_new_baseline(tmp_path: Path, st
     with SQLiteExecutionStore(path) as store:
         store.claim_instance("inst", now=at(10))
         added = store.events(after_seq=len(events))
-    assert version(path) == SCHEMA_VERSION == 8
+    assert version(path) == SCHEMA_VERSION == 9
     assert operation_rows(path) == rows
     assert event_rows(path)[: len(events)] == events
     assert [e.type for e in added] == [EventType.OWNERSHIP_ACQUIRED]
@@ -732,7 +732,7 @@ def test_a_schema_6_store_migrates_to_7_keeping_every_row(tmp_path: Path) -> Non
     with SQLiteExecutionStore(path) as store:
         store.claim_instance("inst", now=at(10))
         waiting = store.list_in_states({S.RETRY_WAIT})
-    assert version(path) == SCHEMA_VERSION == 8
+    assert version(path) == SCHEMA_VERSION == 9
     # Every row keeps its values; the new column is empty: an old wait is due at once.
     assert [(*row, None) for row in before] == execution_rows(path)
     assert event_rows(path)[: len(events)] == events
@@ -770,7 +770,7 @@ def test_a_schema_7_store_migrates_to_8_keeping_every_row(tmp_path: Path) -> Non
         store.claim_instance("inst", now=at(10))
         assert store.suspension() is None
         assert store.budget_totals(at(10)) == BudgetTotals()
-    assert version(path) == SCHEMA_VERSION == 8
+    assert version(path) == SCHEMA_VERSION == 9
     assert before == execution_rows(path)
     assert event_rows(path)[: len(events)] == events
     with closing(sqlite3.connect(path)) as conn:

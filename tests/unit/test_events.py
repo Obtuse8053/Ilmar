@@ -288,6 +288,8 @@ ADDED_CODES = {
     "model-spend-settled",  # P5 part 2b (ADR-0039, proposed)
     "spend-uncertain",
     "spend-reviewed",  # P5 part 2b: also the suspension reason
+    "gate-recorded",  # ADR-0040 (#91)
+    "gate-revoked",  # ADR-0040 (#91)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)

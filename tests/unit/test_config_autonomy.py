@@ -27,7 +27,7 @@ def supervised(**autonomy: Any) -> dict[str, Any]:
     adapters["task_provider"]["options"] = {"repository": "someone/ilmar-disposable"}
     return {
         "adapters": adapters,
-        "autonomy": {"mode": "supervised", **autonomy},
+        "autonomy": {"mode": "supervised", "repository_id": 987654321, **autonomy},
         "budget": {"daily_usd": 2.0, "monthly_usd": 10.0, "reserve_per_execution_usd": 1.0,
                    "provider_cap_attested_usd": 10.0, "kill_switch_file": "/etc/ilmar/KILL"},
         "verification": {"image": "localhost/verify:1", "commands": [
@@ -38,12 +38,12 @@ def supervised(**autonomy: Any) -> dict[str, Any]:
 def test_without_autonomy_the_mode_is_manual() -> None:
     data = supervised()
     del data["autonomy"]
-    assert parse_config(data, base_dir=BASE).autonomy == Autonomy("manual", 60.0)
+    assert parse_config(data, base_dir=BASE).autonomy == Autonomy("manual", 60.0, None)
 
 
 def test_a_complete_supervised_configuration_is_accepted() -> None:
     config = parse_config(supervised(poll_interval_seconds=30), base_dir=BASE)
-    assert config.autonomy == Autonomy("supervised", 30.0)
+    assert config.autonomy == Autonomy("supervised", 30.0, 987654321)
 
 
 @pytest.mark.parametrize("mode", ["autonomous", "self-hosting"])
@@ -61,6 +61,9 @@ def test_the_later_modes_are_refused(mode: str) -> None:
         ({"poll_interval_seconds": True}, "between 1 and 86400"),
         ({"poll_interval_seconds": float("inf")}, "between 1 and 86400"),
         ({"restart": True}, "unknown"),
+        ({"repository_id": "987654321"}, "positive integer"),
+        ({"repository_id": 0}, "positive integer"),
+        ({"repository_id": True}, "positive integer"),
     ],
 )
 def test_bad_autonomy_settings_are_refused(autonomy: dict[str, Any], message: str) -> None:
@@ -79,6 +82,7 @@ def _unpinned(data: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
+        (lambda d: d["autonomy"].pop("repository_id"), "repository_id"),
         (lambda d: d.update(limits={"max_concurrent_executions": 2}),
          "max_concurrent_executions = 1"),
         (lambda d: d.pop("budget"), "kill_switch_file"),

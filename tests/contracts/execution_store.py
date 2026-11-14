@@ -36,8 +36,17 @@ from ilmar.domain.errors import (
     SuspendedError,
 )
 from ilmar.domain.event_history import StoredState, verify
-from ilmar.domain.events import Actor, ActorKind, Event, EventContext, EventType, derive_events
+from ilmar.domain.events import (
+    COORDINATOR,
+    Actor,
+    ActorKind,
+    Event,
+    EventContext,
+    EventType,
+    derive_events,
+)
 from ilmar.domain.execution import Execution, ExecutionState
+from ilmar.domain.gates import GateEvidence, GateRecorded, GateRevoked
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -804,7 +813,86 @@ def cancel_event(fence: Fence, *, execution: str = "e1", request: str = "q-" + "
     )
 
 
-class ExecutionStoreContract(FencingContract, EventLogContract):
+# -- gate records (ADR-0040, #91) ---------------------------------------------------------
+
+GATE_EVIDENCE = GateEvidence(
+    mode="supervised", repository_id=987654321, repository="someone/ilmar-disposable",
+    agent_version="2.1.318", evidence="https://github.com/Obtuse8053/Ilmar/pull/130",
+    live_test="https://github.com/Obtuse8053/Ilmar/actions/runs/43567969214",
+    fixture="tests/fixtures/claude_code_streams/2.1.318-recorded.json",
+    fixture_sha256="a" * 64, gate1="https://github.com/Obtuse8053/Ilmar/issues/93",
+)  # fmt: skip
+
+
+def person(fence: Fence, seconds: float, ref: str = "alice") -> EventContext:
+    return EventContext(at=at(seconds), instance=fence.instance_id, epoch=fence.epoch,
+                        actor=Actor(ActorKind.HUMAN, ref))  # fmt: skip
+
+
+class GateRecordContract:
+    """Only a person writes a gate record; one active per mode; revoked, never
+    removed; each change has its event."""
+
+    def test_a_person_records_and_revokes_a_gate(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        assert store.gate_records() == ()
+        store.commit(fence, Commit(gate=GateRecorded(GATE_EVIDENCE, at(1))),
+                     context=person(fence, 1))  # fmt: skip
+        (record,) = store.gate_records()
+        assert (record.evidence, record.recorded_by, record.active) == (
+            GATE_EVIDENCE,
+            "alice",
+            True,
+        )
+        store.commit(fence, Commit(gate=GateRevoked("supervised", at(2))),
+                     context=person(fence, 2, "bob"))  # fmt: skip
+        (revoked,) = store.gate_records()
+        assert (revoked.revoked_at, revoked.revoked_by, revoked.active) == (at(2), "bob", False)
+        store.commit(fence, Commit(gate=GateRecorded(GATE_EVIDENCE, at(3))),
+                     context=person(fence, 3))  # fmt: skip
+        assert [r.active for r in store.gate_records()] == [False, True]  # the old one stays
+        events = [(e.type, e.reason, e.actor.ref) for e in store.events()
+                  if e.type.value.startswith("instance.gate")]  # fmt: skip
+        assert events == [
+            (EventType.INSTANCE_GATE_RECORDED, "gate-recorded", "alice"),
+            (EventType.INSTANCE_GATE_REVOKED, "gate-revoked", "bob"),
+            (EventType.INSTANCE_GATE_RECORDED, "gate-recorded", "alice"),
+        ]
+        revoke = next(e for e in store.events() if e.type is EventType.INSTANCE_GATE_REVOKED)
+        assert dict(revoke.data) == {"mode": "supervised", "record_seq": 1}
+
+    @pytest.mark.parametrize("actor", [COORDINATOR, None])
+    def test_nothing_but_a_person_writes_a_gate(
+        self, store: ExecutionStore, actor: Actor | None
+    ) -> None:
+        fence = claimed(store)
+        context = None if actor is None else EventContext(
+            at=at(1), instance=fence.instance_id, epoch=fence.epoch, actor=actor,
+            pass_id="p-0123456789")  # fmt: skip
+        with pytest.raises(LedgerIntegrityError, match="only a person"):
+            store.commit(fence, Commit(gate=GateRecorded(GATE_EVIDENCE, at(1))), context=context)
+        assert store.gate_records() == ()
+
+    def test_one_active_record_per_mode_and_only_an_active_one_is_revoked(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        with pytest.raises(LedgerIntegrityError, match="no active"):
+            store.commit(fence, Commit(gate=GateRevoked("supervised", at(1))),
+                         context=person(fence, 1))  # fmt: skip
+        store.commit(fence, Commit(gate=GateRecorded(GATE_EVIDENCE, at(2))),
+                     context=person(fence, 2))  # fmt: skip
+        with pytest.raises(LedgerIntegrityError, match="already active"):
+            store.commit(fence, Commit(gate=GateRecorded(GATE_EVIDENCE, at(3))),
+                         context=person(fence, 3))  # fmt: skip
+        assert len(store.gate_records()) == 1
+
+    def test_a_gate_is_written_in_a_commit_of_its_own(self) -> None:
+        with pytest.raises(ValueError, match="commit of its own"):
+            Commit(gate=GateRevoked("supervised", at(1)), resume=at(1))
+
+
+class ExecutionStoreContract(FencingContract, EventLogContract, GateRecordContract):
     def make_store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
         raise NotImplementedError
 
