@@ -73,11 +73,17 @@ class Claim:
 
     outcome: ClaimOutcome
     claim_id: str | None = None
+    object_id: str | None = None
+    """The tracker's immutable id of the object holding the claim, when the
+    provider can tell it: recorded so a later targeted release can name exactly
+    this claim and never a newer one (ADR-0031 §3, #125 review)."""
 
     def __post_init__(self) -> None:
         if self.outcome is ClaimOutcome.CLAIMED:
             _require_opaque(self.claim_id or "", "claim_id")
-        elif self.claim_id is not None:
+            if self.object_id is not None:
+                _require_opaque(self.object_id, "object_id")
+        elif self.claim_id is not None or self.object_id is not None:
             raise ValueError("only a CLAIMED outcome carries a claim id")
 
 

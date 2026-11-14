@@ -217,7 +217,7 @@ class FakeTaskProvider:
         if own:
             self._write("label", ref)
             tracked.label = True
-            return Claim(ClaimOutcome.CLAIMED, own[0].token)
+            return Claim(ClaimOutcome.CLAIMED, own[0].token, own[0].object_id)
         if tracked.label:
             return Claim(ClaimOutcome.CLAIMED_BY_OTHER)
         if not tracked.eligible or tracked.excluded:
@@ -226,7 +226,7 @@ class FakeTaskProvider:
         self._write("post-claim", ref, claim.object_id)
         tracked.claims.append(claim)
         tracked.label = True
-        return Claim(ClaimOutcome.CLAIMED, claim.token)
+        return Claim(ClaimOutcome.CLAIMED, claim.token, claim.object_id)
 
     def release(self, ref: TaskRef) -> None:
         tracked = self._tasks.get(ref)

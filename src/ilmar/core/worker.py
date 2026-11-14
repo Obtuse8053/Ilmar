@@ -1236,7 +1236,8 @@ class _Run:
             if decision is not None and blocked.failed_for_protected_path(self.store, execution):
                 # A maintainer's release or abandon (ADR-0031 §3): the claim release
                 # its command journaled is performed, or repeated, here.
-                effects.release(self.current(), self.lease, step=blocked.step(decision))
+                # Pinned to the claim recorded in its intent; a replacement is never touched.
+                effects.release_pinned(self.current(), self.lease, step=blocked.step(decision))
                 return WorkerResult(self.id, Outcome.FAILED, reason, code=blocked.REASONS[decision])
             if blocked_for_maintainer(self.store, execution):  # ADR-0031 §3: claim kept
                 self.note(

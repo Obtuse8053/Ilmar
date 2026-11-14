@@ -37,7 +37,7 @@ from ilmar.domain.events import Actor, ActorKind, EventType
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.ledger import Fence, OperationKind, OperationStatus
 from ilmar.domain.safety_controls import safety_controls
-from ilmar.domain.tasks import TaskRef
+from ilmar.domain.tasks import Claim, ClaimOutcome, HeldClaim, ReleaseResult, TaskRef
 from ilmar.domain.verification import VerificationPolicy
 from recovery_support import Crash
 
@@ -104,7 +104,7 @@ def block(setup: Setup) -> None:
 def decide(setup: Setup, key: str, decision: str, *, fence: Fence | None = None) -> None:
     execution = blocked.find(setup.store, key)
     commit, context = blocked.resolve(
-        execution, decision, fence=fence or setup.ownership.fence, now=setup.clock(),
+        setup.store, execution, decision, fence=fence or setup.ownership.fence, now=setup.clock(),
         instance="inst", actor=MAINTAINER,
     )  # fmt: skip
     setup.store.commit(fence or setup.ownership.fence, commit, context=context)
@@ -228,15 +228,15 @@ def test_an_ordinary_failure_stays_finished(tmp_path: Path) -> None:
 
 def crash_on_release(setup: Setup, *, after: bool) -> None:
     """The next tracker release raises ``Crash`` before or after acting."""
-    real = setup.tasks.release
+    real = setup.tasks.release_claim
 
-    def release(ref: TaskRef) -> None:
-        setup.tasks.release = real  # type: ignore[method-assign]
+    def release(claim: HeldClaim) -> ReleaseResult:
+        setup.tasks.release_claim = real  # type: ignore[method-assign]
         if after:
-            real(ref)
+            real(claim)
         raise Crash
 
-    setup.tasks.release = release  # type: ignore[method-assign]
+    setup.tasks.release_claim = release  # type: ignore[method-assign]
 
 
 @pytest.mark.parametrize("decision", ["release", "abandon"])
@@ -277,17 +277,17 @@ def test_a_tracker_failure_is_repeated_until_settled(tmp_path: Path, decision: s
     setup = guarded(tmp_path)
     block(setup)
     decide(setup, "1", decision)
-    real = setup.tasks.release
+    real = setup.tasks.release_claim
 
-    def failing(ref: TaskRef) -> None:
+    def failing(claim: HeldClaim) -> ReleaseResult:
         raise OSError("the tracker timed out")
 
-    setup.tasks.release = failing  # type: ignore[method-assign]
+    setup.tasks.release_claim = failing  # type: ignore[method-assign]
     setup.coordinator().run_once()
     assert release_ops(setup)[0][1] is not OperationStatus.SUCCEEDED
     assert ONE in [c.ref for c in setup.tasks.held_claims()]
     assert setup.store.get("e2") is None  # the claim may still be held: not picked
-    setup.tasks.release = real  # type: ignore[method-assign]
+    setup.tasks.release_claim = real  # type: ignore[method-assign]
     finish(setup, decision)
 
 
@@ -334,3 +334,132 @@ def test_blocked_tasks_ahead_never_starve_the_backlog(tmp_path: Path) -> None:
     states = {e.task: e.state for e in setup.store.list_in_states(set(S))}
     assert states == {ONE: S.FAILED, TWO: S.SUCCEEDED}
     assert [e.task for e in blocked.blocked(setup.store)] == [ONE]
+
+
+# -- the release names exactly the original claim (#125 review, 2026-11-14) -------------
+
+
+def own_claims(setup: Setup) -> list[str]:
+    return [c.object_id for c in setup.tasks.own_claims(ONE)]
+
+
+def claims(setup: Setup) -> list[str]:
+    return [c.object_id for c in setup.tasks._tasks[ONE].claims]
+
+
+def replace_claim(setup: Setup) -> str:
+    """The original claim goes and a newer authentic claim takes its place (a
+    replacement): another instance's, so this one's orphan cleanup has no
+    business with it either. A different token and object."""
+    tracked = setup.tasks._tasks[ONE]
+    tracked.claims[:] = [c for c in tracked.claims if not setup.tasks._authentic(c)]
+    return setup.tasks.claim_as(ONE, "other-instance").object_id
+
+
+def deleted(setup: Setup) -> list[str]:
+    return [w[2] for w in setup.tasks.writes if w[0] == "delete-claim" and w[1] == str(ONE)]
+
+
+def test_the_intent_pins_the_claim_s_token_and_object(tmp_path: Path) -> None:
+    setup = guarded(tmp_path)
+    block(setup)
+    (original,) = setup.tasks.own_claims(ONE)
+    decide(setup, "1", "release")
+    (operation,) = [o for o in setup.store.operations("e1") if o.kind is OperationKind.RELEASE_TASK]
+    assert dict(operation.intent) == {
+        "task": str(ONE), "claim": original.token, "object": original.object_id,
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize("decision", ["release", "abandon"])
+def test_a_replacement_claim_before_the_release_is_never_deleted(
+    tmp_path: Path, decision: str
+) -> None:
+    setup = guarded(tmp_path)
+    block(setup)
+    (original,) = own_claims(setup)
+    decide(setup, "1", decision)
+    replacement = replace_claim(setup)
+    setup.coordinator().run_once()
+    assert claims(setup) == [replacement]
+    assert deleted(setup) == []
+    (operation,) = [o for o in setup.store.operations("e1") if o.kind is OperationKind.RELEASE_TASK]
+    assert (operation.status, operation.result.get("result")) == (
+        OperationStatus.SUCCEEDED,
+        "absent",
+    )
+    assert original not in claims(setup)
+
+
+def test_a_replacement_that_races_the_revalidation_is_never_deleted(tmp_path: Path) -> None:
+    """The original is replaced between the intent and the tracker's re-read."""
+    setup = guarded(tmp_path)
+    block(setup)
+    decide(setup, "1", "release")
+    replaced: list[str] = []
+
+    def race(claim: HeldClaim) -> None:
+        if not replaced:
+            replaced.append(replace_claim(setup))
+
+    setup.tasks.hooks["reread"] = [race]
+    setup.coordinator().run_once()
+    assert claims(setup) == replaced
+    assert deleted(setup) == []
+
+
+@pytest.mark.parametrize("decision", ["release", "abandon"])
+def test_a_crash_after_deleting_the_original_then_a_replacement_is_kept(
+    tmp_path: Path, decision: str
+) -> None:
+    setup = guarded(tmp_path)
+    block(setup)
+    (original,) = own_claims(setup)
+    decide(setup, "1", decision)
+    crash_on_release(setup, after=True)  # the original is deleted; the outcome is lost
+    with pytest.raises(Crash):
+        setup.coordinator().run_once()
+    replacement = setup.tasks.claim_as(ONE, "other-instance").object_id
+    setup = restart(setup, tmp_path / DB)
+    setup.coordinator().run_once()  # the repeat names the pinned original only
+    assert claims(setup) == [replacement]
+    assert deleted(setup) == [original]  # exactly once, and never the replacement
+    assert release_ops(setup) == [(f"blocked-{decision}", OperationStatus.SUCCEEDED)]
+
+
+def test_a_claim_object_that_changed_hands_is_left_alone(tmp_path: Path) -> None:
+    setup = guarded(tmp_path)
+    block(setup)
+    decide(setup, "1", "release")
+    (found,) = setup.tasks.own_claims(ONE)
+    found.author = "mallory"  # the same object, no longer this instance's authentic claim
+    setup.coordinator().run_once()
+    assert deleted(setup) == []
+    (operation,) = [o for o in setup.store.operations("e1") if o.kind is OperationKind.RELEASE_TASK]
+    assert operation.result.get("result") == "changed"
+
+
+def test_without_a_recorded_claim_object_nothing_is_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim recorded without its object (an older record) cannot be released
+    safely by Ilmar: the command refuses and writes nothing."""
+    setup = guarded(tmp_path)
+    real = setup.tasks.claim
+
+    def tokens_only(ref: TaskRef) -> Claim:
+        claim = real(ref)
+        return Claim(claim.outcome, claim.claim_id)
+
+    monkeypatch.setattr(setup.tasks, "claim", tokens_only)
+    block(setup)
+    with pytest.raises(blocked.BlockedError, match="cannot be released safely"):
+        decide(setup, "1", "release")
+    assert release_ops(setup) == []
+
+
+def test_only_a_claimed_outcome_names_its_object() -> None:
+    assert Claim(ClaimOutcome.CLAIMED, "tok", "o-1").object_id == "o-1"
+    assert Claim(ClaimOutcome.CLAIMED, "tok").object_id is None  # a provider may not know
+    with pytest.raises(ValueError, match="only a CLAIMED outcome"):
+        Claim(ClaimOutcome.CLAIMED_BY_OTHER, object_id="o-1")

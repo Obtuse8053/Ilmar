@@ -114,10 +114,14 @@ def run(
             except blocked.BlockedError as exc:
                 print(f"error: {exc}", file=err)
                 return NOT_FOUND
-            commit, context = blocked.resolve(
-                execution, args.action, fence=ownership.fence, now=now(),
-                instance=config.instance_id, actor=actor,
-            )  # fmt: skip
+            try:
+                commit, context = blocked.resolve(
+                    store, execution, args.action, fence=ownership.fence, now=now(),
+                    instance=config.instance_id, actor=actor,
+                )  # fmt: skip
+            except blocked.BlockedError as exc:
+                print(f"error: {exc}", file=err)
+                return NOT_FOUND
             try:
                 store.commit(ownership.fence, commit, context=context)
             except (ConcurrencyConflictError, LedgerIntegrityError) as exc:

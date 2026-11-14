@@ -12,11 +12,14 @@ never retried, picked again or published. Only a maintainer resolves it:
 The decision is recorded durably, as an ``execution.block_resolved`` event by
 the maintainer, **in the same commit** as the journaled intent of the claim
 release (an operation keyed ``release-task:<execution>:<attempt>:blocked-<decision>``).
+The intent **pins the claim** this execution took: its token and the
+tracker's id of the object holding it, both recorded when it was claimed.
 The tracker call itself is an external effect: the worker performs it in a
-later pass through the journal, which repeats it after a crash or an
-ambiguous outcome until it succeeds (release is idempotent). Until then the
-execution needs attention, so its task is never picked while the claim may
-still be held.
+later pass through the journal, from that stored intent only, and repeats it
+after a crash or an ambiguous outcome. It deletes only that object, after
+revalidating its token, so a newer authentic claim (a replacement) is never
+deleted. Until it succeeds the execution needs attention, so its task is
+never picked while the claim may still be held.
 
 The commit is fenced like any other: only the instance's owner can write it,
 so it cannot be made while a coordinator runs, and a stale owner cannot
@@ -28,9 +31,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from ilmar.core.effects import claim_intent
 from ilmar.domain.events import BLOCK_DECISIONS, Actor, Event, EventContext, EventType
 from ilmar.domain.execution import Execution, ExecutionState
 from ilmar.domain.ledger import Commit, Fence, Operation, OperationKind, OperationStatus
+from ilmar.domain.tasks import ClaimOutcome, HeldClaim
 from ilmar.ports.execution_store import ExecutionStore
 
 PROTECTED_PATH = "protected-path"
@@ -95,7 +100,28 @@ def find(store: ExecutionStore, task: str) -> Execution:
     return matches[-1]
 
 
+def pinned_claim(store: ExecutionStore, execution: Execution) -> HeldClaim:
+    """The claim this execution took, as recorded when it claimed: its token and
+    the tracker object holding it. Without both, nothing can be released safely."""
+    for operation in store.operations(execution.id):
+        if (
+            operation.kind is OperationKind.CLAIM_TASK
+            and operation.status is OperationStatus.SUCCEEDED
+            and operation.result.get("outcome") == ClaimOutcome.CLAIMED.value
+        ):
+            token = operation.result.get("claim_id")
+            obj = operation.result.get("object_id")
+            if token and obj:
+                return HeldClaim(execution.task, token, obj)
+            raise BlockedError(
+                f"{execution.id}: the claim's tracker object was not recorded when it was "
+                "taken, so it cannot be released safely by Ilmar; release it by hand"
+            )
+    raise BlockedError(f"{execution.id}: no claim of this execution is recorded")
+
+
 def resolve(
+    store: ExecutionStore,
     execution: Execution,
     decision: str,
     *,
@@ -105,10 +131,12 @@ def resolve(
     actor: Actor,
 ) -> tuple[Commit, EventContext]:
     """The one fenced commit that records ``decision`` and the intent of the claim
-    release it implies. Nothing external happens here."""
+    release it implies, pinned to the claim this execution took. Nothing external
+    happens here."""
+    claim = pinned_claim(store, execution)
     intent = Operation.intended(
         OperationKind.RELEASE_TASK, execution.id, execution.attempt,
-        fence=fence, now=now, step=step(decision),
+        fence=fence, now=now, step=step(decision), intent=claim_intent(claim),
     )  # fmt: skip
     event = Event.create(
         EventType.EXECUTION_BLOCK_RESOLVED,

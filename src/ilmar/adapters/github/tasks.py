@@ -182,7 +182,7 @@ class GitHubTaskProvider:
             return Claim(ClaimOutcome.CLAIMED_BY_OTHER)  # forged own markers included
         if own:  # only ours: held by this instance (reconciled by the coordinator)
             self._add_label(number)
-            return Claim(ClaimOutcome.CLAIMED, own[0].token)
+            return Claim(ClaimOutcome.CLAIMED, own[0].token, str(own[0].comment_id))
         if self._claimed in _labels(issue):
             # Our label without any claim comment: a leftover. Stay conservative;
             # reconciliation (ADR-0026) or a human clears it.
@@ -201,7 +201,7 @@ class GitHubTaskProvider:
             # Another party is claiming too: a misconfiguration (ADR-0013). Back off.
             self._withdraw(number, [mine])
             return Claim(ClaimOutcome.CLAIMED_BY_OTHER)
-        return Claim(ClaimOutcome.CLAIMED, token)
+        return Claim(ClaimOutcome.CLAIMED, token, str(mine))
 
     def release(self, ref: TaskRef) -> None:
         self._own_login()

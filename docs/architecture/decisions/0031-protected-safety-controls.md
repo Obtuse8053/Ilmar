@@ -276,6 +276,15 @@ This records the implementation of §3; the decision is unchanged.
     `release-task:<execution>:<attempt>:blocked-<decision>`.
   The command takes the instance lock, so it cannot run beside a coordinator,
   and a stale fence cannot write the commit.
+- **The claim is pinned** (maintainer review of #125, 2026-11-14). The
+  intent names the claim this execution took: its token and the tracker's id
+  of the object holding it. `claim-task` now records that object id.
+  - The worker calls `release_claim` with exactly that claim, which
+    revalidates the token right before it deletes anything.
+  - A replacement claim, ours or anyone's, is never deleted: `absent` or
+    `changed` means the pinned claim is gone.
+  - Without a recorded object id (a claim taken before this change), the
+    command refuses and the claim has to be released by hand.
 - **The tracker call.** It is a separate external effect, never in the
   command. The execution's worker performs it in the next pass through the
   journal: `release-task` is repeatable and the release is idempotent, so a

@@ -89,9 +89,15 @@ def test_get_handles_foreign_refs_missing_issues_and_pull_requests(api: FakeGitH
 
 def test_claim_posts_one_marker_and_label_and_is_idempotent(api: FakeGitHub) -> None:
     p = provider(api)
-    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
-    assert p.claim(ref(1)).outcome is ClaimOutcome.CLAIMED
+    first = p.claim(ref(1))
+    again = p.claim(ref(1))
+    assert first.outcome is again.outcome is ClaimOutcome.CLAIMED
     assert len(claims(api, 1)) == 1
+    # The claim names its comment, the object a targeted release deletes, and
+    # held_claims agrees on both identities (#125 review).
+    (held,) = p.held_claims()
+    assert (first.claim_id, first.object_id) == (held.claim_id, held.object_id)
+    assert (again.claim_id, again.object_id) == (held.claim_id, held.object_id)
     assert CLAIMED in api.issues[1].labels
 
 
