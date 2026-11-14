@@ -44,7 +44,9 @@ from ilmar.core.ownership import Ownership
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
 from ilmar.core.starts import StartLimits, account_start
 from ilmar.core.state_machine import RetryBackoff
+from ilmar.core.trial_admission import TrialAdmissionStore
 from ilmar.domain.budget import Suspension, SuspensionReason
+from ilmar.domain.changes import RepositoryIdentity
 from ilmar.domain.errors import (
     ConfigError,
     FencingError,
@@ -54,7 +56,7 @@ from ilmar.domain.errors import (
     StartLogError,
 )
 from ilmar.domain.events import EventType
-from ilmar.domain.gates import trial_in_force
+from ilmar.domain.gates import TrialCap, trial_in_force
 from ilmar.domain.ledger import Commit
 
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
@@ -142,27 +144,46 @@ def run(
                 _suspend_restart_loop(store, ownership, breach, now())
                 print(f"suspended: restart loop ({breach})", file=err)
                 return int(ExitCode.SUSPENDED)
+            cap: TrialCap | None = None
+            if trial:
+                # ADR-0041 §5: every admission, from every path, carries the cap of
+                # the trial in force now, and the store checks it atomically.
+                in_force = trial_in_force(store.trial_records(), now())
+                cap = TrialCap.of(in_force) if in_force is not None else None
+                if cap is not None:
+                    components.execution_store = TrialAdmissionStore(store, cap)
             coordinator = make_coordinator(config, components, ownership, now)
             engaged = kill_switch.checker(config.budget.kill_switch_file if config.budget else None)
 
             def check() -> tuple[int, str] | None:
                 try:
-                    live: int | str = components.source_control.repository_id(
+                    live: RepositoryIdentity | str = components.source_control.repository_identity(
                         components.target.repository
                     )
                 except ProviderError as exc:
                     live = str(exc)[:200]
                 runner = config.adapters.get("agent_runner")
                 version = runner.options.get("expected_version") if runner else None
+                use = trial_use(store, config, now()) if trial else None
+                if (
+                    use is not None
+                    and use.record is not None
+                    and (cap is None or use.record.seq != cap.trial_seq)
+                ):
+                    return (
+                        3,
+                        "a different trial is in force than the one this loop started "
+                        "under; restart the loop",
+                    )
                 return loop_blocker(LoopFacts(
                     configuration=configuration_digest(path), started_with=started_with,
                     mode=config.autonomy.mode,
                     expected_version=version if isinstance(version, str) else None,
-                    repository_id=config.autonomy.repository_id, live_repository_id=live,
+                    repository_id=config.autonomy.repository_id, live_repository=live,
                     gates=store.gate_records(), kill_switch_engaged=engaged(),
                     suspension=store.suspension(),
                     latest_update=store.latest_update(), now=now(),
-                    trial=trial_use(store, config, now()) if trial else None,
+                    trial=use,
                 ))  # fmt: skip
 
             def run_pass() -> int:

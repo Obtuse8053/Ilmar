@@ -32,6 +32,11 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 
 GATED_MODES = ("supervised",)
+ILMAR_REPOSITORY_ID = 1441625109
+"""Ilmar's own repository on GitHub (Obtuse8053/Ilmar), by its immutable ID.
+No gate record, trial or Mode 1 configuration may name it, and the loop refuses
+it, or any fork of it, as the live target (ADR-0030 §5, ADR-0041). Names and the
+``self_repository`` flag remain as defence in depth."""
 """The modes a gate record may be written for. ``manual`` needs none."""
 
 _VERSION = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,6}$")
@@ -65,6 +70,8 @@ class GateEvidence:
             raise ValueError(f"no gate is recorded for mode {self.mode!r}")
         if type(self.repository_id) is not int or not 0 < self.repository_id < 2**53:
             raise ValueError("repository_id must be a positive integer")
+        if self.repository_id == ILMAR_REPOSITORY_ID:
+            raise ValueError("a gate is never recorded for Ilmar's own repository")
         checks = (
             ("repository", _REPOSITORY, "owner/name"),
             ("agent_version", _VERSION, "an exact x.y.z"),
@@ -166,6 +173,8 @@ class TrialTerms:
     def __post_init__(self) -> None:
         if type(self.repository_id) is not int or not 0 < self.repository_id < 2**53:
             raise ValueError("repository_id must be a positive integer")
+        if self.repository_id == ILMAR_REPOSITORY_ID:
+            raise ValueError("a trial never runs on Ilmar's own repository")
         if not isinstance(self.repository, str) or not _REPOSITORY.match(self.repository):
             raise ValueError("repository must be owner/name")
         if self.repository.lower() == "obtuse8053/ilmar":
@@ -239,3 +248,28 @@ def unrevoked_trial(records: Iterable[TrialRecord]) -> TrialRecord | None:
 
 
 GateChange = GateRecorded | GateRevoked | TrialAuthorized | TrialRevoked
+
+
+@dataclass(frozen=True, slots=True)
+class TrialCap:
+    """What ``--loop --trial`` attaches to every commit that admits work (ADR-0041 §5).
+
+    The store checks it in the same transaction as the admission: the trial is
+    still unrevoked and has these exact terms; the admission falls inside its
+    window; and executions created and money reserved or charged since it
+    started stay within its limits. So no path, recovery included, admits past
+    a trial's bounds, whatever the loop's own pre-pass check saw."""
+
+    trial_seq: int
+    since: datetime
+    expires_at: datetime
+    max_executions: int
+    max_spend_micros: int
+
+    @classmethod
+    def of(cls, record: TrialRecord) -> TrialCap:
+        t = record.terms
+        return cls(record.seq, t.starts_at, t.expires_at, t.max_executions, t.max_spend_micros)
+
+    def matches(self, record: TrialRecord) -> bool:
+        return TrialCap.of(record) == self

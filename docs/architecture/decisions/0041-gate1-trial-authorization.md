@@ -102,6 +102,45 @@ Any failure stops the loop: 3 for the authorization, 78 for a suspension or
 the kill switch. A pass already running is bounded by the agent and execution
 time limits (ADR-0029), not by the expiry.
 
+### 5. Enforced at every admission, not only before each pass
+
+The pre-pass check (§4) is not the only guard. With `--trial`, the loop gives
+the coordinator a store wrapper that adds the trial's cap (`TrialCap`: its
+`seq`, window and limits) to **every** commit that admits work, whichever path
+admits it:
+
+- a new claim;
+- an attempt started after a retry wait;
+- an execution recovered after a crash.
+
+The real store checks the cap in the same transaction as the admission
+(`check_trial`), and refuses with `SuspendedError` (`trial-limit`), writing
+nothing, unless:
+
+- the trial exists, is unrevoked, and has exactly the cap's terms (a forged or
+  stale cap is refused);
+- the admission falls inside the trial's window;
+- executions created since the trial started, with this commit's, stay within
+  `max_executions`;
+- money reserved or charged since the trial started, with this commit's
+  charges, stays within `max_spend_micros`.
+
+A pass refused this way ends the loop with exit 78. A different trial in force
+than the one the loop started under stops it with exit 3 at the next check.
+
+### 6. Ilmar's own repository, by immutable ID
+
+Names and the `self_repository` flag can be renamed or forgotten, so Ilmar's
+own repository is also refused by its immutable GitHub ID
+(`ILMAR_REPOSITORY_ID`):
+
+- in trial terms, gate evidence and a supervised configuration;
+- by the loop, for the live target **or any repository forked from it**.
+
+The source-control port's read is `repository_identity`: the ID, and the IDs
+of the repositories a fork came from (its parent and the root). A fork whose
+lineage cannot be read is an error, and the loop refuses.
+
 ## Consequences
 
 - The Gate 1 live run can exercise the real loop without any gate record
@@ -123,6 +162,16 @@ time limits (ADR-0029), not by the expiry.
   still applies.
 - **Command:** the execution limit and the spending cap stop a real trial
   loop; expiry, revocation, suspension and the kill switch stop it.
+- **Admission (adversarial):** with no pre-pass check at all, the store
+  refuses:
+  - an execution beyond the count;
+  - a restarted attempt's reservation beyond the cap;
+  - a revoked, forged, expired or not-yet-started trial.
+
+  A coordinator driven directly under the wrapper admits only what the trial
+  allows.
+- **Ilmar's repository:** its ID and any fork of it, at every depth, are
+  refused in configuration, terms, evidence and the live target.
 - **CLI:** authorize, show, end; every bound refused; the attestation and
   supervised mode are required.
 

@@ -385,6 +385,49 @@ def check_budget(
         added_month[month] = added_month.get(month, 0) + charge.amount_micros
 
 
+TRIAL_LIMIT = "trial-limit"
+
+
+def check_trial(
+    changes: Commit,
+    *,
+    trial: Callable[[int], TrialRecord | None],
+    created_since: Callable[[datetime], int],
+    charged_since: Callable[[datetime], int],
+) -> None:
+    """ADR-0041 §5, enforced where it is atomic: a commit carrying a trial cap
+    admits work only within that trial. Refused with ``SuspendedError``
+    (``trial-limit``); nothing is written.
+
+    * The trial exists, is unrevoked, and has exactly the cap's terms.
+    * Every admission (an execution created, claimed, or an attempt started)
+      happens inside the trial's window.
+    * Executions created since the trial started, with this commit's, stay
+      within ``max_executions``.
+    * Money reserved or charged since the trial started, with this commit's
+      charges, stays within ``max_spend_micros``."""
+    cap = changes.trial
+    if cap is None:
+        return
+
+    def refuse(why: str) -> None:
+        raise SuspendedError(f"outside the trial authorization: {why}", reason=TRIAL_LIMIT)
+
+    record = trial(cap.trial_seq)
+    if record is None or record.revoked_at is not None or not cap.matches(record):
+        refuse(f"trial {cap.trial_seq} is revoked, missing or not the one authorized")
+    created = [t for e, t in changes.created if not e.state.is_terminal]
+    admitting = created + [t for _, t in changes.applied if t.to_state in _ADMITTING]
+    for transition in admitting:
+        if not cap.since <= transition.at < cap.expires_at:
+            refuse(f"{transition.execution_id} is admitted outside the trial's window")
+    if created and created_since(cap.since) + len(created) > cap.max_executions:
+        refuse(f"the trial's {cap.max_executions} execution(s) are used up")
+    added = sum(c.amount_micros for c in changes.charges)
+    if added and charged_since(cap.since) + added > cap.max_spend_micros:
+        refuse("the trial's spending cap would be exceeded")
+
+
 def check_commit(
     fence: Fence,
     changes: Commit,

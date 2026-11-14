@@ -39,7 +39,13 @@ from ilmar.domain.ledger import Commit, Fence, Operation, OperationStatus, Resou
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
-from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+from ilmar.ports.execution_store import (
+    check_apply,
+    check_commit,
+    check_create,
+    check_fence,
+    check_trial,
+)
 
 FROM_SCHEMA_VERSION = 0
 """What the baseline records as the version migrated from: this store has no schema."""
@@ -170,6 +176,14 @@ class InMemoryExecutionStore:
                 latest_update=max((e.updated_at for e in self._executions.values()), default=None),
                 suspension=self._suspension,
                 totals=self._totals,
+            )
+            check_trial(
+                changes,
+                trial=lambda seq: next((t for t in self._trials if t.seq == seq), None),
+                created_since=lambda at: sum(
+                    1 for e in self._executions.values() if e.created_at >= at
+                ),
+                charged_since=lambda at: sum(c.amount_micros for c in self._charges if c.at >= at),
             )
             events = event_log.commit_events(
                 fence,

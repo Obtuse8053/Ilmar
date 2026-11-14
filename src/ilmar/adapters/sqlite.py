@@ -89,7 +89,13 @@ from ilmar.domain.ledger import (
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
-from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+from ilmar.ports.execution_store import (
+    check_apply,
+    check_commit,
+    check_create,
+    check_fence,
+    check_trial,
+)
 
 SCHEMA_VERSION = 10
 """The version this code writes. A database is at it once it has been claimed."""
@@ -766,6 +772,17 @@ class SQLiteExecutionStore:
                 suspension=_suspension(conn),
                 totals=lambda at: _budget_totals(conn, at),
             )
+            check_trial(
+                changes,
+                trial=lambda seq: next((t for t in _trial_records(conn) if t.seq == seq), None),
+                created_since=lambda at: _integer(conn.execute(
+                    "SELECT COUNT(*) FROM executions WHERE created_at >= ?", (_encode_time(at),)
+                ).fetchone()[0]),
+                charged_since=lambda at: _integer(conn.execute(
+                    "SELECT COALESCE(SUM(amount_micros), 0) FROM budget_ledger WHERE at >= ?",
+                    (_encode_time(at),),
+                ).fetchone()[0]),
+            )  # fmt: skip
             # Derived and paired against the stored rows, before any is written.
             events = event_log.commit_events(
                 fence,

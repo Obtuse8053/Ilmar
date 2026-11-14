@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ilmar.domain.budget import Suspension
-from ilmar.domain.gates import GateRecord, TrialRecord, active_gate
+from ilmar.domain.changes import RepositoryIdentity
+from ilmar.domain.gates import ILMAR_REPOSITORY_ID, GateRecord, TrialRecord, active_gate
 
 NOT_ENABLED, SUSPENDED, STOPPED = 3, 78, 0
 
@@ -48,7 +49,7 @@ class LoopFacts:
     expected_version: str | None
     repository_id: int | None
     """``[autonomy] repository_id``: the approved target."""
-    live_repository_id: int | str
+    live_repository: RepositoryIdentity | str
     """The ID the forge reports now, or why it could not be read."""
     gates: Sequence[GateRecord]
     kill_switch_engaged: bool
@@ -137,11 +138,14 @@ def loop_blocker(facts: LoopFacts) -> tuple[int, str] | None:
             f"the {what} is for agent {approved_version}, not the configured "
             f"expected_version {facts.expected_version}"
         )
-    if isinstance(facts.live_repository_id, str):
-        return NOT_ENABLED, f"the target's repository ID cannot be read: {facts.live_repository_id}"
-    if facts.live_repository_id != facts.repository_id:
+    live = facts.live_repository
+    if isinstance(live, str):
+        return NOT_ENABLED, f"the target's repository identity cannot be read: {live}"
+    if live.is_or_descends_from(ILMAR_REPOSITORY_ID) or approved_id == ILMAR_REPOSITORY_ID:
+        return NOT_ENABLED, "the target is Ilmar's own repository, or a fork of it (ADR-0030 §5)"
+    if live.id != facts.repository_id:
         return NOT_ENABLED, (
-            f"the target is repository {facts.live_repository_id}, not the approved "
+            f"the target is repository {live.id}, not the approved "
             f"{facts.repository_id}: a fork or another repository is never approved"
         )
     if facts.kill_switch_engaged:
