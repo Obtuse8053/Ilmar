@@ -233,3 +233,21 @@ def test_counting_tokens_is_checked_and_never_charged(live: Live) -> None:
     assert json.loads(payload)["input_tokens"] > 0
     assert live.charges() == []
     assert live.gateway.budget.spent() == 0
+
+
+def test_a_closed_gateway_leaves_a_complete_record_of_real_requests(live: Live) -> None:
+    """ADR-0039 against the real provider: after a plain and a streamed request,
+    closing writes a final record whose totals match the charges, and nothing
+    in it is uncertain."""
+    for stream in (False, True):
+        status, payload = live.post(message(stream=stream))
+        assert status == 200, payload[:300]
+        settled_reported(live)
+    live.gateway.close(30.0)
+    found = mg.parse_spend(live.log.getvalue().splitlines())
+    assert found["closed"] is True
+    assert (found["requests"], found["unsettled"], found["uncertain"]) == (2, 0, None)
+    charged = sum(int(line.split("charged=")[1].split()[0]) for line in live.charges())
+    assert found["charged"] == charged > 0
+    status, _ = live.post(message())
+    assert status == 503  # closed: nothing more reaches the provider
