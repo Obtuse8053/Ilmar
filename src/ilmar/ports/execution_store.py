@@ -27,7 +27,7 @@ from ilmar.domain.errors import (
 )
 from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
-from ilmar.domain.gates import GateRecord
+from ilmar.domain.gates import GateRecord, TrialRecord
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -119,6 +119,12 @@ class ExecutionStore(Protocol):
 
     def suspension(self) -> Suspension | None:
         """The suspension in force, or ``None``."""
+        ...
+
+    def trial_records(self) -> Sequence[TrialRecord]:
+        """Every trial authorization (ADR-0041), revoked and expired ones too,
+        oldest first. Written only through ``Commit.gate``, by a person; at most
+        one is in force at a time."""
         ...
 
     def gate_records(self) -> Sequence[GateRecord]:

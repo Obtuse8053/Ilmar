@@ -42,7 +42,14 @@ from ilmar.domain.events import (
     resumed_event,
 )
 from ilmar.domain.execution import Execution
-from ilmar.domain.gates import GateRecord, GateRecorded
+from ilmar.domain.gates import (
+    TRIAL_MODE,
+    GateRecord,
+    GateRecorded,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+)
 from ilmar.domain.ledger import Commit, Fence, Operation, Resource
 from ilmar.domain.verification import EvidenceRecord
 
@@ -96,7 +103,7 @@ def commit_events(
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
     suspended: Suspension | None = None,
-    gated: GateRecord | None = None,
+    gated: GateRecord | TrialRecord | None = None,
 ) -> tuple[Event, ...]:
     """The events ``changes`` must be committed with, ``data.from`` filled and paired.
 
@@ -352,15 +359,24 @@ def stored_state(
 
 
 def check_gate_change(
-    changes: Commit, context: EventContext | None, active: GateRecord | None
+    changes: Commit, context: EventContext | None, active: GateRecord | TrialRecord | None
 ) -> None:
-    """ADR-0040, enforced by the store: only a person records or revokes a gate;
-    a mode has at most one active record; only an active record is revoked."""
+    """ADR-0040 and ADR-0041, enforced by the store: only a person records or
+    revokes a gate or a trial; a mode has at most one active record and at most
+    one trial is in force; only an active record or unrevoked trial is revoked."""
     gate = changes.gate
     if gate is None:
         return
     if context is None or context.actor.kind is not ActorKind.HUMAN:
         raise LedgerIntegrityError("only a person records or revokes a gate")
+    if isinstance(gate, TrialAuthorized):
+        if active is not None:
+            raise LedgerIntegrityError("a trial authorization is already in force")
+        return
+    if isinstance(gate, TrialRevoked):
+        if active is None:
+            raise LedgerIntegrityError("no unrevoked trial authorization to revoke")
+        return
     if isinstance(gate, GateRecorded):
         if active is not None:
             raise LedgerIntegrityError(
@@ -371,8 +387,11 @@ def check_gate_change(
 
 
 def gate_mode(changes: Commit) -> str | None:
-    """The mode a commit's gate change is about, if it has one."""
+    """The mode a commit's gate change is about, if it has one; ``TRIAL_MODE``
+    for a trial authorization or revocation (ADR-0041)."""
     gate = changes.gate
     if gate is None:
         return None
+    if isinstance(gate, TrialAuthorized | TrialRevoked):
+        return TRIAL_MODE
     return gate.evidence.mode if isinstance(gate, GateRecorded) else gate.mode

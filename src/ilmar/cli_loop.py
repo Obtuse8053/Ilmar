@@ -39,7 +39,7 @@ from ilmar.core import kill_switch
 from ilmar.core.components import Components
 from ilmar.core.coordinator import Coordinator, ExitCode
 from ilmar.core.layout import WorkspaceLayout
-from ilmar.core.loop import LoopFacts, loop_blocker, run_loop
+from ilmar.core.loop import LoopFacts, TrialUse, loop_blocker, run_loop
 from ilmar.core.ownership import Ownership
 from ilmar.core.safe_fs import ensure_directory, require_canonical_root
 from ilmar.core.starts import StartLimits, account_start
@@ -53,6 +53,8 @@ from ilmar.domain.errors import (
     ProviderError,
     StartLogError,
 )
+from ilmar.domain.events import EventType
+from ilmar.domain.gates import trial_in_force
 from ilmar.domain.ledger import Commit
 
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
@@ -88,6 +90,7 @@ def make_coordinator(
 def run(
     path: Path,
     *,
+    trial: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     stop: threading.Event | None = None,
     builder: Callable[[IlmarConfig], Any] = build,
@@ -159,6 +162,7 @@ def run(
                     gates=store.gate_records(), kill_switch_engaged=engaged(),
                     suspension=store.suspension(),
                     latest_update=store.latest_update(), now=now(),
+                    trial=trial_use(store, config, now()) if trial else None,
                 ))  # fmt: skip
 
             def run_pass() -> int:
@@ -178,6 +182,26 @@ def run(
                 check=check, run_pass=run_pass, poll_interval=config.autonomy.poll_interval_seconds,
                 stop=stop, report=lambda line: print(line, file=err),
             )  # fmt: skip
+
+
+def trial_use(store: Any, config: IlmarConfig, at: datetime) -> TrialUse:
+    """The trial in force and what was used under it (ADR-0041), from the store."""
+    records = store.trial_records()
+    record = trial_in_force(records, at)
+    executions = spent = 0
+    if record is not None:
+        since = record.terms.starts_at
+        for event in store.events():
+            when = datetime.strptime(event.at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+            if when < since:
+                continue
+            if event.type is EventType.EXECUTION_CREATED:
+                executions += 1
+            elif event.type in (EventType.BUDGET_RESERVED, EventType.BUDGET_CHARGED):
+                spent += int(event.data.get("amount_micros", 0))
+    reserve = config.budget.limits.reserve_micros if config.budget else 0
+    return TrialUse(record=record, latest=records[-1] if records else None,
+                    executions=executions, spent_micros=spent, reserve_micros=reserve)  # fmt: skip
 
 
 def configuration_digest(path: Path) -> str:

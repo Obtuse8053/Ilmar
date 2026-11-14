@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ilmar.domain.budget import Suspension
-from ilmar.domain.gates import GateRecord, active_gate
+from ilmar.domain.gates import GateRecord, TrialRecord, active_gate
 
 NOT_ENABLED, SUSPENDED, STOPPED = 3, 78, 0
 
@@ -55,6 +55,63 @@ class LoopFacts:
     suspension: Suspension | None
     latest_update: datetime | None
     now: datetime
+    trial: TrialUse | None = None
+    """``--loop --trial`` (ADR-0041): the trial in force and its use so far;
+    ``None`` for the permanent loop, which never accepts a trial."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrialUse:
+    """What ``--loop --trial`` reads about its authorization before each pass."""
+
+    record: TrialRecord | None
+    """The trial in force now (unrevoked, started, not expired), if any."""
+    latest: TrialRecord | None
+    """The newest trial at all, to say why none is in force."""
+    executions: int
+    """Executions created since the trial started."""
+    spent_micros: int
+    """Reservations and charges made since the trial started."""
+    reserve_micros: int
+    """What one more attempt reserves: it must still fit the trial's cap."""
+
+
+def _authorization(facts: LoopFacts) -> tuple[int, str] | tuple[int, str, str]:
+    """``(repository_id, agent_version)`` of what authorizes this loop, or a refusal
+    ``(code, reason, "")``."""
+    use = facts.trial
+    if use is None:
+        gate = active_gate(facts.gates, "supervised")
+        if gate is None:
+            return NOT_ENABLED, "no active supervised gate record (ilmar gate record)", ""
+        return gate.evidence.repository_id, gate.evidence.agent_version
+    trial = use.record
+    if trial is None:
+        latest = use.latest
+        why = (
+            "none was authorized" if latest is None
+            else f"trial {latest.seq} was revoked" if latest.revoked_at is not None
+            else f"trial {latest.seq} expired at {latest.terms.expires_at.isoformat()}"
+            if facts.now >= latest.terms.expires_at
+            else f"trial {latest.seq} starts at {latest.terms.starts_at.isoformat()}"
+        )  # fmt: skip
+        return NOT_ENABLED, f"no trial authorization in force: {why} (ilmar gate trial)", ""
+    if use.executions >= trial.terms.max_executions:
+        return (
+            NOT_ENABLED,
+            (f"the trial's {trial.terms.max_executions} execution(s) are used up"),
+            "",
+        )
+    if use.spent_micros + use.reserve_micros > trial.terms.max_spend_micros:
+        return (
+            NOT_ENABLED,
+            (
+                f"another attempt would exceed the trial's spending cap ({use.spent_micros} of "
+                f"{trial.terms.max_spend_micros} micro-dollars reserved or charged)"
+            ),
+            "",
+        )
+    return trial.terms.repository_id, trial.terms.agent_version
 
 
 def loop_blocker(facts: LoopFacts) -> tuple[int, str] | None:
@@ -66,17 +123,18 @@ def loop_blocker(facts: LoopFacts) -> tuple[int, str] | None:
         )
     if facts.mode != "supervised":
         return NOT_ENABLED, f'[autonomy] mode is "{facts.mode}": loop mode needs "supervised"'
-    gate = active_gate(facts.gates, "supervised")
-    if gate is None:
-        return NOT_ENABLED, "no active supervised gate record (ilmar gate record)"
-    if facts.repository_id is None or gate.evidence.repository_id != facts.repository_id:
+    found = _authorization(facts)
+    if len(found) == 3:
+        return found[0], str(found[1])
+    approved_id, approved_version = found[0], str(found[1])
+    what = "gate record" if facts.trial is None else "trial authorization"
+    if facts.repository_id is None or approved_id != facts.repository_id:
         return NOT_ENABLED, (
-            f"the gate record is for repository {gate.evidence.repository_id}, not the "
-            f"configured {facts.repository_id}"
+            f"the {what} is for repository {approved_id}, not the configured {facts.repository_id}"
         )
-    if facts.expected_version is None or gate.evidence.agent_version != facts.expected_version:
+    if facts.expected_version is None or approved_version != facts.expected_version:
         return NOT_ENABLED, (
-            f"the gate record is for agent {gate.evidence.agent_version}, not the configured "
+            f"the {what} is for agent {approved_version}, not the configured "
             f"expected_version {facts.expected_version}"
         )
     if isinstance(facts.live_repository_id, str):

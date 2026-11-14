@@ -28,12 +28,22 @@ from ilmar import cli_loop
 from ilmar.adapters.memory import InMemoryExecutionStore
 from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.layout import WorkspaceLayout
-from ilmar.core.loop import LoopFacts, loop_blocker, run_loop
+from ilmar.core.loop import LoopFacts, TrialUse, loop_blocker, run_loop
 from ilmar.core.ownership import Ownership
 from ilmar.core.starts import StartLimits, start_log_path
 from ilmar.domain.budget import Suspension, SuspensionReason
 from ilmar.domain.events import Actor, ActorKind, EventContext
-from ilmar.domain.gates import GateEvidence, GateRecord, GateRecorded, GateRevoked
+from ilmar.domain.gates import (
+    GateChange,
+    GateEvidence,
+    GateRecord,
+    GateRecorded,
+    GateRevoked,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+    TrialTerms,
+)
 from ilmar.domain.ledger import Commit
 from ilmar.domain.workspace import NetworkPolicy
 
@@ -205,7 +215,7 @@ def builder(world: dict[str, Any]) -> Callable[[Any], Components]:
     return build
 
 
-def gate(world: dict[str, Any], change: GateRecorded | GateRevoked) -> None:
+def gate(world: dict[str, Any], change: GateChange) -> None:
     store = world["store"]
     layout = WorkspaceLayout.under(world["tmp"] / "state")
     with Ownership.take(layout=layout, store=store, instance_id="inst", now=NOW) as owner:
@@ -404,3 +414,136 @@ def test_unreviewed_uncertain_spend_keeps_the_loop_stopped_whatever_the_suspensi
 def worked_beyond(world: dict[str, Any], *known: str) -> bool:
     return any(e.type.value == "execution.created" and e.execution not in known
                for e in world["store"].events())  # fmt: skip
+
+
+# -- the Gate 1 trial (ADR-0041) ----------------------------------------------------------
+
+TERMS = TrialTerms(
+    repository_id=REPO_ID, repository="someone/ilmar-disposable", agent_version="2.1.318",
+    max_executions=2, max_spend_micros=3_000_000, starts_at=NOW - timedelta(hours=1),
+    expires_at=NOW + timedelta(hours=1), purpose="https://github.com/Obtuse8053/Ilmar/issues/93",
+)  # fmt: skip
+TRIAL = TrialRecord(1, TERMS, "alice")
+
+
+def use(record: TrialRecord | None = TRIAL, **changes: Any) -> TrialUse:
+    base = TrialUse(record=record, latest=TRIAL, executions=0, spent_micros=0,
+                    reserve_micros=1_000_000)  # fmt: skip
+    return replace(base, **changes)
+
+
+def test_a_trial_in_force_allows_a_trial_pass_without_a_gate() -> None:
+    assert loop_blocker(facts(gates=(), trial=use())) is None
+
+
+@pytest.mark.parametrize(
+    ("trial", "reason"),
+    [
+        (use(record=None, latest=None), "none was authorized"),
+        (use(record=None, latest=replace(TRIAL, revoked_at=NOW, revoked_by="bob")), "revoked"),
+        (use(record=None, latest=replace(TRIAL, terms=replace(
+            TERMS, expires_at=NOW - timedelta(seconds=1)))), "expired"),
+        (use(executions=2), "execution(s) are used up"),
+        (use(spent_micros=2_000_001), "spending cap"),
+    ],
+)  # fmt: skip
+def test_a_trial_out_of_force_or_used_up_refuses(trial: TrialUse, reason: str) -> None:
+    refused = loop_blocker(facts(gates=(GATE,), trial=trial))  # a gate never substitutes
+    assert refused is not None
+    assert refused[0] == 3
+    assert reason in refused[1]
+
+
+def test_a_trial_never_authorizes_the_permanent_loop() -> None:
+    refused = loop_blocker(facts(gates=(), trial=None))
+    assert refused == (3, "no active supervised gate record (ilmar gate record)")
+
+
+@pytest.mark.parametrize(
+    ("changes", "code"),
+    [
+        ({"repository_id": 111}, 3), ({"live_repository_id": 111}, 3),
+        ({"expected_version": "2.1.319"}, 3), ({"kill_switch_engaged": True}, 78),
+        ({"suspension": Suspension(SuspensionReason.OPERATOR, NOW)}, 78),
+        ({"configuration": "sha256:bb"}, 3),
+    ],
+)  # fmt: skip
+def test_a_trial_keeps_every_other_mode_1_rule(changes: dict[str, Any], code: int) -> None:
+    refused = loop_blocker(facts(gates=(), trial=use(), **changes))
+    assert refused is not None
+    assert refused[0] == code
+
+
+def trial_loop(world: dict[str, Any], *, passes: int = 1, at: datetime = NOW,
+               between: Callable[[Path], None] | None = None) -> tuple[int, str]:  # fmt: skip
+    stop = threading.Event()
+    seen = [0]
+    real = world["scm"].repository_id
+    path = world["tmp"] / "ilmar.toml"
+
+    def counting(repository: Any) -> int:
+        seen[0] += 1
+        if seen[0] == 2 and between is not None:
+            between(path)
+        if seen[0] > passes:
+            stop.set()
+        return int(real(repository))
+
+    world["scm"].repository_id = counting
+    err = io.StringIO()
+    try:
+        code = cli_loop.run(config(world), trial=True, now=lambda: at, stop=stop,
+                            builder=builder(world), boot_id=lambda: "boot-1", limits=ANY_RATE,
+                            out=io.StringIO(), err=err)  # fmt: skip
+    finally:
+        world["scm"].repository_id = real
+    return code, err.getvalue()
+
+
+def test_the_trial_loop_runs_under_a_trial_and_stops_at_its_execution_limit(
+    world: dict[str, Any],
+) -> None:
+    gate(world, TrialAuthorized(replace(TERMS, max_executions=1), NOW))
+    code, err = trial_loop(world, passes=5)
+    assert code == 3
+    assert "execution(s) are used up" in err
+    assert worked(world)
+    assert world["store"].gate_records() == ()  # no gate was ever written
+
+
+def test_the_trial_expires_without_anyone_acting(world: dict[str, Any]) -> None:
+    gate(world, TrialAuthorized(TERMS, NOW))
+    code, err = trial_loop(world, at=NOW + timedelta(hours=2))
+    assert (code, "expired" in err) == (3, True)
+    assert not worked(world)
+
+
+def test_a_revoked_trial_stops_the_trial_loop(world: dict[str, Any]) -> None:
+    gate(world, TrialAuthorized(TERMS, NOW))
+    gate(world, TrialRevoked(NOW))
+    code, err = trial_loop(world)
+    assert (code, "revoked" in err) == (3, True)
+
+
+def test_suspension_and_kill_switch_stop_the_trial_loop(world: dict[str, Any]) -> None:
+    gate(world, TrialAuthorized(TERMS, NOW))
+    (world["tmp"] / "KILL").write_text("")
+    assert trial_loop(world)[0] == 78
+    (world["tmp"] / "KILL").unlink()
+    uncertain_spend(world, also=SuspensionReason.OPERATOR)
+    assert trial_loop(world)[0] == 78
+
+
+def test_the_spending_cap_counts_reservations_made_under_the_trial(
+    world: dict[str, Any],
+) -> None:
+    gate(world, TrialAuthorized(replace(TERMS, max_spend_micros=1_500_000), NOW))
+    code, err = trial_loop(world, passes=5)  # 1 USD per attempt: only one fits
+    assert (code, "spending cap" in err) == (3, True)
+
+
+def test_a_permanent_loop_ignores_a_trial(world: dict[str, Any]) -> None:
+    gate(world, TrialAuthorized(TERMS, NOW))
+    code, err = loop(world)
+    assert (code, "no active supervised gate record" in err) == (3, True)
+    assert not worked(world)

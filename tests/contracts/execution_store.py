@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,14 @@ from ilmar.domain.events import (
     derive_events,
 )
 from ilmar.domain.execution import Execution, ExecutionState
-from ilmar.domain.gates import GateEvidence, GateRecorded, GateRevoked
+from ilmar.domain.gates import (
+    GateEvidence,
+    GateRecorded,
+    GateRevoked,
+    TrialAuthorized,
+    TrialRevoked,
+    TrialTerms,
+)
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -893,7 +901,61 @@ class GateRecordContract:
             Commit(gate=GateRevoked("supervised", at(1)), resume=at(1))
 
 
-class ExecutionStoreContract(FencingContract, EventLogContract, GateRecordContract):
+TRIAL = TrialTerms(
+    repository_id=987654321, repository="someone/ilmar-disposable", agent_version="2.1.318",
+    max_executions=3, max_spend_micros=5_000_000, starts_at=at(1), expires_at=at(3600),
+    purpose="https://github.com/Obtuse8053/Ilmar/issues/93",
+)  # fmt: skip
+
+
+class TrialAuthorizationContract:
+    """ADR-0041: only a person authorizes or revokes a trial; one in force at a
+    time; expiry needs no one; revoked, never removed; kept apart from gates."""
+
+    def test_a_person_authorizes_and_revokes_a_trial(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=person(fence, 1))
+        (trial,) = store.trial_records()
+        assert (trial.terms, trial.authorized_by, trial.in_force(at(2))) == (TRIAL, "alice", True)
+        assert store.gate_records() == ()  # never a gate record
+        with pytest.raises(LedgerIntegrityError, match="already in force"):
+            store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(2))),
+                         context=person(fence, 2))  # fmt: skip
+        store.commit(fence, Commit(gate=TrialRevoked(at(3))), context=person(fence, 3, "bob"))
+        (revoked,) = store.trial_records()
+        assert (revoked.revoked_by, revoked.in_force(at(4))) == ("bob", False)
+        with pytest.raises(LedgerIntegrityError, match="no unrevoked trial"):
+            store.commit(fence, Commit(gate=TrialRevoked(at(5))), context=person(fence, 5))
+        kinds = [(e.type, e.reason) for e in store.events() if "trial" in e.type.value]
+        assert kinds == [
+            (EventType.INSTANCE_TRIAL_AUTHORIZED, "trial-authorized"),
+            (EventType.INSTANCE_TRIAL_REVOKED, "trial-revoked"),
+        ]
+
+    def test_an_expired_trial_is_out_of_force_and_may_be_followed(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=person(fence, 1))
+        (trial,) = store.trial_records()
+        assert not trial.in_force(at(3600))  # expired on its own
+        later = replace(TRIAL, starts_at=at(4000), expires_at=at(8000))
+        store.commit(fence, Commit(gate=TrialAuthorized(later, at(4000))),
+                     context=person(fence, 4000))  # fmt: skip
+        assert [t.seq for t in store.trial_records()] == [1, 2]
+
+    def test_nothing_but_a_person_authorizes_a_trial(self, store: ExecutionStore) -> None:
+        fence = claimed(store)
+        context = EventContext(at=at(1), instance=fence.instance_id, epoch=fence.epoch,
+                               actor=COORDINATOR, pass_id="p-0123456789")  # fmt: skip
+        with pytest.raises(LedgerIntegrityError, match="only a person"):
+            store.commit(fence, Commit(gate=TrialAuthorized(TRIAL, at(1))), context=context)
+        assert store.trial_records() == ()
+
+
+class ExecutionStoreContract(
+    FencingContract, EventLogContract, GateRecordContract, TrialAuthorizationContract
+):
     def make_store(self, tmp_path: Path) -> Iterator[ExecutionStore]:
         raise NotImplementedError
 
