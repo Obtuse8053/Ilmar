@@ -60,16 +60,18 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#18 (reservation ledger, suspension and kill switch), with #110 (candidate
-secret scan, a Gate 1 prerequisite) in parallel. #90's runtime limits and
-credential path are merged; #90 awaits its acceptance audit.
+Gate 1 (#93). The code side is in place once #132 (the Gate 1 trial
+authorization, ADR-0041) is merged: loop mode (#91), gate records (ADR-0040),
+spend settlement (ADR-0039), the secret scan (#110) and the runtime limits
+(#90, awaiting its acceptance audit). What remains is evidence the maintainer
+collects (see #93).
 
 Hard gates that stay in force:
 - the real-Podman coordinator-SIGKILL test in #90, which Gate 1 also needs;
 - a passed pinned-version live test and a reviewed, recorded stream fixture
   before Mode 1 (the synthetic fixture never counts);
 - #91 enforces the version and gate requirements before it allows loop mode.
-- #110 (candidate secret scan) is in place before Gate 1;
+- #110 (candidate secret scan, merged) stays in force for Gate 1;
 - `tests/integration/test_claude_code_pinned.py` passes on the pinned image;
 - #111 (credential-injecting proxy) lands before Mode 2, untrusted
   repositories or self-hosting.
