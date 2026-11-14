@@ -219,6 +219,8 @@ class Effects:
             result = {"outcome": claim.outcome.value}
             if claim.claim_id is not None:  # the claim this execution holds (ADR-0026 §3a)
                 result["claim_id"] = claim.claim_id
+            if claim.object_id is not None:  # and the object holding it (ADR-0031 §3)
+                result["object_id"] = claim.object_id
             return result
 
         result = self._journal.perform(K.CLAIM_TASK, execution, effect, lease=lease, after=then)
@@ -230,6 +232,32 @@ class Effects:
             return {}
 
         self._journal.perform(K.RELEASE_TASK, execution, effect, lease=lease, step=step)
+
+    def release_pinned(
+        self, execution: Execution, lease: ExecutionLease, *, step: str
+    ) -> ReleaseResult:
+        """Release exactly the claim an operation's recorded intent names
+        (ADR-0031 §3, #125 review): its object, revalidated against its token
+        right before deletion. A replacement claim, ours or anyone's, is never
+        deleted: ``CHANGED`` and ``ABSENT`` mean the pinned claim is gone, so
+        there is nothing of it left to release. Performed, and repeated after a
+        crash, only from the intent stored with the operation."""
+        key = operation_key(K.RELEASE_TASK, execution.id, execution.attempt, step)
+        recorded = self._c.execution_store.operation(key)
+        if recorded is None or not recorded.intent:
+            raise LedgerIntegrityError(f"{key}: no pinned claim recorded")
+        claim = claim_from_intent(recorded.intent)
+        if claim.ref != execution.task:
+            raise LedgerIntegrityError(f"{key}: the pinned claim names another task")
+
+        def effect() -> Mapping[str, str]:
+            return {"result": self._c.task_provider.release_claim(claim).value}
+
+        result = self._journal.perform(
+            K.RELEASE_TASK, execution, effect, lease=lease, step=step,
+            intent=recorded.intent,
+        )  # fmt: skip
+        return ReleaseResult(result["result"])
 
     def restore_label(
         self, execution: Execution, lease: ExecutionLease, *, claim: HeldClaim, step: str

@@ -72,6 +72,16 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-13: **#92 part 2a submitted: `ilmar blocked list|release|abandon`**
+  (ADR-0031 §3).
+  - Each decision is one fenced commit: the maintainer's
+    `execution.block_resolved` event and the journaled claim-release intent.
+    The tracker call happens at the next run, through the journal.
+  - A released task is picked again as a new execution. An abandoned task
+    stays out of the backlog.
+  - Crash safety is tested at each boundary between the store and the tracker.
+  - Still to come: the per-pass blocked count and the pre-push workflow
+    inspection.
 - 2026-11-12: **#118 merged** (#92 part 1).
   - **C0 passed** on Claude Code 2.1.318 (run 43181484162). The recorded
     request shape is on #111: `claude-opus-5-5`, `max_tokens` 128000, about

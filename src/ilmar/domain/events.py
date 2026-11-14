@@ -100,6 +100,10 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "suspension-check-failed": "The suspension check failed while an agent ran, so all "
         "new work is suspended until an operator resumes once the check succeeds again "
         "(ADR-0029 §4).",
+        "maintainer-released": "A maintainer released a blocked task: its claim is "
+        "released and it may be picked again as a new execution (ADR-0031 §3).",
+        "maintainer-abandoned": "A maintainer abandoned a blocked task: its claim is "
+        "released and Ilmar never picks it again (ADR-0031 §3).",
         "protected-path": "The candidate touches a protected safety control; it is never "
         "pushed and its task stays claimed and blocked for a maintainer (ADR-0031).",
         "candidate-secret": "The candidate or its change request contains one of the "
@@ -343,6 +347,10 @@ OBSERVATIONS: Mapping[str, str] = MappingProxyType(
 )
 _POSITIVE = _integer(1)
 SUSPENSION_REASONS = tuple(r.value for r in SuspensionReason)
+BLOCK_DECISIONS = ("release", "abandon")
+"""A maintainer's resolution of a blocked task (ADR-0031 §3): ``release`` makes
+it eligible again as a new execution; ``abandon`` leaves it out of the backlog.
+Both release Ilmar's claim."""
 
 _MESSAGE_PARAM_VALUES: Mapping[str, frozenset[str]] = MappingProxyType(
     {"reason": frozenset(REASON_CODES), "kind": frozenset(k.value for k in ResourceKind)}
@@ -404,6 +412,7 @@ class EventType(enum.Enum):
     BUDGET_CHARGED = "budget.charged"
     INSTANCE_SUSPENDED = "instance.suspended"
     INSTANCE_RESUMED = "instance.resumed"
+    EXECUTION_BLOCK_RESOLVED = "execution.block_resolved"
 
 
 RESERVED_TYPES: Mapping[str, int] = MappingProxyType(
@@ -510,6 +519,9 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
         EventType.INSTANCE_RESUMED: {  # the reason is operator-resumed; this is what cleared
             "cleared": (_one_of(SUSPENSION_REASONS), True),
         },
+        EventType.EXECUTION_BLOCK_RESOLVED: {  # ADR-0031 §3: a maintainer's decision
+            "decision": (_one_of(BLOCK_DECISIONS), True),
+        },
         EventType.EXECUTION_CLAIM_LOST: {  # ADR-0026 §3a
             "state": (_one_of(CLAIM_LOST_STATES), True),
             "claim": (_pattern(_OPAQUE_ID), True),
@@ -522,7 +534,13 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
 _NEEDS_REASON = frozenset({EventType.RESOURCE_QUARANTINED})
 # Event types no row derives (ADR-0024 §9, ``Commit.extra_events``): given by the
 # core, with an explicit reason and an execution, never an ``unclassified`` fallback.
-EXTRA_TYPES = frozenset({EventType.EXECUTION_CANCEL_REQUESTED, EventType.EXECUTION_CLAIM_LOST})
+EXTRA_TYPES = frozenset(
+    {
+        EventType.EXECUTION_CANCEL_REQUESTED,
+        EventType.EXECUTION_CLAIM_LOST,
+        EventType.EXECUTION_BLOCK_RESOLVED,
+    }
+)
 
 
 # -- credential shapes (ADR-0024 §7, layer 3) ------------------------------------------

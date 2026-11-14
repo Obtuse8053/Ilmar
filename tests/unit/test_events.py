@@ -283,6 +283,8 @@ ADDED_CODES = {
     "agent-stalled",  # ADR-0035 (#13)
     "suspension-interrupted",  # ADR-0029 §3 (#18 part 2)
     "suspension-check-failed",  # ADR-0029 §4 (#18 part 2, #122 review)
+    "maintainer-released",  # ADR-0031 §3 (#92 part 2)
+    "maintainer-abandoned",  # ADR-0031 §3 (#92 part 2)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)
