@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from gateway_policy import BUDGET, POLICY
 from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
 from ilmar.adapters.podman.runtime import Completed, subprocess_executor
 from ilmar.core.layout import WorkspaceLayout
@@ -62,7 +63,7 @@ def main(state: Path, name: str, stage: str) -> None:
     runtime = PodmanRuntime(
         layout=layout,
         executor=executor,
-        gateway=GatewaySettings(image=str(PROXY_IMAGE), key=key,
+        gateway=GatewaySettings(image=str(PROXY_IMAGE), key=key, policy=POLICY, budget=BUDGET,
                                 upstream="http://192.0.2.1:9", allow_plain_http_upstream=True),
     )  # fmt: skip
     runtime.start(

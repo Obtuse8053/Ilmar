@@ -229,7 +229,10 @@ def test_a_rewrite_that_would_grow_the_body_is_refused_and_releases_its_reservat
 
 
 def sse(*events: dict[str, Any]) -> bytes:
-    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+    return b"".join(
+        b"event: " + str(e.get("type")).encode() + b"\ndata: " + json.dumps(e).encode() + b"\n\n"
+        for e in events
+    )
 
 
 def start(**usage: Any) -> dict[str, Any]:
@@ -411,6 +414,7 @@ def test_writes_without_a_breakdown_are_charged_at_the_one_hour_rate() -> None:
 
 def test_a_plain_response_is_settled_from_its_body() -> None:
     message = {"type": "message", "stop_reason": "end_turn",
+               "content": [{"type": "text", "text": "hi"}],
                "usage": {"input_tokens": 10, "output_tokens": 5}}  # fmt: skip
     settled = ga.charge(metered(json.dumps(message).encode(), streamed=False), PRICE, DOLLAR)
     assert settled.charged == ga._cost(10, PRICE.input) + ga._cost(5, PRICE.output)
@@ -505,3 +509,13 @@ def test_the_policy_comes_from_json() -> None:
     with pytest.raises(ValueError, match="threshold"):
         ModelPrice(input=1, output=1, cache_write_5m=1, cache_write_1h=1, cache_read=1,
                    long_context_threshold=5)  # fmt: skip
+
+
+def test_halt_stops_the_attempt_without_a_charge() -> None:
+    budget = Budget(limit=50 * DOLLAR, policy=POLICY)
+    budget.halt("provider status 500")
+    assert (budget.halted, budget.halt_reason, budget.spent()) == (True, "provider status 500", 0)
+    with pytest.raises(RequestRefused, match="provider status 500"):
+        budget.admit(body(max_tokens=2_000))
+    budget.halt("later")  # the first reason stays
+    assert budget.halt_reason == "provider status 500"

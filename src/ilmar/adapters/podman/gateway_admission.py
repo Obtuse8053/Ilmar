@@ -66,6 +66,7 @@ micro-dollars, always rounded up.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -79,7 +80,7 @@ TOP_LEVEL_FIELDS = frozenset(
     {
         "model", "messages", "system", "max_tokens", "metadata", "stop_sequences",
         "stream", "temperature", "top_k", "top_p", "tools", "tool_choice", "thinking",
-        "service_tier",
+        "service_tier", "output_config", "context_management",
     }
 )  # fmt: skip
 """Everything else is refused until it is priced and reviewed."""
@@ -100,6 +101,51 @@ BILLED_BETA_FAMILIES = (
     "skills",
 )
 """Refused even when the operator allows them: priced outside this module's model."""
+
+ADVANCED_TOOL_USE = "advanced-tool-use-2025-11-20"
+CONTEXT_MANAGEMENT = "context-management-2025-06-27"
+PER_TURN_CONTROL = "per-turn-control-2026-07-01"
+TOOL_CHANGES = "mid-conversation-tool-changes-2026-07-01"
+DISPLAY_UPDATES = "thinking-display-updates-2026-08-18"
+INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+EFFORT = "effort-2025-11-24"
+THINKING_TOKEN_COUNT = "thinking-token-count-2026-05-13"  # noqa: S105 - a feature name
+CANDIDATE_BETAS = frozenset(
+    {
+        "claude-code-20250219", INTERLEAVED_THINKING, EFFORT, PER_TURN_CONTROL,
+        TOOL_CHANGES, DISPLAY_UPDATES, CONTEXT_MANAGEMENT, THINKING_TOKEN_COUNT,
+    }
+)  # fmt: skip
+"""Reviewed for pinned Claude Code 2.1.318 and approved as candidates (maintainer,
+2026-11-13). Still enabled only through ``allowed_betas``; nothing is allowed by
+default. ``thinking-token-count``: the ``estimated_tokens`` it adds to
+``thinking_delta`` events is not billable and never counted."""
+NEVER_ALLOWED_BETAS = frozenset({ADVANCED_TOOL_USE})
+"""Denied server-side capabilities: refused when their features are used, and
+dropped from the header when they are not. They cannot be allowed."""
+EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+THINKING_KEYS = frozenset({"type", "budget_tokens", "display"})
+DISPLAYS = frozenset({"summarized", "omitted"})
+"""``updates`` also, with ``thinking-display-updates``."""
+TOOL_KEYS = frozenset({"type", "name", "description", "input_schema", "cache_control"})
+"""Custom tools only. ``defer_loading``, ``allowed_callers``, ``input_examples``
+and anything else are refused: they belong to denied or unreviewed features."""
+MESSAGE_KEYS = frozenset({"role", "content"})
+SYSTEM_MESSAGE_KEYS = frozenset({"role", "content", "output_config"})
+SYSTEM_MESSAGE_BLOCKS = frozenset({"text", "tool_addition", "tool_removal"})
+TOOL_CHANGE_BLOCK_KEYS = frozenset({"type", "tool", "cache_control"})
+TEXT_BLOCK_KEYS = frozenset({"type", "text", "cache_control"})
+CACHE_TTLS = frozenset({"5m", "1h"})
+RESPONSE_BLOCKS = frozenset({"text", "thinking", "redacted_thinking", "tool_use"})
+STREAM_EVENTS = frozenset(
+    {
+        "message_start", "message_delta", "message_stop", "content_block_start",
+        "content_block_delta", "content_block_stop", "ping", "error",
+    }
+)  # fmt: skip
+"""Stream events the meter understands; any other fails the report closed."""
+DELTA_TYPES = frozenset({"text_delta", "input_json_delta", "thinking_delta", "signature_delta"})
+"""Response content the meter understands; any other (a server tool's) halts."""
 USAGE_KEYS = frozenset(
     {
         "input_tokens", "output_tokens", "cache_creation_input_tokens",
@@ -178,7 +224,9 @@ class AdmissionPolicy:
             raise ValueError("allowances must not be negative")
         if self.image_tokens is not None and self.image_tokens < 1:
             raise ValueError("image_tokens must be positive, or None to refuse images")
-        billed = sorted(b for b in self.allowed_betas if _billed_beta(b))
+        billed = sorted(
+            b for b in self.allowed_betas if _billed_beta(b) or b in NEVER_ALLOWED_BETAS
+        )
         if billed:
             raise ValueError(f"beta features billed separately cannot be allowed: {billed}")
 
@@ -202,6 +250,11 @@ class Admitted:
     input_estimate: int
     capped_from: int | None = None
     """The ``max_tokens`` the client asked for, when it was lowered."""
+    betas: tuple[str, ...] = ()
+    """The ``anthropic-beta`` values to forward, in the order sent."""
+    dropped: tuple[str, ...] = ()
+    """Values the client sent that are dropped because their feature is unused."""
+    streamed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,9 +295,9 @@ class Budget:
 
     def admit(self, body: bytes, betas: Iterable[str] = ()) -> tuple[int, Admitted]:
         """Check, constrain and reserve; ``(ticket, admitted)``, or ``RequestRefused``."""
-        _check_betas(betas, self.policy)
         request = parse(body)
-        model, price, input_tokens, requested = assess(request, len(body), self.policy)
+        kept, dropped = resolve_betas(betas, request, self.policy)
+        model, price, input_tokens, requested = assess(request, len(body), self.policy, kept)
         input_cost = _cost(input_tokens, max(price.input_rates(input_tokens)))
         output_rate = price.output_rate(input_tokens)
         wanted = min(requested, self.policy.max_output_tokens)
@@ -277,7 +330,23 @@ class Budget:
                 raise RequestRefused("invalid_request_error", "the request cannot be re-encoded")
             body = rewritten
         capped = requested if granted != requested else None
-        return ticket, Admitted(body, reservation, model, granted, input_tokens, capped)
+        streamed = request.get("stream") is True
+        return ticket, Admitted(
+            body, reservation, model, granted, input_tokens, capped, kept, dropped, streamed
+        )
+
+    def check(self, body: bytes, betas: Iterable[str] = ()) -> Admitted:
+        """Validate a token-counting request: the same checks, nothing reserved
+        (counting is not billed). The halt applies to it too."""
+        request = parse(body)
+        kept, dropped = resolve_betas(betas, request, self.policy)
+        model, _, input_tokens, _ = assess(request, len(body), self.policy, kept, counting=True)
+        with self._lock:
+            if self.halted:
+                raise RequestRefused(
+                    "budget_exceeded", f"this attempt is stopped: {self.halt_reason}", status=429
+                )
+        return Admitted(body, 0, model, 0, input_tokens, None, kept, dropped)
 
     def settle(self, ticket: int, settled: Settled) -> Settled:
         """Close a request at what it cost, in full. An overrun, or a usage report
@@ -301,6 +370,14 @@ class Budget:
         with self._lock:
             self.in_flight.pop(ticket)
 
+    def halt(self, reason: str) -> None:
+        """Stop the attempt without a charge: for a request that is not billed
+        (counting tokens) whose provider failed or could not be reached. What
+        made it fail may affect billed requests too, so nothing more goes."""
+        with self._lock:
+            if not self.halted:
+                self.halted, self.halt_reason = True, reason
+
     def spent(self) -> int:
         with self._lock:
             return self.settled + sum(self.in_flight.values())
@@ -313,11 +390,113 @@ def _billed_beta(beta: str) -> bool:
     return any(beta.startswith(family) for family in BILLED_BETA_FAMILIES)
 
 
-def _check_betas(betas: Iterable[str], policy: AdmissionPolicy) -> None:
-    for value in betas:
-        for beta in (b.strip() for b in value.split(",")):
-            if beta and (_billed_beta(beta) or beta not in policy.allowed_betas):
-                raise RequestRefused("invalid_request_error", f"beta feature not allowed: {beta}")
+_BETA_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,79}$")
+
+
+def split_betas(values: Iterable[str]) -> list[str]:
+    """Every value of every ``anthropic-beta`` header, split on commas, in order,
+    without repeats. The provider reads all of them, so all are checked."""
+    betas: list[str] = []
+    for value in values:
+        for beta in (part.strip() for part in value.split(",")):
+            if beta and beta not in betas:
+                betas.append(beta)
+    return betas
+
+
+def resolve_betas(
+    values: Iterable[str], request: Mapping[str, Any], policy: AdmissionPolicy
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(kept, dropped)``. A beta is kept when the operator allowed it; dropped
+    when it is not allowed but its feature is visibly unused in this request;
+    otherwise the request is refused. A beta whose use cannot be seen in the
+    request (no detector) is never dropped."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for beta in split_betas(values):
+        if not _BETA_NAME.match(beta):
+            raise RequestRefused("invalid_request_error", "malformed anthropic-beta value")
+        denied = _billed_beta(beta) or beta in NEVER_ALLOWED_BETAS
+        if beta in policy.allowed_betas and not denied:
+            kept.append(beta)
+            continue
+        detector = FEATURE_DETECTORS.get(beta)
+        if detector is not None and not detector(request):
+            dropped.append(beta)
+            continue
+        raise RequestRefused("invalid_request_error", f"beta feature not allowed: {beta}")
+    return tuple(kept), tuple(dropped)
+
+
+def _tools(request: Mapping[str, Any]) -> list[Any]:
+    tools = request.get("tools")
+    return tools if isinstance(tools, list) else []
+
+
+def _system_messages(request: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+
+
+def _system_blocks(request: Mapping[str, Any]) -> list[Any]:
+    blocks: list[Any] = []
+    for message in _system_messages(request):
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks.extend(content)
+    return blocks
+
+
+def _all_block_types(request: Mapping[str, Any]) -> set[object]:
+    kinds: set[object] = set()
+    messages = request.get("messages")
+    for message in messages if isinstance(messages, list) else []:
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            kinds.add(block.get("type") if isinstance(block, dict) else None)
+    return kinds
+
+
+_ADVANCED_TOOL_KEYS = frozenset({"defer_loading", "allowed_callers", "input_examples"})
+_ADVANCED_BLOCKS = ("server_tool_use", "tool_search", "tool_reference")
+
+
+def _uses_advanced_tool_use(request: Mapping[str, Any]) -> bool:
+    for tool in _tools(request):
+        if not isinstance(tool, dict):
+            return True  # cannot tell: treat as used
+        kind = tool.get("type")
+        if set(tool) & _ADVANCED_TOOL_KEYS or (
+            isinstance(kind, str) and kind.startswith("tool_search")
+        ):
+            return True
+    return any(
+        isinstance(kind, str) and kind.startswith(_ADVANCED_BLOCKS)
+        for kind in _all_block_types(request)
+    )
+
+
+def _thinking_field(request: Mapping[str, Any], key: str) -> object:
+    thinking = request.get("thinking")
+    return thinking.get(key) if isinstance(thinking, dict) else None
+
+
+FEATURE_DETECTORS: Mapping[str, Any] = {
+    ADVANCED_TOOL_USE: _uses_advanced_tool_use,
+    CONTEXT_MANAGEMENT: lambda r: "context_management" in r,
+    PER_TURN_CONTROL: lambda r: any("output_config" in m for m in _system_messages(r)),
+    TOOL_CHANGES: lambda r: any(
+        isinstance(b, dict) and b.get("type") in ("tool_addition", "tool_removal")
+        for b in _system_blocks(r)
+    ),
+    DISPLAY_UPDATES: lambda r: _thinking_field(r, "display") == "updates",
+    INTERLEAVED_THINKING: lambda r: _thinking_field(r, "type") == "enabled",
+    EFFORT: lambda r: "output_config" in r,
+}
+"""Whether a request uses a beta's feature, for the betas whose use is visible
+in the request. Only these can be dropped when not allowed."""
 
 
 def parse(body: bytes) -> dict[str, Any]:
@@ -331,9 +510,16 @@ def parse(body: bytes) -> dict[str, Any]:
 
 
 def assess(
-    request: Mapping[str, Any], body_bytes: int, policy: AdmissionPolicy
+    request: Mapping[str, Any],
+    body_bytes: int,
+    policy: AdmissionPolicy,
+    betas: tuple[str, ...] = (),
+    *,
+    counting: bool = False,
 ) -> tuple[str, ModelPrice, int, int]:
-    """Validate; return the model, its price, the input estimate and the requested max."""
+    """Validate; return the model, its price, the input estimate and the requested
+    max. ``betas`` are the kept beta values: a shape that needs one is refused
+    without it. ``counting``: a token-counting request has no ``max_tokens``."""
     unknown = sorted(set(request) - TOP_LEVEL_FIELDS)
     if unknown:
         raise RequestRefused("invalid_request_error", f"field not allowed here: {unknown[0]}")
@@ -341,18 +527,24 @@ def assess(
     price = policy.prices.get(model) if isinstance(model, str) else None
     if price is None or not isinstance(model, str):
         raise RequestRefused("permission_error", "model not allowed by this gateway", 403)
-    requested = request.get("max_tokens")
-    if not isinstance(requested, int) or not _count(requested) or requested < 1:
-        raise RequestRefused("invalid_request_error", "max_tokens must be a positive integer")
+    requested: object = 0
+    if not counting or "max_tokens" in request:
+        requested = request.get("max_tokens")
+        if not isinstance(requested, int) or not _count(requested) or requested < 1:
+            raise _refuse("max_tokens must be a positive integer")
     if request.get("service_tier", "standard_only") != "standard_only":
         raise RequestRefused("invalid_request_error", "only the standard service tier")
-    images, units = _content(request)
+    tools = request.get("tools")
+    names = _check_tools(tools) if tools is not None else frozenset()
+    images, units = _content(request, betas, names)
     if images and policy.image_tokens is None:
         raise RequestRefused("invalid_request_error", "images are not allowed by this gateway")
-    tools = request.get("tools")
-    if tools is not None:
-        _check_tools(tools)
-    _check_thinking_shape(request.get("thinking"))
+    _check_thinking_shape(request.get("thinking"), betas)
+    if "output_config" in request:
+        _check_output_config(request["output_config"])
+    if "context_management" in request:
+        _need(CONTEXT_MANAGEMENT, betas, "context_management")
+        _check_context_management(request["context_management"])
     input_tokens = (
         body_bytes
         + units * policy.message_overhead_tokens
@@ -361,40 +553,133 @@ def assess(
     )
     if price.long_context_threshold is None and input_tokens > 200_000:
         raise RequestRefused("request_too_large", "too large for this model's attested prices", 413)
-    return model, price, input_tokens, requested
+    return model, price, input_tokens, requested if isinstance(requested, int) else 0
 
 
-def _check_tools(tools: object) -> None:
+def _refuse(message: str) -> RequestRefused:
+    return RequestRefused("invalid_request_error", message)
+
+
+def _need(beta: str, betas: tuple[str, ...], what: str) -> None:
+    if beta not in betas:
+        raise _refuse(f"{what} needs the {beta} beta, which is not allowed")
+
+
+def _keys(value: object, allowed: frozenset[str], what: str) -> Mapping[str, Any]:
+    """``value`` as an object whose keys are all in ``allowed``."""
+    if not isinstance(value, dict):
+        raise _refuse(f"{what} must be an object")
+    extra = sorted(set(value) - allowed)
+    if extra:
+        raise _refuse(f"{what}: field not allowed here: {extra[0]}")
+    return value
+
+
+def _check_cache_control(value: object) -> None:
+    control = _keys(value, frozenset({"type", "ttl"}), "cache_control")
+    if control.get("type") != "ephemeral" or control.get("ttl", "5m") not in CACHE_TTLS:
+        raise _refuse("cache_control must be ephemeral, with a ttl of 5m or 1h")
+
+
+def _check_tools(tools: object) -> frozenset[str]:
+    """Custom tools only, with reviewed fields; their names."""
     if not isinstance(tools, list):
-        raise RequestRefused("invalid_request_error", "tools must be a list")
+        raise _refuse("tools must be a list")
+    names: set[str] = set()
     for tool in tools:
         if not isinstance(tool, dict) or tool.get("type", "custom") != "custom":
-            raise RequestRefused(
-                "invalid_request_error", "only custom tools; server tools are refused"
-            )
+            raise _refuse("only custom tools; server tools are refused")
+        _keys(tool, TOOL_KEYS, "tool")
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            raise _refuse("a tool needs a name")
+        if "cache_control" in tool:
+            _check_cache_control(tool["cache_control"])
+        names.add(name)
+    return frozenset(names)
 
 
-def _check_thinking_shape(thinking: object) -> None:
+def _check_thinking_shape(thinking: object, betas: tuple[str, ...] = ()) -> None:
     if thinking is None:
         return
-    if not isinstance(thinking, dict) or thinking.get("type") not in THINKING_TYPES:
-        raise RequestRefused("invalid_request_error", "thinking type not allowed")
-    budget = thinking.get("budget_tokens")
+    shape = _keys(thinking, THINKING_KEYS, "thinking")
+    if shape.get("type") not in THINKING_TYPES:
+        raise _refuse("thinking type not allowed")
+    budget = shape.get("budget_tokens")
     if budget is not None and not _count(budget):
-        raise RequestRefused("invalid_request_error", "thinking budget must be an integer")
+        raise _refuse("thinking budget must be an integer")
+    if "display" in shape:
+        display = shape["display"]
+        if display == "updates":
+            _need(DISPLAY_UPDATES, betas, 'thinking.display "updates"')
+        elif display not in DISPLAYS:
+            raise _refuse("thinking.display not allowed")
 
 
 def _check_thinking(request: Mapping[str, Any], max_tokens: int) -> None:
     thinking = request.get("thinking")
     budget = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
     if isinstance(budget, int) and budget >= max_tokens:
-        raise RequestRefused(
-            "invalid_request_error",
-            f"thinking budget must be below max_tokens ({max_tokens} after the gateway's limit)",
+        raise _refuse(
+            f"thinking budget must be below max_tokens ({max_tokens} after the gateway's limit)"
         )
 
 
-def _content(request: Mapping[str, Any]) -> tuple[int, int]:
+def _check_output_config(value: object) -> None:
+    config = _keys(value, frozenset({"effort"}), "output_config")
+    if config.get("effort") not in EFFORTS:
+        raise _refuse("output_config.effort must be low, medium, high, xhigh or max")
+
+
+def _counter(value: object, kinds: frozenset[str], what: str, *, positive: bool = False) -> None:
+    counter = _keys(value, frozenset({"type", "value"}), what)
+    number = counter.get("value")
+    if counter.get("type") not in kinds or not _count(number):
+        raise _refuse(f"{what} is not understood")
+    if positive and number == 0:
+        raise _refuse(f"{what} must be positive")
+
+
+_CLEAR_TOOL_USES = "clear_tool_uses_20250919"
+_CLEAR_THINKING = "clear_thinking_20251015"
+
+
+def _check_context_management(value: object) -> None:
+    edits = _keys(value, frozenset({"edits"}), "context_management").get("edits")
+    if not isinstance(edits, list) or not 1 <= len(edits) <= 2:
+        raise _refuse("context_management.edits must list one or two edits")
+    seen: set[object] = set()
+    for edit in edits:
+        kind = edit.get("type") if isinstance(edit, dict) else None
+        if kind in seen:
+            raise _refuse("context_management: an edit type is repeated")
+        seen.add(kind)
+        if kind == _CLEAR_TOOL_USES:
+            fields = frozenset({"type", "trigger", "keep", "clear_at_least", "exclude_tools",
+                                "clear_tool_inputs"})  # fmt: skip
+            shape = _keys(edit, fields, "context_management edit")
+            if "trigger" in shape:
+                _counter(shape["trigger"], frozenset({"input_tokens", "tool_uses"}), "trigger")
+            if "keep" in shape:
+                _counter(shape["keep"], frozenset({"tool_uses"}), "keep")
+            if "clear_at_least" in shape:
+                _counter(shape["clear_at_least"], frozenset({"input_tokens"}), "clear_at_least")
+            exclude = shape.get("exclude_tools", [])
+            if not isinstance(exclude, list) or not all(isinstance(n, str) for n in exclude):
+                raise _refuse("exclude_tools must list tool names")
+            if not isinstance(shape.get("clear_tool_inputs", False), bool):
+                raise _refuse("clear_tool_inputs must be true or false")
+        elif kind == _CLEAR_THINKING:
+            shape = _keys(edit, frozenset({"type", "keep"}), "context_management edit")
+            if "keep" in shape and shape["keep"] != "all":
+                _counter(shape["keep"], frozenset({"thinking_turns"}), "keep", positive=True)
+        else:
+            raise _refuse(f"context_management edit not allowed: {kind}")
+
+
+def _content(
+    request: Mapping[str, Any], betas: tuple[str, ...] = (), tools: frozenset[str] = frozenset()
+) -> tuple[int, int]:
     """(image blocks, framing units); refuse anything outside the allow-list.
     A framing unit is a system block, a message or a content block."""
     images = 0
@@ -406,21 +691,63 @@ def _content(request: Mapping[str, Any]) -> tuple[int, int]:
     elif isinstance(system, str):
         units += 1
     elif system is not None:
-        raise RequestRefused("invalid_request_error", "system must be text or blocks")
+        raise _refuse("system must be text or blocks")
     messages = request.get("messages")
     if not isinstance(messages, list):
-        raise RequestRefused("invalid_request_error", "messages must be a list")
+        raise _refuse("messages must be a list")
     for message in messages:
         if not isinstance(message, dict):
-            raise RequestRefused("invalid_request_error", "a message must be an object")
+            raise _refuse("a message must be an object")
         units += 1
+        role = message.get("role")
+        if role == "system":
+            units += _system_message(message, betas, tools)
+            continue
+        if role not in ("user", "assistant"):
+            raise _refuse("message role not allowed")
+        _keys(message, MESSAGE_KEYS, "message")
         content = message.get("content")
         if isinstance(content, list):
             images += _blocks(content)
             units += len(content)
         elif not isinstance(content, str):
-            raise RequestRefused("invalid_request_error", "content must be text or blocks")
+            raise _refuse("content must be text or blocks")
     return images, units
+
+
+def _system_message(
+    message: Mapping[str, Any], betas: tuple[str, ...], tools: frozenset[str]
+) -> int:
+    """A mid-conversation system message: text, tool changes by reference to a
+    declared custom tool, and per-turn effort. Its content blocks, counted."""
+    _keys(message, SYSTEM_MESSAGE_KEYS, "system message")
+    if "output_config" in message:
+        _need(PER_TURN_CONTROL, betas, "a system message's output_config")
+        _check_output_config(message["output_config"])
+    content = message.get("content")
+    if isinstance(content, str):
+        return 0
+    if not isinstance(content, list):
+        raise _refuse("system message content must be text or blocks")
+    for block in content:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text":
+            shape = _keys(block, TEXT_BLOCK_KEYS, "text block")
+            if not isinstance(shape.get("text"), str):
+                raise _refuse("a text block needs text")
+        elif kind in ("tool_addition", "tool_removal"):
+            _need(TOOL_CHANGES, betas, str(kind))
+            shape = _keys(block, TOOL_CHANGE_BLOCK_KEYS, str(kind))
+            tool = _keys(shape.get("tool"), frozenset({"type", "name"}), f"{kind}.tool")
+            if tool.get("type") != "tool_reference":
+                raise _refuse("tool changes only by reference to a declared tool")
+            if tool.get("name") not in tools:
+                raise _refuse("a tool change must name a declared custom tool")
+        else:
+            raise _refuse(f"content type not allowed in a system message: {kind}")
+        if "cache_control" in block:
+            _check_cache_control(block["cache_control"])
+    return len(content)
 
 
 def _blocks(blocks: list[Any], allowed: frozenset[str] = CONTENT_TYPES) -> int:
@@ -458,9 +785,17 @@ class UsageMeter:
     * plain: a ``message`` with a ``stop_reason`` and such a usage.
 
     Anything else makes it invalid: a missing or partial usage, a count that is
-    not a non-negative integer, an unknown usage field, server-tool use, a tier
-    other than ``standard``, cache writes that do not add up, an ``error``
-    event, or an unreadable event or body.
+    not a non-negative integer, an unknown usage field, server-tool use, response
+    content outside ``RESPONSE_BLOCKS``, a stream event outside
+    ``STREAM_EVENTS`` or a delta outside ``DELTA_TYPES``, an event after
+    ``message_stop``, a stream that does not end on an event boundary
+    (truncated or malformed trailing data), a tier other than ``standard``, cache
+    writes that do not add up, an ``error`` event, an unreadable event or body,
+    or a reason from outside the body (``reject``: a non-200 status).
+
+    Content deltas are never counted: the ``estimated_tokens`` that
+    ``thinking-token-count`` adds to ``thinking_delta`` is not billable, and only
+    ``usage.output_tokens`` is charged.
     """
 
     streamed: bool
@@ -475,6 +810,8 @@ class UsageMeter:
     invalid: str = ""
     _buffer: bytes = b""
     _plain: bytearray = field(default_factory=bytearray)
+    _name: bytes | None = None
+    _data: list[bytes] = field(default_factory=list)
 
     @property
     def valid(self) -> bool:
@@ -487,11 +824,48 @@ class UsageMeter:
         self._buffer += chunk
         while b"\n" in self._buffer:
             line, _, self._buffer = self._buffer.partition(b"\n")
-            if line.startswith(b"data:"):
-                self._event(line[5:].strip())
+            self._line(line.removesuffix(b"\r"))
+
+    def reject(self, why: str) -> None:
+        """Mark the report untrusted for a reason outside the body (a non-200
+        status, a cut-off connection): the whole reservation is charged."""
+        self._bad(why)
+
+    def _line(self, line: bytes) -> None:
+        """One server-sent-events line. Only ``event:`` and ``data:`` fields
+        are understood; a blank line ends an event."""
+        if not line:
+            self._dispatch()
+            return
+        if line.startswith(b":"):
+            return  # a comment, as the format allows
+        name, _, value = line.partition(b":")
+        value = value.removeprefix(b" ")
+        if name == b"event":
+            if self._name is not None:
+                self._bad("event name repeated")
+            self._name = value
+        elif name == b"data":
+            self._data.append(value)
+        else:
+            self._bad("stream field not understood")
+
+    def _dispatch(self) -> None:
+        if self._name is None and not self._data:
+            return  # blank lines between events
+        name, data = self._name, b"\n".join(self._data)
+        self._name, self._data = None, []
+        if not data:
+            self._bad("event without data")
+            return
+        self._event(data, name)
 
     def finish(self) -> None:
         if self.streamed:
+            # A stream must end on an event boundary: anything left is truncated
+            # or malformed, so nothing in it can be trusted.
+            if self._buffer.strip() or self._name is not None or self._data:
+                self._bad("stream truncated")
             return
         try:
             message = json.loads(bytes(self._plain))
@@ -502,13 +876,22 @@ class UsageMeter:
             self._bad("not a message")
             return
         self._usage(message.get("usage"), start=True)
+        content = message.get("content")
+        for block in content if isinstance(content, list) else [None]:
+            self._block(block.get("type") if isinstance(block, dict) else None)
         self.delta = self.started  # a plain message reports its final usage at once
         self.stopped = message.get("stop_reason") is not None
 
     def _bad(self, why: str) -> None:
         self.invalid = self.invalid or why
 
-    def _event(self, data: bytes) -> None:
+    def _block(self, kind: object) -> None:
+        """Response content outside ``RESPONSE_BLOCKS`` (a server tool's, or
+        anything new) may be billed in ways this meter cannot see: untrusted."""
+        if kind not in RESPONSE_BLOCKS:
+            self._bad(f"response content not understood: {kind}")
+
+    def _event(self, data: bytes, name: bytes | None = None) -> None:
         try:
             event = json.loads(data)
         except ValueError:
@@ -518,11 +901,27 @@ class UsageMeter:
             self._bad("event unreadable")
             return
         kind = event.get("type")
+        if kind not in STREAM_EVENTS:
+            self._bad(f"stream event not understood: {kind}")  # fail closed
+            return
+        if name is not None and name.decode("utf-8", "replace") != kind:
+            self._bad("event name and type disagree")
+            return
+        if self.stopped:
+            self._bad("event after message_stop")
+            return
         if kind == "message_start":
             message = event.get("message")
             self._usage(message.get("usage") if isinstance(message, dict) else None, start=True)
         elif kind == "message_delta":
             self._usage(event.get("usage"), start=False)
+        elif kind == "content_block_start":
+            block = event.get("content_block")
+            self._block(block.get("type") if isinstance(block, dict) else None)
+        elif kind == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict) or delta.get("type") not in DELTA_TYPES:
+                self._bad("content delta not understood")
         elif kind == "message_stop":
             self.stopped = True
         elif kind == "error":
@@ -588,6 +987,8 @@ class UsageMeter:
 def charge(meter: UsageMeter, price: ModelPrice, reservation: int) -> Settled:
     """What the request cost: its reported usage in full (above its reservation
     too), or its whole reservation when the report is not complete and valid."""
+    if meter.invalid:  # the first problem seen, from the body or from outside it
+        return Settled(reservation, reservation, meter.invalid)
     if not meter.stopped:
         return Settled(reservation, reservation, "incomplete")
     if not meter.valid:

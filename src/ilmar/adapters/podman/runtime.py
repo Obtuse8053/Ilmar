@@ -67,7 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Protocol
 
-from ilmar.adapters.podman import egress_proxy, model_gateway
+from ilmar.adapters.podman import egress_proxy, gateway_admission, model_gateway
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.mounts import authorize_mount
 from ilmar.domain.errors import (
@@ -112,6 +112,7 @@ EGRESS_PROXY_SUFFIX = "-egress"
 EGRESS_NETWORK_SUFFIX = "-net"
 _PROXY_SCRIPT = "/ilmar-egress-proxy.py"
 _GATEWAY_SCRIPT = "/ilmar-model-gateway.py"
+_GATEWAY_ADMISSION = "/ilmar-gateway-admission.py"
 _GATEWAY_RUN = "/run/ilmar-gateway"
 _GATEWAY_KEY_FIFO = _GATEWAY_RUN + "/key"
 _KEY_WRITER = (
@@ -488,10 +489,17 @@ class GatewaySettings:
     an environment, a log or ``repr``. ``upstream`` is the provider;
     ``allow_plain_http_upstream`` exists for tests with a stand-in provider.
     ``extra_hosts`` pins hostnames in the sidecar's ``/etc/hosts``.
+
+    ``policy`` (JSON) and ``budget`` (micro-dollars) are the spending controls
+    the sidecar enforces (``gateway_admission``, ADR-0037 §2): there is no
+    gateway without them. Until P5 part 2b they are fixed for the runtime;
+    then the coordinator passes each attempt's budget.
     """
 
     image: str
     key: str = field(repr=False)
+    policy: str
+    budget: int
     upstream: str = "https://api.anthropic.com"
     egress_network: str = "podman"
     port: int = 8080
@@ -511,8 +519,9 @@ class GatewaySettings:
             raise ValueError(f"invalid network name: {self.egress_network!r}")
         if not 1024 <= self.port <= 65535:
             raise ValueError("port must be an unprivileged port")
-        if self.max_request_bytes < 1 or self.max_in_flight < 1:
+        if self.max_request_bytes < 1 or self.max_in_flight < 1 or self.budget < 1:
             raise ValueError("gateway limits must be positive")
+        gateway_admission.policy_from_json(self.policy)  # refuse a bad policy here
         pinned = {}
         for host, address in self.extra_hosts.items():
             name = egress_proxy.hostname(host)
@@ -1177,8 +1186,10 @@ class PodmanRuntime:
         labels = _owner_labels(spec.owner)
         subnets = self._create_private_network(network, labels)
         script = Path(model_gateway.__file__).resolve()
-        if _UNSAFE_IN_MOUNT.search(str(script)):
-            raise ProviderError(f"path not usable in a mount option: {script}")
+        admission = Path(gateway_admission.__file__).resolve()
+        for path in (script, admission):
+            if _UNSAFE_IN_MOUNT.search(str(path)):
+                raise ProviderError(f"path not usable in a mount option: {path}")
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
         args = [
@@ -1188,6 +1199,7 @@ class PodmanRuntime:
             "--read-only-tmpfs=false", "--env-host=false", "--http-proxy=false",
             "--network", network, "--network", settings.egress_network,
             "--mount", f"type=bind,source={script},destination={_GATEWAY_SCRIPT},ro=true",
+            "--mount", f"type=bind,source={admission},destination={_GATEWAY_ADMISSION},ro=true",
             # Memory only, for the handoff FIFO; the key itself never lands here.
             "--tmpfs", f"{_GATEWAY_RUN}:rw,noexec,nosuid,nodev,size=64k,mode=1777",
             "--pids-limit", "256", "--memory", "256m",
@@ -1207,6 +1219,9 @@ class PodmanRuntime:
             "--clients", ",".join(subnets),
             "--max-request-bytes", str(settings.max_request_bytes),
             "--max-in-flight", str(settings.max_in_flight),
+            "--admission-module", _GATEWAY_ADMISSION,
+            "--policy", settings.policy,
+            "--budget", str(settings.budget),
         ]  # fmt: skip
         if settings.allow_plain_http_upstream:
             args.append("--allow-plain-http-upstream")
