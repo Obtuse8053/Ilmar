@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """``ilmar quarantine list|resolve`` (ADR-0042, #59): a person resolves a quarantine.
 
-``list`` reads. ``resolve`` checks what it can now, then records one fenced,
-append-only ``resource.resolved`` event as the person named by ``--as``:
+``list`` reads. ``resolve`` takes the instance lock first, and only then reads
+the row and checks what it can, immediately before it records one fenced,
+append-only ``resource.resolved`` event as the person named by ``--as``. A
+coordinator cannot change anything between the check and the record:
 
 * a sandbox: no part of it (container, sidecar, network) may remain, and a
   part with another owner is reported, never touched. This command removes
@@ -98,26 +100,8 @@ def run(
         except ValueError as exc:
             print(f"error: --as: {exc}", file=err)
             return CONFIGURATION
-        row = store.resource(args.resource)
-        if row is None or row.status is not ResourceStatus.QUARANTINED:
-            print(f"error: {args.resource} is not a quarantined resource", file=err)
-            return CONFIGURATION
-        if row.execution_id != args.execution:
-            print(f"error: {args.resource} belongs to execution {row.execution_id}", file=err)
-            return CONFIGURATION
-        if row.key in resolved_keys(store, row.execution_id):
-            print(f"already resolved: {row.key}", file=out)
-            return OK
-        try:
-            observed = _verify(row, config, runtime)
-        except ProviderError as exc:
-            print(f"error: cannot check the runtime, so nothing was recorded: {exc}", file=err)
-            return CONFIGURATION
-        if isinstance(observed, list):
-            for line in observed:
-                print(f"remains: {line}", file=err)
-            print("refused: nothing was recorded", file=err)
-            return REFUSED
+        # Everything is checked under the instance lock, immediately before the
+        # commit, so nothing can change between the check and the record.
         try:
             ownership = Ownership.take(layout=layout, store=store,
                                        instance_id=config.instance_id, now=now())  # fmt: skip
@@ -125,6 +109,26 @@ def run(
             print(f"error: cannot own this instance (is a coordinator running?): {exc}", file=err)
             return CONFIGURATION
         with ownership:
+            row = store.resource(args.resource)
+            if row is None or row.status is not ResourceStatus.QUARANTINED:
+                print(f"error: {args.resource} is not a quarantined resource", file=err)
+                return CONFIGURATION
+            if row.execution_id != args.execution:
+                print(f"error: {args.resource} belongs to execution {row.execution_id}", file=err)
+                return CONFIGURATION
+            if row.key in resolved_keys(store, row.execution_id):
+                print(f"already resolved: {row.key}", file=out)
+                return OK
+            try:
+                observed = _verify(row, config, runtime)
+            except ProviderError as exc:
+                print(f"error: cannot check the runtime, so nothing was recorded: {exc}", file=err)
+                return CONFIGURATION
+            if isinstance(observed, list):
+                for line in observed:
+                    print(f"remains: {line}", file=err)
+                print("refused: nothing was recorded", file=err)
+                return REFUSED
             at = now()
             try:
                 event = Event.create(
