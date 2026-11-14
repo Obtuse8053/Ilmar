@@ -48,6 +48,7 @@ def test_only_effects_that_are_safe_to_repeat_are_repeatable() -> None:
         K.CLAIM_TASK,
         K.RELEASE_TASK,
         K.STOP_CONTAINER,
+        K.CLOSE_GATEWAY,  # stops the agent and closes the gateway; closing twice is a no-op
         K.FREEZE_CANDIDATE,
         K.UPSERT_CHANGE_REQUEST,
         K.RESTORE_CLAIM_LABEL,  # adds only a label beside one authentic object (ADR-0026)

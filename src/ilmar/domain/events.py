@@ -100,6 +100,13 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "suspension-check-failed": "The suspension check failed while an agent ran, so all "
         "new work is suspended until an operator resumes once the check succeeds again "
         "(ADR-0029 §4).",
+        "model-spend-settled": "The gateway's record of an attempt's model requests "
+        "was settled into the ledger; any cost beyond the reservation is an extra charge.",
+        "spend-uncertain": "What an attempt's model requests cost is not known in full: "
+        "all new work is suspended until an operator checks the provider's figures "
+        "(ADR-0039).",
+        "spend-reviewed": "An operator checked the model provider's own usage and billing "
+        "for an attempt whose gateway spend was uncertain (ADR-0039).",
         "maintainer-released": "A maintainer released a blocked task: its claim is "
         "released and it may be picked again as a new execution (ADR-0031 §3).",
         "maintainer-abandoned": "A maintainer abandoned a blocked task: its claim is "
@@ -413,6 +420,8 @@ class EventType(enum.Enum):
     INSTANCE_SUSPENDED = "instance.suspended"
     INSTANCE_RESUMED = "instance.resumed"
     EXECUTION_BLOCK_RESOLVED = "execution.block_resolved"
+    EXECUTION_MODEL_SPEND = "execution.model_spend"
+    EXECUTION_SPEND_REVIEWED = "execution.spend_reviewed"
 
 
 RESERVED_TYPES: Mapping[str, int] = MappingProxyType(
@@ -519,6 +528,16 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
         EventType.INSTANCE_RESUMED: {  # the reason is operator-resumed; this is what cleared
             "cleared": (_one_of(SUSPENSION_REASONS), True),
         },
+        EventType.EXECUTION_MODEL_SPEND: {  # P5 part 2b: what the gateway settled
+            "requests": (_integer(0), True),
+            "charged_micros": (_integer(0), True),
+            "unsettled_micros": (_integer(0), True),
+            "overrun_micros": (_integer(0), True),
+            "extra_micros": (_integer(0), True),
+        },
+        EventType.EXECUTION_SPEND_REVIEWED: {  # ADR-0039: which uncertain settlement
+            "spend_seq": (_integer(1), True),
+        },
         EventType.EXECUTION_BLOCK_RESOLVED: {  # ADR-0031 §3: a maintainer's decision
             "decision": (_one_of(BLOCK_DECISIONS), True),
         },
@@ -539,6 +558,8 @@ EXTRA_TYPES = frozenset(
         EventType.EXECUTION_CANCEL_REQUESTED,
         EventType.EXECUTION_CLAIM_LOST,
         EventType.EXECUTION_BLOCK_RESOLVED,
+        EventType.EXECUTION_MODEL_SPEND,
+        EventType.EXECUTION_SPEND_REVIEWED,
     }
 )
 

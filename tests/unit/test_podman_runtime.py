@@ -1228,13 +1228,11 @@ def test_a_directory_the_sandbox_needs_is_never_sealed(
 # -- GATEWAY: the model gateway sidecar (#111 P4, ADR-0037 §1) ------------------------
 
 REAL_KEY = "sk-ant-real-key-only-for-the-sidecar-0001"
-GATEWAY = GatewaySettings(
-    image="localhost/ilmar-proxy:1", policy=POLICY, budget=BUDGET, key=REAL_KEY
-)
+GATEWAY = GatewaySettings(image="localhost/ilmar-proxy:1", policy=POLICY, key=REAL_KEY)
 
 
 def gateway_spec(workspace: Workspace, **kwargs: object) -> ContainerSpec:
-    return spec(workspace, network=NetworkPolicy.GATEWAY, **kwargs)
+    return spec(workspace, network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET, **kwargs)
 
 
 def test_gateway_needs_gateway_settings(
@@ -1291,11 +1289,17 @@ def test_the_gateway_sidecar_is_hardened_and_holds_the_only_route(
     assert command[command.index("--budget") + 1] == str(BUDGET)
 
 
-def test_a_gateway_needs_a_valid_spending_policy_and_a_positive_budget() -> None:
-    with pytest.raises(ValueError, match="positive"):
-        GatewaySettings(image="localhost/p:1", key=REAL_KEY, policy=POLICY, budget=0)
+def test_a_gateway_needs_a_valid_spending_policy_and_each_sandbox_a_budget(
+    workspace: Workspace,
+) -> None:
+    """P5 part 2b: the budget is the attempt's, carried by its ContainerSpec."""
+    for budget in (None, 0, -1):
+        with pytest.raises(ValueError, match="model budget"):
+            spec(workspace, network=NetworkPolicy.GATEWAY, model_budget_micros=budget)
+    with pytest.raises(ValueError, match="only a GATEWAY"):
+        spec(workspace, network=NetworkPolicy.NONE, model_budget_micros=BUDGET)
     with pytest.raises((ValueError, KeyError)):
-        GatewaySettings(image="localhost/p:1", key=REAL_KEY, policy="{}", budget=BUDGET)
+        GatewaySettings(image="localhost/p:1", key=REAL_KEY, policy="{}")
 
 
 def test_the_real_key_reaches_the_sidecar_once_on_stdin_and_never_a_file(
@@ -1380,15 +1384,11 @@ def test_a_gateway_that_refuses_the_key_leaves_nothing(
 
 def test_gateway_settings_are_validated() -> None:
     with pytest.raises(ValueError, match="https"):
-        GatewaySettings(
-            image="localhost/p:1", policy=POLICY, budget=BUDGET, key=REAL_KEY, upstream="http://h"
-        )
+        GatewaySettings(image="localhost/p:1", policy=POLICY, key=REAL_KEY, upstream="http://h")
     with pytest.raises(ValueError, match="one non-empty line"):
-        GatewaySettings(image="localhost/p:1", policy=POLICY, budget=BUDGET, key="a\nb")
-    assert REAL_KEY not in repr(
-        GatewaySettings(image="localhost/p:1", policy=POLICY, budget=BUDGET, key=REAL_KEY)
-    )
-    tests_only = GatewaySettings(image="localhost/p:1", policy=POLICY, budget=BUDGET,
+        GatewaySettings(image="localhost/p:1", policy=POLICY, key="a\nb")
+    assert REAL_KEY not in repr(GatewaySettings(image="localhost/p:1", policy=POLICY, key=REAL_KEY))
+    tests_only = GatewaySettings(image="localhost/p:1", policy=POLICY,
                                  key=REAL_KEY, upstream="http://10.0.0.1:9",
                                  allow_plain_http_upstream=True)  # fmt: skip
     assert tests_only.upstream == "http://10.0.0.1:9"

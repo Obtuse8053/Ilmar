@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
@@ -140,6 +141,37 @@ class ContainerRuntime(Protocol):
         made it, so a restarted coordinator cannot reuse a sandbox's route. The
         caller passes the token only through ``run(env=...)``.
         """
+        ...
+
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        """Quiesce the ``GATEWAY`` sandbox ``name`` before its spend is read (ADR-0039).
+
+        Stops the sandbox's own container, so the agent can send nothing more,
+        and confirms it stopped; the sandbox is not removed. Then tells the
+        sandbox's gateway to admit nothing more and, once requests in flight
+        have settled or a bounded drain has passed, to write its final record.
+
+        Works from durable data (the name and owner in the ledger), so a
+        restarted coordinator can do it. Idempotent. Returns ``False`` if the
+        sandbox has no gateway (any more).
+
+        * ``OwnershipConflictError`` if either container has another owner;
+          nothing is touched.
+        * ``ContainmentError`` if the stop cannot be confirmed.
+        """
+        ...
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        """What the ``GATEWAY`` sandbox ``name``'s gateway settled for its model
+        requests, read from the gateway's own record (its log, kept until the
+        sandbox is removed). Called after ``close_model_gateway`` and before the
+        sandbox is removed, also by a restarted coordinator. Changes nothing.
+
+        Waits a bounded time for the gateway's final record. Raises
+        ``ProviderError`` unless the record is complete and consistent: the
+        agent's container still running, no gateway owned by ``owner``, a line
+        that does not parse, missing lines, a gateway that restarted, or no
+        final record in time. The caller then treats the spend as uncertain."""
         ...
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:

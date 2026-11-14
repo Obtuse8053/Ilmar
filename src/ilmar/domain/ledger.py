@@ -70,6 +70,9 @@ class OperationKind(enum.Enum):
     """Not repeatable: it is costly and changes the workspace. An unknown
     outcome abandons the attempt (ADR-0021)."""
     STOP_CONTAINER = "stop-container"
+    CLOSE_GATEWAY = "close-gateway"
+    """Stops a ``GATEWAY`` sandbox's agent and closes its gateway before the
+    spend is read (ADR-0039). Repeatable: closing twice changes nothing."""
     FREEZE_CANDIDATE = "freeze-candidate"
     VERIFY = "verify"
     PUBLISH_REVISION = "publish-revision"
@@ -98,6 +101,7 @@ _REPEATABLE = frozenset(
         OperationKind.CLAIM_TASK,  # idempotent claim (ADR-0013)
         OperationKind.RELEASE_TASK,  # removes only Ilmar's own label
         OperationKind.STOP_CONTAINER,  # stopping a gone container is a no-op
+        OperationKind.CLOSE_GATEWAY,  # idempotent: a closed gateway stays closed
         OperationKind.FREEZE_CANDIDATE,  # deterministic revision (port contract)
         OperationKind.UPSERT_CHANGE_REQUEST,  # keyed by head branch
         OperationKind.RESTORE_CLAIM_LABEL,  # targeted, adds one label (ADR-0026 §5)

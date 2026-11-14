@@ -72,6 +72,18 @@ Hard gates that stay in force:
 
 ## Change log
 
+- 2026-11-14: **#124, #125 and #126 merged.** C1 re-run on Claude Code 2.1.318
+  passed with strict admission (run 43567969214, recorded on #111).
+  - **P5 part 2b submitted: gateway spend settlement** (#127, ADR-0039,
+    proposed; revised after review). Each attempt's reservation is its gateway
+    budget. Before any agent sandbox is removed, it is quiesced (agent stopped,
+    gateway closed with a final record) and its spend settled once, as an
+    `execution.model_spend` event plus any `extra` charge. Uncertain spend
+    suspends all new work, and no resume lifts any suspension until an
+    operator reviews the provider's figures (`--provider-spend-reviewed`).
+    Gateway-backed and autonomous operation stay disabled.
+  - ADR-0033 and ADR-0037 are cited on `main` but exist only in the open
+    PR #115.
 - 2026-11-13: **#92 part 2a submitted: `ilmar blocked list|release|abandon`**
   (ADR-0031 §3).
   - Each decision is one fenced commit: the maintainer's

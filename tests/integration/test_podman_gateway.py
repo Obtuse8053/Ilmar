@@ -12,6 +12,8 @@ IPv4 address, outside both containers. The tests show that:
 * the sandbox cannot reach the provider (or anything else) directly;
 * the real key appears in neither container's definition nor in the
   sandbox, and the host copy is gone once the sidecar has read it;
+* closing stops the agent, keeps the sandbox, and leaves a complete record
+  of what the gateway settled (ADR-0039);
 * stopping the sandbox removes the sidecar and the network.
 
 No Claude Code here (see ``test_claude_code_gateway_compat.py``). Opt-in:
@@ -32,6 +34,7 @@ import pytest
 from gateway_policy import BUDGET, POLICY
 from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
+from ilmar.domain.errors import ProviderError
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
 
 from integration.gateway_support import Provider
@@ -51,6 +54,7 @@ from integration.podman_support import (
 )
 
 pytestmark = pytest.mark.integration
+LAYOUT: list[WorkspaceLayout] = []
 
 NAME = "ilmar-it-gateway"
 OWNER = ResourceOwner(instance_id="it", execution_id="gateway", attempt=1, token="tok-gateway")
@@ -65,6 +69,8 @@ ASK = sh(
 
 @pytest.fixture(scope="module")
 def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, Provider, str]]:
+    """The runtime, one GATEWAY sandbox, the stand-in provider and the host
+    address. The layout is kept in ``LAYOUT`` for tests that start another."""
     require(("podman", PODMAN), ("ILMAR_TEST_PODMAN_IMAGE", IMAGE))
     require(("ILMAR_TEST_PODMAN_PROXY_IMAGE", PROXY_IMAGE))
     host = host_ipv4()
@@ -74,11 +80,12 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     provider = Provider(host, root / "provider.jsonl", REAL_KEY)
     layout = WorkspaceLayout.under(root.resolve() / "state")
     layout.workspaces_root.mkdir(parents=True)
+    LAYOUT[:] = [layout]
     workspace = make_workspace(layout, "gateway")
     runtime = PodmanRuntime(
         layout=layout,
         gateway=GatewaySettings(
-            image=str(PROXY_IMAGE), key=REAL_KEY, policy=POLICY, budget=BUDGET,
+            image=str(PROXY_IMAGE), key=REAL_KEY, policy=POLICY,
             upstream=f"http://{host}:{provider.port}",
             allow_plain_http_upstream=True,
         ),
@@ -87,7 +94,8 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     handle = runtime.start(
         ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=NAME, owner=OWNER,
                       workspace_identity=identity_of(workspace),
-                      network=NetworkPolicy.GATEWAY, lifetime_seconds=900)
+                      network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                      lifetime_seconds=900)
     )  # fmt: skip
     try:
         yield (runtime, handle), provider, host
@@ -165,6 +173,39 @@ def test_the_real_key_is_in_neither_container_nor_the_sandbox(
     shown = attempt(sandbox, sh("env; cat /proc/1/environ 2>/dev/null; ls -la / /run 2>&1"))
     assert REAL_KEY not in shown
     assert not list(Path("/tmp").glob("ilmar-gateway-*"))  # the host copy is gone
+
+
+def test_closing_stops_the_agent_and_leaves_a_complete_record(
+    world: tuple[Sandbox, Provider, str],
+) -> None:
+    """ADR-0039: the agent is stopped (kept), the gateway closed, and the
+    record read back complete, consistent and with every request in it."""
+    (runtime, _), _, _ = world
+    name, owner = f"{NAME}-close", ResourceOwner("it", "gateway-close", 1, "tok-close")
+    workspace = make_workspace(LAYOUT[0], "gateway-close")
+    remove_everything(name)
+    handle = runtime.start(
+        ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=name, owner=owner,
+                      workspace_identity=identity_of(workspace),
+                      network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                      lifetime_seconds=900)
+    )  # fmt: skip
+    try:
+        base, token = route((runtime, handle))
+        for _ in range(2):
+            out = attempt((runtime, handle), [*ASK, token, f"{base}/v1/messages?beta=true"])
+            assert out.endswith("exit=0\n"), out
+        assert runtime.close_model_gateway(name, owner=owner) is True
+        assert not runtime.is_running(handle)  # stopped, not removed
+        assert runtime.find(name) is not None
+        assert runtime.close_model_gateway(name, owner=owner) is True  # idempotent
+        spend = runtime.model_spend(name, owner=owner)
+        assert spend.requests == 2  # both on record; the record is complete
+        assert runtime.remove_owned(name, owner=owner) is True
+        with pytest.raises(ProviderError):
+            runtime.model_spend(name, owner=owner)  # the record went with the sandbox
+    finally:
+        remove_everything(name)
 
 
 def test_stopping_the_sandbox_removes_the_sidecar_and_the_network(

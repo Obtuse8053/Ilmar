@@ -30,7 +30,7 @@ from ilmar.config import IlmarConfig, load_config
 from ilmar.core import kill_switch
 from ilmar.core.ownership import Ownership
 from ilmar.core.starts import StartLimits, breach_if_started, read_starts, start_log_path
-from ilmar.core.suspension import resume_blocker
+from ilmar.core.suspension import resume_blocker, spend_reviews, unreviewed_spend
 from ilmar.domain.budget import Suspension, SuspensionReason, micros_to_usd
 from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError, StartLogError
 from ilmar.domain.events import Actor, ActorKind, EventContext
@@ -71,6 +71,12 @@ def add_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         action="store_true",
         help="for a suspension-check-failed suspension: you confirm its cause is fixed; "
         "the check must also succeed now",
+    )
+    resume.add_argument(
+        "--provider-spend-reviewed",
+        action="store_true",
+        help="for uncertain gateway spend: you checked the model provider's own usage "
+        "and billing for the attempts listed",
     )
     budget = commands.add_parser("budget", help="show charges, allowances and any suspension")
     budget.add_argument("--config", required=True, help="the configuration file")
@@ -144,6 +150,7 @@ def run(
                     )
                 except StartLogError as exc:
                     restart_breach = f"an unusable start log ({exc})"
+            pending = unreviewed_spend(store.events())
             blocker = resume_blocker(
                 current,
                 now=at,
@@ -156,12 +163,21 @@ def run(
                     config.budget.kill_switch_file if config.budget else None
                 )(),
                 restart_breach=restart_breach,
+                unreviewed=len(pending),
+                spend_reviewed=args.provider_spend_reviewed,
             )
+            for event in pending:
+                print(f"uncertain gateway spend: execution {event.execution} "
+                      f"attempt {event.attempt}", file=err)  # fmt: skip
             if blocker is not None:
                 print(f"still suspended ({current.reason.value}): {blocker}", file=err)
                 return SUSPENDED
+            reviews = spend_reviews(pending, at=at, instance=config.instance_id,
+                                    epoch=ownership.fence.epoch, actor=actor)  # fmt: skip
             try:
-                store.commit(ownership.fence, Commit(resume=at), context=context)
+                store.commit(
+                    ownership.fence, Commit(resume=at, extra_events=reviews), context=context
+                )
             except LedgerIntegrityError as exc:
                 print(f"error: {exc}", file=err)
                 return CONFIGURATION
@@ -188,6 +204,7 @@ def _status(config: IlmarConfig, *, out: TextIO, err: TextIO, now: datetime) -> 
     try:
         suspension = store.suspension()  # type: ignore[attr-defined]
         totals = store.budget_totals(now)  # type: ignore[attr-defined]
+        pending = unreviewed_spend(store.events())  # type: ignore[attr-defined]
     finally:
         store.close()  # type: ignore[attr-defined]
     if config.budget is None:
@@ -199,6 +216,9 @@ def _status(config: IlmarConfig, *, out: TextIO, err: TextIO, now: datetime) -> 
         print(f"this month: {micros_to_usd(totals.month_micros)} of "
               f"{micros_to_usd(limits.monthly_micros)} USD reserved", file=out)  # fmt: skip
         print(f"reservation per attempt: {micros_to_usd(limits.reserve_micros)} USD", file=out)
+    for event in pending:  # ADR-0039: blocks every resume until reviewed
+        print(f"uncertain gateway spend awaiting review: execution {event.execution} "
+              f"attempt {event.attempt}", file=out)  # fmt: skip
     if suspension is None:
         print("not suspended", file=out)
         return OK

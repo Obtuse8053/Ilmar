@@ -70,6 +70,7 @@ from typing import IO, Any, Protocol
 from ilmar.adapters.podman import egress_proxy, gateway_admission, model_gateway
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.mounts import authorize_mount
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.errors import (
     ContainmentError,
     OwnershipConflictError,
@@ -105,6 +106,8 @@ LABEL_EXECUTION = "io.ilmar.owner.execution"
 LABEL_ATTEMPT = "io.ilmar.owner.attempt"
 LABEL_TOKEN = "io.ilmar.owner.token"  # noqa: S105 - a label key, not a secret
 LABEL_ROLE = "io.ilmar.role"
+LABEL_GATEWAY = "io.ilmar.model-gateway"
+"""Marks an egress sidecar that is a model gateway, whose log is its spend record."""
 ROLE_SANDBOX = "sandbox"
 ROLE_EGRESS_PROXY = "egress-proxy"
 ROLE_EGRESS_NETWORK = "egress-network"
@@ -148,6 +151,8 @@ TIMED_OUT_EXIT_CODE = -9
 _DEFAULT_HOME = PurePosixPath("/home/ilmar")
 _CONTAINER_TMP = "/tmp"  # noqa: S108 - a path inside the sandbox, not on the host
 _CONTROL_TIMEOUT = 120.0
+_STOP_CONFIRM = 10.0
+"""How long a killed agent container may take to be seen stopped (ADR-0039)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,22 +495,25 @@ class GatewaySettings:
     ``allow_plain_http_upstream`` exists for tests with a stand-in provider.
     ``extra_hosts`` pins hostnames in the sidecar's ``/etc/hosts``.
 
-    ``policy`` (JSON) and ``budget`` (micro-dollars) are the spending controls
-    the sidecar enforces (``gateway_admission``, ADR-0037 §2): there is no
-    gateway without them. Until P5 part 2b they are fixed for the runtime;
-    then the coordinator passes each attempt's budget.
+    ``policy`` (JSON) is the spending policy the sidecar enforces
+    (``gateway_admission``, ADR-0037 §2): there is no gateway without it. Each
+    attempt's budget comes with its ``ContainerSpec`` (P5 part 2b).
+    ``drain_seconds`` is how long a closing gateway waits for requests in
+    flight; ``settle_timeout``, longer, bounds how long ``model_spend`` waits
+    for the gateway's final record (ADR-0039).
     """
 
     image: str
     key: str = field(repr=False)
     policy: str
-    budget: int
     upstream: str = "https://api.anthropic.com"
     egress_network: str = "podman"
     port: int = 8080
     max_request_bytes: int = 4 * 1024 * 1024
     max_in_flight: int = 4
     ready_timeout: float = 20.0
+    drain_seconds: float = 20.0
+    settle_timeout: float = 30.0
     allow_plain_http_upstream: bool = False
     extra_hosts: Mapping[str, str] = field(default_factory=dict)
 
@@ -519,8 +527,10 @@ class GatewaySettings:
             raise ValueError(f"invalid network name: {self.egress_network!r}")
         if not 1024 <= self.port <= 65535:
             raise ValueError("port must be an unprivileged port")
-        if self.max_request_bytes < 1 or self.max_in_flight < 1 or self.budget < 1:
+        if self.max_request_bytes < 1 or self.max_in_flight < 1:
             raise ValueError("gateway limits must be positive")
+        if not 0 < self.drain_seconds < self.settle_timeout:
+            raise ValueError("drain_seconds must be positive and shorter than settle_timeout")
         gateway_admission.policy_from_json(self.policy)  # refuse a bad policy here
         pinned = {}
         for host, address in self.extra_hosts.items():
@@ -671,6 +681,87 @@ class PodmanRuntime:
 
     def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
         return self._routes.get(handle.id)
+
+    def _gateway_of(self, name: str, owner: ResourceOwner) -> ContainerInfo | None:
+        """The gateway sidecar of sandbox ``name``, checked: owned by ``owner`` and
+        labelled as a gateway. ``None`` if there is none."""
+        info = self.find(name + EGRESS_PROXY_SUFFIX)
+        if info is None:
+            return None
+        details = self._inspect(info.handle.id)
+        labels = ((details or {}).get("Config") or {}).get("Labels") or {}
+        if details is None:
+            return None
+        if info.owner != owner:
+            raise OwnershipConflictError(f"{info.handle.name} is not owned by the recorded attempt")
+        if labels.get(LABEL_GATEWAY) != "true":
+            raise ProviderError(f"{info.handle.name} is not a model gateway")
+        return info
+
+    def _agent_stopped(self, name: str, owner: ResourceOwner) -> bool:
+        """Whether sandbox ``name``'s own container is gone or not running."""
+        info = self.find(name)
+        if info is None:
+            return True
+        if info.owner != owner:
+            raise OwnershipConflictError(f"container {name} is not owned by the recorded attempt")
+        return not self._running(info.handle.id)
+
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        """See the port. Works from durable data, like ``remove_owned``."""
+        agent = self.find(name)
+        gateway = self._gateway_of(name, owner)
+        if agent is not None:
+            if agent.owner != owner:
+                raise OwnershipConflictError(
+                    f"container {name} is not owned by the recorded attempt"
+                )
+            # Killed, not removed: the agent can send nothing more, and its sandbox
+            # (with the gateway's record) stays until the spend is settled.
+            self._podman_call(["kill", agent.handle.id])
+            deadline = self._clock() + _STOP_CONFIRM
+            while self._running(agent.handle.id):
+                if self._clock() >= deadline:
+                    raise ContainmentError(
+                        f"container {name} could not be confirmed stopped",
+                        container_id=agent.handle.id, name=name,
+                    )  # fmt: skip
+                self._sleep(0.2)
+        if gateway is None:
+            return False
+        if self._running(gateway.handle.id):
+            done = self._podman_call(["kill", "--signal", "USR1", gateway.handle.id])
+            if done.returncode != 0 and self._running(gateway.handle.id):
+                self._expect_success(done, "kill --signal USR1 (model gateway)")
+        return True
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        if self._gateway is None:
+            raise ProviderError("this runtime has no model gateway")
+        if not self._agent_stopped(name, owner):
+            raise ProviderError(f"the agent of {name} is still running")
+        info = self._gateway_of(name, owner)
+        if info is None:
+            raise ProviderError(f"no model gateway of this sandbox to read: {name}")
+        deadline = self._clock() + self._gateway.settle_timeout
+        while True:
+            done = self._podman_call(["logs", info.handle.id])
+            self._expect_success(done, "logs")
+            lines = (done.stdout + "\n" + done.stderr).splitlines()
+            try:
+                found = model_gateway.parse_spend([line.strip() for line in lines])
+            except ValueError as error:
+                raise ProviderError(f"the gateway's record is not trusted: {error}") from error
+            if found["closed"]:
+                break
+            if self._clock() >= deadline or not self._running(info.handle.id):
+                raise ProviderError("the gateway wrote no final record: it may be incomplete")
+            self._sleep(0.5)
+        return ModelSpend(
+            requests=found["requests"], charged_micros=found["charged"],
+            unsettled_micros=found["unsettled"], overrun_micros=found["overrun"],
+            uncertain=found["uncertain"],
+        )  # fmt: skip
 
     def find(self, name: str) -> ContainerInfo | None:
         listed = self._podman_call(
@@ -1208,7 +1299,8 @@ class PodmanRuntime:
         ]  # fmt: skip
         for host, address in sorted(settings.extra_hosts.items()):
             args += ["--add-host", f"{host}:{address}"]
-        for key, value in (labels | {LABEL_ROLE: ROLE_EGRESS_PROXY}).items():
+        gateway_labels = labels | {LABEL_ROLE: ROLE_EGRESS_PROXY, LABEL_GATEWAY: "true"}
+        for key, value in gateway_labels.items():
             args += ["--label", f"{key}={value}"]
         args += [
             settings.image, "python3", "-I", _GATEWAY_SCRIPT,
@@ -1221,7 +1313,8 @@ class PodmanRuntime:
             "--max-in-flight", str(settings.max_in_flight),
             "--admission-module", _GATEWAY_ADMISSION,
             "--policy", settings.policy,
-            "--budget", str(settings.budget),
+            "--budget", str(spec.model_budget_micros),
+            "--drain-seconds", str(settings.drain_seconds),
         ]  # fmt: skip
         if settings.allow_plain_http_upstream:
             args.append("--allow-plain-http-upstream")

@@ -63,13 +63,14 @@ def main(state: Path, name: str, stage: str) -> None:
     runtime = PodmanRuntime(
         layout=layout,
         executor=executor,
-        gateway=GatewaySettings(image=str(PROXY_IMAGE), key=key, policy=POLICY, budget=BUDGET,
+        gateway=GatewaySettings(image=str(PROXY_IMAGE), key=key, policy=POLICY,
                                 upstream="http://192.0.2.1:9", allow_plain_http_upstream=True),
     )  # fmt: skip
     runtime.start(
         ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=name, owner=OWNER,
                       workspace_identity=identity_of(workspace),
-                      network=NetworkPolicy.GATEWAY, lifetime_seconds=600)
+                      network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                      lifetime_seconds=600)
     )  # fmt: skip
     print("STARTED-WITHOUT-DYING", flush=True)
 

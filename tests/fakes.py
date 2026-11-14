@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
@@ -407,6 +408,13 @@ class FakeContainerRuntime:
         self.commands: list[tuple[str, tuple[str, ...]]] = []
         self.started_specs: list[ContainerSpec] = []  # every spec start() accepted, in order
         self.model_routes: dict[str, ModelAccess] = {}  # GATEWAY sandboxes, by id
+        self.model_spends: dict[str, ModelSpend | Exception] = {}
+        """What ``model_spend`` reports for a GATEWAY sandbox, by name; by default
+        nothing was spent. An exception is raised instead (an unreadable record)."""
+        self.spend_reads: list[str] = []
+        self.gateway_closes: list[str] = []  # every close_model_gateway call, by name
+        self.closed_gateways: set[str] = set()
+        self.close_failures: dict[str, Exception] = {}
 
     @property
     def name(self) -> str:
@@ -564,6 +572,35 @@ class FakeContainerRuntime:
     def is_running(self, handle: ContainerHandle) -> bool:
         container = self._containers.get(handle.id)
         return container is not None and container.running
+
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        """Stops the agent (kept, not removed) and closes the gateway, as Podman does.
+        ``close_failures[name]`` is raised instead (an unconfirmed stop)."""
+        self.gateway_closes.append(name)
+        if isinstance(failure := self.close_failures.get(name), Exception):
+            raise failure
+        container = self._by_name(name)
+        if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
+            return False
+        if container.spec.owner != owner:
+            raise OwnershipConflictError(f"container {name} is owned by someone else")
+        container.running = False
+        self.closed_gateways.add(name)
+        return True
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        self.spend_reads.append(name)
+        container = self._by_name(name)
+        if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
+            raise ProviderError(f"no model gateway of this sandbox to read: {name}")
+        if container.spec.owner != owner:
+            raise ProviderError("the gateway belongs to another owner")
+        if container.running or name not in self.closed_gateways:
+            raise ProviderError("the gateway wrote no final record: it may be incomplete")
+        found = self.model_spends.get(name, ModelSpend(requests=0, charged_micros=0))
+        if isinstance(found, Exception):
+            raise found
+        return found
 
     def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
         container = self._containers.get(handle.id)
