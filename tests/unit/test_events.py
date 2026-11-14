@@ -286,7 +286,8 @@ ADDED_CODES = {
     "maintainer-released",  # ADR-0031 §3 (#92 part 2)
     "maintainer-abandoned",  # ADR-0031 §3 (#92 part 2)
     "model-spend-settled",  # P5 part 2b (ADR-0039, proposed)
-    "spend-uncertain",  # P5 part 2b: also the suspension reason
+    "spend-uncertain",
+    "spend-reviewed",  # P5 part 2b: also the suspension reason
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)

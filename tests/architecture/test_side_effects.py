@@ -35,7 +35,7 @@ READS = {
     "feed", "close",
     # ADR-0037 §1: the in-memory route of a GATEWAY sandbox.
     "model_access",
-    # P5 part 2b (ADR-0039, proposed): reads the gateway sidecar's log.
+    # ADR-0039 (proposed): reads the gateway sidecar's log; changes nothing.
     "model_spend",
 }  # fmt: skip
 
@@ -73,6 +73,7 @@ def test_the_mutating_set_is_derived_from_the_ports() -> None:
         "start", "stop", "run", "remove_owned",
         "release_claim", "restore_label",  # ADR-0026 §5: targeted, journaled writes
         "clear_label",  # ADR-0027 §1: targeted, journaled write
+        "close_model_gateway",  # ADR-0039 (proposed): journaled as close-gateway
     }  # fmt: skip
     assert expected == MUTATING
 

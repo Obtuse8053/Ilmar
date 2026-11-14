@@ -106,7 +106,7 @@ from ilmar.domain.ledger import (
 from ilmar.domain.safety_controls import touched
 from ilmar.domain.tasks import ClaimOutcome, HeldClaim, Standing, Task
 from ilmar.domain.verification import EvidenceRecord, Verdict
-from ilmar.domain.workspace import ContainerHandle, NetworkPolicy, ResourceOwner
+from ilmar.domain.workspace import NetworkPolicy, ResourceOwner
 from ilmar.ports.execution_store import ExecutionStore
 
 _LOG = logging.getLogger(__name__)
@@ -468,65 +468,89 @@ class _Run:
             for e in self.store.events(execution_id=self.id)
         )
 
-    def settle_spend(self, execution: Execution, handle: ContainerHandle | None) -> None:
-        """Settle what the gateway recorded for this attempt into the ledger, once,
+    def agent_ran(self, attempt: int) -> bool:
+        """Whether attempt ``attempt``'s agent run was ever begun. Before it, no
+        request could reach the gateway: the throwaway route token is handed to
+        the sandbox only by that step (ADR-0037 §1)."""
+        return self.store.operation(operation_key(K.RUN_AGENT, self.id, attempt)) is not None
+
+    def remove_attempt_sandbox(self, resource: Resource) -> None:
+        """Remove a sandbox of this execution, settling its gateway's spend first
+        (ADR-0039): no path removes a ``GATEWAY`` agent sandbox unsettled."""
+        if resource.name == container_name(
+            self.w.components.instance_id, self.id, resource.attempt
+        ):
+            self.settle_spend(resource.attempt, resource.name)
+        self.w.effects.remove_sandbox(self.current(), self.lease, resource=resource)
+
+    def settle_spend(self, attempt: int, name: str) -> None:
+        """Settle what the gateway recorded for ``attempt`` into the ledger, once,
         before its sandbox (and the gateway's record with it) is removed.
 
-        One commit: an ``execution.model_spend`` event; an ``extra`` charge for any
-        cost beyond the attempt's reservation; and, when the cost is not known in
-        full (an untrusted report, a request never settled, a record that cannot
-        be read or is already gone), a ``spend-uncertain`` suspension of all new
-        work. The reservation itself is never lowered."""
-        if not self.gateway_attempt() or self.spend_settled(execution.attempt):
+        First the sandbox is quiesced (``close-gateway``): its agent is stopped
+        and confirmed stopped, the gateway admits nothing more and, after a
+        bounded drain, writes its final record. Then the record is read. One
+        commit holds an ``execution.model_spend`` event; an ``extra`` charge for
+        any cost beyond the attempt's reservation; and, when the cost is not
+        known in full, a ``spend-uncertain`` suspension of all new work (unless
+        another suspension is in force: the event alone then keeps ``ilmar
+        resume`` from lifting it without a spend review). The reservation itself
+        is never lowered.
+
+        Uncertain: a quiescence that cannot be confirmed, an incomplete,
+        inconsistent or unreadable record, an untrusted report, a request never
+        settled, or a record already gone. Any other error is recorded as
+        uncertain too, and then raised."""
+        if not self.gateway_attempt() or self.spend_settled(attempt):
             return
-        reserved = self.w.budget.reserve_micros if self.w.budget is not None else 0
         spend: ModelSpend | None = None
-        uncertain: str | None
-        if handle is None:
+        uncertain: str | None = None
+        unexpected: Exception | None = None
+        row = self.store.resource(resource_key(ResourceKind.CONTAINER, self.id, attempt, name))
+        if not self.agent_ran(attempt):
+            spend = ModelSpend(requests=0, charged_micros=0)  # no token was ever handed out
+        elif row is None or row.status in (R.RELEASED, R.QUARANTINED):
             uncertain = "the gateway's record was gone before it was settled"
         else:
+            owner = ResourceOwner(
+                self.w.components.instance_id, row.execution_id, row.attempt, row.owner_token
+            )
             try:
-                spend = self.w.components.container_runtime.model_spend(
-                    handle, owner=self.owner(execution)
-                )
-                uncertain = spend.uncertain
-            except ProviderError as error:
-                uncertain = f"the gateway's record could not be read: {error}"
+                if not self.w.effects.close_model_gateway(self.current(), self.lease, resource=row):
+                    uncertain = "the sandbox had no gateway record to settle"
+                else:
+                    spend = self.w.components.container_runtime.model_spend(name, owner=owner)
+                    uncertain = spend.uncertain
+            except (ProviderError, ContainmentError, OwnershipConflictError) as error:
+                uncertain = f"{type(error).__name__}: {error}"
+            except Exception as error:
+                uncertain, unexpected = f"an unexpected {type(error).__name__}", error
+        self.record_spend(attempt, spend or ModelSpend(requests=0, charged_micros=0), uncertain)
+        if unexpected is not None:
+            raise unexpected
+
+    def record_spend(self, attempt: int, spend: ModelSpend, uncertain: str | None) -> None:
+        reserved = self.w.budget.reserve_micros if self.w.budget is not None else 0
         now = self.w.clock()
-        spend = spend or ModelSpend(requests=0, charged_micros=0)
         extra = spend.extra(reserved)  # noqa: S610 - ModelSpend.extra, not Django
         event = Event.create(
             EventType.EXECUTION_MODEL_SPEND, at=now, instance=self.w.components.instance_id,
             epoch=self.w.effects.fence.epoch, actor=COORDINATOR,
-            pass_id=self.w.effects.events.pass_id, execution=self.id,
-            attempt=execution.attempt,
-            reason="spend-uncertain" if uncertain else "model-spend-settled",
+            pass_id=self.w.effects.events.pass_id, execution=self.id, attempt=attempt,
+            reason=SuspensionReason.SPEND_UNCERTAIN.value if uncertain else "model-spend-settled",
             data={"requests": spend.requests, "charged_micros": spend.charged_micros,
                   "unsettled_micros": spend.unsettled_micros,
                   "overrun_micros": spend.overrun_micros, "extra_micros": extra},
         )  # fmt: skip
-        charges = (
-            (Charge(self.id, execution.attempt, ChargeKind.EXTRA, extra, now),) if extra else ()
-        )
+        charges = (Charge(self.id, attempt, ChargeKind.EXTRA, extra, now),) if extra else ()
         suspend = None
         if uncertain is not None and self.store.suspension() is None:
-            detail = f"execution {self.id} attempt {execution.attempt}: {uncertain}"[:300]
+            detail = f"execution {self.id} attempt {attempt}: {uncertain}"[:300]
             suspend = Suspension(SuspensionReason.SPEND_UNCERTAIN, now, detail=detail)
         self.w.effects.journal.record(
             Commit(extra_events=(event,), charges=charges, suspend=suspend),
             lease=self.lease, execution_id=self.id,
         )  # fmt: skip
-
-    def sandbox_handle(self, execution: Execution, name: str) -> ContainerHandle | None:
-        """The recorded handle of this attempt's sandbox, if it still exists."""
-        start = self.op(execution, K.START_CONTAINER, name)
-        if start is None or start.status is not ST.SUCCEEDED:
-            return None
-        result = start.result
-        found = self.w.components.container_runtime.find(name)
-        if found is None or found.handle.id != result.get("id"):
-            return None
-        return ContainerHandle(result["runtime"], result["id"], result["name"])
 
     def record_suspension(self, reason: SuspensionReason, detail: str) -> None:
         """Write a suspension unless one is already in force.
@@ -718,26 +742,27 @@ class _Run:
         never = recorded_never_transient(start) or recorded_never_transient(run)
         if never:  # recorded before the crash: fail, as the uninterrupted path does
             if sandbox is not None:
-                effects.remove_sandbox(execution, self.lease, resource=sandbox)
+                self.remove_attempt_sandbox(sandbox)
             raise _never("the agent step failed", never)
         if run is None:
             # A crash after the sandbox was created and before the agent ran: the
             # sandbox is never reused (ADR-0022). Remove it and start over.
             if sandbox is not None:
-                effects.remove_sandbox(execution, self.lease, resource=sandbox)
+                self.remove_attempt_sandbox(sandbox)
             if start is not None and start.status in _UNFINISHED:
                 effects.settle_start(self.current(), self.lease, name=name)
             raise TransientError("interrupted before the agent ran", code="interrupted")
-        # A restart after the agent ran: settle what the gateway recorded while its
-        # record still exists; once it is gone the spend is uncertain (fail closed).
-        self.settle_spend(execution, self.sandbox_handle(execution, name))
+        # A restart after the agent ran: the old agent may still be running. The
+        # sandbox is quiesced and its spend settled while the gateway's record
+        # still exists; a record already gone is uncertain (fail closed).
+        self.settle_spend(execution.attempt, name)
         if run.status in _UNFINISHED:
             effects.abandon_agent_run(self.current(), self.lease)
             if sandbox is not None:
-                effects.remove_sandbox(self.current(), self.lease, resource=sandbox)
+                self.remove_attempt_sandbox(sandbox)
             raise TransientError("interrupted while the agent ran", code="interrupted")
         if sandbox is not None:  # the sandbox must be confirmed gone before freezing
-            effects.remove_sandbox(execution, self.lease, resource=sandbox)
+            self.remove_attempt_sandbox(sandbox)
         if run.status is ST.FAILED:
             raise TransientError("the agent run was interrupted", code="interrupted")
         result = AgentResult(
@@ -804,10 +829,8 @@ class _Run:
                                   request=self.request(), stop=watcher.signal)  # fmt: skip
         finally:
             sandbox = self.row(execution, ResourceKind.CONTAINER, name)
-            if sandbox is not None:
-                # P5 part 2b: the gateway's record is read before it is removed.
-                self.settle_spend(self.current(), handle)
-                effects.remove_sandbox(self.current(), self.lease, resource=sandbox)
+            if sandbox is not None:  # ADR-0039: settled (quiesced, then read) first
+                self.remove_attempt_sandbox(sandbox)
             if watcher.request is not None:  # recorded as validated, right after the run
                 self.apply_inbox(validated=watcher.request)
             elif watcher.suspended_by == SuspensionReason.KILL_SWITCH.value:
@@ -1376,7 +1399,7 @@ class _Run:
         """Remove every sandbox of this execution the ledger does not show as gone."""
         for row in self.store.resources(execution_id=self.id, statuses=set(_LIVE)):
             if row.kind is ResourceKind.CONTAINER:
-                self.w.effects.remove_sandbox(self.current(), self.lease, resource=row)
+                self.remove_attempt_sandbox(row)
 
     def delete_final_workspace(self, execution: Execution) -> None:
         deletions = self.ops(execution, K.DELETE_WORKSPACE)

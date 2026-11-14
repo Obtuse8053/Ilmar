@@ -21,8 +21,10 @@ from ilmar.cli import _build_parser
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.ownership import InstanceLock, Ownership
 from ilmar.domain.budget import Suspension, SuspensionReason
-from ilmar.domain.events import ActorKind, EventType
+from ilmar.domain.events import COORDINATOR, ActorKind, Event, EventType
+from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.ledger import Commit
+from ilmar.domain.tasks import TaskRef
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 3, 1, 12, tzinfo=UTC)
@@ -179,3 +181,79 @@ def test_the_actor_label_is_validated(config: Path, name: str) -> None:
     code, _, err = ilmar("suspend", "--config", str(config), "--as", name)
     assert code == 3
     assert "--as" in err
+
+
+# -- uncertain gateway spend (ADR-0039) -----------------------------------------------
+
+
+def uncertain_spend(state: Path, *, suspend: SuspensionReason | None) -> None:
+    """What a settlement records when an attempt's gateway spend is uncertain:
+    the event, and a suspension unless ``suspend`` is another one in force."""
+    state.mkdir(exist_ok=True)
+    with store(state) as opened:
+        ownership = Ownership.take(layout=WorkspaceLayout.under(state), store=opened,
+                                   instance_id="default", now=NOW)  # fmt: skip
+        with ownership:
+            event = Event.create(
+                EventType.EXECUTION_MODEL_SPEND, at=NOW, instance="default",
+                epoch=ownership.fence.epoch, actor=COORDINATOR, pass_id="p-0123456789",
+                execution="e1", attempt=1, reason="spend-uncertain",
+                data={"requests": 1, "charged_micros": 0, "unsettled_micros": 500,
+                      "overrun_micros": 0, "extra_micros": 0},
+            )  # fmt: skip
+            queued = Execution("e1", TaskRef("github", "o/r#1"), ExecutionState.QUEUED, 1, 1,
+                               NOW, NOW)  # fmt: skip
+            opened.commit(ownership.fence, Commit(created=(
+                (queued, Transition("e1", None, ExecutionState.QUEUED, NOW, "queued")),
+            )))  # fmt: skip
+            if suspend is not None:
+                opened.commit(ownership.fence, Commit(suspend=Suspension(suspend, NOW)))
+            opened.commit(
+                ownership.fence,
+                Commit(
+                    extra_events=(event,),
+                    suspend=None if suspend else Suspension(SuspensionReason.SPEND_UNCERTAIN, NOW),
+                ),
+            )
+
+
+def test_uncertain_spend_needs_the_operator_to_review_the_provider_s_figures(
+    config: Path, state: Path
+) -> None:
+    uncertain_spend(state, suspend=None)
+    code, out, _ = ilmar("budget", "--config", str(config))
+    assert code == 78
+    assert "uncertain gateway spend awaiting review: execution e1 attempt 1" in out
+    code, _, err = ilmar("resume", "--config", str(config), "--as", "bob")
+    assert code == 78
+    assert "--provider-spend-reviewed" in err
+    assert "execution e1 attempt 1" in err
+    code, out, _ = ilmar("resume", "--config", str(config), "--as", "bob",
+                         "--provider-spend-reviewed")  # fmt: skip
+    assert code == 0
+    assert "spend-uncertain suspension is lifted" in out
+    with store(state) as opened:
+        (review,) = [e for e in opened.events() if e.type is EventType.EXECUTION_SPEND_REVIEWED]
+        spend = next(e for e in opened.events() if e.type is EventType.EXECUTION_MODEL_SPEND)
+    assert (review.execution, review.attempt, review.reason) == ("e1", 1, "spend-reviewed")
+    assert review.data["spend_seq"] == spend.seq
+    assert (review.actor.kind, review.actor.ref) == (ActorKind.HUMAN, "bob")
+    code, out, _ = ilmar("budget", "--config", str(config))
+    assert (code, "awaiting review" in out) == (0, False)
+
+
+def test_another_suspension_cannot_hide_uncertain_spend(config: Path, state: Path) -> None:
+    """The spend became uncertain while an operator suspension was in force: no
+    spend-uncertain suspension could be written, yet the operator's own resume
+    is still held until the spend is reviewed."""
+    uncertain_spend(state, suspend=SuspensionReason.OPERATOR)
+    with store(state) as opened:
+        held = opened.suspension()
+        assert held is not None
+        assert held.reason is SuspensionReason.OPERATOR
+    code, _, err = ilmar("resume", "--config", str(config), "--as", "bob")
+    assert code == 78
+    assert "--provider-spend-reviewed" in err
+    code, _, _ = ilmar("resume", "--config", str(config), "--as", "bob",
+                       "--provider-spend-reviewed")  # fmt: skip
+    assert code == 0

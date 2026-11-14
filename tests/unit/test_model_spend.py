@@ -9,8 +9,13 @@
 * When the cost is not known in full (an untrusted report, a request never
   settled, a record that cannot be read or is already gone), all new work is
   suspended (``spend-uncertain``) until an operator resumes.
-* After a crash, the restarted worker settles from the record if it still
-  exists, and fails closed if it does not.
+* Before reading, the sandbox is quiesced: its agent stopped and confirmed
+  stopped, the gateway closed and its final record written. A stop that
+  cannot be confirmed, an incomplete record or an unexpected error is
+  uncertain.
+* After a crash, the restarted worker quiesces and settles from the record
+  if it still exists, and fails closed if it does not. A sandbox whose agent
+  never ran settles at zero: no request could have reached the gateway.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from coordinator_support import Setup, make_setup
 from ilmar.core.components import AgentSandbox
 from ilmar.core.worker import Outcome
 from ilmar.domain.budget import BudgetLimits, ChargeKind, ModelSpend, SuspensionReason
-from ilmar.domain.errors import ProviderError
+from ilmar.domain.errors import ContainmentError, ProviderError
 from ilmar.domain.events import EventType
 from ilmar.domain.ledger import OperationKind as K
 from ilmar.domain.workspace import NetworkPolicy
@@ -77,7 +82,12 @@ def test_a_settled_spend_is_recorded_once_before_removal(setup: Setup) -> None:
     }]  # fmt: skip
     assert charges(setup) == [(ChargeKind.RESERVATION, 1_000_000)]  # never lowered
     assert setup.store.suspension() is None
-    assert setup.runtime.spend_reads == [name(setup)]  # read while the sandbox existed
+    # Quiesced first (the agent stopped, the gateway closed), then read, while
+    # the sandbox still existed; the close is journaled.
+    assert setup.runtime.gateway_closes == [name(setup)]
+    assert setup.runtime.spend_reads == [name(setup)]
+    kinds = [o.kind for o in setup.store.operations("e1")]
+    assert kinds.index(K.CLOSE_GATEWAY) < kinds.index(K.STOP_CONTAINER)
 
 
 def test_cost_beyond_the_reservation_is_an_extra_charge(setup: Setup) -> None:
@@ -99,6 +109,8 @@ def test_cost_beyond_the_reservation_is_an_extra_charge(setup: Setup) -> None:
         ModelSpend(requests=2, charged_micros=100_000, unsettled_micros=500_000,
                    uncertain="1 request(s) admitted but never settled"),
         ProviderError("podman logs failed"),
+        ProviderError("the gateway wrote no final record: it may be incomplete"),
+        ProviderError("the gateway's record is not trusted: lines are missing"),
     ],
 )  # fmt: skip
 def test_an_uncertain_spend_suspends_all_new_work(
@@ -116,35 +128,70 @@ def test_an_uncertain_spend_suspends_all_new_work(
     assert len(report.results) == 1
 
 
-def test_a_crash_before_settlement_settles_from_the_surviving_record(setup: Setup) -> None:
+def test_a_stop_that_cannot_be_confirmed_is_uncertain(setup: Setup) -> None:
+    setup.runtime.close_failures[name(setup)] = ContainmentError(
+        "container could not be confirmed stopped", container_id="x", name=name(setup)
+    )
+    setup.coordinator(budget=LIMITS).run_once()
+    held = setup.store.suspension()
+    assert held is not None
+    assert held.reason is SuspensionReason.SPEND_UNCERTAIN
+    assert "ContainmentError" in held.detail
+    assert setup.runtime.spend_reads == []  # never read before the agent is stopped
+
+
+def test_an_unexpected_accounting_error_is_recorded_uncertain_then_raised(setup: Setup) -> None:
+    setup.runtime.model_spends[name(setup)] = RuntimeError("a bug")
+    report = setup.coordinator(budget=LIMITS).run_once()
+    # Raised, not swallowed: the worker's process boundary blocks the execution.
+    assert report.results[0].code == "unexpected-error"
+    (spend,) = spends(setup)
+    assert spend["reason"] == "spend-uncertain"
+    held = setup.store.suspension()
+    assert held is not None
+    assert held.reason is SuspensionReason.SPEND_UNCERTAIN
+
+
+def test_spending_after_a_coordinator_crash_is_quiesced_then_settled(setup: Setup) -> None:
+    """The coordinator dies after the agent ran and before settlement. The old
+    agent keeps running (and spending) meanwhile. The restarted coordinator
+    stops it and closes the gateway before it reads, and records the later,
+    larger figure."""
     setup.runtime.model_spends[name(setup)] = ModelSpend(requests=1, charged_micros=200_000)
-    real = setup.runtime.model_spend
-    calls = [0]
+    real = setup.runtime.close_model_gateway
 
-    def crash_once(handle, *, owner):  # type: ignore[no-untyped-def]
-        calls[0] += 1
-        if calls[0] == 1:
-            raise Crash
-        return real(handle, owner=owner)
+    def crash(name: str, *, owner: object) -> bool:
+        raise Crash
 
-    setup.runtime.model_spend = crash_once  # type: ignore[method-assign]
+    setup.runtime.close_model_gateway = crash  # type: ignore[method-assign]
     with pytest.raises(Crash):
         setup.coordinator(budget=LIMITS).run_once()
     assert spends(setup) == []
-    assert setup.runtime.find(name(setup)) is not None  # the record is still there
+    agent = setup.runtime.find(name(setup))
+    assert agent is not None
+    assert agent.running  # still there, still running
+    setup.runtime.model_spends[name(setup)] = ModelSpend(requests=4, charged_micros=700_000)
+    setup.runtime.close_model_gateway = real  # type: ignore[method-assign]
     setup.coordinator(budget=LIMITS).run_once()
     (spend,) = spends(setup)
-    assert (spend["reason"], spend["charged_micros"]) == ("model-spend-settled", 200_000)
+    assert (spend["reason"], spend["requests"], spend["charged_micros"]) == (
+        "model-spend-settled", 4, 700_000,
+    )  # fmt: skip
+    assert setup.runtime.gateway_closes == [name(setup)]
+    assert setup.runtime.spend_reads == [name(setup)]  # once, after the agent stopped
     assert setup.store.suspension() is None
 
 
 def test_a_record_gone_before_settlement_fails_closed(setup: Setup) -> None:
-    def crash(handle, *, owner):  # type: ignore[no-untyped-def]
+    real = setup.runtime.close_model_gateway
+
+    def crash(name: str, *, owner: object) -> bool:
         raise Crash
 
-    setup.runtime.model_spend = crash  # type: ignore[method-assign]
+    setup.runtime.close_model_gateway = crash  # type: ignore[method-assign]
     with pytest.raises(Crash):
         setup.coordinator(budget=LIMITS).run_once()
+    setup.runtime.close_model_gateway = real  # type: ignore[method-assign]
     for container in list(setup.runtime._containers.values()):  # the sandbox is gone
         setup.runtime._containers.pop(container.handle.id)
     setup.coordinator(budget=LIMITS).run_once()
@@ -153,7 +200,25 @@ def test_a_record_gone_before_settlement_fails_closed(setup: Setup) -> None:
     held = setup.store.suspension()
     assert held is not None
     assert held.reason is SuspensionReason.SPEND_UNCERTAIN
-    assert "gone" in held.detail
+
+
+def test_a_sandbox_whose_agent_never_ran_settles_at_zero(setup: Setup) -> None:
+    """A crash after the sandbox started and before the agent run was recorded:
+    no route token was ever handed out, so nothing can have been spent."""
+    real = setup.runtime.start
+
+    def crash_after_start(spec: object) -> object:
+        real(spec)
+        raise Crash
+
+    setup.runtime.start = crash_after_start  # type: ignore[method-assign,assignment]
+    with pytest.raises(Crash):
+        setup.coordinator(budget=LIMITS).run_once()
+    setup.runtime.start = real  # type: ignore[method-assign]
+    setup.coordinator(budget=LIMITS).run_once()
+    first = spends(setup)[0]
+    assert (first["reason"], first["requests"]) == ("model-spend-settled", 0)
+    assert setup.store.suspension() is None
 
 
 def test_a_non_gateway_attempt_never_reads_a_spend(tmp_path: Path) -> None:

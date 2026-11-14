@@ -143,17 +143,35 @@ class ContainerRuntime(Protocol):
         """
         ...
 
-    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
-        """What the ``GATEWAY`` sandbox ``handle``'s gateway settled for its model
-        requests (P5 part 2b), read from the gateway's own durable record (the
-        sidecar's log, kept until the sandbox is removed). Called after the agent
-        has stopped and before the sandbox is removed, also by a restarted
-        coordinator. Waits a bounded time for requests still in flight to settle,
-        and reports any left as ``unsettled``.
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        """Quiesce the ``GATEWAY`` sandbox ``name`` before its spend is read (ADR-0039).
 
-        Raises ``ProviderError`` when the record cannot be read or trusted (no
-        gateway owned by ``owner``, a line that does not parse): the caller then
-        treats the attempt's spend as uncertain."""
+        Stops the sandbox's own container, so the agent can send nothing more,
+        and confirms it stopped; the sandbox is not removed. Then tells the
+        sandbox's gateway to admit nothing more and, once requests in flight
+        have settled or a bounded drain has passed, to write its final record.
+
+        Works from durable data (the name and owner in the ledger), so a
+        restarted coordinator can do it. Idempotent. Returns ``False`` if the
+        sandbox has no gateway (any more).
+
+        * ``OwnershipConflictError`` if either container has another owner;
+          nothing is touched.
+        * ``ContainmentError`` if the stop cannot be confirmed.
+        """
+        ...
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        """What the ``GATEWAY`` sandbox ``name``'s gateway settled for its model
+        requests, read from the gateway's own record (its log, kept until the
+        sandbox is removed). Called after ``close_model_gateway`` and before the
+        sandbox is removed, also by a restarted coordinator. Changes nothing.
+
+        Waits a bounded time for the gateway's final record. Raises
+        ``ProviderError`` unless the record is complete and consistent: the
+        agent's container still running, no gateway owned by ``owner``, a line
+        that does not parse, missing lines, a gateway that restarted, or no
+        final record in time. The caller then treats the spend as uncertain."""
         ...
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:

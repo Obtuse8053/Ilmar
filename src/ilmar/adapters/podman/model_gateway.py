@@ -35,9 +35,12 @@ nothing reaches the provider. The log has one line per request (method, path,
 status, sizes) and, for a metered request, one ``CHARGE`` line (micro-dollars,
 reason, halt); never a header value, a body or a credential.
 
-Still to come (P5 part 2b): the coordinator passes each attempt's budget and
-records the charges in its ledger. Until then, no configuration may route a
-real agent through this gateway.
+Its log is the attempt's spending record (ADR-0039): one ``READY`` line when
+it starts serving, an ``ADMIT`` line before a metered request may reach the
+provider and a ``CHARGE`` line when it is settled. On ``SIGUSR1`` it closes:
+it admits nothing more, waits up to ``--drain-seconds`` for requests in
+flight, then writes one ``CLOSED`` line with its own totals, so the
+coordinator can tell a complete record from an empty or cut-off one.
 """
 
 from __future__ import annotations
@@ -52,10 +55,12 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import sys
 import threading
+import time
 import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -77,26 +82,48 @@ _CHARGE = re.compile(
     r"CHARGE ticket=(\d{1,12}) charged=(\d{1,16}) reservation=(\d{1,16}) "
     r"overrun=(\d{1,16}) reason=([A-Za-z0-9.:_-]{1,80}) spent=\d{1,16} halted=(true|false)"
 )
+READY = "ilmar-gateway READY"
+_CLOSED = re.compile(
+    r"CLOSED admitted=(\d{1,12}) settled=(\d{1,12}) charged=(\d{1,16}) open=(\d{1,12})"
+)
 
 
 def parse_spend(lines: list[str]) -> dict[str, Any]:
     """What this gateway's own log says an attempt's model requests cost.
 
-    Read by the runtime from the sidecar's log (P5 part 2b). Only ``ADMIT``
-    and ``CHARGE`` lines count; a line that starts like one but does not parse,
-    a ticket admitted twice, or a charge without its admission is a
-    ``ValueError``: the record is not trusted. ``uncertain`` is the first reason
-    the true cost is unknown: a settlement that was not a trusted report, or a
-    request admitted but never settled."""
+    Read by the runtime from the sidecar's log (ADR-0039). ``READY``,
+    ``ADMIT``, ``CHARGE`` and ``CLOSED`` lines count; every other line is
+    ignored. The record is *not trusted* (``ValueError``) when:
+
+    * a line starts like one of those but does not parse;
+    * ``READY`` appears more than once (the gateway restarted and lost its
+      state) or an ``ADMIT`` comes before it;
+    * a ticket is admitted twice, or charged without its admission;
+    * a ``CLOSED`` line's totals differ from the lines before it (lines are
+      missing), it appears twice, or an ``ADMIT`` follows it.
+
+    ``closed`` says whether the final record is there. Without it the record
+    may be incomplete, and the caller must not take it as the whole cost.
+    ``uncertain`` is the first reason the true cost is unknown even so: a
+    settlement that was not a trusted report, or a request admitted but never
+    settled. A ``CHARGE`` after ``CLOSED`` (a request that outlasted the drain)
+    still counts."""
     admitted: dict[int, int] = {}
-    charged = overrun = settled = 0
+    charged = overrun = settled = admits = 0
+    ready = closed = False
+    left_open = 0
     uncertain: str | None = None
     for line in lines:
-        if line.startswith("ADMIT"):
+        if line.startswith("ilmar-gateway READY"):
+            if line != READY or ready:
+                raise ValueError("the gateway started more than once: its record is incomplete")
+            ready = True
+        elif line.startswith("ADMIT"):
             match = _ADMIT.fullmatch(line)
-            if match is None or int(match[1]) in admitted:
+            if match is None or int(match[1]) in admitted or not ready or closed:
                 raise ValueError("a gateway ADMIT line is not understood")
             admitted[int(match[1])] = int(match[2])
+            admits += 1
         elif line.startswith("CHARGE"):
             match = _CHARGE.fullmatch(line)
             if match is None or admitted.pop(int(match[1]), None) is None:
@@ -106,11 +133,21 @@ def parse_spend(lines: list[str]) -> dict[str, Any]:
             overrun += int(match[4])
             if match[5] != "reported" and uncertain is None:
                 uncertain = f"a report the gateway did not trust ({match[5]})"
+        elif line.startswith("CLOSED"):
+            match = _CLOSED.fullmatch(line)
+            if match is None or closed or not ready:
+                raise ValueError("a gateway CLOSED line is not understood")
+            if (int(match[1]), int(match[2]), int(match[3])) != (admits, settled, charged):
+                raise ValueError("the gateway's record is missing lines")
+            closed, left_open = True, int(match[4])
+    if left_open and uncertain is None:
+        uncertain = f"{left_open} request(s) still in flight when the gateway closed"
     if admitted and uncertain is None:
         uncertain = f"{len(admitted)} request(s) admitted but never settled"
     return {
         "requests": settled + len(admitted), "charged": charged,
         "unsettled": sum(admitted.values()), "overrun": overrun, "uncertain": uncertain,
+        "closed": closed,
     }  # fmt: skip
 
 
@@ -206,6 +243,12 @@ class Gateway:
         self._log = log if log is not None else sys.stdout
         self._log_lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(config.max_in_flight)
+        # ADR-0039: admission and closing exclude each other, so no request is
+        # admitted once closing has begun, and the totals match the log.
+        self._state = threading.Condition()
+        self._closing = False
+        self._open: set[int] = set()
+        self._admits = self._settled = self._charged = 0
         gateway = self
 
         class Handler(_Handler):
@@ -220,7 +263,7 @@ class Gateway:
         return str(host), int(port)
 
     def serve_forever(self) -> None:
-        self.log("ilmar-gateway READY")
+        self.log(READY)
         self._server.serve_forever(poll_interval=0.2)
 
     def shutdown(self) -> None:
@@ -256,6 +299,48 @@ class Gateway:
 
     def try_acquire(self) -> bool:
         return self._slots.acquire(blocking=False)
+
+    @property
+    def closing(self) -> bool:
+        with self._state:
+            return self._closing
+
+    def record_admit(self, ticket: int, reservation: int) -> bool:
+        """Put a metered request on record, unless the gateway is closing."""
+        with self._state:
+            if self._closing:
+                return False
+            self._open.add(ticket)
+            self._admits += 1
+            self.log(f"ADMIT ticket={ticket} reservation={reservation}")
+            return True
+
+    def record_charge(self, ticket: int, charged: int, line: str) -> None:
+        with self._state:
+            self._settled += 1
+            self._charged += charged
+            self.log(line)
+
+    def finished(self, ticket: int) -> None:
+        """The request's handling has ended, charged or not."""
+        with self._state:
+            self._open.discard(ticket)
+            self._state.notify_all()
+
+    def close(self, drain: float, *, clock: Any = time.monotonic) -> None:
+        """Admit nothing more; wait up to ``drain`` seconds for requests in flight;
+        then write the ``CLOSED`` line, once. A second call does nothing."""
+        with self._state:
+            if self._closing:
+                return
+            self._closing = True
+            deadline = clock() + drain
+            while self._open and (left := deadline - clock()) > 0:
+                self._state.wait(min(left, 0.2))
+            self.log(
+                f"CLOSED admitted={self._admits} settled={self._settled} "
+                f"charged={self._charged} open={len(self._open)}"
+            )
 
     def release(self) -> None:
         self._slots.release()
@@ -298,6 +383,8 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if len(body) != length:
             return self._refuse(400, "invalid_request_error", "incomplete body")
+        if gateway.closing:
+            return self._refuse(503, "overloaded_error", "the gateway is closed")
         betas = self.headers.get_all("anthropic-beta") or []
         admission = gateway.admission
         ticket: int | None = None
@@ -312,12 +399,16 @@ class _Handler(BaseHTTPRequestHandler):
             if ticket is not None:
                 gateway.budget.release(ticket)
             return self._refuse(429, "rate_limit_error", "too many requests in flight")
-        if ticket is not None:  # from here on it may reach the provider: on record
-            gateway.log(f"ADMIT ticket={ticket} reservation={admitted.reservation}")
-        try:
+        if ticket is not None and not gateway.record_admit(ticket, admitted.reservation):
+            gateway.budget.release(ticket)  # closed meanwhile: never sent, never on record
+            gateway.release()
+            return self._refuse(503, "overloaded_error", "the gateway is closed")
+        try:  # from here on it may reach the provider: on record
             self._forward(path, query, admitted, ticket)
         finally:
             gateway.release()
+            if ticket is not None:
+                gateway.finished(ticket)
 
     # -- forwarding -------------------------------------------------------------------
 
@@ -409,11 +500,12 @@ class _Handler(BaseHTTPRequestHandler):
             settled = admission.charge(meter, price, reservation)
         gateway.budget.settle(ticket, settled)
         reason = _REASON.sub("_", settled.reason)[:80]
-        gateway.log(
+        gateway.record_charge(
+            ticket, settled.charged,
             f"CHARGE ticket={ticket} charged={settled.charged} reservation={reservation} "
             f"overrun={settled.overrun} reason={reason} "
-            f"spent={gateway.budget.spent()} halted={str(gateway.budget.halted).lower()}"
-        )
+            f"spent={gateway.budget.spent()} halted={str(gateway.budget.halted).lower()}",
+        )  # fmt: skip
 
     def _refuse(self, status: int, kind: str, message: str) -> None:
         payload = json.dumps(
@@ -452,6 +544,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.owner.log(line)
 
 
+DRAIN_SECONDS = 20.0
+"""How long a closing gateway waits for requests in flight (ADR-0039)."""
 AWAITING_KEY = "ilmar-gateway AWAITING-KEY"
 _MAX_KEY_BYTES = 4096
 
@@ -498,7 +592,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--policy", required=True, help="the admission policy, as JSON")
     parser.add_argument("--budget", type=int, required=True, help="B, in micro-dollars")
     parser.add_argument("--admission-module", default=ADMISSION_MODULE)
+    parser.add_argument("--drain-seconds", type=float, default=DRAIN_SECONDS)
     args = parser.parse_args(argv)
+    # ADR-0039: SIGUSR1 closes the gateway. Handled from the start, so an early
+    # signal never ends the process (its default action) and is never lost.
+    closer: list[Gateway] = []
+    asked = threading.Event()
+
+    def on_close(signum: int, frame: object) -> None:
+        asked.set()
+        for gateway in closer:
+            threading.Thread(target=gateway.close, args=(args.drain_seconds,), daemon=True).start()
+
+    signal.signal(signal.SIGUSR1, on_close)
     admission = load_admission(args.admission_module)
     admission.policy_from_json(args.policy)  # refuse a bad policy before taking the key
     config = GatewayConfig(
@@ -513,7 +619,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     host, _, port = args.listen.rpartition(":")
     socket.setdefaulttimeout(None)
-    Gateway((host, int(port)), config, admission=admission).serve_forever()
+    gateway = Gateway((host, int(port)), config, admission=admission)
+    closer.append(gateway)
+    if asked.is_set():
+        threading.Thread(target=gateway.close, args=(args.drain_seconds,), daemon=True).start()
+    gateway.serve_forever()
     return 0
 
 

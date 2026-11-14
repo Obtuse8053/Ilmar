@@ -635,3 +635,100 @@ def test_a_good_counting_request_neither_charges_nor_halts(running: Running) -> 
     assert not running.gateway.budget.halted
     running.provider.payload = GOOD
     assert running.post()[0] == 200
+
+
+# -- closing and the final record (ADR-0039) -----------------------------------------
+
+
+def record(running: Running) -> dict[str, object]:
+    return mg.parse_spend(running.log.getvalue().splitlines())
+
+
+def test_closing_writes_a_final_record_that_matches_the_lines_before_it(
+    running: Running,
+) -> None:
+    for _ in range(2):
+        assert running.post()[0] == 200
+    assert record(running)["closed"] is False  # no final record yet: maybe incomplete
+    running.gateway.close(1.0)
+    running.gateway.close(1.0)  # idempotent: one final record
+    found = record(running)
+    assert found["closed"] is True
+    assert (found["requests"], found["charged"], found["uncertain"]) == (2, 270, None)
+    (closed,) = [line for line in running.log.getvalue().splitlines() if line.startswith("CLOSED")]
+    assert closed == "CLOSED admitted=2 settled=2 charged=270 open=0"
+
+
+def test_a_closed_gateway_admits_nothing_more(running: Running) -> None:
+    running.gateway.close(1.0)
+    status, _, data = running.post()
+    assert (status, json.loads(data)["error"]["type"]) == (503, "overloaded_error")
+    assert running.provider.seen == []
+    assert "ADMIT" not in running.log.getvalue()
+
+
+def test_closing_waits_for_a_request_in_flight_to_settle() -> None:
+    provider = Provider(hold=threading.Event())
+    for running in start(provider):
+        sent = threading.Thread(target=running.post)
+        sent.start()
+        assert provider.entered.wait(5)
+        closer = threading.Thread(target=running.gateway.close, args=(5.0,))
+        closer.start()
+        time.sleep(0.2)
+        assert "CLOSED" not in running.log.getvalue()  # still draining
+        provider.hold.set()  # type: ignore[union-attr]
+        closer.join(5)
+        sent.join(5)
+        found = record(running)
+        assert (found["closed"], found["requests"], found["uncertain"]) == (True, 1, None)
+
+
+def test_a_request_outlasting_the_drain_is_uncertain() -> None:
+    provider = Provider(hold=threading.Event())
+    for running in start(provider):
+        sent = threading.Thread(target=running.post)
+        sent.start()
+        assert provider.entered.wait(5)
+        running.gateway.close(0.1)
+        found = record(running)
+        assert found["closed"] is True
+        assert found["uncertain"] == "1 request(s) still in flight when the gateway closed"
+        provider.hold.set()  # type: ignore[union-attr]
+        sent.join(5)
+        assert record(running)["requests"] == 1  # its late charge still counts
+
+
+R = "ilmar-gateway READY"
+A = "ADMIT ticket=1 reservation=500"
+C = ("CHARGE ticket=1 charged=100 reservation=500 overrun=0 reason=reported "
+     "spent=100 halted=false")  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [A, C],  # no READY: an ADMIT before the gateway started
+        [R, A, R, C],  # restarted: its earlier state is lost
+        [R, C],  # a charge without its admission
+        [R, A, A],  # admitted twice
+        [R, A, "CLOSED admitted=1 settled=0 charged=0 open=1", "CLOSED admitted=1 settled=0 "
+         "charged=0 open=1"],  # two final records
+        [R, A, C, "CLOSED admitted=2 settled=1 charged=100 open=0"],  # a line is missing
+        [R, A, C, "CLOSED admitted=1 settled=1 charged=90 open=0"],  # totals differ
+        [R, "CLOSED admitted=0 settled=0 charged=0 open=0", A],  # admitted after closing
+        [R, "ADMIT ticket=x reservation=1"],  # not understood
+        [R, "CLOSED admitted=0"],
+        ["ilmar-gateway READY again"],
+    ],
+)  # fmt: skip
+def test_an_inconsistent_record_is_not_trusted(lines: list[str]) -> None:
+    with pytest.raises(ValueError, match="gateway"):
+        mg.parse_spend(lines)
+
+
+def test_an_empty_or_cut_off_record_is_never_complete() -> None:
+    assert mg.parse_spend([])["closed"] is False
+    assert mg.parse_spend([R, A, C])["closed"] is False
+    complete = mg.parse_spend([R, A, C, "CLOSED admitted=1 settled=1 charged=100 open=0"])
+    assert (complete["closed"], complete["charged"], complete["uncertain"]) == (True, 100, None)

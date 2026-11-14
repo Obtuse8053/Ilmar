@@ -12,6 +12,8 @@ IPv4 address, outside both containers. The tests show that:
 * the sandbox cannot reach the provider (or anything else) directly;
 * the real key appears in neither container's definition nor in the
   sandbox, and the host copy is gone once the sidecar has read it;
+* closing stops the agent, keeps the sandbox, and leaves a complete record
+  of what the gateway settled (ADR-0039);
 * stopping the sandbox removes the sidecar and the network.
 
 No Claude Code here (see ``test_claude_code_gateway_compat.py``). Opt-in:
@@ -32,6 +34,7 @@ import pytest
 from gateway_policy import BUDGET, POLICY
 from ilmar.adapters.podman import GatewaySettings, PodmanRuntime
 from ilmar.core.layout import WorkspaceLayout
+from ilmar.domain.errors import ProviderError
 from ilmar.domain.workspace import ContainerSpec, NetworkPolicy, ResourceOwner
 
 from integration.gateway_support import Provider
@@ -166,6 +169,41 @@ def test_the_real_key_is_in_neither_container_nor_the_sandbox(
     shown = attempt(sandbox, sh("env; cat /proc/1/environ 2>/dev/null; ls -la / /run 2>&1"))
     assert REAL_KEY not in shown
     assert not list(Path("/tmp").glob("ilmar-gateway-*"))  # the host copy is gone
+
+
+def test_closing_stops_the_agent_and_leaves_a_complete_record(
+    world: tuple[Sandbox, Provider, str], tmp_path: Path
+) -> None:
+    """ADR-0039: the agent is stopped (kept), the gateway closed, and the
+    record read back complete, consistent and with every request in it."""
+    (runtime, _), _, _ = world
+    name, owner = f"{NAME}-close", ResourceOwner("it", "gateway-close", 1, "tok-close")
+    layout = WorkspaceLayout.under(tmp_path.resolve() / "state")
+    layout.workspaces_root.mkdir(parents=True)
+    workspace = make_workspace(layout, "gateway-close")
+    remove_everything(name)
+    handle = runtime.start(
+        ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=name, owner=owner,
+                      workspace_identity=identity_of(workspace),
+                      network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                      lifetime_seconds=900)
+    )  # fmt: skip
+    try:
+        base, token = route((runtime, handle))
+        for _ in range(2):
+            out = attempt((runtime, handle), [*ASK, token, f"{base}/v1/messages?beta=true"])
+            assert out.endswith("exit=0\n"), out
+        assert runtime.close_model_gateway(name, owner=owner) is True
+        assert not runtime.is_running(handle)  # stopped, not removed
+        assert runtime.find(name) is not None
+        assert runtime.close_model_gateway(name, owner=owner) is True  # idempotent
+        spend = runtime.model_spend(name, owner=owner)
+        assert spend.requests == 2  # both on record; the record is complete
+        assert runtime.remove_owned(name, owner=owner) is True
+        with pytest.raises(ProviderError):
+            runtime.model_spend(name, owner=owner)  # the record went with the sandbox
+    finally:
+        remove_everything(name)
 
 
 def test_stopping_the_sandbox_removes_the_sidecar_and_the_network(

@@ -74,8 +74,11 @@ class StopObservingRuntime:
         self.inner = inner
         self.stops: list[StopSignal | None] = []
 
-    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
-        return self.inner.model_spend(handle, owner=owner)
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        return self.inner.close_model_gateway(name, owner=owner)
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        return self.inner.model_spend(name, owner=owner)
 
     @property
     def name(self) -> str:

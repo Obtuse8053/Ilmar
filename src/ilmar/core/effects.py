@@ -731,6 +731,31 @@ class Effects:
                 )
             raise
 
+    def close_model_gateway(
+        self, execution: Execution, lease: ExecutionLease, *, resource: Resource
+    ) -> bool:
+        """Quiesce a recorded ``GATEWAY`` sandbox before its spend is read (ADR-0039).
+
+        Journaled as ``close-gateway:<execution>:<current attempt>:<name>``, a
+        repeatable kind. The owner comes from the ledger row, so this works
+        after a restart. Returns whether the sandbox had a gateway to close.
+        Errors propagate: the caller settles the spend as uncertain.
+        """
+        if resource.kind is not ResourceKind.CONTAINER:
+            raise LedgerIntegrityError(f"{resource.key} is not a sandbox")
+        owner = ResourceOwner(
+            self._c.instance_id, resource.execution_id, resource.attempt, resource.owner_token
+        )
+
+        def effect() -> Mapping[str, str]:
+            closed = self._c.container_runtime.close_model_gateway(resource.name, owner=owner)
+            return {"closed": str(closed).lower()}
+
+        result = self._journal.perform(
+            K.CLOSE_GATEWAY, execution, effect, lease=lease, step=resource.name
+        )
+        return result["closed"] == "true"
+
     # -- settling what a crash left unclear (ADR-0022) ----------------------------------
 
     def settle_directory_step(

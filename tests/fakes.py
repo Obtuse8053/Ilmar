@@ -412,6 +412,9 @@ class FakeContainerRuntime:
         """What ``model_spend`` reports for a GATEWAY sandbox, by name; by default
         nothing was spent. An exception is raised instead (an unreadable record)."""
         self.spend_reads: list[str] = []
+        self.gateway_closes: list[str] = []  # every close_model_gateway call, by name
+        self.closed_gateways: set[str] = set()
+        self.close_failures: dict[str, Exception] = {}
 
     @property
     def name(self) -> str:
@@ -570,14 +573,31 @@ class FakeContainerRuntime:
         container = self._containers.get(handle.id)
         return container is not None and container.running
 
-    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
-        self.spend_reads.append(handle.name)
-        container = self._containers.get(handle.id)
+    def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
+        """Stops the agent (kept, not removed) and closes the gateway, as Podman does.
+        ``close_failures[name]`` is raised instead (an unconfirmed stop)."""
+        self.gateway_closes.append(name)
+        if isinstance(failure := self.close_failures.get(name), Exception):
+            raise failure
+        container = self._by_name(name)
         if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
-            raise ProviderError(f"no model gateway of this sandbox to read: {handle.name}")
+            return False
+        if container.spec.owner != owner:
+            raise OwnershipConflictError(f"container {name} is owned by someone else")
+        container.running = False
+        self.closed_gateways.add(name)
+        return True
+
+    def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
+        self.spend_reads.append(name)
+        container = self._by_name(name)
+        if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
+            raise ProviderError(f"no model gateway of this sandbox to read: {name}")
         if container.spec.owner != owner:
             raise ProviderError("the gateway belongs to another owner")
-        found = self.model_spends.get(handle.name, ModelSpend(requests=0, charged_micros=0))
+        if container.running or name not in self.closed_gateways:
+            raise ProviderError("the gateway wrote no final record: it may be incomplete")
+        found = self.model_spends.get(name, ModelSpend(requests=0, charged_micros=0))
         if isinstance(found, Exception):
             raise found
         return found
