@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.changes import (
     CandidateRevision,
     ChangeRequest,
@@ -407,6 +408,10 @@ class FakeContainerRuntime:
         self.commands: list[tuple[str, tuple[str, ...]]] = []
         self.started_specs: list[ContainerSpec] = []  # every spec start() accepted, in order
         self.model_routes: dict[str, ModelAccess] = {}  # GATEWAY sandboxes, by id
+        self.model_spends: dict[str, ModelSpend | Exception] = {}
+        """What ``model_spend`` reports for a GATEWAY sandbox, by name; by default
+        nothing was spent. An exception is raised instead (an unreadable record)."""
+        self.spend_reads: list[str] = []
 
     @property
     def name(self) -> str:
@@ -564,6 +569,18 @@ class FakeContainerRuntime:
     def is_running(self, handle: ContainerHandle) -> bool:
         container = self._containers.get(handle.id)
         return container is not None and container.running
+
+    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
+        self.spend_reads.append(handle.name)
+        container = self._containers.get(handle.id)
+        if container is None or container.spec.network is not NetworkPolicy.GATEWAY:
+            raise ProviderError(f"no model gateway of this sandbox to read: {handle.name}")
+        if container.spec.owner != owner:
+            raise ProviderError("the gateway belongs to another owner")
+        found = self.model_spends.get(handle.name, ModelSpend(requests=0, charged_micros=0))
+        if isinstance(found, Exception):
+            raise found
+        return found
 
     def model_access(self, handle: ContainerHandle) -> ModelAccess | None:
         container = self._containers.get(handle.id)

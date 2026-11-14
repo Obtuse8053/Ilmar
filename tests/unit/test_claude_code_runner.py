@@ -136,7 +136,7 @@ def gateway_setup(
     allow_probe(runtime)
     spec = ContainerSpec(image="img", host_workspace=tmp_path, name="agent", owner=OWNER,
                          workspace_identity=identity_of(tmp_path),
-                         network=NetworkPolicy.GATEWAY)  # fmt: skip
+                         network=NetworkPolicy.GATEWAY, model_budget_micros=1_000_000)  # fmt: skip
     return runtime, runtime.start(spec), script
 
 

@@ -178,7 +178,7 @@ def test_pinned_claude_code_works_through_a_separate_gateway_sidecar(tmp_path: P
         layout=layout,
         gateway=GatewaySettings(
             image=os.environ.get("ILMAR_TEST_PODMAN_PROXY_IMAGE") or IMAGE,  # needs python3
-            key=REAL_KEY, policy=POLICY, budget=BUDGET,
+            key=REAL_KEY, policy=POLICY,
             upstream=f"http://{host}:{provider.port}",
             allow_plain_http_upstream=True,
         ),
@@ -187,7 +187,8 @@ def test_pinned_claude_code_works_through_a_separate_gateway_sidecar(tmp_path: P
         handle = runtime.start(
             ContainerSpec(image=IMAGE, host_workspace=workspace, name=SIDECAR_NAME, owner=owner,
                           workspace_identity=identity_of(workspace),
-                          network=NetworkPolicy.GATEWAY, sealed_paths=SEALED_PATHS,
+                          network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                          sealed_paths=SEALED_PATHS,
                           lifetime_seconds=900)
         )  # fmt: skip
         try:

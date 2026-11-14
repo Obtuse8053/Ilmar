@@ -235,6 +235,7 @@ class Coordinator:
             verifier=verifier,
             clock=clock,
             sandbox_lifetime_seconds=lifetime,
+            model_budget_micros=budget.reserve_micros if budget is not None else None,
         )
         coordinator = cls(
             components=components,

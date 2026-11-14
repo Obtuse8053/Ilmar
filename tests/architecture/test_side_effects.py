@@ -35,6 +35,8 @@ READS = {
     "feed", "close",
     # ADR-0037 §1: the in-memory route of a GATEWAY sandbox.
     "model_access",
+    # P5 part 2b (ADR-0039, proposed): reads the gateway sidecar's log.
+    "model_spend",
 }  # fmt: skip
 
 

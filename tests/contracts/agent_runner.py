@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 import pytest
 
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
@@ -72,6 +73,9 @@ class StopObservingRuntime:
     def __init__(self, inner: ContainerRuntime) -> None:
         self.inner = inner
         self.stops: list[StopSignal | None] = []
+
+    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
+        return self.inner.model_spend(handle, owner=owner)
 
     @property
     def name(self) -> str:

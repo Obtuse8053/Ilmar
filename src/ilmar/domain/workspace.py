@@ -181,8 +181,18 @@ class ContainerSpec:
     """The longest the container may exist after it starts (ADR-0029 §1). The
     runtime itself stops it then, even if the process that started it has died;
     ``None`` sets no runtime-side limit."""
+    model_budget_micros: int | None = None
+    """For a ``GATEWAY`` sandbox, the attempt's model budget the gateway enforces
+    (its reservation, ADR-0029 §2; P5 part 2b). Required for ``GATEWAY`` and
+    refused for every other policy."""
 
     def __post_init__(self) -> None:
+        budget = self.model_budget_micros
+        if self.network is NetworkPolicy.GATEWAY:
+            if type(budget) is not int or budget < 1:
+                raise ValueError("a GATEWAY sandbox needs a positive model budget")
+        elif budget is not None:
+            raise ValueError("only a GATEWAY sandbox has a model budget")
         if self.lifetime_seconds is not None and not (
             math.isfinite(self.lifetime_seconds) and self.lifetime_seconds > 0
         ):

@@ -109,6 +109,36 @@ class Charge:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelSpend:
+    """What a gateway recorded for one attempt's model requests (P5 part 2b).
+
+    ``charged_micros`` is the sum the gateway settled (reported usage in full,
+    or a whole reservation for a report it did not trust). ``unsettled_micros``
+    is the reservation of requests admitted but never settled. ``overrun_micros``
+    is what reported usage cost beyond the requests' reservations. ``uncertain``
+    is the first reason the true cost is unknown, if there is one."""
+
+    requests: int
+    charged_micros: int
+    unsettled_micros: int = 0
+    overrun_micros: int = 0
+    uncertain: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("requests", "charged_micros", "unsettled_micros", "overrun_micros"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= MAX_MICROS:
+                raise ValueError(f"{name} must be a whole number from 0")
+        if self.unsettled_micros and self.uncertain is None:
+            raise ValueError("unsettled requests make the spend uncertain")
+
+    def extra(self, reserved: int) -> int:
+        """What the ledger must add to the attempt's reservation: what the gateway
+        charged beyond it. Never negative: a charge is never lowered."""
+        return max(0, self.charged_micros + self.unsettled_micros - reserved)
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetTotals:
     """What is charged in one UTC day and in its month."""
 
@@ -139,6 +169,12 @@ class SuspensionReason(enum.Enum):
     """The kill-switch and suspension check failed while an agent ran (ADR-0029 §4):
     whether work may go on was unknown, so all of it stopped. Lifted only by an
     operator, and only once the check succeeds again."""
+    SPEND_UNCERTAIN = "spend-uncertain"
+    """What an attempt's model requests cost could not be settled from the
+    gateway's record: a report the gateway did not trust, a request still
+    unsettled, or a record that could not be read (P5 part 2b). The ledger holds
+    the reservation; what the provider billed beyond it is unknown, so an
+    operator checks the provider's own figures before resuming."""
 
 
 @dataclass(frozen=True, slots=True)

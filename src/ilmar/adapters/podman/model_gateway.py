@@ -72,6 +72,48 @@ REQUEST_HEADERS = frozenset({"content-type", "accept", "anthropic-version", "use
 """Forwarded as sent, along with ``x-stainless-*`` (SDK metadata). Nothing else.
 ``anthropic-beta`` is rebuilt from the values admission kept."""
 MESSAGES = "/v1/messages"
+_ADMIT = re.compile(r"ADMIT ticket=(\d{1,12}) reservation=(\d{1,16})")
+_CHARGE = re.compile(
+    r"CHARGE ticket=(\d{1,12}) charged=(\d{1,16}) reservation=(\d{1,16}) "
+    r"overrun=(\d{1,16}) reason=([A-Za-z0-9.:_-]{1,80}) spent=\d{1,16} halted=(true|false)"
+)
+
+
+def parse_spend(lines: list[str]) -> dict[str, Any]:
+    """What this gateway's own log says an attempt's model requests cost.
+
+    Read by the runtime from the sidecar's log (P5 part 2b). Only ``ADMIT``
+    and ``CHARGE`` lines count; a line that starts like one but does not parse,
+    a ticket admitted twice, or a charge without its admission is a
+    ``ValueError``: the record is not trusted. ``uncertain`` is the first reason
+    the true cost is unknown: a settlement that was not a trusted report, or a
+    request admitted but never settled."""
+    admitted: dict[int, int] = {}
+    charged = overrun = settled = 0
+    uncertain: str | None = None
+    for line in lines:
+        if line.startswith("ADMIT"):
+            match = _ADMIT.fullmatch(line)
+            if match is None or int(match[1]) in admitted:
+                raise ValueError("a gateway ADMIT line is not understood")
+            admitted[int(match[1])] = int(match[2])
+        elif line.startswith("CHARGE"):
+            match = _CHARGE.fullmatch(line)
+            if match is None or admitted.pop(int(match[1]), None) is None:
+                raise ValueError("a gateway CHARGE line is not understood")
+            settled += 1
+            charged += int(match[2])
+            overrun += int(match[4])
+            if match[5] != "reported" and uncertain is None:
+                uncertain = f"a report the gateway did not trust ({match[5]})"
+    if admitted and uncertain is None:
+        uncertain = f"{len(admitted)} request(s) admitted but never settled"
+    return {
+        "requests": settled + len(admitted), "charged": charged,
+        "unsettled": sum(admitted.values()), "overrun": overrun, "uncertain": uncertain,
+    }  # fmt: skip
+
+
 ADMISSION_MODULE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_admission.py")
 
 
@@ -270,6 +312,8 @@ class _Handler(BaseHTTPRequestHandler):
             if ticket is not None:
                 gateway.budget.release(ticket)
             return self._refuse(429, "rate_limit_error", "too many requests in flight")
+        if ticket is not None:  # from here on it may reach the provider: on record
+            gateway.log(f"ADMIT ticket={ticket} reservation={admitted.reservation}")
         try:
             self._forward(path, query, admitted, ticket)
         finally:
@@ -366,7 +410,7 @@ class _Handler(BaseHTTPRequestHandler):
         gateway.budget.settle(ticket, settled)
         reason = _REASON.sub("_", settled.reason)[:80]
         gateway.log(
-            f"CHARGE charged={settled.charged} reservation={reservation} "
+            f"CHARGE ticket={ticket} charged={settled.charged} reservation={reservation} "
             f"overrun={settled.overrun} reason={reason} "
             f"spent={gateway.budget.spent()} halted={str(gateway.budget.halted).lower()}"
         )

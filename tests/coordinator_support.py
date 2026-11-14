@@ -192,6 +192,7 @@ def make_setup(
     store: ExecutionStore | None = None,
     verification: VerificationPolicy | None = None,
     secret_scanner: SecretScanner | None = None,
+    agent_sandbox: AgentSandbox | None = None,
 ) -> Setup:
     state = tmp_path.resolve() / "state"
     state.mkdir()
@@ -211,7 +212,8 @@ def make_setup(
         container_runtime=runtime,
         agent_runner=agent,
         execution_store=store,
-        agent_sandbox=AgentSandbox("localhost/agent:1", NetworkPolicy.ALLOWLIST, ("api.example",)),
+        agent_sandbox=agent_sandbox
+        or AgentSandbox("localhost/agent:1", NetworkPolicy.ALLOWLIST, ("api.example",)),
         target=Target(REPO, "main"),
         verification=verification or policy(),
         secret_scanner=secret_scanner,

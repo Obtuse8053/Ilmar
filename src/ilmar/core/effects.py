@@ -78,6 +78,7 @@ from ilmar.domain.workspace import (
     ContainerHandle,
     ContainerSpec,
     DirectoryIdentity,
+    NetworkPolicy,
     ResourceOwner,
     StopSignal,
 )
@@ -185,6 +186,7 @@ class Effects:
         verifier: Verifier,
         clock: Callable[[], datetime],
         sandbox_lifetime_seconds: float,
+        model_budget_micros: int | None = None,
     ) -> None:
         if not (math.isfinite(sandbox_lifetime_seconds) and sandbox_lifetime_seconds > 0):
             # ADR-0029 §1: no agent sandbox may start without a runtime-side lifetime.
@@ -194,6 +196,9 @@ class Effects:
         self._verifier = verifier
         self._clock = clock
         self._sandbox_lifetime = sandbox_lifetime_seconds
+        self._model_budget = model_budget_micros
+        """Each attempt's model budget for a GATEWAY sandbox: its reservation
+        (ADR-0029 §2; P5 part 2b). Without a budget no GATEWAY sandbox starts."""
 
     @property
     def fence(self) -> Fence:
@@ -537,6 +542,12 @@ class Effects:
         sandbox = self._c.agent_sandbox
         runtime = self._c.container_runtime
 
+        gateway = sandbox.network is NetworkPolicy.GATEWAY
+        if gateway and self._model_budget is None:
+            raise PolicyViolationError(
+                "a GATEWAY sandbox needs [budget]: the gateway enforces each attempt's reservation"
+            )
+
         def effect() -> Mapping[str, str]:
             spec = ContainerSpec(
                 image=sandbox.image,
@@ -549,6 +560,7 @@ class Effects:
                 limits=sandbox.limits,
                 sealed_paths=sandbox.sealed_paths,
                 lifetime_seconds=self._sandbox_lifetime,
+                model_budget_micros=self._model_budget if gateway else None,
             )
             handle = runtime.start(spec)
             return {"id": handle.id, "name": handle.name, "runtime": handle.runtime}

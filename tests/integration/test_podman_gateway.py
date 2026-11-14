@@ -78,7 +78,7 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     runtime = PodmanRuntime(
         layout=layout,
         gateway=GatewaySettings(
-            image=str(PROXY_IMAGE), key=REAL_KEY, policy=POLICY, budget=BUDGET,
+            image=str(PROXY_IMAGE), key=REAL_KEY, policy=POLICY,
             upstream=f"http://{host}:{provider.port}",
             allow_plain_http_upstream=True,
         ),
@@ -87,7 +87,8 @@ def world(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Sandbox, P
     handle = runtime.start(
         ContainerSpec(image=str(IMAGE), host_workspace=workspace, name=NAME, owner=OWNER,
                       workspace_identity=identity_of(workspace),
-                      network=NetworkPolicy.GATEWAY, lifetime_seconds=900)
+                      network=NetworkPolicy.GATEWAY, model_budget_micros=BUDGET,
+                      lifetime_seconds=900)
     )  # fmt: skip
     try:
         yield (runtime, handle), provider, host

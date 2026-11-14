@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
+from ilmar.domain.budget import ModelSpend
 from ilmar.domain.workspace import (
     CommandResult,
     ContainerHandle,
@@ -140,6 +141,19 @@ class ContainerRuntime(Protocol):
         made it, so a restarted coordinator cannot reuse a sandbox's route. The
         caller passes the token only through ``run(env=...)``.
         """
+        ...
+
+    def model_spend(self, handle: ContainerHandle, *, owner: ResourceOwner) -> ModelSpend:
+        """What the ``GATEWAY`` sandbox ``handle``'s gateway settled for its model
+        requests (P5 part 2b), read from the gateway's own durable record (the
+        sidecar's log, kept until the sandbox is removed). Called after the agent
+        has stopped and before the sandbox is removed, also by a restarted
+        coordinator. Waits a bounded time for requests still in flight to settle,
+        and reports any left as ``unsettled``.
+
+        Raises ``ProviderError`` when the record cannot be read or trusted (no
+        gateway owned by ``owner``, a line that does not parse): the caller then
+        treats the attempt's spend as uncertain."""
         ...
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
