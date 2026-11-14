@@ -162,6 +162,8 @@ REASON_CODES: Mapping[str, str] = MappingProxyType(
         "operator-suspended": "An operator suspended new work.",
         "clock-anomaly": "The clock is behind the latest persisted time.",
         "operator-resumed": "An operator resumed new work after its cause was gone.",
+        "quarantine-resolved": "A person verified that a quarantined resource is gone or "
+        "unchanged, and recorded its resolution; the resource stays quarantined (ADR-0042).",
         "gate-recorded": "A person recorded that a mode's gate passed, with its evidence "
         "(ADR-0040).",
         "gate-revoked": "A person revoked a mode's gate record; the mode is off at the "
@@ -300,6 +302,13 @@ _PASS = re.compile(r"^p-[0-9a-f]{6,32}$")
 _REQUEST_ID = re.compile(r"^q-[0-9a-f]{32}$")  # a cancellation request (ADR-0025)
 CANCEL_DECISIONS = frozenset({"accepted", "too-late", "already-terminal", "duplicate"})
 CLAIM_LOST_STATES = frozenset({"observed", "cleared"})  # ADR-0026 §3a
+_RESOURCE_KEY = re.compile(
+    r"^[a-z][a-z-]{0,40}:[A-Za-z0-9][A-Za-z0-9_.-]{0,127}:\d{1,6}:[^\x00-\x1f\x7f]{1,512}$"
+)
+RESOLUTION_ACTIONS = ("removed-by-hand", "was-already-gone", "left-unchanged")
+"""What the person did, from a closed set: the event log keeps no free text."""
+RESOLUTION_OBSERVATIONS = ("absent", "identity-matches")
+"""What ``ilmar quarantine resolve`` saw before recording a resolution (ADR-0042)."""
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")  # a tracker's claim id
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # a UTC budget day (ADR-0029 §2)
 _MONTH = re.compile(r"^\d{4}-\d{2}$")  # a UTC budget month
@@ -435,6 +444,7 @@ class EventType(enum.Enum):
     BUDGET_CHARGED = "budget.charged"
     INSTANCE_SUSPENDED = "instance.suspended"
     INSTANCE_RESUMED = "instance.resumed"
+    RESOURCE_RESOLVED = "resource.resolved"
     INSTANCE_GATE_RECORDED = "instance.gate_recorded"
     INSTANCE_GATE_REVOKED = "instance.gate_revoked"
     EXECUTION_BLOCK_RESOLVED = "execution.block_resolved"
@@ -543,6 +553,11 @@ DATA_SCHEMAS: Mapping[EventType, Schema] = MappingProxyType(
             "month": (_pattern(_MONTH), True),
         },
         EventType.INSTANCE_SUSPENDED: {},  # ADR-0029 §3: the reason code is the cause
+        EventType.RESOURCE_RESOLVED: {  # ADR-0042: a person's verified resolution
+            "resource": (_pattern(_RESOURCE_KEY), True),
+            "observed": (_one_of(RESOLUTION_OBSERVATIONS), True),
+            "action": (_one_of(RESOLUTION_ACTIONS), True),
+        },
         EventType.INSTANCE_RESUMED: {  # the reason is operator-resumed; this is what cleared
             "cleared": (_one_of(SUSPENSION_REASONS), True),
         },
@@ -594,6 +609,7 @@ EXTRA_TYPES = frozenset(
         EventType.EXECUTION_BLOCK_RESOLVED,
         EventType.EXECUTION_MODEL_SPEND,
         EventType.EXECUTION_SPEND_REVIEWED,
+        EventType.RESOURCE_RESOLVED,
     }
 )
 

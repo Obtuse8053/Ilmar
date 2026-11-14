@@ -35,6 +35,8 @@ READS = {
     "feed", "close",
     # ADR-0040 (proposed): the target's immutable ID, read live by loop mode.
     "repository_id",
+    # ADR-0042 (proposed): what remains of a sandbox, for a person's resolution.
+    "sandbox_parts",
     # ADR-0037 §1: the in-memory route of a GATEWAY sandbox.
     "model_access",
     # ADR-0039 (proposed): reads the gateway sidecar's log; changes nothing.

@@ -58,6 +58,7 @@ from ilmar.domain.workspace import (
     ModelAccess,
     NetworkPolicy,
     ResourceOwner,
+    SandboxPart,
     StopSignal,
 )
 from ilmar.ports.container_runtime import ContainerRuntime, StreamConsumer
@@ -461,6 +462,12 @@ class FakeContainerRuntime:
             del self._containers[existing.handle.id]
         self.started_specs.append(spec)
         return self._create(spec, spec.owner)
+
+    def sandbox_parts(self, name: str) -> tuple[SandboxPart, ...]:
+        found = self._by_name(name)
+        if found is None:
+            return ()
+        return (SandboxPart("container", name, found.spec.owner),)
 
     def find(self, name: str) -> ContainerInfo | None:
         found = self._by_name(name)

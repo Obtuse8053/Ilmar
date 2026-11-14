@@ -88,6 +88,7 @@ from ilmar.domain.workspace import (
     NetworkPolicy,
     ResourceLimits,
     ResourceOwner,
+    SandboxPart,
     StopSignal,
     StreamVerdict,
 )
@@ -885,6 +886,19 @@ class PodmanRuntime:
         if _owner(details) != owner:
             raise OwnershipConflictError(f"container {handle.name} is owned by someone else")
         self._remove_sandbox(container_id, handle.name)
+
+    def sandbox_parts(self, name: str) -> tuple[SandboxPart, ...]:
+        """See the port: read from labels, so a restarted process can tell."""
+        parts: list[SandboxPart] = []
+        for kind, part in (("container", name), ("sidecar", name + EGRESS_PROXY_SUFFIX)):
+            found = self.find(part)
+            if found is not None:
+                parts.append(SandboxPart(kind, part, found.owner))
+        network = name + EGRESS_NETWORK_SUFFIX
+        if self._podman_call(["network", "exists", network]).returncode == 0:
+            labels = self._network(network).get("labels") or {}
+            parts.append(SandboxPart("network", network, _owner({"Config": {"Labels": labels}})))
+        return tuple(parts)
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:
         """See the port. Needs no in-memory state: labels identify the owner."""

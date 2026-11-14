@@ -25,6 +25,7 @@ from ilmar.domain.workspace import (
     ContainerSpec,
     ModelAccess,
     ResourceOwner,
+    SandboxPart,
     StopSignal,
 )
 from ilmar.ports.agent_runner import AgentRunner
@@ -76,6 +77,9 @@ class StopObservingRuntime:
 
     def close_model_gateway(self, name: str, *, owner: ResourceOwner) -> bool:
         return self.inner.close_model_gateway(name, owner=owner)
+
+    def sandbox_parts(self, name: str) -> tuple[SandboxPart, ...]:
+        return self.inner.sandbox_parts(name)
 
     def model_spend(self, name: str, *, owner: ResourceOwner) -> ModelSpend:
         return self.inner.model_spend(name, owner=owner)
