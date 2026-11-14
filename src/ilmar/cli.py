@@ -17,6 +17,7 @@ from ilmar import (
     cli_events,
     cli_gate,
     cli_loop,
+    cli_quarantine,
     cli_suspend,
 )
 from ilmar.adapters.registry import build, plan
@@ -53,6 +54,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cli_blocked.run(args)
     if args.command == "gate":
         return cli_gate.run(args)
+    if args.command == "quarantine":
+        return cli_quarantine.run(args)
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
@@ -103,6 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     cli_suspend.add_parsers(commands)
     cli_blocked.add_parser(commands)
     cli_gate.add_parser(commands)
+    cli_quarantine.add_parser(commands)
     validate.add_argument(
         "--check-environment",
         action="store_true",

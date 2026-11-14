@@ -403,6 +403,59 @@ class FencingContract:
         with pytest.raises(LedgerIntegrityError, match="cannot move"):
             store.commit(fence, Commit(resources=(reused,)))
 
+    def _quarantined(self, store: ExecutionStore, fence: Fence) -> Resource:
+        fenced_execution(store, fence)
+        planned = Resource.intended(
+            ResourceKind.CONTAINER, "e1", 1, "ilmar-inst-e1-1", owner_token="tok", now=at(2)
+        )
+        store.commit(fence, Commit(resources=(planned,)))
+        active = planned.moved(R.ACTIVE, now=at(3), identity="c0ffee")
+        store.commit(fence, Commit(resources=(active,)))
+        quarantined = active.moved(R.QUARANTINED, now=at(4), note="removal unconfirmed")
+        store.commit(fence, Commit(resources=(quarantined,)))
+        return quarantined
+
+    @staticmethod
+    def _resolution(fence: Fence, actor: Actor, key: str, execution: str = "e1") -> Event:
+        return Event.create(
+            EventType.RESOURCE_RESOLVED, at=at(5), instance=fence.instance_id, epoch=fence.epoch,
+            actor=actor, pass_id="p-0123456789" if actor.kind is ActorKind.COORDINATOR else None,
+            execution=execution, attempt=1, reason="quarantine-resolved",
+            data={"resource": key, "observed": "absent", "action": "removed-by-hand"},
+        )  # fmt: skip
+
+    def test_a_person_records_a_resolution_and_the_row_stays_quarantined(
+        self, store: ExecutionStore
+    ) -> None:
+        """ADR-0042: an append-only record; ADR-0020's rule for the row holds."""
+        fence = claimed(store)
+        row = self._quarantined(store, fence)
+        person = Actor(ActorKind.HUMAN, "alice")
+        context = EventContext(at=at(5), instance=fence.instance_id, epoch=fence.epoch,
+                               actor=person)  # fmt: skip
+        store.commit(fence, Commit(extra_events=(self._resolution(fence, person, row.key),)),
+                     context=context)  # fmt: skip
+        assert store.resource(row.key) == row
+        (event,) = [e for e in store.events() if e.type is EventType.RESOURCE_RESOLVED]
+        assert (event.actor.ref, event.data["resource"]) == ("alice", row.key)
+
+    def test_only_a_person_resolves_and_only_a_quarantined_resource_of_its_execution(
+        self, store: ExecutionStore
+    ) -> None:
+        fence = claimed(store)
+        row = self._quarantined(store, fence)
+        other, created = MACHINE.start(TASK_B, execution_id="e2", now=at(1))
+        store.commit(fence, Commit(created=((other, created),)))
+        person = Actor(ActorKind.HUMAN, "alice")
+        for event, why in (
+            (self._resolution(fence, COORDINATOR, row.key), "only a person"),
+            (self._resolution(fence, person, row.key.replace("e1-1", "e9-9")), "not a quarantined"),
+            (self._resolution(fence, person, row.key, execution="e2"), "another execution"),
+        ):
+            with pytest.raises(LedgerIntegrityError, match=why):
+                store.commit(fence, Commit(extra_events=(event,)))
+        assert not [e for e in store.events() if e.type is EventType.RESOURCE_RESOLVED]
+
     def test_a_candidate_is_recorded_only_with_its_freeze(self, store: ExecutionStore) -> None:
         fence = claimed(store)
         execution = to_running_agent(store, fence, fenced_execution(store, fence))
