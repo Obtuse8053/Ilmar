@@ -27,6 +27,7 @@ from ilmar.domain.errors import (
 )
 from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
+from ilmar.domain.gates import GateRecord
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -118,6 +119,13 @@ class ExecutionStore(Protocol):
 
     def suspension(self) -> Suspension | None:
         """The suspension in force, or ``None``."""
+        ...
+
+    def gate_records(self) -> Sequence[GateRecord]:
+        """Every gate record, revoked ones included, oldest first (ADR-0040).
+
+        Written only through ``Commit.gate``, by a person (the commit's context
+        actor); a mode has at most one active record."""
         ...
 
     def budget_totals(self, at: datetime) -> BudgetTotals:

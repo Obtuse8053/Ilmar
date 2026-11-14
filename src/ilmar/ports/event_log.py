@@ -37,10 +37,12 @@ from ilmar.domain.events import (
     accounting_events,
     baseline_events,
     derive_events,
+    gate_events,
     resource_ref,
     resumed_event,
 )
 from ilmar.domain.execution import Execution
+from ilmar.domain.gates import GateRecord, GateRecorded
 from ilmar.domain.ledger import Commit, Fence, Operation, Resource
 from ilmar.domain.verification import EvidenceRecord
 
@@ -94,10 +96,13 @@ def commit_events(
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
     suspended: Suspension | None = None,
+    gated: GateRecord | None = None,
 ) -> tuple[Event, ...]:
     """The events ``changes`` must be committed with, ``data.from`` filled and paired.
 
     ``suspended`` is the stored suspension, if any (named by ``instance.resumed``).
+    ``gated`` is the stored active gate record of the commit's gate mode, if
+    any (checked, and named by ``instance.gate_revoked``; ADR-0040).
 
     The lookups return the **stored** rows, before this commit. Raises
     ``LedgerIntegrityError`` for a context that does not belong to ``fence``,
@@ -105,6 +110,7 @@ def commit_events(
     """
     if changes.empty:
         return ()
+    check_gate_change(changes, context, gated)
     extras = check_extra_events(fence, changes, execution=execution)  # before reading them
     if context is None:
         context = default_context(fence, changes)
@@ -132,6 +138,9 @@ def commit_events(
             if suspended is None:
                 raise LedgerIntegrityError("there is no suspension to resume")
             accounting += (resumed_event(suspended.reason.value, context),)
+        accounting += gate_events(
+            changes, context, revoked_seq=gated.seq if gated is not None else None
+        )
     except EventEnvelopeError as error:
         raise LedgerIntegrityError(f"an event of this commit is invalid: {error}") from None
     return events + accounting + extras
@@ -340,3 +349,30 @@ def stored_state(
         transitions=dict(transitions),
         evidence=dict(evidence),
     )
+
+
+def check_gate_change(
+    changes: Commit, context: EventContext | None, active: GateRecord | None
+) -> None:
+    """ADR-0040, enforced by the store: only a person records or revokes a gate;
+    a mode has at most one active record; only an active record is revoked."""
+    gate = changes.gate
+    if gate is None:
+        return
+    if context is None or context.actor.kind is not ActorKind.HUMAN:
+        raise LedgerIntegrityError("only a person records or revokes a gate")
+    if isinstance(gate, GateRecorded):
+        if active is not None:
+            raise LedgerIntegrityError(
+                f"a {gate.evidence.mode} gate record is already active; revoke it first"
+            )
+    elif active is None:
+        raise LedgerIntegrityError(f"no active {gate.mode} gate record to revoke")
+
+
+def gate_mode(changes: Commit) -> str | None:
+    """The mode a commit's gate change is about, if it has one."""
+    gate = changes.gate
+    if gate is None:
+        return None
+    return gate.evidence.mode if isinstance(gate, GateRecorded) else gate.mode

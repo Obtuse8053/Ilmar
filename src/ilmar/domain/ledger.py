@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from ilmar.domain.budget import BudgetLimits, Charge, ChargeKind, Suspension
 from ilmar.domain.execution import Execution, Transition
+from ilmar.domain.gates import GateChange
 
 if TYPE_CHECKING:  # events imports this module; the store validates extra events
     from ilmar.domain.events import Event
@@ -482,10 +483,14 @@ class Commit:
     suspend: Suspension | None = None
     resume: datetime | None = None
     """When the suspension is cleared (set only to resume)."""
+    gate: GateChange | None = None
+    """A gate record written or revoked (ADR-0040): only by a person, alone."""
 
     def __post_init__(self) -> None:
         if self.suspend is not None and self.resume is not None:
             raise ValueError("a commit suspends or resumes, not both")
+        if self.gate is not None and not _only_gate(self):
+            raise ValueError("a gate record is written in a commit of its own")
         reservations = [(c.execution_id, c.attempt) for c in self.charges
                         if c.kind is ChargeKind.RESERVATION]  # fmt: skip
         if len(set(reservations)) != len(reservations):
@@ -509,6 +514,7 @@ class Commit:
             or self.charges
             or self.suspend is not None
             or self.resume is not None
+            or self.gate is not None
         )
 
 
@@ -519,3 +525,12 @@ def changed_paths_digest(paths: Iterable[str]) -> str:
     """A digest of a candidate's changed paths, independent of their order."""
     canonical = json.dumps(sorted(set(paths)), ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _only_gate(commit: Commit) -> bool:
+    """Whether ``commit`` changes nothing but its gate record (ADR-0040)."""
+    return not (
+        commit.created or commit.applied or commit.operations or commit.resources
+        or commit.extra_events or commit.charges or commit.budget is not None
+        or commit.suspend is not None or commit.resume is not None
+    )  # fmt: skip

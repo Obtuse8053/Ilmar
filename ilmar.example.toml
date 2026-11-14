@@ -131,7 +131,10 @@ timeout_seconds = 1200
 # also needs a gate record and the fail-closed start checks, and the loop is
 # not yet available. Mode 1 needs max_concurrent_executions = 1, a [budget]
 # with kill_switch_file, [verification], a pinned expected_version, and a
-# dedicated test repository: never Ilmar's own.
+# dedicated test repository: never Ilmar's own, bound by its immutable GitHub
+# repository ID (ADR-0040; `gh api repos/OWNER/NAME --jq .id`). The gate record
+# is written by a person with `ilmar gate record`.
 # [autonomy]
 # mode = "manual"
 # poll_interval_seconds = 60
+# repository_id = 123456789

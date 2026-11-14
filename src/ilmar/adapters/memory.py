@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Collection, Sequence
+from dataclasses import replace
 from datetime import datetime
 
 from ilmar.domain.budget import BudgetTotals, Charge, Suspension, utc_day, utc_month
@@ -24,6 +25,7 @@ from ilmar.domain.errors import (
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
+from ilmar.domain.gates import GateRecord, GateRecorded, active_gate
 from ilmar.domain.ledger import Commit, Fence, Operation, OperationStatus, Resource, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
@@ -41,6 +43,7 @@ class InMemoryExecutionStore:
         self._lock = threading.Lock()
         self._charges: list[Charge] = []
         self._suspension: Suspension | None = None
+        self._gates: list[GateRecord] = []
         self._executions: dict[str, Execution] = {}
         self._history: dict[str, list[Transition]] = {}
         self._evidence: dict[str, list[str]] = {}  # serialised, so stored copies cannot change
@@ -166,6 +169,7 @@ class InMemoryExecutionStore:
                 operation=self._operations.get,
                 resource=self._resources.get,
                 suspended=self._suspension,
+                gated=self._active_gate(changes),
             )
             new_tasks = [e.task for e, _ in changes.created if not e.state.is_terminal]
             if len(new_tasks) != len(set(new_tasks)):
@@ -189,6 +193,7 @@ class InMemoryExecutionStore:
                 self._suspension = changes.suspend
             if changes.resume is not None:
                 self._suspension = None
+            self._write_gate(changes, context)
             self._append(events)
 
     def _totals(self, at: datetime) -> BudgetTotals:
@@ -201,6 +206,28 @@ class InMemoryExecutionStore:
     def suspension(self) -> Suspension | None:
         with self._lock:
             return self._suspension
+
+    def gate_records(self) -> Sequence[GateRecord]:
+        with self._lock:
+            return tuple(self._gates)
+
+    def _active_gate(self, changes: Commit) -> GateRecord | None:
+        mode = event_log.gate_mode(changes)
+        return None if mode is None else active_gate(self._gates, mode)
+
+    def _write_gate(self, changes: Commit, context: EventContext | None) -> None:
+        gate = changes.gate
+        if gate is None or context is None:  # checked: a gate change has a person's context
+            return
+        if isinstance(gate, GateRecorded):
+            self._gates.append(GateRecord(len(self._gates) + 1, gate.evidence, gate.at,
+                                          context.actor.ref or ""))  # fmt: skip
+            return
+        held = active_gate(self._gates, gate.mode)
+        if held is not None:
+            self._gates[held.seq - 1] = replace(
+                held, revoked_at=gate.at, revoked_by=context.actor.ref or ""
+            )
 
     def budget_totals(self, at: datetime) -> BudgetTotals:
         with self._lock:

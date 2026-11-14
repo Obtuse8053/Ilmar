@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ilmar import __version__, cli_blocked, cli_cancel, cli_events, cli_suspend
+from ilmar import __version__, cli_blocked, cli_cancel, cli_events, cli_gate, cli_suspend
 from ilmar.adapters.registry import build, plan
 from ilmar.config import load_config
 from ilmar.core import kill_switch
@@ -45,6 +45,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cli_suspend.run(args)
     if args.command == "blocked":
         return cli_blocked.run(args)
+    if args.command == "gate":
+        return cli_gate.run(args)
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
@@ -81,6 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
     cli_cancel.add_parser(commands)
     cli_suspend.add_parsers(commands)
     cli_blocked.add_parser(commands)
+    cli_gate.add_parser(commands)
     validate.add_argument(
         "--check-environment",
         action="store_true",

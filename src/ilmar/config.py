@@ -120,6 +120,10 @@ class Autonomy:
     mode: str = "manual"
     poll_interval_seconds: float = 60.0
     """ADR-0030 §3: how long the loop waits between passes."""
+    repository_id: int | None = None
+    """ADR-0040: the approved target's immutable GitHub repository ID. Required
+    in ``supervised``; the gate record and the live repository must match it,
+    so a rename keeps the approval and a fork never inherits it."""
 
 
 MODES = ("manual", "supervised")
@@ -206,7 +210,12 @@ def parse_config(
 
 
 def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:
-    _reject_unknown(raw, {"mode", "poll_interval_seconds"}, "[autonomy]")
+    _reject_unknown(raw, {"mode", "poll_interval_seconds", "repository_id"}, "[autonomy]")
+    repository_id = raw.get("repository_id")
+    if repository_id is not None and (
+        type(repository_id) is not int or not 0 < repository_id < 2**53
+    ):
+        raise ConfigError("[autonomy] repository_id must be a positive integer")
     mode = raw.get("mode", "manual")
     if mode in LATER_MODES:
         raise ConfigError(
@@ -222,12 +231,17 @@ def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:
         or not 1 <= interval <= 86_400
     ):
         raise ConfigError("[autonomy] poll_interval_seconds must be between 1 and 86400")
-    return Autonomy(mode=mode, poll_interval_seconds=float(interval))
+    return Autonomy(mode=mode, poll_interval_seconds=float(interval), repository_id=repository_id)
 
 
 def _check_supervised(config: IlmarConfig, *, self_target: bool) -> None:
     """Mode 1's own rules, refused here so they never reach a running loop."""
     where = '[autonomy] mode = "supervised"'
+    if config.autonomy.repository_id is None:
+        raise ConfigError(
+            f"{where} needs [autonomy] repository_id: the approved target's immutable "
+            "repository ID (ADR-0040)"
+        )
     if config.limits.max_concurrent_executions != 1:
         raise ConfigError(f"{where} needs [limits] max_concurrent_executions = 1 (ADR-0029)")
     if config.budget is None or config.budget.kill_switch_file is None:
