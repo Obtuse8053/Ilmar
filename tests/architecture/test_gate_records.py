@@ -15,7 +15,7 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "ilmar"
 WRITERS = {SRC / "cli_gate.py"}
-CHANGES = {"GateRecorded", "GateRevoked"}
+CHANGES = {"GateRecorded", "GateRevoked", "TrialAuthorized", "TrialRevoked"}
 
 
 def _builds_a_gate_change(path: Path) -> list[int]:

@@ -290,6 +290,8 @@ ADDED_CODES = {
     "spend-reviewed",  # P5 part 2b: also the suspension reason
     "gate-recorded",  # ADR-0040 (#91)
     "gate-revoked",  # ADR-0040 (#91)
+    "trial-authorized",  # ADR-0041 (#93)
+    "trial-revoked",  # ADR-0041 (#93)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)

@@ -34,7 +34,7 @@ READS = {
     # command's stdout; validating it changes nothing outside Ilmar.
     "feed", "close",
     # ADR-0040 (proposed): the target's immutable ID, read live by loop mode.
-    "repository_id",
+    "repository_identity",
     # ADR-0037 §1: the in-memory route of a GATEWAY sandbox.
     "model_access",
     # ADR-0039 (proposed): reads the gateway sidecar's log; changes nothing.

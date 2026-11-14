@@ -64,7 +64,18 @@ from ilmar.domain.errors import (
 from ilmar.domain.event_history import StoredState
 from ilmar.domain.events import CorruptEventError, Event, EventContext
 from ilmar.domain.execution import Execution, ExecutionState, Transition
-from ilmar.domain.gates import GateEvidence, GateRecord, GateRecorded, active_gate
+from ilmar.domain.gates import (
+    GateEvidence,
+    GateRecord,
+    GateRecorded,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+    TrialTerms,
+    active_gate,
+    trial_in_force,
+    unrevoked_trial,
+)
 from ilmar.domain.ledger import (
     Commit,
     Fence,
@@ -78,9 +89,15 @@ from ilmar.domain.ledger import (
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
-from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+from ilmar.ports.execution_store import (
+    check_apply,
+    check_commit,
+    check_create,
+    check_fence,
+    check_trial,
+)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 """The version this code writes. A database is at it once it has been claimed."""
 NEW_DATABASE_VERSION = 3
 """A brand-new database is created at this version: no events yet, since the
@@ -431,10 +448,33 @@ WHEN OLD.revoked_at IS NOT NULL
   OR NEW.recorded_by IS NOT OLD.recorded_by OR NEW.revoked_at IS NULL
 BEGIN SELECT RAISE(ABORT, 'a gate record is only ever revoked, once'); END;
 """,
+    # ADR-0041 (#93): bounded, expiring trial authorizations, apart from gates.
+    9: """
+CREATE TABLE trial_authorization (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    terms          TEXT NOT NULL,
+    authorized_at  TEXT NOT NULL,
+    authorized_by  TEXT NOT NULL,
+    revoked_at     TEXT,
+    revoked_by     TEXT,
+    CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
+) STRICT;
+
+CREATE TRIGGER trial_authorization_cannot_be_removed BEFORE DELETE ON trial_authorization
+BEGIN SELECT RAISE(ABORT, 'trial authorizations cannot be removed'); END;
+CREATE TRIGGER trial_authorization_only_revoked_once BEFORE UPDATE ON trial_authorization
+WHEN OLD.revoked_at IS NOT NULL
+  OR NEW.seq IS NOT OLD.seq OR NEW.terms IS NOT OLD.terms
+  OR NEW.authorized_at IS NOT OLD.authorized_at OR NEW.authorized_by IS NOT OLD.authorized_by
+  OR NEW.revoked_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'a trial authorization is only ever revoked, once'); END;
+""",
 }
 
 GATE_SCHEMA_VERSION = 9
 """The first version with ``gate_record`` (#91, ADR-0040)."""
+TRIAL_SCHEMA_VERSION = 10
+"""The first version with ``trial_authorization`` (#93, ADR-0041)."""
 
 BUDGET_SCHEMA_VERSION = 8
 """The first version with ``budget_ledger`` and ``suspension`` (#18)."""
@@ -557,6 +597,10 @@ class SQLiteExecutionStore:
     def gate_records(self) -> Sequence[GateRecord]:
         with self._reading() as conn:
             return _gate_records(conn)
+
+    def trial_records(self) -> Sequence[TrialRecord]:
+        with self._reading() as conn:
+            return _trial_records(conn)
 
     def suspension(self) -> Suspension | None:
         with self._reading(any_version=True) as conn:
@@ -728,6 +772,17 @@ class SQLiteExecutionStore:
                 suspension=_suspension(conn),
                 totals=lambda at: _budget_totals(conn, at),
             )
+            check_trial(
+                changes,
+                trial=lambda seq: next((t for t in _trial_records(conn) if t.seq == seq), None),
+                created_since=lambda at: _integer(conn.execute(
+                    "SELECT COUNT(*) FROM executions WHERE created_at >= ?", (_encode_time(at),)
+                ).fetchone()[0]),
+                charged_since=lambda at: _integer(conn.execute(
+                    "SELECT COALESCE(SUM(amount_micros), 0) FROM budget_ledger WHERE at >= ?",
+                    (_encode_time(at),),
+                ).fetchone()[0]),
+            )  # fmt: skip
             # Derived and paired against the stored rows, before any is written.
             events = event_log.commit_events(
                 fence,
@@ -1463,7 +1518,31 @@ def _gate_records(conn: sqlite3.Connection) -> tuple[GateRecord, ...]:
     return tuple(records)
 
 
-def _active_gate(conn: sqlite3.Connection, changes: Commit) -> GateRecord | None:
+def _trial_records(conn: sqlite3.Connection) -> tuple[TrialRecord, ...]:
+    if _version(conn) < TRIAL_SCHEMA_VERSION:
+        return ()
+    rows = conn.execute(
+        "SELECT seq, terms, authorized_by, revoked_at, revoked_by "
+        "FROM trial_authorization ORDER BY seq"
+    ).fetchall()
+    return tuple(
+        TrialRecord(
+            _integer(seq),
+            TrialTerms.from_json(_text(terms)),
+            _text(by),
+            None if revoked_at is None else _decode_time(_text(revoked_at)),
+            None if revoked_by is None else _text(revoked_by),
+        )
+        for seq, terms, by, revoked_at, revoked_by in rows
+    )
+
+
+def _active_gate(conn: sqlite3.Connection, changes: Commit) -> GateRecord | TrialRecord | None:
+    gate = changes.gate
+    if isinstance(gate, TrialAuthorized):
+        return trial_in_force(_trial_records(conn), gate.at)
+    if isinstance(gate, TrialRevoked):
+        return unrevoked_trial(_trial_records(conn))
     mode = event_log.gate_mode(changes)
     return None if mode is None else active_gate(_gate_records(conn), mode)
 
@@ -1475,6 +1554,22 @@ def _write_gate(conn: sqlite3.Connection, changes: Commit, context: EventContext
     if _version(conn) < GATE_SCHEMA_VERSION or context is None:  # pragma: no cover - checked
         raise LedgerIntegrityError("this store cannot hold gate records yet")
     who = context.actor.ref or ""
+    if isinstance(gate, TrialAuthorized | TrialRevoked):
+        if _version(conn) < TRIAL_SCHEMA_VERSION:  # pragma: no cover - claim migrates first
+            raise LedgerIntegrityError("this store cannot hold trial authorizations yet")
+        if isinstance(gate, TrialAuthorized):
+            conn.execute(
+                "INSERT INTO trial_authorization (terms, authorized_at, authorized_by) "
+                "VALUES (?, ?, ?)",
+                (gate.terms.to_json(), _encode_time(gate.at), who),
+            )
+            return
+        conn.execute(
+            "UPDATE trial_authorization SET revoked_at = ?, revoked_by = ? "
+            "WHERE seq = (SELECT MAX(seq) FROM trial_authorization WHERE revoked_at IS NULL)",
+            (_encode_time(gate.at), who),
+        )
+        return
     if isinstance(gate, GateRecorded):
         conn.execute(
             "INSERT INTO gate_record (mode, evidence, recorded_at, recorded_by) "
