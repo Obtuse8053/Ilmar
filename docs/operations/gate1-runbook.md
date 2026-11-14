@@ -249,6 +249,21 @@ Stop and suspend:
 
     ilmar suspend --config ~/.config/ilmar/ilmar.gate1.toml --as <you> --note "<why>"
 
-Then keep the output and open an issue. Never edit the store by hand. A
-quarantined resource has no supported resolution yet (#59): the loop stops
-with exit 2, and the execution stays blocked.
+Then keep the output and open an issue. Never edit the store by hand.
+
+**A quarantine** stops the loop with exit 2 (#59, ADR-0042; a Gate 1
+dependency, #135 and #136):
+
+1. List quarantined resources:
+
+       ilmar quarantine list --config ~/.config/ilmar/ilmar.gate1.toml
+
+2. Inspect what remains with `podman ps -a` and `podman network ls`. Remove
+   only this sandbox's own parts by hand; never anything with another owner.
+3. Record the resolution:
+
+       ilmar quarantine resolve --config ~/.config/ilmar/ilmar.gate1.toml \
+         --execution <e> --resource <key> --as <you> --action removed-by-hand
+
+   It refuses while any part remains. The next pass finishes the execution,
+   and the event goes into the evidence.
