@@ -12,10 +12,16 @@
   - **ADR-0024 §4:** event types `instance.trial_authorized` and
     `instance.trial_revoked`; reason codes `trial-authorized` and
     `trial-revoked`.
-- Asked for by the maintainer on 2026-11-14 to resolve a circular
-  dependency. Gate 1 (#93) requires a supervised `ilmar run --loop` on the
-  test repository, but the loop needs a gate record, and no gate record may
-  exist before Gate 1.
+- Asked for by the maintainer on 2026-11-14.
+
+## Context and problem
+
+Gate 1 (#93) requires a supervised `ilmar run --loop` on the dedicated test
+repository. But the loop runs only with an active gate record (ADR-0040), and
+no gate record may exist before Gate 1 passes (ADR-0030 §2). Without a third
+path, Gate 1 can never be reached. That path must not weaken what a gate
+record means: nothing written for the trial may ever authorize production
+operation.
 
 ## Considered options
 
