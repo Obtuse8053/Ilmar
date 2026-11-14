@@ -46,10 +46,13 @@ there is no supported way to do that:
   execution, its kind and name, and whether it is already resolved.
   Read-only.
 - `ilmar quarantine resolve --config … --execution E --resource KEY --as NAME
-  --note TEXT`:
+  --action ACTION`:
   - it takes the instance lock and writes one fenced commit, like every
     mutating command (ADR-0012);
-  - the note is short, printable and refused if it looks like a credential.
+  - `ACTION` says what the person did, from a closed set: `removed-by-hand`,
+    `was-already-gone` or `left-unchanged`. The event log keeps no free text
+    (ADR-0024 §7), so a reason in words belongs in the issue that tracks the
+    quarantine.
 
 They are never run by the coordinator, the loop or any scheduled path. The
 store refuses a `resource.resolved` event whose actor is not a person, and an
@@ -73,9 +76,8 @@ The command records nothing unless what it can check is true now:
 An `execution.`-scoped extra event, `resource.resolved`:
 
 - the execution, the reason `quarantine-resolved` and the person as actor;
-- data: the resource key and what was observed (`absent` or
-  `identity-matches`);
-- the note, through the event log's credential refusal.
+- data: the resource key, what was observed (`absent` or
+  `identity-matches`) and the person's action.
 
 The resource row is unchanged and stays `QUARANTINED`. Automation still never
 reuses, mounts, deletes or releases it.
