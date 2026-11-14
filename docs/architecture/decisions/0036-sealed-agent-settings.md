@@ -139,7 +139,18 @@ rewrites it during a run, so it cannot be sealed without breaking Claude Code.
 **What the agent loses:** it cannot see or edit a repository's `.claude/`
 directory.
 
-### Gate 1 and the proxy (recommendation, for the maintainer to decide)
+### Gate 1 and the proxy
+
+**Decided by the maintainer on 2026-11-11.**
+- **#110 is a mandatory Gate 1 prerequisite.** It scans the frozen candidate
+  deterministically and claims no detection of arbitrary transformations.
+- **#111 is not required for Gate 1**, on a controlled, credential-free test
+  repository with trusted tasks and a capped workspace.
+- **#111 is mandatory before** Mode 2, untrusted repositories or
+  self-hosting.
+- **The pinned-version compatibility test stays mandatory.**
+
+The recommendation the decision followed:
 
 Gate 1 runs Mode 1, supervised, on a dedicated test repository (ADR-0030). On
 that repository the routes the proxy would close need a credential other than

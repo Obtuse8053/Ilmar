@@ -60,15 +60,21 @@ maintainer records it. M4 order (Modes 2 and 3) is in
 
 ## Recommended next task
 
-#90 (runtime limits, Podman `--timeout` and the single model-credential
-path), then #18 (reservation ledger, suspension and kill switch). These are the
-essentials for supervised autonomy.
+Gate 1 (#93). The code side is in place once #132 (the Gate 1 trial
+authorization, ADR-0041) is merged: loop mode (#91), gate records (ADR-0040),
+spend settlement (ADR-0039), the secret scan (#110) and the runtime limits
+(#90, awaiting its acceptance audit). What remains is evidence the maintainer
+collects (see #93).
 
 Hard gates that stay in force:
 - the real-Podman coordinator-SIGKILL test in #90, which Gate 1 also needs;
 - a passed pinned-version live test and a reviewed, recorded stream fixture
   before Mode 1 (the synthetic fixture never counts);
 - #91 enforces the version and gate requirements before it allows loop mode.
+- #110 (candidate secret scan, merged) stays in force for Gate 1;
+- `tests/integration/test_claude_code_pinned.py` passes on the pinned image;
+- #111 (credential-injecting proxy) lands before Mode 2, untrusted
+  repositories or self-hosting.
 
 ## Change log
 
@@ -213,6 +219,15 @@ Hard gates that stay in force:
     local records. It is in the agent-run operation and the evidence's agent
     report. For `agent-failed` and `provider-refused` it is also in the local
     failure reason and in `ilmar run` output. It is never published.
+- 2026-11-11: **#90 part 2 merged** (#109; ADR-0036 Proposed). #90 stays open
+  until its acceptance audit.
+  - **Maintainer decisions on credential containment**, recorded in
+    `autonomy-roadmap.md`, ADR-0036 and #93:
+    - #110 (candidate secret scan) is a mandatory Gate 1 prerequisite;
+    - #111 (credential-injecting proxy) is not required for Gate 1 on a
+      controlled, credential-free test repository, but is mandatory before
+      Mode 2, untrusted repositories or self-hosting;
+    - the pinned-version compatibility test stays mandatory.
 - 2026-11-11: **#90 part 1 merged** (#108). **Part 2 submitted: one credential
   path and provider failures** (ADR-0029 §5).
   - **Credential path:** before Claude Code starts, a fixed probe runs in the
