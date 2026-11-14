@@ -126,6 +126,25 @@ class Autonomy:
     so a rename keeps the approval and a fork never inherits it."""
 
 
+@dataclass(frozen=True, slots=True)
+class Supervisor:
+    """``[supervisor]`` (ADR-0043): restarts by an outside supervisor (systemd).
+
+    Off by default, and it cannot be turned on yet: supervisor restarts belong
+    to Mode 2, which needs its own gate (#96). The limits may only be made
+    stricter than these defaults; loosening one needs a new ADR."""
+
+    enabled: bool = False
+    min_interval_seconds: float = 60.0
+    backoff_max_seconds: float = 3600.0
+    cooldown_seconds: float = 21600.0
+    per_hour: int = 6
+    per_day: int = 20
+
+
+SUPERVISOR_MODES: tuple[str, ...] = ()
+"""Operating modes in which ``[supervisor] enabled = true`` is allowed: none
+until a Mode 2 mode and its gate exist (ADR-0043 §3)."""
 MODES = ("manual", "supervised")
 LATER_MODES = ("autonomous", "self-hosting")
 ILMAR_REPOSITORY = "obtuse8053/ilmar"
@@ -144,6 +163,8 @@ class IlmarConfig:
     instance_id: str = DEFAULT_INSTANCE_ID
     autonomy: Autonomy = Autonomy()
     """Without ``[autonomy]``: manual operation."""
+    supervisor: Supervisor = Supervisor()
+    """Without ``[supervisor]``: no supervisor restarts (ADR-0043)."""
     base_dir: Path | None = None
     """The directory relative option paths resolve against (the file's directory)."""
     source: Path | None = None
@@ -167,7 +188,9 @@ def parse_config(
 ) -> IlmarConfig:
     """Validate already-parsed configuration data."""
     _reject_unknown(
-        data, {"ilmar", "limits", "adapters", "verification", "budget", "autonomy"}, "top level"
+        data,
+        {"ilmar", "limits", "adapters", "verification", "budget", "autonomy", "supervisor"},
+        "top level",
     )
 
     general = _table(data, "ilmar", "[ilmar]")
@@ -200,13 +223,65 @@ def parse_config(
         ),
         instance_id=instance_id,
         autonomy=_parse_autonomy(_table(data, "autonomy", "[autonomy]")),
+        supervisor=_parse_supervisor(_table(data, "supervisor", "[supervisor]")),
         base_dir=base_dir,
         source=source,
     )
     if config.autonomy.mode == "supervised":
         self_target = _table(data, "verification", "[verification]").get("self_repository")
         _check_supervised(config, self_target=self_target is True)
+    if config.supervisor.enabled and config.autonomy.mode not in SUPERVISOR_MODES:
+        raise ConfigError(
+            f"[supervisor] enabled = true is not available in mode {config.autonomy.mode!r}: "
+            "supervisor restarts need Mode 2 and its gate (ADR-0043)"
+        )
     return config
+
+
+_SUPERVISOR_FLOORS: dict[str, tuple[float, float]] = {
+    # key: (lowest allowed, highest allowed). The defaults are the loosest values.
+    "min_interval_seconds": (60.0, 86400.0),
+    "backoff_max_seconds": (60.0, 86400.0),
+    "cooldown_seconds": (60.0, 7 * 86400.0),
+    "per_hour": (1, 6),
+    "per_day": (1, 20),
+}
+
+
+def _parse_supervisor(raw: Mapping[str, Any]) -> Supervisor:
+    """ADR-0043 §2: every limit may only be stricter than its default."""
+    _reject_unknown(raw, {"enabled", *_SUPERVISOR_FLOORS}, "[supervisor]")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("[supervisor] enabled must be true or false")
+    defaults = Supervisor()
+    values: dict[str, float | int] = {}
+    for key, (low, high) in _SUPERVISOR_FLOORS.items():
+        value = raw.get(key, getattr(defaults, key))
+        integral = key.startswith("per_")
+        if isinstance(value, bool) or not isinstance(value, int if integral else (int, float)):
+            kind = "an integer" if integral else "a number of seconds"
+            raise ConfigError(f"[supervisor] {key} must be {kind}")
+        if not low <= value <= high or (isinstance(value, float) and not math.isfinite(value)):
+            raise ConfigError(
+                f"[supervisor] {key} must be between {low:g} and {high:g} "
+                "(only stricter than the default; ADR-0043)"
+            )
+        values[key] = value if integral else float(value)
+    if values["backoff_max_seconds"] < values["min_interval_seconds"]:
+        raise ConfigError("[supervisor] backoff_max_seconds must be at least min_interval_seconds")
+    if values["backoff_max_seconds"] < defaults.backoff_max_seconds:
+        # A shorter cap makes restarts faster: looser, not stricter.
+        raise ConfigError(
+            "[supervisor] backoff_max_seconds may not be below its default of "
+            f"{defaults.backoff_max_seconds:g} (only stricter; ADR-0043)"
+        )
+    if values["cooldown_seconds"] < max(values["backoff_max_seconds"], defaults.cooldown_seconds):
+        raise ConfigError(
+            "[supervisor] cooldown_seconds must be at least backoff_max_seconds and its "
+            f"default of {defaults.cooldown_seconds:g} (only stricter; ADR-0043)"
+        )
+    return Supervisor(enabled=enabled, **values)  # type: ignore[arg-type]
 
 
 def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:

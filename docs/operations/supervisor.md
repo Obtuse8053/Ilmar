@@ -74,34 +74,43 @@ in its own pull request after the maintainer approves this design.
 
 Restarts are bounded twice, and the two bounds are independent of each other.
 
+**Supervision is off by default** (ADR-0043 §3). Under systemd, `ilmar run
+--loop` exits 3 (never restarted) unless `[supervisor] enabled = true`. That
+setting is refused until a Mode 2 gate exists, so do not enable the unit yet.
+
 **1. systemd's own limits.** These are set in the unit:
-- `Restart=on-failure`, after a fixed `RestartSec=12min`;
+- `Restart=on-failure`, with a delay that grows from `RestartSec=2min` to
+  `RestartMaxDelaySec=2h` over `RestartSteps=6` (systemd 254 or later);
 - at most `StartLimitBurst=10` starts per day (`StartLimitIntervalSec=1d`);
 - exit 3 (configuration) and exit 78 (suspended) are never restarted
   (`RestartPreventExitStatus=3 78`), and a clean stop (exit 0) is never
   restarted either.
 
-The timing keeps systemd inside the start log's limits (below), so every
-restart systemd makes is one Ilmar accepts:
-- Even if every run failed at once, 12 minutes apart gives at most 5 starts
-  in any hour; the log allows 6, each at least 60 seconds apart.
-- systemd stops after 10 starts in a day; the log allows 20.
-
-The start log then only catches what the unit does not: manual starts, a
-changed unit, or a clock that jumped. The delay does not grow, on purpose:
-systemd's growing delays do not shrink back after a long healthy run, and a
-fixed schedule is one the tests can check. A test simulates this schedule
-against the start log.
+Each of systemd's delays is at least the start log's required gap for the
+same restart (below), so every restart systemd makes is one Ilmar accepts. A
+test simulates the schedule against the log.
+- **systemd's growing delay does not shrink after a long healthy run**, so it
+  can only be slower than the log, whose chain resets after a cooldown.
+- **The exact formula of systemd's growth was not verified** against its
+  source. Check it on your host before Gate 2:
+  `systemctl --user show -p RestartUSecNext ilmar`. If systemd is ever
+  faster, the log suspends: that is safe, but it needs you.
+- **With systemd older than 254**, delete `RestartSteps` and
+  `RestartMaxDelaySec`, and set `RestartSec=1h`. A shorter fixed delay
+  (ADR-0033's 12 minutes) is suspended at the sixth start of a chain.
 
 **2. Ilmar's own start log.** It works even if the unit is changed or
 replaced.
 - **What it records:** the first thing `ilmar run --loop` does, before
   reading the store or claiming ownership, is to append a record to
   `<state_dir>/coordinator/starts.log` and fsync it.
-- **The defaults:**
-  - at least 60 seconds between starts;
-  - at most 6 starts per hour;
-  - at most 20 starts per UTC day.
+- **The defaults** (`[supervisor]`, ADR-0043; each may only be made stricter):
+  - at least 60 seconds between starts (`min_interval_seconds`);
+  - within a chain of restarts, each less than 6 hours after the one before
+    (`cooldown_seconds`), a gap that doubles from 60 seconds up to one hour
+    (`backoff_max_seconds`);
+  - at most 6 starts per hour (`per_hour`);
+  - at most 20 starts per UTC day (`per_day`).
 - **On a breach:** Ilmar writes a `restart-loop` suspension and exits 78.
 - **Clock rule:** a record dated in the future counts as recent, so a clock
   that went backwards can only make the limits stricter.
@@ -113,6 +122,7 @@ replaced.
 ## Resuming after a restart loop
 
 `ilmar resume --as <you>` lifts a `restart-loop` suspension only when a start
-now would not breach the limits. If it would, wait for the window to pass.
+now would not breach the limits, backoff included. If it would, wait for the
+window or the backoff to pass.
 Resuming writes no start record. Fix the cause first: the service log
 (`journalctl --user -u ilmar`) shows why each start failed.

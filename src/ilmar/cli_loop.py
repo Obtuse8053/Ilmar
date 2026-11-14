@@ -25,10 +25,11 @@ Order, each step fail closed:
 from __future__ import annotations
 
 import hashlib
+import os
 import signal
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -92,7 +93,8 @@ def run(
     stop: threading.Event | None = None,
     builder: Callable[[IlmarConfig], Any] = build,
     boot_id: Callable[[], str] | None = None,
-    limits: StartLimits = StartLimits(),  # noqa: B008 - immutable defaults
+    limits: StartLimits | None = None,
+    environ: Mapping[str, str] | None = None,
     out: Any = None,
     err: Any = None,
 ) -> int:
@@ -115,11 +117,18 @@ def run(
     try:
         layout.coordinator_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         breach = account_start(
-            layout.coordinator_root, now=now(), boot_id=(boot_id or _boot_id)(), limits=limits
-        )
+            layout.coordinator_root, now=now(), boot_id=(boot_id or _boot_id)(),
+            limits=limits or start_limits(config),
+        )  # fmt: skip
     except (StartLogError, OSError) as exc:
         print(f"error: the start log is unusable; nothing started: {exc}", file=err)
         return int(ExitCode.SUSPENDED)
+    if under_systemd(os.environ if environ is None else environ) and not config.supervisor.enabled:
+        # ADR-0043 §3: supervision is off by default. The start is on record; a
+        # supervisor never restarts exit 3.
+        print("error: started by systemd, but [supervisor] enabled is not true: supervisor "
+              "restarts are off (ADR-0043); nothing started", file=err)  # fmt: skip
+        return int(ExitCode.CONFIGURATION)
     try:
         components = builder(config)
     except ConfigError as exc:
@@ -198,6 +207,22 @@ def _suspend_restart_loop(store: Any, ownership: Ownership, breach: str, at: dat
     except LedgerIntegrityError:
         if store.suspension() is None:
             raise
+
+
+def start_limits(config: IlmarConfig) -> StartLimits:
+    """The start log's limits, from ``[supervisor]`` (ADR-0043 §2)."""
+    policy = config.supervisor
+    return StartLimits(
+        min_interval_seconds=policy.min_interval_seconds, per_hour=policy.per_hour,
+        per_day=policy.per_day, backoff_max_seconds=policy.backoff_max_seconds,
+        cooldown_seconds=policy.cooldown_seconds,
+    )  # fmt: skip
+
+
+def under_systemd(environ: Mapping[str, str]) -> bool:
+    """Whether systemd started this process: it sets ``INVOCATION_ID`` for every
+    unit it runs. Another supervisor is not detected (ADR-0043, Consequences)."""
+    return bool(environ.get("INVOCATION_ID"))
 
 
 def _boot_id() -> str:

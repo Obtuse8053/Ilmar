@@ -8,6 +8,7 @@ comes with #91; these tests pin the log, the limits and the unit file.
 from __future__ import annotations
 
 import configparser
+import itertools
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -66,7 +67,9 @@ def test_a_fault_after_the_write_keeps_the_record(
 ) -> None:
     """A failure at any later step (here the compaction) leaves the record."""
     path = start_log_path(tmp_path)
-    record_start(path, StartRecord(at(-3 * 24 * 60), "old"))  # makes compaction run
+    old = [at(-3 * 24 * 60 - 60 * i) for i in range(12, 0, -1)]
+    for when in old:  # more than the chain's tail: makes compaction run
+        record_start(path, StartRecord(when, "old"))
 
     def fail(*_args: object) -> None:
         raise OSError("disk gone")
@@ -74,7 +77,7 @@ def test_a_fault_after_the_write_keeps_the_record(
     monkeypatch.setattr(os, "replace", fail)
     with pytest.raises(StartLogError):
         start(tmp_path, 0)
-    assert [r.at for r in read_starts(path)] == [at(-3 * 24 * 60), at(0)]
+    assert [r.at for r in read_starts(path)] == [*old, at(0)]
 
 
 @pytest.mark.parametrize(
@@ -245,24 +248,46 @@ def seconds(span: str) -> float:
     raise AssertionError(f"unexpected time span {span!r}")
 
 
+def systemd_delay(service: configparser.SectionProxy, restart: int) -> timedelta:
+    """systemd's delay before automatic restart number ``restart`` (1-based).
+
+    systemd 254 grows it from ``RestartSec`` to ``RestartMaxDelaySec`` over
+    ``RestartSteps`` (R31). The fastest reading is assumed: geometric
+    interpolation, the first restart at ``RestartSec``. Its counter never
+    shrinks after healthy running (R32), so any other reading is slower."""
+    first = seconds(service["RestartSec"])
+    if "RestartSteps" not in service:
+        return timedelta(seconds=first)
+    steps = int(service["RestartSteps"])
+    last = seconds(service["RestartMaxDelaySec"])
+    step = min(restart - 1, steps)
+    return timedelta(seconds=min(first * (last / first) ** (step / steps), last))
+
+
+def test_the_unit_backs_off_exponentially() -> None:
+    service = unit()["Service"]
+    delays = [systemd_delay(service, k).total_seconds() for k in range(1, 9)]
+    assert delays[0] == 120
+    assert all(b > a for a, b in itertools.pairwise(delays[:7]))
+    assert delays[-1] == 7200
+
+
 def test_every_restart_systemd_makes_is_one_the_start_log_accepts(tmp_path: Path) -> None:
-    """#117 review: the unit's own timing stays inside the start log's default
-    limits, so a permitted restart is never itself a restart loop.
+    """#117 review and ADR-0043 §4: the unit's own timing stays inside the start
+    log's default limits, backoff included, so a permitted restart is never
+    itself a restart loop.
 
     Worst case: every run fails the instant it starts, so systemd restarts it
-    after exactly ``RestartSec``, until ``StartLimitBurst`` starts in
-    ``StartLimitIntervalSec``. Each of those starts must be accepted. Delays
-    that do not grow keep this a fixed schedule we can check.
+    after exactly its delay for that restart, until ``StartLimitBurst`` starts
+    in ``StartLimitIntervalSec``. Each of those starts must be accepted.
     """
     parsed = unit()
     service, section = parsed["Service"], parsed["Unit"]
-    assert "RestartSteps" not in service
-    assert "RestartMaxDelaySec" not in service
-    delay = timedelta(seconds=seconds(service["RestartSec"]))
     burst = int(section["StartLimitBurst"])
     window = timedelta(seconds=seconds(section["StartLimitIntervalSec"]))
     limits = StartLimits()  # the defaults loop mode uses
-    assert delay.total_seconds() > limits.min_interval_seconds
+    for restart in range(1, burst + 1):
+        assert systemd_delay(service, restart) >= limits.required_gap(restart)
     for first in (T0, datetime(2026, 11, 12, 23, 30, tzinfo=UTC)):  # also across midnight
         root = tmp_path / first.strftime("%H%M")
         now = first
@@ -273,12 +298,119 @@ def test_every_restart_systemd_makes_is_one_the_start_log_accepts(tmp_path: Path
             starts.append(now)
             found = account_start(root, now=now, boot_id="boot-1", limits=limits)
             assert found is None, f"start {len(starts)} at {now}: {found}"
-            now += delay
+            now += systemd_delay(service, len(starts))
         assert len(starts) == burst
         assert burst <= limits.per_day
+
+
+def test_without_restart_steps_a_fixed_delay_must_be_the_backoff_cap(tmp_path: Path) -> None:
+    """ADR-0043 §4: on systemd older than 254, only a fixed ``RestartSec`` of at
+    least ``backoff_max_seconds`` (1 h) is never faster than the log. ADR-0033's
+    12 minutes is suspended at the sixth start of a chain: safe, but not slower."""
+    limits = StartLimits()
+    assert all(timedelta(hours=1) >= limits.required_gap(n) for n in range(1, 30))
+    root, now = tmp_path, T0
+    for number in range(1, 6):
+        assert account_start(root, now=now, boot_id="b", limits=limits) is None, number
+        now += timedelta(minutes=12)
+    found = account_start(root, now=now, boot_id="b", limits=limits)
+    assert found is not None
+    assert "backoff" in found
 
 
 def test_a_restart_inside_the_minimum_interval_would_be_refused(tmp_path: Path) -> None:
     """Why the old ``RestartSec=30s`` was wrong: the first restart breached."""
     assert start(tmp_path, 0, StartLimits()) is None
     assert start(tmp_path, 0.5, StartLimits()) is not None
+
+
+# -- backoff and cooldown (ADR-0043 §1) -----------------------------------------------
+
+WIDE = StartLimits(per_hour=6, per_day=20)  # the defaults
+
+
+def test_each_restart_of_a_chain_waits_twice_as_long(tmp_path: Path) -> None:
+    """Gaps of 1, 2, 4, 8, 16 and 32 minutes are just enough."""
+    minute = 0.0
+    assert start(tmp_path, minute, WIDE) is None
+    for gap in (1, 2, 4, 8, 16, 32):
+        minute += gap
+        assert start(tmp_path, minute, WIDE) is None, gap
+
+
+@pytest.mark.parametrize("earlier", [1, 2, 3, 4, 5, 6])
+def test_a_restart_one_second_early_is_a_loop(tmp_path: Path, earlier: int) -> None:
+    minute = 0.0
+    assert start(tmp_path, minute, WIDE) is None
+    for n in range(1, earlier):
+        minute += 2 ** (n - 1)
+        assert start(tmp_path, minute, WIDE) is None
+    found = start(tmp_path, minute + 2 ** (earlier - 1) - 1 / 60, WIDE)
+    assert found is not None
+    # The first restart's gap is the minimum interval, which reports itself.
+    expected = "within 60 seconds" if earlier == 1 else f"restart {earlier} of a chain"
+    assert expected in found
+
+
+def test_the_gap_is_capped_at_backoff_max() -> None:
+    assert WIDE.required_gap(7) == timedelta(hours=1)
+    assert WIDE.required_gap(500) == timedelta(hours=1)
+    assert WIDE.required_gap(0) == timedelta(0)
+    assert WIDE.chain_depth == 7
+
+
+def test_a_quiet_cooldown_resets_the_chain(tmp_path: Path) -> None:
+    """A run that stayed up longer than the cooldown restarts after a minute."""
+    minute = 0.0
+    for gap in (0, 1, 2, 4, 8):
+        minute += gap
+        assert start(tmp_path, minute, WIDE) is None
+    minute += 6 * 60  # six quiet hours
+    assert start(tmp_path, minute, WIDE) is None
+    assert start(tmp_path, minute + 1, WIDE) is None  # chain of one: one minute
+    found = start(tmp_path, minute + 2, WIDE)  # the next needs two
+    assert found is not None
+    assert "restart 2 of a chain" in found
+
+
+def test_a_chain_older_than_a_day_keeps_its_backoff(tmp_path: Path) -> None:
+    """Compaction keeps the chain's tail, so a long chain never forgets its depth."""
+    limits = StartLimits(per_day=20, cooldown_seconds=7 * 86400)
+    minute = 0.0
+    for _ in range(8):  # a full chain, one an hour, over the cap
+        assert start(tmp_path, minute, limits) is None
+        minute += 60
+    minute += 2 * 24 * 60  # beyond the daily window, inside the cooldown
+    assert start(tmp_path, minute, limits) is None
+    assert len(read_starts(start_log_path(tmp_path))) == limits.chain_depth + 1
+    found = start(tmp_path, minute + 59, limits)  # the cap still holds: one hour
+    assert found is not None
+    assert "backoff needs 3600" in found
+
+
+def test_a_future_dated_record_continues_the_chain(tmp_path: Path) -> None:
+    path = start_log_path(tmp_path)
+    record_start(path, StartRecord(at(600), "clock-ahead"))
+    found = start(tmp_path, 0, WIDE)
+    assert found is not None  # inside every window: stricter, never looser
+
+
+def test_resume_waits_for_the_backoff(tmp_path: Path) -> None:
+    for minute in (0, 1, 3):
+        assert start(tmp_path, minute, WIDE) is None
+    records = read_starts(start_log_path(tmp_path))
+    assert breach_if_started(records, now=at(6.9), limits=WIDE) is not None  # needs 4 min
+    assert breach_if_started(records, now=at(7), limits=WIDE) is None
+
+
+def test_a_supervisor_ignoring_its_delays_is_suspended(tmp_path: Path) -> None:
+    """Crash loop: restarts every 90 seconds, faster than the backoff allows."""
+    found = None
+    minute = 0.0
+    for _ in range(6):
+        found = start(tmp_path, minute, WIDE)
+        if found is not None:
+            break
+        minute += 1.5
+    assert found is not None
+    assert "backoff" in found

@@ -30,7 +30,7 @@ from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.layout import WorkspaceLayout
 from ilmar.core.loop import LoopFacts, loop_blocker, run_loop
 from ilmar.core.ownership import Ownership
-from ilmar.core.starts import StartLimits, start_log_path
+from ilmar.core.starts import StartLimits, read_starts, start_log_path
 from ilmar.domain.budget import Suspension, SuspensionReason
 from ilmar.domain.events import Actor, ActorKind, EventContext
 from ilmar.domain.gates import GateEvidence, GateRecord, GateRecorded, GateRevoked
@@ -219,7 +219,8 @@ ANY_RATE = StartLimits(min_interval_seconds=0)
 
 def loop(world: dict[str, Any], *, passes: int = 1, mode: str = "supervised",
          limits: StartLimits = ANY_RATE,
-         between: Callable[[Path], None] | None = None) -> tuple[int, str]:  # fmt: skip
+         between: Callable[[Path], None] | None = None,
+         environ: dict[str, str] | None = None) -> tuple[int, str]:  # fmt: skip
     """``between(config)`` runs right before the second check, after one pass."""
     stop = threading.Event()
     seen = [0]
@@ -239,7 +240,7 @@ def loop(world: dict[str, Any], *, passes: int = 1, mode: str = "supervised",
     try:
         code = cli_loop.run(config(world, mode), now=lambda: NOW, stop=stop,
                             builder=builder(world), boot_id=lambda: "boot-1", limits=limits,
-                            out=io.StringIO(), err=err)  # fmt: skip
+                            environ=environ or {}, out=io.StringIO(), err=err)  # fmt: skip
     finally:
         world["scm"].repository_id = real
     return code, err.getvalue()
@@ -404,3 +405,28 @@ def test_unreviewed_uncertain_spend_keeps_the_loop_stopped_whatever_the_suspensi
 def worked_beyond(world: dict[str, Any], *known: str) -> bool:
     return any(e.type.value == "execution.created" and e.execution not in known
                for e in world["store"].events())  # fmt: skip
+
+
+# -- supervision is off by default (ADR-0043 §3) --------------------------------------
+
+
+def test_under_systemd_the_loop_refuses_while_supervision_is_off(world: dict[str, Any]) -> None:
+    code, err = loop(world, environ={"INVOCATION_ID": "0123456789abcdef"})
+    assert code == 3  # never restarted by the unit
+    assert "[supervisor] enabled is not true" in err
+    assert not worked(world)
+    # The start is on record before the refusal: a supervisor that restarts
+    # exit 3 anyway is still bounded by the log.
+    records = read_starts(start_log_path(world["tmp"] / "state" / "coordinator"))
+    assert len(records) == 1
+
+
+def test_every_refused_start_is_still_counted(world: dict[str, Any]) -> None:
+    """A supervisor that restarts exit 3 anyway does no work, and every one of
+    its starts is on record for the start log's limits."""
+    for count in (1, 2, 3):
+        code, _ = loop(world, environ={"INVOCATION_ID": "x"})
+        assert code == 3
+        records = read_starts(start_log_path(world["tmp"] / "state" / "coordinator"))
+        assert len(records) == count
+    assert not worked(world)
