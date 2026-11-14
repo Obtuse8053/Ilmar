@@ -45,6 +45,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0038](0038-candidate-secret-scan.md) | Scan the candidate and outgoing text for the deployment's own secrets | Proposed |
 | [0039](0039-gateway-spend-settlement.md) | Settle each attempt's model spend from the gateway into the ledger | Proposed |
 | [0040](0040-gate-records.md) | Gate records bound to version-pinned evidence and an immutable target | Proposed |
+| [0042](0042-quarantine-resolution.md) | A person resolves a quarantined resource, and the row stays quarantined | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer
