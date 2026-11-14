@@ -125,3 +125,13 @@ timeout_seconds = 1200
 # While this file exists, Ilmar suspends with kill-switch (ADR-0029 §4). Keep it
 # outside the state directory's workspaces and repositories.
 # kill_switch_file = "/etc/ilmar/KILL"
+
+# ADR-0030 (#91): the operating mode. "manual" (the default) is `ilmar run
+# --once` only. "supervised" (Mode 1) is one of three opt-ins for the loop; it
+# also needs a gate record and the fail-closed start checks, and the loop is
+# not yet available. Mode 1 needs max_concurrent_executions = 1, a [budget]
+# with kill_switch_file, [verification], a pinned expected_version, and a
+# dedicated test repository: never Ilmar's own.
+# [autonomy]
+# mode = "manual"
+# poll_interval_seconds = 60
