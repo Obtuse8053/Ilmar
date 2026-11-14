@@ -48,3 +48,14 @@ def test_it_runs_the_compatibility_test_as_required_evidence() -> None:
     assert "ILMAR_LIVE_REQUIRED=1" in WORKFLOW  # a skip would be a failure
     assert "tests/integration/test_claude_code_gateway_compat.py" in WORKFLOW
     assert "grep -Eqx '[0-9]+\\.[0-9]+\\.[0-9]+'" in WORKFLOW
+
+
+def test_it_also_runs_the_sealed_settings_check_as_required_evidence() -> None:
+    """#93: the pinned Claude Code with sealed settings and an invalid key only."""
+    assert "tests/integration/test_claude_code_pinned.py" in WORKFLOW
+    step = WORKFLOW.split("Sealed settings with the pinned Claude Code", 1)[1].split("- name:", 1)[
+        0
+    ]
+    assert "ILMAR_LIVE_REQUIRED=1" in step  # a skip would be a failure
+    assert "ANTHROPIC_API_KEY" not in WORKFLOW
+    assert "steps.build.outcome == 'success'" in step

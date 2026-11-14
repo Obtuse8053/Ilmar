@@ -7,9 +7,16 @@ name: Gateway compatibility (manual, no secrets)
 # it. No secret, no environment and no real model call are involved, so this
 # needs no reviewer gate beyond being started by hand on main.
 #
-# The record (issue-111-gateway-compat.json) is kept as an artifact for the
-# maintainer to review. Nothing is posted and nothing is published. Unattended
-# operation stays disabled.
+# Then, in the same job and with the same image, the Gate 1 sealed-settings
+# check (#93, ADR-0036): tests/integration/test_claude_code_pinned.py. The
+# pinned Claude Code runs in a sealed, allow-listed sandbox whose only route is
+# the egress proxy to api.anthropic.com, with a deliberately invalid key, so
+# the provider refuses it. It is the one real call here, and it carries no
+# credential. A repository apiKeyHelper must never run.
+#
+# The records (issue-111-gateway-compat.json, issue-90-pinned-sealed-run.json)
+# are kept as artifacts for the maintainer to review. Nothing is posted and
+# nothing is published. Unattended operation stays disabled.
 
 on:
   workflow_dispatch:
@@ -49,6 +56,7 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Build the agent image at the pinned version (from the digest-pinned base)
+        id: build
         run: |
           podman version
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
@@ -60,14 +68,23 @@ jobs:
           export ILMAR_LIVE_REQUIRED=1
           export ILMAR_LIVE_REPORT_DIR="$RUNNER_TEMP/gateway-reports"
           pytest -m integration -v -rs tests/integration/test_claude_code_gateway_compat.py
+      - name: Sealed settings with the pinned Claude Code (Gate 1, invalid key only)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          podman rm --all --force --time 0 || true
+          export ILMAR_TEST_CLAUDE_IMAGE="localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION"
+          export ILMAR_TEST_PODMAN_PROXY_IMAGE=docker.io/library/python:3.12-alpine
+          export ILMAR_LIVE_REQUIRED=1
+          export ILMAR_LIVE_REPORT_DIR="$RUNNER_TEMP/gateway-reports"
+          pytest -m integration -v -rs tests/integration/test_claude_code_pinned.py
       - name: Remove every container
         if: always()
         run: podman rm --all --force --time 0 || true
-      - name: Keep the record (no credentials; the throwaway token is checked out of it)
+      - name: Keep the records (no credentials; the token and the invalid key are checked out)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gateway-compat-record
+          name: gateway-compat-records
           path: ${{ runner.temp }}/gateway-reports/*.json
           if-no-files-found: ignore
           retention-days: 30
