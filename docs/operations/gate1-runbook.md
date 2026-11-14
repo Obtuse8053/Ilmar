@@ -100,7 +100,14 @@ what establishes it.
        python3 scripts/gate1_repo_check.py --mirror /tmp/d.git \
          --repository Obtuse8053/ilmar-disposable --report gate1-repo-check.json
 
-   It must exit 0. Keep `gate1-repo-check.json` for the evidence.
+   It must exit 0 and report `"passed": true`. There is no option to skip a
+   check, and any missing or malformed GitHub answer fails it. It also proves
+   the mirror is of this repository as it is now, so make a **fresh** mirror
+   each time. Keep `gate1-repo-check.json` for the evidence.
+
+   **It cannot prove the repository holds no secrets.** It finds only the
+   credential shapes it knows, and it does not read issue or PR comments.
+   Review the repository yourself as well, and say so in the evidence.
 
 5. **Trusted tasks.** Create them as issues, then add `ilmar:ready` only when
    the trial starts:
