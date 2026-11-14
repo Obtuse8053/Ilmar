@@ -539,6 +539,10 @@ class _Handler(BaseHTTPRequestHandler):
         payload = json.dumps(
             {"type": "error", "error": {"type": kind, "message": message}}
         ).encode()
+        # Why, in this gateway's own words (field and feature names, no values),
+        # so a compatibility gap can be found from the log alone. Logged before
+        # the answer is sent, so the record never lags what the client saw.
+        self._finish(status, 0, len(payload), refused=kind, why=_REASON.sub("_", message)[:100])
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
@@ -546,9 +550,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
         self.close_connection = True
-        # Why, in this gateway's own words (field and feature names, no values),
-        # so a compatibility gap can be found from the log alone.
-        self._finish(status, 0, len(payload), refused=kind, why=_REASON.sub("_", message)[:100])
 
     def _finish(
         self,
