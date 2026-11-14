@@ -11,7 +11,8 @@ Building has two phases:
    between ports. It reads no environment variable, touches no file and
    starts nothing. ``ilmar config validate`` runs this phase.
 2. :func:`build` runs :func:`plan`, then creates the adapters in port order.
-   Secrets are read from the environment only now. If any step fails,
+   Secrets are read only now, from the environment or from systemd
+   credentials (``[secrets] source``, never both). If any step fails,
    everything already created is closed, in reverse order, before the error
    propagates, and the error text never contains a secret.
 
@@ -30,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ilmar.adapters.credentials import read_credentials
 from ilmar.adapters.options import Options, Secrets
 from ilmar.config import PORT_NAMES, IlmarConfig
 from ilmar.core.components import AgentSandbox, Components, Target, close_all
@@ -237,6 +239,17 @@ def store_writer(
     return context.layout, lambda: store_plan.create(Secrets({}))
 
 
+def secret_values(
+    config: IlmarConfig, blueprint: Blueprint, environ: Mapping[str, str]
+) -> Mapping[str, str]:
+    """Where the adapters' secrets come from (``[secrets] source``). From systemd
+    credentials, every named secret is read now, and the environment is never
+    consulted for any of them."""
+    if config.credentials_from == "systemd-credentials":
+        return read_credentials(blueprint.environment, environ=environ)
+    return environ
+
+
 def build(
     config: IlmarConfig,
     *,
@@ -245,7 +258,7 @@ def build(
 ) -> Components:
     """Create every configured adapter. The caller owns the result and must close it."""
     blueprint = plan(config, registry=registry)
-    environment = os.environ if environ is None else environ
+    environment = secret_values(config, blueprint, os.environ if environ is None else environ)
     _check_sandbox_secrets_by_value(blueprint.plans, environment)
     scanner = _secret_scanner(blueprint.plans, environment)
     secrets = Secrets(environment)

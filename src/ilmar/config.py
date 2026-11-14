@@ -144,6 +144,10 @@ class IlmarConfig:
     instance_id: str = DEFAULT_INSTANCE_ID
     autonomy: Autonomy = Autonomy()
     """Without ``[autonomy]``: manual operation."""
+    credentials_from: str = "environment"
+    """``[secrets] source``: where the secrets the adapters name are read from.
+    ``environment`` (the default) or ``systemd-credentials`` (the unit's
+    ``$CREDENTIALS_DIRECTORY``, by the same names; no fallback)."""
     base_dir: Path | None = None
     """The directory relative option paths resolve against (the file's directory)."""
     source: Path | None = None
@@ -167,7 +171,9 @@ def parse_config(
 ) -> IlmarConfig:
     """Validate already-parsed configuration data."""
     _reject_unknown(
-        data, {"ilmar", "limits", "adapters", "verification", "budget", "autonomy"}, "top level"
+        data,
+        {"ilmar", "limits", "adapters", "verification", "budget", "autonomy", "secrets"},
+        "top level",
     )
 
     general = _table(data, "ilmar", "[ilmar]")
@@ -200,6 +206,7 @@ def parse_config(
         ),
         instance_id=instance_id,
         autonomy=_parse_autonomy(_table(data, "autonomy", "[autonomy]")),
+        credentials_from=_parse_secrets(_table(data, "secrets", "[secrets]")),
         base_dir=base_dir,
         source=source,
     )
@@ -207,6 +214,17 @@ def parse_config(
         self_target = _table(data, "verification", "[verification]").get("self_repository")
         _check_supervised(config, self_target=self_target is True)
     return config
+
+
+SECRET_SOURCES = ("environment", "systemd-credentials")
+
+
+def _parse_secrets(raw: Mapping[str, Any]) -> str:
+    _reject_unknown(raw, {"source"}, "[secrets]")
+    source = raw.get("source", "environment")
+    if source not in SECRET_SOURCES:
+        raise ConfigError(f"[secrets] source must be one of {', '.join(SECRET_SOURCES)}")
+    return str(source)
 
 
 def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:
