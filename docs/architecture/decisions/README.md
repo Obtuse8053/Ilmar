@@ -38,8 +38,10 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0029](0029-supervised-mode-limits-and-budget.md) | Mode 1 limits, accounting reservations, suspension and one credential path | Accepted |
 | [0030](0030-operating-modes-and-gates.md) | Operating modes, gate records and the supervised loop | Accepted |
 | [0031](0031-protected-safety-controls.md) | Candidates that touch safety controls are never pushed; candidate code never runs with secrets | Accepted |
+| [0033](0033-supervisor-and-restart-accounting.md) | A systemd supervisor with durable restart accounting | Proposed |
 | [0035](0035-agent-progress-and-stall-detection.md) | Agent progress from stream events, and stall detection | Accepted |
 | [0036](0036-sealed-agent-settings.md) | Seal the agent's own settings at the sandbox boundary | Proposed |
+| [0037](0037-sidecar-model-gateway.md) | A model gateway sidecar, with estimated per-request reservations and halts | Proposed |
 | [0038](0038-candidate-secret-scan.md) | Scan the candidate and outgoing text for the deployment's own secrets | Proposed |
 | [0039](0039-gateway-spend-settlement.md) | Settle each attempt's model spend from the gateway into the ledger | Proposed |
 
