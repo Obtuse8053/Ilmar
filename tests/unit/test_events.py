@@ -307,6 +307,16 @@ def test_the_reason_codes_are_the_adr_table_and_the_deliberate_additions() -> No
         assert re.fullmatch(r"[a-z]+(-[a-z]+)*", code), code
 
 
+def test_every_reason_description_is_one_sentence_run() -> None:
+    """Regression: an edit once left a stale clause concatenated onto a
+    description. Each one ends with a full stop, and no full stop is followed
+    directly by more text."""
+    for code, text in ev.REASON_CODES.items():
+        assert text.endswith("."), code
+        assert not re.search(r"\.[A-Za-z]", text), (code, text)
+        assert "  " not in text, code
+
+
 def test_every_never_transient_error_has_its_own_code() -> None:
     from ilmar.core.effects import NEVER_TRANSIENT
 
