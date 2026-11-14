@@ -108,6 +108,27 @@ class Budget:
 
 
 @dataclass(frozen=True, slots=True)
+class Autonomy:
+    """``[autonomy]`` (ADR-0030): which operating mode this deployment asks for.
+
+    ``manual`` (the default) is ``ilmar run --once`` only. ``supervised`` is
+    Mode 1. Asking for it is one of three opt-ins: the loop (#91) also needs an
+    unrevoked gate record and the fail-closed start checks, and stays disabled
+    until all hold. ``autonomous`` and ``self-hosting`` are refused here.
+    """
+
+    mode: str = "manual"
+    poll_interval_seconds: float = 60.0
+    """ADR-0030 §3: how long the loop waits between passes."""
+
+
+MODES = ("manual", "supervised")
+LATER_MODES = ("autonomous", "self-hosting")
+ILMAR_REPOSITORY = "obtuse8053/ilmar"
+"""Ilmar's own repository: never a Mode 1 target (ADR-0030 §5)."""
+
+
+@dataclass(frozen=True, slots=True)
 class IlmarConfig:
     state_dir: Path
     limits: Limits
@@ -117,6 +138,8 @@ class IlmarConfig:
     budget: Budget | None = None
     """``None`` without ``[budget]``: no reservations (manual operation only)."""
     instance_id: str = DEFAULT_INSTANCE_ID
+    autonomy: Autonomy = Autonomy()
+    """Without ``[autonomy]``: manual operation."""
     base_dir: Path | None = None
     """The directory relative option paths resolve against (the file's directory)."""
     source: Path | None = None
@@ -139,7 +162,9 @@ def parse_config(
     data: Mapping[str, Any], *, base_dir: Path, source: Path | None = None
 ) -> IlmarConfig:
     """Validate already-parsed configuration data."""
-    _reject_unknown(data, {"ilmar", "limits", "adapters", "verification", "budget"}, "top level")
+    _reject_unknown(
+        data, {"ilmar", "limits", "adapters", "verification", "budget", "autonomy"}, "top level"
+    )
 
     general = _table(data, "ilmar", "[ilmar]")
     _reject_unknown(general, {"state_dir", "instance_id"}, "[ilmar]")
@@ -153,7 +178,7 @@ def parse_config(
     if not state_dir.is_absolute():
         state_dir = base_dir / state_dir
 
-    return IlmarConfig(
+    config = IlmarConfig(
         state_dir=state_dir,
         limits=_parse_limits(_table(data, "limits", "[limits]")),
         adapters=_parse_adapters(_table(data, "adapters", "[adapters]")),
@@ -170,9 +195,60 @@ def parse_config(
             else None
         ),
         instance_id=instance_id,
+        autonomy=_parse_autonomy(_table(data, "autonomy", "[autonomy]")),
         base_dir=base_dir,
         source=source,
     )
+    if config.autonomy.mode == "supervised":
+        self_target = _table(data, "verification", "[verification]").get("self_repository")
+        _check_supervised(config, self_target=self_target is True)
+    return config
+
+
+def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:
+    _reject_unknown(raw, {"mode", "poll_interval_seconds"}, "[autonomy]")
+    mode = raw.get("mode", "manual")
+    if mode in LATER_MODES:
+        raise ConfigError(
+            f"[autonomy] mode {mode!r} is not available: it needs a later gate (ADR-0030)"
+        )
+    if mode not in MODES:
+        raise ConfigError(f"[autonomy] mode must be one of {', '.join(MODES)}")
+    interval = raw.get("poll_interval_seconds", 60.0)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, int | float)
+        or not math.isfinite(interval)
+        or not 1 <= interval <= 86_400
+    ):
+        raise ConfigError("[autonomy] poll_interval_seconds must be between 1 and 86400")
+    return Autonomy(mode=mode, poll_interval_seconds=float(interval))
+
+
+def _check_supervised(config: IlmarConfig, *, self_target: bool) -> None:
+    """Mode 1's own rules, refused here so they never reach a running loop."""
+    where = '[autonomy] mode = "supervised"'
+    if config.limits.max_concurrent_executions != 1:
+        raise ConfigError(f"{where} needs [limits] max_concurrent_executions = 1 (ADR-0029)")
+    if config.budget is None or config.budget.kill_switch_file is None:
+        raise ConfigError(f"{where} needs a [budget] with kill_switch_file (ADR-0029 §6)")
+    if config.verification is None:
+        raise ConfigError(f"{where} needs [verification]: nothing unverified is published")
+    runner = config.adapters.get("agent_runner")
+    version = runner.options.get("expected_version") if runner is not None else None
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ConfigError(
+            f"{where} needs [adapters.agent_runner] expected_version as an exact x.y.z "
+            "(ADR-0035): the gate evidence is for one pinned version"
+        )
+    repositories = {
+        str(adapter.options.get("repository", "")).lower() for adapter in config.adapters.values()
+    }
+    if self_target or ILMAR_REPOSITORY in repositories:
+        raise ConfigError(
+            f"{where} refuses Ilmar's own repository as the target (ADR-0030 §5): "
+            "Mode 1 uses a dedicated test repository"
+        )
 
 
 _BUDGET_KEYS = (
