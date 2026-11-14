@@ -509,3 +509,13 @@ def test_the_policy_comes_from_json() -> None:
     with pytest.raises(ValueError, match="threshold"):
         ModelPrice(input=1, output=1, cache_write_5m=1, cache_write_1h=1, cache_read=1,
                    long_context_threshold=5)  # fmt: skip
+
+
+def test_halt_stops_the_attempt_without_a_charge() -> None:
+    budget = Budget(limit=50 * DOLLAR, policy=POLICY)
+    budget.halt("provider status 500")
+    assert (budget.halted, budget.halt_reason, budget.spent()) == (True, "provider status 500", 0)
+    with pytest.raises(RequestRefused, match="provider status 500"):
+        budget.admit(body(max_tokens=2_000))
+    budget.halt("later")  # the first reason stays
+    assert budget.halt_reason == "provider status 500"

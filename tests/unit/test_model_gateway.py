@@ -580,3 +580,58 @@ def test_a_malformed_or_truncated_stream_halts(payload: bytes) -> None:
         assert "halted=true" in line
         assert running.post()[0] == 429
         assert len(provider.seen) == 1
+
+
+# -- counting requests: never charged, but a provider failure halts (#124 review) ------
+
+COUNT = json.dumps({"model": MODEL, "messages": [USER]}).encode()
+
+
+def halts(log: io.StringIO) -> list[str]:
+    return [line for line in log.getvalue().splitlines() if line.startswith("HALT ")]
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, 503, 529, 201])
+def test_a_failed_counting_request_halts_without_a_charge(status: int) -> None:
+    provider = Provider(payload=b'{"type": "error"}', status=status)
+    for running in start(provider):
+        assert running.post("/v1/messages/count_tokens", body=COUNT)[0] == status
+        assert charges(running.log) == []
+        assert running.gateway.budget.spent() == 0  # nothing charged
+        (line,) = halts(running.log)
+        assert f"reason=provider_status_{status}" in line
+        assert running.gateway.budget.halted
+        for path, body in (("/v1/messages", BODY), ("/v1/messages/count_tokens", COUNT)):
+            code, _, data = running.post(path, body=body)
+            assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == 1  # nothing more reached the provider
+
+
+def test_an_unreachable_provider_on_counting_halts_without_a_charge() -> None:
+    config = mg.GatewayConfig(
+        token_sha256=hashlib.sha256(TOKEN.encode()).hexdigest(), key=KEY,
+        upstream=mg.Upstream("http", "127.0.0.1", 9), clients=LOOPBACK,
+        policy=POLICY, budget=BUDGET,
+    )  # fmt: skip
+    log = io.StringIO()
+    gateway = mg.Gateway(("127.0.0.1", 0), config, log=log)
+    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+    try:
+        client = Running(gateway, Provider(), log)
+        assert client.post("/v1/messages/count_tokens", body=COUNT)[0] == 502
+        assert charges(log) == []
+        assert gateway.budget.spent() == 0
+        assert "reason=provider_unreachable" in halts(log)[0]
+        code, _, data = client.post()
+        assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+    finally:
+        gateway.shutdown()
+
+
+def test_a_good_counting_request_neither_charges_nor_halts(running: Running) -> None:
+    running.provider.payload = b'{"input_tokens": 12}'
+    assert running.post("/v1/messages/count_tokens", body=COUNT)[0] == 200
+    assert (charges(running.log), halts(running.log)) == ([], [])
+    assert not running.gateway.budget.halted
+    running.provider.payload = GOOD
+    assert running.post()[0] == 200

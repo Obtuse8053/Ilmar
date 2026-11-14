@@ -370,6 +370,14 @@ class Budget:
         with self._lock:
             self.in_flight.pop(ticket)
 
+    def halt(self, reason: str) -> None:
+        """Stop the attempt without a charge: for a request that is not billed
+        (counting tokens) whose provider failed or could not be reached. What
+        made it fail may affect billed requests too, so nothing more goes."""
+        with self._lock:
+            if not self.halted:
+                self.halted, self.halt_reason = True, reason
+
     def spent(self) -> int:
         with self._lock:
             return self.settled + sum(self.in_flight.values())

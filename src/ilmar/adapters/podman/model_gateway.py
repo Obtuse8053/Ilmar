@@ -335,7 +335,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self.close_connection = True  # the client sees a cut-off stream
                 meter.reject("stream cut off")
             meter.finish()
-            self._settle(ticket, admitted, meter, None)
+            counting_failed = ticket is None and response.status != 200
+            failure = f"provider status {response.status}" if counting_failed else None
+            self._settle(ticket, admitted, meter, failure)
             self._finish(response.status, len(body), sent, dropped=admitted.dropped,
                          capped=admitted.capped_from)  # fmt: skip
         finally:
@@ -345,10 +347,15 @@ class _Handler(BaseHTTPRequestHandler):
     def _settle(
         self, ticket: int | None, admitted: ga.Admitted, meter: ga.UsageMeter, failure: str | None
     ) -> None:
-        """Charge a metered request and log it. Counting requests are not billed."""
-        if ticket is None:
-            return
+        """Charge a metered request and log it. A counting request is not billed;
+        its provider failing, or being unreachable, still halts the attempt."""
         gateway = self.owner
+        if ticket is None:
+            if failure is not None:
+                gateway.budget.halt(failure)
+                reason = _REASON.sub("_", failure)[:80]
+                gateway.log(f"HALT counting reason={reason} charged=0 halted=true")
+            return
         admission = gateway.admission
         reservation = admitted.reservation
         if failure is not None:
