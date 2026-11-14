@@ -2,8 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-11-14
-- Sources: ADR-0028, ADR-0030, ADR-0033; systemd 254 release notes (NEWS);
-  GNU Taler design document 102 (systemd restart policy) · Findings: none new
+- Sources: [R31], [R32]; ADR-0028, ADR-0030, ADR-0033 · Findings: none new
 - Amends ADR-0033 (Proposed) by addition: §1's fixed `RestartSec` and §3's
   fixed limits. No accepted text is edited.
 - Asked for by the maintainer, 2026-11-14 (#95): "configurable restart
@@ -110,10 +109,10 @@ default needs a new ADR, not a setting.
 - **If the two disagree, the log wins.** A supervisor restarting faster
   than the log allows is suspended. It is never obeyed.
 - **What is and is not verified.** systemd 254 added `RestartSteps=` and
-  `RestartMaxDelaySec=` for exponentially growing restart delays [systemd
-  254 NEWS]. Its delay grows with the number of automatic restarts and does
-  not shrink after healthy running [GNU Taler DD 102]. Ilmar's chain resets
-  after the cooldown, so systemd's delay can only be longer. The unit test
+  `RestartMaxDelaySec=` for exponentially growing restart delays [R31].
+  Its delay grows with the number of automatic restarts and does not
+  shrink after healthy running [R32]. Ilmar's chain resets after the
+  cooldown, so systemd's delay can only be longer. The unit test
   assumes systemd interpolates geometrically from `RestartSec=` to
   `RestartMaxDelaySec=` over `RestartSteps=`. That exact formula has not
   been checked against systemd's source in this decision. Before Gate 2,
