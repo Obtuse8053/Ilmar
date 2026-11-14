@@ -103,9 +103,11 @@ default needs a new ADR, not a setting.
   of its delays is at least the log's required gap for the same restart,
   and an exit-to-start delay is never longer than the start-to-start gap
   the log measures. A unit test simulates the schedule against the log.
-- **Older systemd** keeps ADR-0033's fixed `RestartSec=12min`, which is
-  slower still. `RestartPreventExitStatus=3 78` and `StartLimitBurst=10` per
-  day are unchanged.
+- **Older systemd** (no `RestartSteps=`) needs a fixed `RestartSec=1h`, the
+  backoff cap. ADR-0033's 12 minutes is *not* slower than the log: the sixth
+  start of a chain needs 16 minutes, so it would be suspended. That is safe,
+  but it is not a schedule to rely on. `RestartPreventExitStatus=3 78` and
+  `StartLimitBurst=10` per day are unchanged.
 - **If the two disagree, the log wins.** A supervisor restarting faster
   than the log allows is suspended. It is never obeyed.
 - **What is and is not verified.** systemd 254 added `RestartSteps=` and
