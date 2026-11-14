@@ -122,17 +122,19 @@ what establishes it.
    `claude_version = 2.1.318`. Download `gateway-compat-records`. Review
    `issue-90-pinned-sealed-run.json`: the outcome is `provider-refused` and no
    repository `apiKeyHelper` ran.
-2. **Recorded stream fixture (you, the step 1 key):**
-
-       python3 scripts/live_run.py
-
-   It asks for the GitHub token and the key with hidden input. It runs the
-   pinned smoke test, then the live end-to-end tests, and writes
+2. **The passed live run and the recorded stream fixture (you, the step 1
+   key).** `ilmar gate record --live-test` takes a GitHub Actions run URL, so
+   use the *Live tests (manual)* workflow (`live.yml`) on `main`, with
+   `claude_version = 2.1.318`. Its one-time setup (the protected `live`
+   environment, its two secrets and a required reviewer) is in
+   `docs/operations/live-testing.md`. The run's artifacts include
    `issue-13-stream-event-types.json` (`provenance: recorded`,
-   `claude_code_version: 2.1.318`) to the report directory it prints. Review it.
-   Then add it in a PR as
+   `claude_code_version: 2.1.318`). Review it. Then add it in a PR as
    `tests/fixtures/claude_code_streams/2.1.318-recorded.json`, and merge it
-   after CI passes.
+   after CI passes. Keep the run's URL for step 9.
+
+   `python3 scripts/live_run.py` runs the same tests on your own machine, but
+   it gives no Actions run URL to record.
 3. **SIGKILL test (#90):** already passed in CI on real Podman (see #93).
    Review it.
 
