@@ -678,6 +678,8 @@ class FakeSourceControl:
 
     def __init__(self, *, name: str = "fake") -> None:
         self._name = name
+        self.repository_ids: dict[str, int] | Exception = {}
+        """``repository_id`` by slug; an exception is raised instead."""
         self._revisions: dict[str, Tree] = {}
         self._parents: dict[str, str | None] = {}
         self._frozen: set[str] = set()  # like refs/ilmar/candidates/* in the real adapter
@@ -730,6 +732,14 @@ class FakeSourceControl:
         return record.title, record.description
 
     # -- SourceControlProvider -------------------------------------------
+
+    def repository_id(self, repository: RepositoryRef) -> int:
+        if isinstance(self.repository_ids, Exception):
+            raise self.repository_ids
+        found = self.repository_ids.get(repository.slug)
+        if found is None:
+            raise ProviderError(f"unknown repository: {repository.slug}")
+        return found
 
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         return self._branches.get((repository, branch))

@@ -510,3 +510,20 @@ def test_a_failure_still_wins_over_an_incomplete_result_set(world: World) -> Non
     world.api.reported_totals[("check_runs", sha)] = 500
     summary = world.provider.checks(world.provider.upsert_change_request(spec()))
     assert summary.state is CheckState.FAILED
+
+
+# -- the repository's immutable ID (ADR-0040) ------------------------------------------
+
+
+def test_the_repository_id_is_read_live(world: World) -> None:
+    repository = RepositoryRef("github", "owner/repo")
+    assert world.provider.repository_id(repository) == 987654321
+    world.api.repository_id = 111  # a fork or a re-created repository answers another
+    assert world.provider.repository_id(repository) == 111
+
+
+@pytest.mark.parametrize("value", [None, "987654321", 0, True])
+def test_a_missing_or_malformed_repository_id_is_an_error(world: World, value: object) -> None:
+    world.api.repository_id = value
+    with pytest.raises(ProviderError, match="no repository ID"):
+        world.provider.repository_id(RepositoryRef("github", "owner/repo"))

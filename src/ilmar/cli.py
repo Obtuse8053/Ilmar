@@ -10,20 +10,26 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ilmar import __version__, cli_blocked, cli_cancel, cli_events, cli_gate, cli_suspend
+from ilmar import (
+    __version__,
+    cli_blocked,
+    cli_cancel,
+    cli_events,
+    cli_gate,
+    cli_loop,
+    cli_suspend,
+)
 from ilmar.adapters.registry import build, plan
+from ilmar.cli_loop import make_coordinator
 from ilmar.config import load_config
-from ilmar.core import kill_switch
-from ilmar.core.coordinator import Coordinator, ExitCode
+from ilmar.core.coordinator import ExitCode
 from ilmar.core.ownership import Ownership
-from ilmar.core.safe_fs import ensure_directory, require_canonical_root
-from ilmar.core.state_machine import RetryBackoff
 from ilmar.domain.errors import ConfigError, FencingError, OwnershipConflictError
 
-UNATTENDED_DISABLED = (
-    "unattended operation is disabled: only `ilmar run --once` is available, run by a "
-    "person who watches it. It stays disabled until the real Claude Code smoke test "
-    "(issue 44) has passed and unattended operation (issue 20) is designed and approved."
+RUN_MODE_REQUIRED = (
+    "choose `ilmar run --once` (one pass, run by a person who watches it) or "
+    '`ilmar run --loop` (Mode 1: needs [autonomy] mode = "supervised" and an active '
+    "gate record, ADR-0030)"
 )
 
 
@@ -50,8 +56,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "config":
         return _config_validate(Path(args.path), check_environment=args.check_environment)
     if args.command == "run":
+        if args.loop:
+            return cli_loop.run(Path(args.config))
         if not args.once:
-            print(f"error: {UNATTENDED_DISABLED}", file=sys.stderr)
+            print(f"error: {RUN_MODE_REQUIRED}", file=sys.stderr)
             return int(ExitCode.CONFIGURATION)
         return _run_once(Path(args.config))
     parser.print_help()
@@ -69,10 +77,12 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path", nargs="?", default="ilmar.toml")
 
     run = commands.add_parser("run", help="process work (needs the instance lock)")
-    run.add_argument(
-        "--once",
+    how = run.add_mutually_exclusive_group()
+    how.add_argument("--once", action="store_true", help="one pass, then exit")
+    how.add_argument(
+        "--loop",
         action="store_true",
-        help="one pass, then exit (required: unattended operation is disabled)",
+        help="passes until stopped, suspended or refused (Mode 1 only; ADR-0030)",
     )
     run.add_argument(
         "--config",
@@ -148,28 +158,7 @@ def _run_once(path: Path) -> int:
             return int(ExitCode.CONFIGURATION)
         with ownership:
             try:
-                ensure_directory(
-                    components.layout.workspaces_root,
-                    root=components.layout.coordinator_root.parent,
-                )
-                require_canonical_root(components.layout.workspaces_root)
-                coordinator = Coordinator.create(
-                    components,
-                    ownership,
-                    max_attempts=config.limits.max_attempts,
-                    agent_timeout_seconds=config.limits.agent_timeout_seconds,
-                    retry_backoff=RetryBackoff(
-                        config.limits.retry_backoff_base_seconds,
-                        config.limits.retry_backoff_max_seconds,
-                    ),
-                    stall_timeout_seconds=config.limits.stall_timeout_seconds,
-                    execution_wall_seconds=config.limits.execution_wall_seconds,
-                    budget=config.budget.limits if config.budget else None,
-                    kill_switch=kill_switch.checker(
-                        config.budget.kill_switch_file if config.budget else None
-                    ),
-                    clock=_now,
-                )
+                coordinator = make_coordinator(config, components, ownership, _now)
                 report = coordinator.run_once()
             except FencingError as exc:
                 print(f"error: ownership lost: {exc}", file=sys.stderr)

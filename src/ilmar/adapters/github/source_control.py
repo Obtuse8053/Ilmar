@@ -101,6 +101,13 @@ class GitHubSourceControl:
     def name(self) -> str:
         return self._name
 
+    def repository_id(self, repository: RepositoryRef) -> int:
+        found = self._client.request("GET", f"/repos/{self._slug(repository)}")
+        value = found.get("id")
+        if type(value) is not int or value < 1:
+            raise ProviderError(f"{repository.slug} has no repository ID")
+        return value
+
     # -- git side ------------------------------------------------------------
 
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
