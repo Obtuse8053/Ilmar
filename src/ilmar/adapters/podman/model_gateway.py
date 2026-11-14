@@ -313,6 +313,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # reservation is charged and the attempt halts.
                 self._settle(ticket, admitted, meter, "provider unreachable")
                 return self._refuse(502, "api_error", "the provider could not be reached")
+            if response.status != 200:
+                # Any other status, whatever its body says, is not a billing report
+                # the gateway trusts: the whole reservation, and the attempt halts.
+                meter.reject(f"provider status {response.status}")
             self.send_response(response.status)
             for name, value in response.getheaders():
                 lower = name.lower()
@@ -329,6 +333,7 @@ class _Handler(BaseHTTPRequestHandler):
                     sent += len(chunk)
             except (OSError, http.client.HTTPException):
                 self.close_connection = True  # the client sees a cut-off stream
+                meter.reject("stream cut off")
             meter.finish()
             self._settle(ticket, admitted, meter, None)
             self._finish(response.status, len(body), sent, dropped=admitted.dropped,

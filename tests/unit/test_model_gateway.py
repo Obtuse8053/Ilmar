@@ -40,7 +40,10 @@ BODY = json.dumps(
 
 
 def sse(*events: dict[str, object]) -> bytes:
-    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+    return b"".join(
+        b"event: " + str(e.get("type")).encode() + b"\ndata: " + json.dumps(e).encode() + b"\n\n"
+        for e in events
+    )
 
 
 GOOD = sse(
@@ -524,3 +527,56 @@ def test_the_charge_log_holds_no_body_or_provider_text() -> None:
         assert "secret-prompt" not in running.log.getvalue()
         reason = line.split("reason=")[1].split(" ")[0]
         assert re.fullmatch(r"[A-Za-z0-9.:_-]+", reason)
+
+
+PLAIN_GOOD = json.dumps({"type": "message", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "OK"}],
+                         "usage": {"input_tokens": 12, "output_tokens": 3}}).encode()  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        (GOOD, 500),  # a well-formed report under an error status
+        (GOOD, 529),
+        (GOOD, 201),  # any status but 200
+        (PLAIN_GOOD, 400),
+        (b"<html>bad gateway</html>", 502),
+        (b"", 503),
+        (b"not json at all", 429),
+    ],
+)
+def test_every_non_200_response_halts_whatever_its_body(payload: bytes, status: int) -> None:
+    provider = Provider(payload=payload, status=status)
+    for running in start(provider):
+        assert running.post()[0] == status
+        (line,) = charges(running.log)
+        reservation = line.split("reservation=")[1].split(" ")[0]
+        assert f"charged={reservation} " in line  # the whole reservation is kept
+        assert f"reason=provider_status_{status}" in line
+        assert "halted=true" in line
+        for _ in range(2):
+            code, _, data = running.post()
+            assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == 1  # nothing more reached the provider
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        GOOD.replace(b"event: message_stop", b"event: message_stop\n\nevent: billing")[:-2],
+        GOOD + b'event: message_billing_notice\ndata: {"type": "message_billing_notice"}\n\n',
+        GOOD[:-1],  # the final blank line is missing
+        GOOD + b"data: {trunc",
+    ],
+)
+def test_a_malformed_or_truncated_stream_halts(payload: bytes) -> None:
+    provider = Provider(payload=payload)
+    for running in start(provider):
+        assert running.post()[0] == 200
+        (line,) = charges(running.log)
+        reservation = line.split("reservation=")[1].split(" ")[0]
+        assert f"charged={reservation} " in line
+        assert "halted=true" in line
+        assert running.post()[0] == 429
+        assert len(provider.seen) == 1

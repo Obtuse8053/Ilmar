@@ -137,6 +137,14 @@ TOOL_CHANGE_BLOCK_KEYS = frozenset({"type", "tool", "cache_control"})
 TEXT_BLOCK_KEYS = frozenset({"type", "text", "cache_control"})
 CACHE_TTLS = frozenset({"5m", "1h"})
 RESPONSE_BLOCKS = frozenset({"text", "thinking", "redacted_thinking", "tool_use"})
+STREAM_EVENTS = frozenset(
+    {
+        "message_start", "message_delta", "message_stop", "content_block_start",
+        "content_block_delta", "content_block_stop", "ping", "error",
+    }
+)  # fmt: skip
+"""Stream events the meter understands; any other fails the report closed."""
+DELTA_TYPES = frozenset({"text_delta", "input_json_delta", "thinking_delta", "signature_delta"})
 """Response content the meter understands; any other (a server tool's) halts."""
 USAGE_KEYS = frozenset(
     {
@@ -770,8 +778,12 @@ class UsageMeter:
 
     Anything else makes it invalid: a missing or partial usage, a count that is
     not a non-negative integer, an unknown usage field, server-tool use, response
-    content outside ``RESPONSE_BLOCKS``, a tier other than ``standard``, cache
-    writes that do not add up, an ``error`` event, or an unreadable event or body.
+    content outside ``RESPONSE_BLOCKS``, a stream event outside
+    ``STREAM_EVENTS`` or a delta outside ``DELTA_TYPES``, an event after
+    ``message_stop``, a stream that does not end on an event boundary
+    (truncated or malformed trailing data), a tier other than ``standard``, cache
+    writes that do not add up, an ``error`` event, an unreadable event or body,
+    or a reason from outside the body (``reject``: a non-200 status).
 
     Content deltas are never counted: the ``estimated_tokens`` that
     ``thinking-token-count`` adds to ``thinking_delta`` is not billable, and only
@@ -790,6 +802,8 @@ class UsageMeter:
     invalid: str = ""
     _buffer: bytes = b""
     _plain: bytearray = field(default_factory=bytearray)
+    _name: bytes | None = None
+    _data: list[bytes] = field(default_factory=list)
 
     @property
     def valid(self) -> bool:
@@ -802,11 +816,48 @@ class UsageMeter:
         self._buffer += chunk
         while b"\n" in self._buffer:
             line, _, self._buffer = self._buffer.partition(b"\n")
-            if line.startswith(b"data:"):
-                self._event(line[5:].strip())
+            self._line(line.removesuffix(b"\r"))
+
+    def reject(self, why: str) -> None:
+        """Mark the report untrusted for a reason outside the body (a non-200
+        status, a cut-off connection): the whole reservation is charged."""
+        self._bad(why)
+
+    def _line(self, line: bytes) -> None:
+        """One server-sent-events line. Only ``event:`` and ``data:`` fields
+        are understood; a blank line ends an event."""
+        if not line:
+            self._dispatch()
+            return
+        if line.startswith(b":"):
+            return  # a comment, as the format allows
+        name, _, value = line.partition(b":")
+        value = value.removeprefix(b" ")
+        if name == b"event":
+            if self._name is not None:
+                self._bad("event name repeated")
+            self._name = value
+        elif name == b"data":
+            self._data.append(value)
+        else:
+            self._bad("stream field not understood")
+
+    def _dispatch(self) -> None:
+        if self._name is None and not self._data:
+            return  # blank lines between events
+        name, data = self._name, b"\n".join(self._data)
+        self._name, self._data = None, []
+        if not data:
+            self._bad("event without data")
+            return
+        self._event(data, name)
 
     def finish(self) -> None:
         if self.streamed:
+            # A stream must end on an event boundary: anything left is truncated
+            # or malformed, so nothing in it can be trusted.
+            if self._buffer.strip() or self._name is not None or self._data:
+                self._bad("stream truncated")
             return
         try:
             message = json.loads(bytes(self._plain))
@@ -832,7 +883,7 @@ class UsageMeter:
         if kind not in RESPONSE_BLOCKS:
             self._bad(f"response content not understood: {kind}")
 
-    def _event(self, data: bytes) -> None:
+    def _event(self, data: bytes, name: bytes | None = None) -> None:
         try:
             event = json.loads(data)
         except ValueError:
@@ -842,6 +893,15 @@ class UsageMeter:
             self._bad("event unreadable")
             return
         kind = event.get("type")
+        if kind not in STREAM_EVENTS:
+            self._bad(f"stream event not understood: {kind}")  # fail closed
+            return
+        if name is not None and name.decode("utf-8", "replace") != kind:
+            self._bad("event name and type disagree")
+            return
+        if self.stopped:
+            self._bad("event after message_stop")
+            return
         if kind == "message_start":
             message = event.get("message")
             self._usage(message.get("usage") if isinstance(message, dict) else None, start=True)
@@ -850,6 +910,10 @@ class UsageMeter:
         elif kind == "content_block_start":
             block = event.get("content_block")
             self._block(block.get("type") if isinstance(block, dict) else None)
+        elif kind == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict) or delta.get("type") not in DELTA_TYPES:
+                self._bad("content delta not understood")
         elif kind == "message_stop":
             self.stopped = True
         elif kind == "error":
@@ -915,6 +979,8 @@ class UsageMeter:
 def charge(meter: UsageMeter, price: ModelPrice, reservation: int) -> Settled:
     """What the request cost: its reported usage in full (above its reservation
     too), or its whole reservation when the report is not complete and valid."""
+    if meter.invalid:  # the first problem seen, from the body or from outside it
+        return Settled(reservation, reservation, meter.invalid)
     if not meter.stopped:
         return Settled(reservation, reservation, "incomplete")
     if not meter.valid:

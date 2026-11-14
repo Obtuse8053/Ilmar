@@ -229,7 +229,10 @@ def test_a_rewrite_that_would_grow_the_body_is_refused_and_releases_its_reservat
 
 
 def sse(*events: dict[str, Any]) -> bytes:
-    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+    return b"".join(
+        b"event: " + str(e.get("type")).encode() + b"\ndata: " + json.dumps(e).encode() + b"\n\n"
+        for e in events
+    )
 
 
 def start(**usage: Any) -> dict[str, Any]:

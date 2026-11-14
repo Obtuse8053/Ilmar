@@ -359,7 +359,10 @@ def test_a_counting_request_is_checked_but_reserves_nothing() -> None:
 
 
 def sse(*events: dict[str, Any]) -> bytes:
-    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+    return b"".join(
+        b"event: " + str(e.get("type")).encode() + b"\ndata: " + json.dumps(e).encode() + b"\n\n"
+        for e in events
+    )
 
 
 START = {"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}}
@@ -399,3 +402,81 @@ def test_response_content_outside_the_allow_list_is_untrusted(kind: object) -> N
     settled = ga.charge(meter, PRICE, DOLLAR)
     assert settled.charged == DOLLAR
     assert not settled.trusted
+
+
+# -- stream framing fails closed (#124 review, 2026-11-14) ---------------------------
+
+
+def framed(*parts: bytes) -> UsageMeter:
+    meter = UsageMeter(streamed=True)
+    for part in parts:
+        meter.feed(part)
+    meter.finish()
+    return meter
+
+
+def raw(event: dict[str, Any], name: str | None = None) -> bytes:
+    head = f"event: {name or event['type']}\n".encode()
+    return head + b"data: " + json.dumps(event).encode() + b"\n\n"
+
+
+GOOD_STREAM = sse(START, DELTA, STOP)
+
+
+def test_a_well_formed_stream_with_comments_pings_and_crlf_is_trusted() -> None:
+    ping = {"type": "ping"}
+    stop_crlf = raw(STOP).replace(b"\n", b"\r\n")
+    meter = framed(b": keep-alive\n\n", raw(START), raw(ping), raw(DELTA), stop_crlf)
+    assert meter.valid, meter.invalid
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        raw(START) + raw({"type": "message_billing_notice", "cost": 1}) + raw(DELTA) + raw(STOP),
+        raw(START) + raw({"type": "server_tool_progress"}) + raw(DELTA) + raw(STOP),
+        raw(START) + raw({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "web_search_delta"}}) + raw(DELTA) + raw(STOP),
+        raw(START, name="message_delta") + raw(DELTA) + raw(STOP),  # name and type disagree
+        raw(START) + b"id: 7\n" + raw(DELTA) + raw(STOP),  # an unknown field
+        raw(START) + raw(DELTA) + raw(STOP) + raw(DELTA),  # an event after message_stop
+        raw(START) + b"event: message_delta\n\n" + raw(DELTA) + raw(STOP),  # no data
+    ],
+)  # fmt: skip
+def test_an_unknown_event_or_field_fails_the_report_closed(stream: bytes) -> None:
+    meter = framed(stream)
+    assert not meter.valid
+    settled = ga.charge(meter, PRICE, DOLLAR)
+    assert (settled.charged, settled.trusted) == (DOLLAR, False)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b'event: message_delta\ndata: {"type": "message_del',  # cut mid-line
+        b"event: message_delta\ndata: " + json.dumps(DELTA).encode() + b"\n",  # no blank line
+        b"event: ping\n",  # a name and nothing more
+        b"garbage-without-newline",
+        b"data: {not json}\n\n",
+    ],
+)
+def test_truncated_or_malformed_trailing_data_invalidates_settlement(tail: bytes) -> None:
+    meter = framed(GOOD_STREAM[: -len(b"\n")] + b"\n", tail)  # a complete report, then the tail
+    assert not meter.valid
+    settled = ga.charge(meter, PRICE, DOLLAR)
+    assert (settled.charged, settled.trusted) == (DOLLAR, False)
+
+
+def test_a_report_cut_before_its_final_blank_line_is_truncated() -> None:
+    meter = framed(GOOD_STREAM[:-1])  # message_stop's data line, without the blank line
+    assert not meter.valid
+    assert meter.invalid == "stream truncated"
+
+
+def test_a_rejection_from_outside_the_body_always_wins() -> None:
+    meter = UsageMeter(streamed=True)
+    meter.feed(GOOD_STREAM)
+    meter.reject("provider status 500")
+    meter.finish()
+    assert not meter.valid
+    assert ga.charge(meter, PRICE, DOLLAR).charged == DOLLAR
