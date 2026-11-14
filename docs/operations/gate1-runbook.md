@@ -17,12 +17,35 @@ Rules for every step:
   repository during the trial either; the evidence is that it opened PRs and
   stopped.
 
+## Operator checklist
+
+Tick each line on #93 as you go. Never paste a credential.
+
+- [ ] 0. #132, #133, #135, #136 and #137 are merged; checkout at `main`.
+- [ ] 1. Dedicated Anthropic workspace, USD 10 monthly limit (or lower), one key.
+- [ ] 2. Cap drill on a scratch workspace: `[provider-refused]`, `ilmar budget`
+      exits 78 with `provider-cap`, no retry. Output posted on #93.
+- [ ] 3. Disposable repository created, seeded, labelled; a **fresh** mirror
+      passes `gate1_repo_check.py` (exit 0); your own review done; three
+      trusted issues created (not yet `ilmar:ready`).
+- [ ] 4. Gateway compatibility run on `main` passes both steps; sealed record
+      reviewed. `live.yml` run passes; the recorded fixture is merged.
+- [ ] 5. Configuration copied, `repository_id` set, `config validate
+      --check-environment` exits 0.
+- [ ] 6. Repository check again; trial authorized (3 executions, USD 5, 8 h).
+- [ ] 7. Supervised loop: PRs open, nothing merged, loop ends with exit 3.
+- [ ] 8. Kill switch (exit 78, `kill-switch`), revocation (exit 3) and
+      configuration-change (exit 3) drills observed.
+- [ ] 9. Evidence PR merged; criteria verified by hand at its merge SHA; then,
+      and only then, `ilmar gate record`.
+
 ## 0. Prerequisites (you)
 
 - A Linux host with rootless Podman, `git`, `gh` (logged in as the
   maintainer) and Python 3.11 or later.
-- An Ilmar checkout at `main`, with #132 (trial authorization) and #133 (the
-  credential-free pinned check) merged:
+- An Ilmar checkout at `main`, with #132 (trial authorization), #133 (the
+  credential-free pinned check), #135 and #136 (quarantine resolution) and
+  #137 (the proxy image pull for the pinned check) merged:
 
       git clone https://github.com/Obtuse8053/Ilmar && cd Ilmar
       python3 -m venv .venv && . .venv/bin/activate && pip install -e .
@@ -130,7 +153,9 @@ what establishes it.
    compatibility (manual, no secrets)* on `main` with
    `claude_version = 2.1.318`. Download `gateway-compat-records`. Review
    `issue-90-pinned-sealed-run.json`: the outcome is `provider-refused` and no
-   repository `apiKeyHelper` ran.
+   repository `apiKeyHelper` ran. (The first run on `main`, 43628921271,
+   passed the gateway step but the sealed step never started: the proxy image
+   was not pulled. #137 fixes the workflow; run it again after it merges.)
 2. **The passed live run and the recorded stream fixture (you, the step 1
    key).** `ilmar gate record --live-test` takes a GitHub Actions run URL, so
    use the *Live tests (manual)* workflow (`live.yml`) on `main`, with
