@@ -41,7 +41,7 @@ RestartSec=2min
 RestartSteps=6
 RestartMaxDelaySec=2h
 # 3: disabled or misconfigured. 78: suspended. Never restarted.
-RestartPreventExitStatus=3 78
+RestartPreventExitStatus=2 3 78
 # Credentials are never in this unit, and never in a plaintext file it reads.
 # Proposed delivery (not yet implemented; see docs/operations/supervisor.md):
 # systemd user-scoped encrypted credentials, decrypted only into the service's

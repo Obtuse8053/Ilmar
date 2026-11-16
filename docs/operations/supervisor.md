@@ -82,9 +82,9 @@ setting is refused until a Mode 2 gate exists, so do not enable the unit yet.
 - `Restart=on-failure`, with a delay that grows from `RestartSec=2min` to
   `RestartMaxDelaySec=2h` over `RestartSteps=6` (systemd 254 or later);
 - at most `StartLimitBurst=10` starts per day (`StartLimitIntervalSec=1d`);
-- exit 3 (configuration) and exit 78 (suspended) are never restarted
-  (`RestartPreventExitStatus=3 78`), and a clean stop (exit 0) is never
-  restarted either.
+- exit 2 (blocked), exit 3 (configuration) and exit 78 (suspended) are
+  never restarted (`RestartPreventExitStatus=2 3 78`), and a clean stop
+  (exit 0) is never restarted either.
 
 Each of systemd's delays is at least the start log's required gap for the
 same restart (below), so every restart systemd makes is one Ilmar accepts. A

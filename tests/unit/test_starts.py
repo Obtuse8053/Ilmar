@@ -206,7 +206,7 @@ def unit() -> configparser.ConfigParser:
 def test_the_unit_never_restarts_a_suspension_or_a_configuration_error() -> None:
     service = unit()["Service"]
     assert service["Restart"] == "on-failure"
-    assert set(service["RestartPreventExitStatus"].split()) == {"3", "78"}
+    assert set(service["RestartPreventExitStatus"].split()) == {"2", "3", "78"}
     assert "--loop" in service["ExecStart"].split()
 
 
@@ -433,12 +433,12 @@ def systemd_restarts(service: configparser.SectionProxy, code: int) -> bool:
     [
         (ExitCode.SUCCESS, False),  # a clean stop
         (ExitCode.FAILURE, True),  # a pass failed: retried, bounded by the start log
-        (ExitCode.BLOCKED, True),  # needs a person; a restart meets the same block
+        (ExitCode.BLOCKED, False),  # needs a person: never (maintainer decision)
         (ExitCode.CONFIGURATION, False),  # never (also: supervision off by default)
         (ExitCode.SUSPENDED, False),  # never: a person resumes
     ],
 )
-def test_the_unit_never_restarts_after_exit_3_or_78(code: ExitCode, restarted: bool) -> None:
+def test_the_unit_restarts_only_a_failed_pass(code: ExitCode, restarted: bool) -> None:
     assert systemd_restarts(unit()["Service"], int(code)) is restarted
 
 
