@@ -88,7 +88,56 @@ maintainer's decision.
 14. **#19:** self-hosting on a disposable copy of Ilmar. Then **#98**,
     Gate 3.
 
+## Progress (2026-11-16)
+
+| Step | PR / issue | State |
+| --- | --- | --- |
+| A1 safety fixes | #138 (gateway fail-closed and adversarial tests), #140 → #141 (restarts), #142 (credentials) | open, sensitive |
+| A2 gateway concurrency | #138 audit; `max_in_flight` defaults to 1 in #146 | decision pending |
+| A5 gateway wiring | #145 (ADR-0044) → #146 | open, sensitive; manual mode only |
+| A7 soak rehearsal | #148 (fake-provider soak) | open, test only |
+| Per-pass reads decode the whole event log | #147 | **found by the soak; Gate 2 blocker** |
+| A4 the Mode 2 mode | — | next ADR |
+| A3 gateway hardening (buffer cap, body timeout, header allow-list, network) | #111 | to do |
+| A6 provider-outage handling | — | to do; the soak covers refusals and rate limits |
+
+## Gate 2 acceptance criteria (proposed for #96)
+
+Each needs evidence committed in an evidence PR. Ilmar checks only the
+record's form (ADR-0040).
+
+1. **Gate 1 recorded.**
+2. **The gateway route,** on real Podman:
+   - the model key is absent from the sandbox's processes, environment,
+     files and logs;
+   - every request is admitted against a reservation;
+   - an uncertain charge stops all forwarding and leaves a `spend-uncertain`
+     suspension that only a person's review lifts.
+3. **Spending:**
+   - charges never exceed `[budget]`'s daily and monthly allowances;
+   - the provider's workspace cap is observed refusing (the Gate 1 cap
+     drill, repeated through the gateway).
+4. **Restarts:**
+   - a crash is restarted under the ADR-0043 backoff;
+   - a restart loop suspends (`restart-loop`);
+   - exits 3 and 78 are never restarted;
+   - systemd's actual `RestartUSecNext` is recorded on the operator's host.
+5. **Credentials:** from systemd encrypted credentials; never in a unit
+   file, an argument, a log or the repository; fails closed when missing.
+6. **Soak:**
+   - **Fake provider:** the harness passes a long run, at least 200
+     lifetimes over several seeds, with pass time flat (#147 fixed).
+   - **Live:** the disposable repository runs unattended for a fixed
+     duration under the USD 10 workspace cap. At least one supervisor
+     restart, one kill switch and one provider outage are observed.
+     Nothing is merged by Ilmar.
+7. **Human control:** every PR is left for a person. Every suspension's
+   resume is a person's command, with the event in the log.
+
 ## Recommended next PRs for approval, in order
 
-#138, #140, #141, #142, #137 (unblocks the pinned evidence), then items A2,
-A4 and A5.
+1. #144 (Gate 1 command sheet; docs).
+2. #138, then #140 → #141, and #142 (sensitive).
+3. #145 → #146 (sensitive).
+4. #148 (test only).
+5. Then #147 and the Mode 2 ADR.

@@ -144,6 +144,23 @@ marked.
 - Gate records come only from `ilmar gate record`, by a person.
 - Autonomy is off until each gate passes.
 
+## 6. Minimum controls before Ilmar may work on its own repository
+
+All must hold at once. Each maps to a test or a recorded check.
+
+| Control | Enforced by |
+| --- | --- |
+| Tasks only from a person's `ilmar:ready` label | the task provider's claim rules (ADR-0026) |
+| Ilmar opens PRs and never merges | Mode 1 and 2 rules; branch protection (#28); an identity without merge rights |
+| Safety-kernel paths frozen for review | the protected-control check against the running release's list (ADR-0031) |
+| Kernel import closure | `tests/architecture/` (new, with the kernel ADR) |
+| Isolated execution | the sandbox (ADR-0014, ADR-0036): no network but the model route, no forge credential |
+| Spending | `[budget]`, the gateway (ADR-0037, ADR-0044) and the workspace cap |
+| Restarts | the start log, backoff (ADR-0043), never after 3 or 78 |
+| Runs only a promoted release | #97: an immutable install; promotion by a person |
+| Health-gated rollback | #97: one automatic rollback, then suspension |
+| A separate gate record for the repository's own ID | ADR-0040's form, a new mode (Mode 3) |
+
 ## Open questions for the maintainer
 
 1. Is "at most one open self-PR at a time" the right limit?
