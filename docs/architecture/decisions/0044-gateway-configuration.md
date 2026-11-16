@@ -72,8 +72,10 @@ route: the key in the sandbox, behind an allow-list proxy.
   exactly as the sidecar will (`gateway_admission`). It must be a regular
   file owned by the operator and not writable by group or others (as the
   configuration file).
-- **Concurrency.** `gateway_max_in_flight` defaults to **1**, so that the
-  overrun bound is one request (ADR-0037 §4). It may be at most 4.
+- **Concurrency is exactly 1** (maintainer decision, 2026-11-16). The sidecar
+  forwards one request at a time, so the overrun bound is one request
+  (ADR-0037 §4). It is not configurable: a `gateway_max_in_flight` option is
+  refused. Raising it would need a new ADR and fresh compatibility evidence.
 - **The image.** `gateway_image` must be pinned by digest (`@sha256:`): it
   runs the process that holds the key.
 - **The upstream.** `gateway_upstream` defaults to
@@ -101,7 +103,7 @@ route: the key in the sandbox, behind an allow-list proxy.
   none, with a `GATEWAY` agent sandbox.
 - **Refusals:** supervised mode; no `[budget]`; only one of the two sides; a
   missing, unparsable or group-writable policy; an image without a digest; a
-  plain-HTTP upstream; `gateway_max_in_flight` outside 1 to 4.
+  plain-HTTP upstream; any `gateway_max_in_flight` option.
 - **The key** never appears in the runner, in `repr` or in the sandbox's
   environment, and the secret scanner knows its value.
 - **A runner with no key** refuses a non-`GATEWAY` sandbox.
