@@ -9,6 +9,7 @@ network) is tested in ``tests/integration/test_podman_gateway.py``.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import http.client
 import io
@@ -1034,3 +1035,109 @@ def test_a_gateway_killed_mid_request_leaves_a_record_that_makes_spend_uncertain
     spend = mg.parse_spend(killed)
     assert spend["uncertain"] is not None
     assert spend["unsettled"] > 0
+
+
+# -- the failure flag and admission are atomic (#138 review, 2026-11-16) --------------
+
+
+class Pause:
+    """Holds the first call of a wrapped method just after it returns."""
+
+    def __init__(self) -> None:
+        self.reached, self.go, self.used = threading.Event(), threading.Event(), False
+
+    def wrap(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        def held(*args: Any) -> Any:
+            result = original(*args)
+            if not self.used:
+                self.used = True
+                self.reached.set()
+                assert self.go.wait(5)
+            return result
+
+        return held
+
+
+def _in_thread(call: Callable[[], tuple[int, Any, bytes]]) -> tuple[threading.Thread, list[int]]:
+    codes: list[int] = []
+
+    def run() -> None:
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            codes.append(call()[0])
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, codes
+
+
+def _halt_breaks(admission: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in Budget.halt")
+
+    monkeypatch.setattr(admission.Budget, "halt", broken)
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_a_request_past_the_early_check_is_refused_once_the_gateway_fails(
+    path: str, halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Request A passes the unlocked failure check and the budget; the gateway then
+    fails (and the budget may not even halt). A must not be forwarded."""
+    admission = mg.load_admission()
+    pause = Pause()
+    method = "admit" if path == "/v1/messages" else "check"
+    monkeypatch.setattr(admission.Budget, method, pause.wrap(getattr(admission.Budget, method)))
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider):
+        body = BODY if path == "/v1/messages" else COUNT
+        thread, codes = _in_thread(functools.partial(running.post, path, body=body))
+        assert pause.reached.wait(5)  # A is between the budget and the last word
+        if halt_breaks:
+            with pytest.raises(RuntimeError):
+                running.gateway.fail("gateway error")
+        else:
+            running.gateway.fail("gateway error")
+        pause.go.set()
+        thread.join(5)
+        assert codes == [429]
+        assert provider.seen == []  # never forwarded
+        assert "ADMIT" not in running.log.getvalue()
+        assert not running.gateway.budget.in_flight  # its reservation released
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+def test_a_concurrent_fault_stops_a_request_waiting_to_be_admitted(
+    halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same race from a real second request: B's own meter faults while A is
+    held after the budget. B is charged its reservation; A is never sent."""
+    admission = mg.load_admission()
+    pause = Pause()
+    monkeypatch.setattr(admission.Budget, "admit", pause.wrap(admission.Budget.admit))
+
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in the meter")
+
+    monkeypatch.setattr(admission.UsageMeter, "feed", broken)
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider, max_in_flight=2):
+        first, codes = _in_thread(running.post)
+        assert pause.reached.wait(5)  # A is held
+        _attempt(running)  # B: forwarded, then its meter faults
+        assert running.gateway.failed == "gateway error"
+        pause.go.set()
+        first.join(5)
+        assert codes == [429]
+        assert len(provider.seen) == 1  # B only
+        assert len(charges(running.log)) == (0 if halt_breaks else 1)
+        spend = _closed_record(running)
+        assert spend["uncertain"] is not None or charges(running.log)

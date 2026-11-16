@@ -316,15 +316,22 @@ class Gateway:
         with self._state:
             return self._closing
 
-    def record_admit(self, ticket: int, reservation: int) -> bool:
-        """Put a metered request on record, unless the gateway is closing."""
+    def admit(self, ticket: int | None, reservation: int) -> str | None:
+        """The last word before forwarding, atomic with ``fail()`` and closing:
+        ``"failed"`` or ``"closing"`` refuses; otherwise a metered request is put
+        on record and ``None`` lets it go. A request this admits before a fault
+        is one in flight at the halt (ADR-0037 §4); none is admitted after. The
+        earlier, unlocked checks only save work."""
         with self._state:
+            if self._failed is not None:
+                return "failed"
             if self._closing:
-                return False
-            self._open.add(ticket)
-            self._admits += 1
-            self.log(f"ADMIT ticket={ticket} reservation={reservation}")
-            return True
+                return "closing"
+            if ticket is not None:
+                self._open.add(ticket)
+                self._admits += 1
+                self.log(f"ADMIT ticket={ticket} reservation={reservation}")
+            return None
 
     def record_charge(self, ticket: int, charged: int, line: str) -> None:
         """Put a settlement on record. The totals move only once the line is
@@ -345,8 +352,9 @@ class Gateway:
         """Forward nothing more. Set before anything that could itself fail, and
         independent of the budget, so a fault inside settlement still stops the
         attempt; then the budget is halted too, if it still can be."""
-        if self._failed is None:
-            self._failed = reason
+        with self._state:  # excludes admit(): no request is admitted after this
+            if self._failed is None:
+                self._failed = reason
         self.budget.halt(reason)
 
     def finished(self, ticket: int) -> None:
@@ -433,9 +441,13 @@ class _Handler(BaseHTTPRequestHandler):
             if ticket is not None:
                 gateway.budget.release(ticket)
             return self._refuse(429, "rate_limit_error", "too many requests in flight")
-        if ticket is not None and not gateway.record_admit(ticket, admitted.reservation):
-            gateway.budget.release(ticket)  # closed meanwhile: never sent, never on record
+        stopped = gateway.admit(ticket, admitted.reservation)
+        if stopped is not None:  # failed or closed meanwhile: never sent, never on record
+            if ticket is not None:
+                gateway.budget.release(ticket)
             gateway.release()
+            if stopped == "failed":
+                return self._refuse(429, "budget_exceeded", "the attempt is halted")
             return self._refuse(503, "overloaded_error", "the gateway is closed")
         self._settled = self._charged_in_budget = False
         try:  # from here on it may reach the provider: on record
