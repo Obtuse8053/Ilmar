@@ -1012,7 +1012,11 @@ def test_a_gateway_killed_mid_request_leaves_a_record_that_makes_spend_uncertain
     for running in start(provider):
         threads = _concurrently(running, 1)
         assert provider.entered.wait(5)
-        _wait_for(lambda log=running.log: "ADMIT" in log.getvalue())
+
+        def admitted(log: io.StringIO = running.log) -> bool:
+            return "ADMIT" in log.getvalue()
+
+        _wait_for(admitted)
         killed = running.log.getvalue().splitlines()  # the log as a kill would leave it
         provider.hold.set()  # type: ignore[union-attr]
         for thread in threads:
