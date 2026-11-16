@@ -44,10 +44,13 @@ pass a health gate, with one automatic rollback. Self-hosting starts on a
    for the maintainer (today's mechanism, unchanged).
 4. **How it publishes.** One branch and one pull request per task, opened by
    the coordinator (ADR-0006), with the evidence bundle and provenance. At
-   most one open self-PR at a time (proposed), so review never queues up.
+   most one open self-PR at a time (**decided**, 2026-11-16), so review
+   never queues up. A second task waits until that PR is merged or closed.
 5. **Who merges.** The maintainer only:
-   - Ilmar's GitHub identity is a separate account or app without merge,
-     admin or bypass rights;
+   - Ilmar's GitHub identity is a **dedicated GitHub App** (**decided**,
+     2026-11-16), installed only on the repositories it works on. It has
+     contents, pull-request and issue access, but no merge, administration,
+     workflow or bypass rights, and short-lived installation tokens;
    - branch protection (#28) requires the maintainer's review and green CI
      on the exact head SHA;
    - a PR Ilmar opened cannot be approved by Ilmar's identity.
@@ -72,8 +75,18 @@ mapped to modules:
 - the loop's stop rules and the CLI commands that record human decisions
   (`gate`, `resume`, `blocked`, `quarantine`).
 
-Everything else (other CLI output, the tracker and forge adapters' non-
-credential logic, docs, ordinary tests) is ordinary code.
+**Initially also in the kernel** (**decided**, 2026-11-16): every
+credential operation, every policy (verification, protection, budget,
+admission) and **every write-capable forge or tracker operation**:
+- pushing;
+- opening or updating a change request;
+- labelling, commenting on, claiming or closing an issue;
+- creating a branch.
+
+The tracker and forge adapters are therefore kernel in full, until a later ADR
+splits their read-only parts out.
+
+Everything else (other CLI output, docs, ordinary tests) is ordinary code.
 
 **Enforcement, all in `tests/architecture/` (itself protected):**
 
@@ -161,10 +174,9 @@ All must hold at once. Each maps to a test or a recorded check.
 | Health-gated rollback | #97: one automatic rollback, then suspension |
 | A separate gate record for the repository's own ID | ADR-0040's form, a new mode (Mode 3) |
 
-## Open questions for the maintainer
+## Decisions (maintainer, 2026-11-16)
 
-1. Is "at most one open self-PR at a time" the right limit?
-2. Should Ilmar's identity be a GitHub App (scoped installation) or a
-   machine user? An App gives finer permissions and no seat.
-3. Should the kernel include the tracker and forge adapters entirely, or
-   only their credential handling?
+1. At most **one open self-improvement PR** at a time, initially.
+2. Ilmar's identity is a **dedicated GitHub App**.
+3. The safety kernel initially protects **all credential, policy and
+   write-capable forge operations** (§2).
