@@ -10,6 +10,21 @@
   the `restart-loop` suspension and its resume rule, and the shipped unit
   (`deploy/systemd/ilmar.service`). Calling it from `ilmar run --loop` is #91
   part 3. Credential delivery to the unit is a separate, approved PR.
+- **Amended by ADR-0043 (Proposed, 2026-11-14), by addition.** Where they
+  differ, ADR-0043 governs:
+  - the fixed `RestartSec=12min` becomes a growing delay (`RestartSec=2min`,
+    `RestartSteps=6`, `RestartMaxDelaySec=2h`; a fixed `1h` on systemd older
+    than 254);
+  - the fixed limits become a `[supervisor]` table that can only be made
+    stricter;
+  - the start log adds an exponential backoff within a chain of restarts,
+    reset by a cooldown;
+  - supervision is off by default: under systemd the loop exits 3 unless
+    `[supervisor] enabled = true`, which no current mode allows.
+
+  Unchanged: the start log is written first and fsynced; its records and
+  clock rule; the `restart-loop` suspension and its resume rule; and
+  `RestartPreventExitStatus=3 78`.
 
 ## Changes from the first proposal (PR #115)
 
