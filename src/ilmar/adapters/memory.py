@@ -10,6 +10,7 @@ coverage starts at the first claim, with a baseline of what exists.
 
 from __future__ import annotations
 
+import bisect
 import threading
 from collections.abc import Collection, Sequence
 from dataclasses import replace
@@ -23,7 +24,7 @@ from ilmar.domain.errors import (
     FencingError,
 )
 from ilmar.domain.event_history import StoredState
-from ilmar.domain.events import Event, EventContext
+from ilmar.domain.events import Event, EventContext, EventType
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.gates import (
     GateRecord,
@@ -67,6 +68,9 @@ class InMemoryExecutionStore:
         self._operations: dict[str, Operation] = {}
         self._resources: dict[str, Resource] = {}
         self._events: list[str] = []  # canonical lines, so stored events cannot change
+        # ADR-0045: what each line is about, so a narrow read decodes only its own.
+        self._event_keys: list[tuple[str | None, EventType]] = []
+        self._by_execution: dict[str | None, list[int]] = {}
 
     def create(
         self, execution: Execution, transition: Transition, *, fence: Fence | None = None
@@ -280,14 +284,32 @@ class InMemoryExecutionStore:
             return tuple(c for c in self._charges if c.execution_id == execution_id)
 
     def events(
-        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        execution_id: str | None = None,
+        types: Collection[EventType] | None = None,
+        instance_scoped: bool = False,
     ) -> Sequence[Event]:
+        if execution_id is not None and instance_scoped:
+            raise ValueError("an execution's events are never instance-scoped")
+        start = max(after_seq, 0)  # seq n is at index n - 1
+        wanted = None if types is None else frozenset(types)
         with self._lock:
-            lines = self._events[max(after_seq, 0) :]
-        events = [Event.from_json(line) for line in lines]
-        if execution_id is not None:
-            events = [e for e in events if e.execution == execution_id]
-        return tuple(events if limit is None else events[:limit])
+            indexes: Sequence[int]
+            if execution_id is not None or instance_scoped:
+                own = self._by_execution.get(execution_id, [])
+                indexes = own[bisect.bisect_left(own, start) :]
+            else:
+                indexes = range(start, len(self._events))
+            lines = []
+            for i in indexes:
+                if wanted is None or self._event_keys[i][1] in wanted:
+                    lines.append(self._events[i])
+                    if limit is not None and len(lines) >= limit:
+                        break
+        return tuple(Event.from_json(line) for line in lines)
 
     def operation(self, key: str) -> Operation | None:
         with self._lock:
@@ -330,7 +352,10 @@ class InMemoryExecutionStore:
     def _append(self, events: Sequence[Event]) -> None:
         """Called last, once every check passed: nothing can fail after it."""
         numbered = event_log.with_seqs(events, len(self._events) + 1)
-        self._events.extend(event.to_json() for event in numbered)
+        for event in numbered:
+            self._by_execution.setdefault(event.execution, []).append(len(self._events))
+            self._event_keys.append((event.execution, event.type))
+            self._events.append(event.to_json())
 
     def _stored_state(self) -> StoredState:
         return event_log.stored_state(

@@ -786,6 +786,42 @@ class EventLogContract:
         assert [e.seq for e in store.events(after_seq=1, limit=2)] == [2, 3]
         assert store.events(after_seq=5) == ()
 
+    def test_narrow_reads_return_exactly_the_full_read_filtered(
+        self, store: ExecutionStore
+    ) -> None:
+        """ADR-0045: every combination of filters equals the whole log filtered."""
+        fence = claimed(store)
+        for n, task in enumerate((TASK_A, TASK_B)):
+            started = at(10 * n + 1)
+            execution, transition = MACHINE.start(task, execution_id=f"e{n + 1}", now=started)
+            store.create(execution, transition, fence=fence)
+            updated, step = MACHINE.advance(execution, S.CLAIMED, now=at(10 * n + 3),
+                                            reason="claimed")  # fmt: skip
+            store.commit(fence, Commit(applied=((updated, step),)))
+            claimed(store)  # an instance-scoped event between them
+            fence = claimed(store)
+        everything = store.events()
+        kinds = {e.type for e in everything}
+        assert None in {e.execution for e in everything}
+        assert len(kinds) >= 3
+        for execution_id, instance in ((None, False), (None, True), ("e1", False), ("e2", False),
+                                       ("nope", False)):  # fmt: skip
+            pair = (EventType.EXECUTION_TRANSITIONED, EventType.OWNERSHIP_ACQUIRED)
+            for types in (None, (), (EventType.EXECUTION_CREATED,), pair):
+                for after in (0, 3, len(everything)):
+                    for limit in (None, 1, 2):
+                        expected = [
+                            e for e in everything if (e.seq or 0) > after
+                            and (execution_id is None or e.execution == execution_id)
+                            and (not instance or e.execution is None)
+                            and (types is None or e.type in types)
+                        ][:limit]  # fmt: skip
+                        got = store.events(after_seq=after, limit=limit, execution_id=execution_id,
+                                           types=types, instance_scoped=instance)  # fmt: skip
+                        assert list(got) == expected, (execution_id, instance, types, after, limit)
+        with pytest.raises(ValueError, match="never instance-scoped"):
+            store.events(execution_id="e1", instance_scoped=True)
+
     # -- extra events (ADR-0025 §4: execution.cancel_requested) ---------------------------
 
     def test_an_extra_event_is_written_in_its_commit_and_keeps_i11(
