@@ -25,7 +25,7 @@ from ilmar.domain.errors import (
     LedgerIntegrityError,
     SuspendedError,
 )
-from ilmar.domain.events import Event, EventContext
+from ilmar.domain.events import Event, EventContext, EventType
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.gates import GateRecord, TrialRecord
 from ilmar.domain.ledger import (
@@ -198,10 +198,19 @@ class ExecutionStore(Protocol):
         ...
 
     def events(
-        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        execution_id: str | None = None,
+        types: Collection[EventType] | None = None,
+        instance_scoped: bool = False,
     ) -> Sequence[Event]:
-        """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order; only
-        ``execution_id``'s when given."""
+        """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order;
+        only ``execution_id``'s when given; only of ``types`` when given; only
+        those naming no execution when ``instance_scoped`` (ADR-0045). Filtering
+        happens before decoding: a narrow read decodes only what it returns. The
+        hash chain is verified over the whole log, never through a filter."""
         ...
 
     def operation(self, key: str) -> Operation | None: ...
