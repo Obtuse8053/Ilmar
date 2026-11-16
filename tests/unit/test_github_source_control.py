@@ -14,7 +14,7 @@ import pytest
 from ilmar.adapters.git.runner import HardenedGit
 from ilmar.adapters.github import GitHubClient
 from ilmar.adapters.github.source_control import INCOMPLETE_CHECKS, MARKER, GitHubSourceControl
-from ilmar.domain.changes import ChangeRequestSpec, CheckState, RepositoryRef
+from ilmar.domain.changes import ChangeRequestSpec, CheckState, RepositoryIdentity, RepositoryRef
 from ilmar.domain.errors import (
     CandidateRejectedError,
     LeaseConflictError,
@@ -517,13 +517,31 @@ def test_a_failure_still_wins_over_an_incomplete_result_set(world: World) -> Non
 
 def test_the_repository_id_is_read_live(world: World) -> None:
     repository = RepositoryRef("github", "owner/repo")
-    assert world.provider.repository_id(repository) == 987654321
+    assert world.provider.repository_identity(repository) == RepositoryIdentity(987654321)
     world.api.repository_id = 111  # a fork or a re-created repository answers another
-    assert world.provider.repository_id(repository) == 111
+    assert world.provider.repository_identity(repository) == RepositoryIdentity(111)
 
 
 @pytest.mark.parametrize("value", [None, "987654321", 0, True])
 def test_a_missing_or_malformed_repository_id_is_an_error(world: World, value: object) -> None:
     world.api.repository_id = value
     with pytest.raises(ProviderError, match="no repository ID"):
-        world.provider.repository_id(RepositoryRef("github", "owner/repo"))
+        world.provider.repository_identity(RepositoryRef("github", "owner/repo"))
+
+
+def test_a_fork_reports_where_it_was_forked_from(world: World) -> None:
+    world.api.repository_extra = {"fork": True, "parent": {"id": 7}, "source": {"id": 1441625109}}
+    found = world.provider.repository_identity(RepositoryRef("github", "owner/repo"))
+    assert found == RepositoryIdentity(987654321, (7, 1441625109))
+    assert found.is_or_descends_from(1441625109)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"fork": "no"}, {"fork": True}, {"fork": True, "parent": {"id": 7}},
+     {"fork": True, "parent": {"id": "7"}, "source": {"id": 9}}],
+)  # fmt: skip
+def test_an_unreadable_lineage_is_an_error(world: World, extra: dict[str, object]) -> None:
+    world.api.repository_extra = extra
+    with pytest.raises(ProviderError):
+        world.provider.repository_identity(RepositoryRef("github", "owner/repo"))

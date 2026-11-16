@@ -14,6 +14,7 @@ from ilmar.domain.workspace import (
     ContainerSpec,
     ModelAccess,
     ResourceOwner,
+    SandboxPart,
     StopSignal,
     StreamVerdict,
 )
@@ -172,6 +173,12 @@ class ContainerRuntime(Protocol):
         agent's container still running, no gateway owned by ``owner``, a line
         that does not parse, missing lines, a gateway that restarted, or no
         final record in time. The caller then treats the spend as uncertain."""
+        ...
+
+    def sandbox_parts(self, name: str) -> tuple[SandboxPart, ...]:
+        """Every part of the sandbox ``name`` that still exists, whoever owns it:
+        its container, any sidecar, its network (ADR-0042). Empty when none
+        remains. Changes nothing; raises ``ProviderError`` when it cannot tell."""
         ...
 
     def remove_owned(self, name: str, *, owner: ResourceOwner) -> bool:

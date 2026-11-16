@@ -42,8 +42,15 @@ from ilmar.domain.events import (
     resumed_event,
 )
 from ilmar.domain.execution import Execution
-from ilmar.domain.gates import GateRecord, GateRecorded
-from ilmar.domain.ledger import Commit, Fence, Operation, Resource
+from ilmar.domain.gates import (
+    TRIAL_MODE,
+    GateRecord,
+    GateRecorded,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+)
+from ilmar.domain.ledger import Commit, Fence, Operation, Resource, ResourceStatus
 from ilmar.domain.verification import EvidenceRecord
 
 _EXECUTION_EVENTS = frozenset({EventType.EXECUTION_CREATED, EventType.EXECUTION_TRANSITIONED})
@@ -96,7 +103,7 @@ def commit_events(
     operation: Callable[[str], Operation | None],
     resource: Callable[[str], Resource | None],
     suspended: Suspension | None = None,
-    gated: GateRecord | None = None,
+    gated: GateRecord | TrialRecord | None = None,
 ) -> tuple[Event, ...]:
     """The events ``changes`` must be committed with, ``data.from`` filled and paired.
 
@@ -111,7 +118,9 @@ def commit_events(
     if changes.empty:
         return ()
     check_gate_change(changes, context, gated)
-    extras = check_extra_events(fence, changes, execution=execution)  # before reading them
+    extras = check_extra_events(
+        fence, changes, execution=execution, resource=resource
+    )  # before reading them
     if context is None:
         context = default_context(fence, changes)
     _check_context(fence, context)
@@ -147,7 +156,11 @@ def commit_events(
 
 
 def check_extra_events(
-    fence: Fence, changes: Commit, *, execution: Callable[[str], Execution | None]
+    fence: Fence,
+    changes: Commit,
+    *,
+    execution: Callable[[str], Execution | None],
+    resource: Callable[[str], Resource | None] | None = None,
 ) -> tuple[Event, ...]:
     """The commit's events that no row derives (ADR-0024 §9), refused unless each is a
     registered extra type, belongs to the fence's owner, is not yet numbered, and
@@ -170,7 +183,22 @@ def check_extra_events(
         subject = str(event.execution)
         if subject not in created and execution(subject) is None:
             raise LedgerIntegrityError(f"an extra event names an unknown execution {subject}")
+        if event.type is EventType.RESOURCE_RESOLVED:
+            _check_resolution(event, resource)
     return tuple(changes.extra_events)
+
+
+def _check_resolution(event: Event, resource: Callable[[str], Resource | None] | None) -> None:
+    """ADR-0042: only a person resolves, and only a quarantined resource of the
+    execution the event names."""
+    if event.actor.kind is not ActorKind.HUMAN:
+        raise LedgerIntegrityError("only a person resolves a quarantined resource")
+    key = str(event.data.get("resource", ""))
+    row = resource(key) if resource is not None else None
+    if row is None or row.status is not ResourceStatus.QUARANTINED:
+        raise LedgerIntegrityError(f"{key} is not a quarantined resource")
+    if row.execution_id != event.execution:
+        raise LedgerIntegrityError(f"{key} belongs to another execution")
 
 
 def _check_context(fence: Fence, context: EventContext) -> None:
@@ -352,15 +380,24 @@ def stored_state(
 
 
 def check_gate_change(
-    changes: Commit, context: EventContext | None, active: GateRecord | None
+    changes: Commit, context: EventContext | None, active: GateRecord | TrialRecord | None
 ) -> None:
-    """ADR-0040, enforced by the store: only a person records or revokes a gate;
-    a mode has at most one active record; only an active record is revoked."""
+    """ADR-0040 and ADR-0041, enforced by the store: only a person records or
+    revokes a gate or a trial; a mode has at most one active record and at most
+    one trial is in force; only an active record or unrevoked trial is revoked."""
     gate = changes.gate
     if gate is None:
         return
     if context is None or context.actor.kind is not ActorKind.HUMAN:
         raise LedgerIntegrityError("only a person records or revokes a gate")
+    if isinstance(gate, TrialAuthorized):
+        if active is not None:
+            raise LedgerIntegrityError("a trial authorization is already in force")
+        return
+    if isinstance(gate, TrialRevoked):
+        if active is None:
+            raise LedgerIntegrityError("no unrevoked trial authorization to revoke")
+        return
     if isinstance(gate, GateRecorded):
         if active is not None:
             raise LedgerIntegrityError(
@@ -371,8 +408,11 @@ def check_gate_change(
 
 
 def gate_mode(changes: Commit) -> str | None:
-    """The mode a commit's gate change is about, if it has one."""
+    """The mode a commit's gate change is about, if it has one; ``TRIAL_MODE``
+    for a trial authorization or revocation (ADR-0041)."""
     gate = changes.gate
     if gate is None:
         return None
+    if isinstance(gate, TrialAuthorized | TrialRevoked):
+        return TRIAL_MODE
     return gate.evidence.mode if isinstance(gate, GateRecorded) else gate.mode
