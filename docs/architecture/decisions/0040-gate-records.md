@@ -121,6 +121,13 @@ Any mismatch, or a revoked record, stops the loop at the next check
 pass that exits 2, 3 or 78 ends the loop; SIGTERM or SIGINT ends it with 0.
 The loop never restarts itself.
 
+### 5. Trials are not gate records (ADR-0041)
+
+The Gate 1 live run uses a separate trial authorization (ADR-0041). It is
+stored apart from gate records and never returned as one, and only
+`ilmar run --loop --trial` accepts it. `ilmar run --loop` reads gate records
+alone, so no trial can authorize the permanent loop.
+
 ## Consequences
 
 - No record can exist unless a person writes one. Ilmar ensures its fields

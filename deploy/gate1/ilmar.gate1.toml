@@ -1,0 +1,71 @@
+# Ilmar's Gate 1 configuration (#93, ADR-0030, ADR-0040, ADR-0041).
+#
+# For the supervised trial on the dedicated disposable repository only. Copy it
+# to ~/.config/ilmar/ilmar.gate1.toml, replace every REPLACE, and validate it:
+#
+#   ilmar config validate ~/.config/ilmar/ilmar.gate1.toml --check-environment
+#
+# It holds no secret: the two credentials come from the environment variables
+# named below (token_env, api_key_env), set only in the terminal that runs Ilmar.
+
+[ilmar]
+state_dir = "/var/tmp/ilmar-gate1"   # outside every repository; mode 0700
+instance_id = "gate1"
+
+[limits]
+max_attempts = 2
+max_concurrent_executions = 1        # Mode 1: one execution at a time
+agent_timeout_seconds = 1800
+stall_timeout_seconds = 600
+execution_wall_seconds = 2400        # the sandbox's hard runtime-side lifetime
+retry_backoff_base_seconds = 120
+retry_backoff_max_seconds = 1800
+
+[autonomy]
+mode = "supervised"
+poll_interval_seconds = 120
+# The disposable repository's immutable ID:
+#   gh api repos/Obtuse8053/ilmar-disposable --jq .id
+repository_id = 0                    # REPLACE: 0 is refused on purpose
+
+[adapters.task_provider]
+kind = "github"
+options = { repository = "Obtuse8053/ilmar-disposable", eligible_label = "ilmar:ready", claimed_label = "ilmar:claimed", human_claim_labels = ["status:in-progress"], excluded_labels = ["needs:maintainer", "status:blocked"], token_env = "ILMAR_GATE1_GITHUB_TOKEN" }
+
+[adapters.source_control]
+kind = "github"
+options = { repository = "Obtuse8053/ilmar-disposable", base_branch = "main", token_env = "ILMAR_GATE1_GITHUB_TOKEN" }
+
+[adapters.container_runtime]
+kind = "podman"
+options = { proxy_image = "docker.io/library/python:3.12-alpine" }
+
+[adapters.agent_runner]
+kind = "claude-code"
+# The pinned image, built by scripts/live_setup.py --claude-version 2.1.318.
+# The key is the one scoped to the dedicated, capped Anthropic workspace.
+options = { image = "localhost/ilmar-claude-code:2.1.318", api_key_env = "ANTHROPIC_API_KEY", expected_version = "2.1.318", max_turns = 60 }
+
+[adapters.execution_store]
+kind = "sqlite"
+options = { path = "/var/tmp/ilmar-gate1/executions.sqlite3" }
+
+[verification]
+# The template's tests use only the standard library: no network, no install.
+image = "docker.io/library/python:3.12-alpine"
+
+[[verification.commands]]
+name = "tests"
+job = "tests"
+argv = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
+timeout_seconds = 300
+
+[budget]
+# The maintainer's Anthropic workspace limit is USD 10 a month: Ilmar's own
+# monthly allowance matches it and may never exceed it. If the workspace limit
+# is lower, lower all three figures to it.
+daily_usd = 5
+monthly_usd = 10
+reserve_per_execution_usd = 2
+provider_cap_attested_usd = 10       # the workspace's real monthly limit, at most monthly_usd
+kill_switch_file = "/var/tmp/ilmar-gate1-KILL"

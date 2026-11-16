@@ -12,6 +12,7 @@ from ilmar.domain.changes import (
     ChangeRequestSpec,
     ChangeRequestState,
     ChecksSummary,
+    RepositoryIdentity,
     RepositoryRef,
 )
 
@@ -29,11 +30,12 @@ class SourceControlProvider(Protocol):
     @property
     def name(self) -> str: ...
 
-    def repository_id(self, repository: RepositoryRef) -> int:
-        """The repository's immutable identifier at the provider, read live
-        (ADR-0040). A rename keeps it; a fork, a transfer to another repository
-        or a re-created repository has another. Raises ``ProviderError`` when it
-        cannot be read. Changes nothing."""
+    def repository_identity(self, repository: RepositoryRef) -> RepositoryIdentity:
+        """The repository's immutable identity at the provider, read live
+        (ADR-0040, ADR-0041): its ID, and the IDs it was forked from. A rename
+        keeps the ID; a fork, a transfer to another repository or a re-created
+        repository has another. Raises ``ProviderError`` when it cannot be read
+        in full. Changes nothing."""
         ...
 
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:

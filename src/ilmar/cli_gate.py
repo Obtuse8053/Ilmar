@@ -28,9 +28,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -39,7 +40,17 @@ from ilmar.config import IlmarConfig, load_config
 from ilmar.core.ownership import Ownership
 from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError
 from ilmar.domain.events import Actor, ActorKind, EventContext
-from ilmar.domain.gates import GATED_MODES, GateEvidence, GateRecorded, GateRevoked
+from ilmar.domain.gates import (
+    GATED_MODES,
+    TRIAL_MAX_DURATION,
+    GateChange,
+    GateEvidence,
+    GateRecorded,
+    GateRevoked,
+    TrialAuthorized,
+    TrialRevoked,
+    TrialTerms,
+)
 from ilmar.domain.ledger import Commit
 from ilmar.ports.execution_store import ExecutionStore
 
@@ -52,9 +63,41 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     actions = gate.add_subparsers(dest="gate_command", required=True)
     record = actions.add_parser("record", help="record that a mode's gate passed")
     revoke = actions.add_parser("revoke", help="revoke a mode's gate record")
-    show = actions.add_parser("show", help="list every gate record")
-    for parser in (record, revoke, show):
+    show = actions.add_parser("show", help="list every gate record and trial authorization")
+    trial = actions.add_parser(
+        "trial", help="authorize a bounded, expiring loop trial for the Gate 1 run (ADR-0041)"
+    )
+    end = actions.add_parser("end-trial", help="revoke the trial authorization")
+    for parser in (record, revoke, show, trial, end):
         parser.add_argument("--config", required=True, help="the configuration file")
+    for parser in (trial, end):
+        parser.add_argument(
+            "--as",
+            dest="actor",
+            required=True,
+            metavar="NAME",
+            help="who, recorded with the event (a short lower-case label)",
+        )
+    trial.add_argument(
+        "--repository-id",
+        required=True,
+        type=int,
+        help="the disposable repository's immutable GitHub ID",
+    )
+    trial.add_argument("--repository", required=True, help="its owner/name today")
+    trial.add_argument("--agent-version", required=True, help="the exact x.y.z to run")
+    trial.add_argument("--max-executions", required=True, type=int, help="at most 20")
+    trial.add_argument(
+        "--max-spend-usd",
+        required=True,
+        type=float,
+        help="reservations and charges under the trial, in USD",
+    )
+    trial.add_argument("--hours", required=True, type=float, help="until expiry; at most 72")
+    trial.add_argument("--purpose", required=True, help="the Gate 1 issue or comment URL")
+    trial.add_argument("--disposable", action="store_true", required=True,
+                       help="you confirm the repository is dedicated and disposable, with "
+                       "no credentials in its content, history or workflows")  # fmt: skip
     for parser in (record, revoke):
         parser.add_argument(
             "--as",
@@ -109,8 +152,17 @@ def run(
         print(f"error: --as: {exc}", file=err)
         return CONFIGURATION
     at = now()
-    gate: GateRecorded | GateRevoked
-    if args.gate_command == "record":
+    gate: GateChange
+    if args.gate_command == "trial":
+        try:
+            terms = _terms(args, config, at)
+        except ValueError as exc:
+            print(f"error: {exc}", file=err)
+            return CONFIGURATION
+        gate = TrialAuthorized(terms, at)
+    elif args.gate_command == "end-trial":
+        gate = TrialRevoked(at)
+    elif args.gate_command == "record":
         try:
             evidence = _evidence(args, root=checkout or Path.cwd())
         except ValueError as exc:
@@ -152,7 +204,17 @@ def run(
         close = getattr(store, "close", None)
         if callable(close):
             close()
-    if isinstance(gate, GateRecorded):
+    if isinstance(gate, TrialAuthorized):
+        t = gate.terms
+        print(f"authorized: trial for repository {t.repository_id} ({t.repository}), agent "
+              f"{t.agent_version}, at most {t.max_executions} execution(s) and "
+              f"{t.max_spend_micros / 1_000_000:.2f} USD, until {t.expires_at.isoformat()}, "
+              f"by {args.actor}. Only `ilmar run --loop --trial` accepts it; it is not a gate "
+              "record and authorizes nothing else.", file=out)  # fmt: skip
+    elif isinstance(gate, TrialRevoked):
+        print("revoked: the trial authorization; the trial loop stops at the next check",
+              file=out)  # fmt: skip
+    elif isinstance(gate, GateRecorded):
         print(f"recorded: the {args.mode} gate, for repository {gate.evidence.repository_id} "
               f"and agent {gate.evidence.agent_version}, by {args.actor}. Ilmar checked the "
               "form and the fixture only; the live run and Gate 1 are as you verified them.",
@@ -194,6 +256,32 @@ def _evidence(args: argparse.Namespace, *, root: Path) -> GateEvidence:
     )  # fmt: skip
 
 
+def _terms(args: argparse.Namespace, config: IlmarConfig, at: datetime) -> TrialTerms:
+    """The trial's terms, checked against the configuration (ADR-0041)."""
+    if config.autonomy.mode != "supervised":
+        raise ValueError('a trial needs [autonomy] mode = "supervised" (all of Mode 1\'s rules)')
+    if config.autonomy.repository_id != args.repository_id:
+        raise ValueError(f"--repository-id {args.repository_id} is not the configured "
+                         f"[autonomy] repository_id {config.autonomy.repository_id}")  # fmt: skip
+    if config.budget is None:
+        raise ValueError("a trial needs a [budget]")
+    if not (math.isfinite(args.max_spend_usd) and math.isfinite(args.hours)):
+        raise ValueError("--max-spend-usd and --hours must be finite")
+    spend = math.ceil(args.max_spend_usd * 1_000_000)
+    if spend > config.budget.provider_cap_attested_micros:
+        raise ValueError("--max-spend-usd may not exceed the attested provider cap")
+    if spend < config.budget.limits.reserve_micros:
+        raise ValueError("--max-spend-usd is below one attempt's reservation")
+    if not 0 < args.hours <= TRIAL_MAX_DURATION.total_seconds() / 3600:
+        raise ValueError("--hours must be more than 0 and at most 72")
+    return TrialTerms(
+        repository_id=args.repository_id, repository=args.repository,
+        agent_version=args.agent_version, max_executions=args.max_executions,
+        max_spend_micros=spend, starts_at=at, expires_at=at + timedelta(hours=args.hours),
+        purpose=args.purpose,
+    )  # fmt: skip
+
+
 def _show(config: IlmarConfig, *, out: TextIO, err: TextIO) -> int:
     try:
         opener = event_reader(config)
@@ -207,8 +295,17 @@ def _show(config: IlmarConfig, *, out: TextIO, err: TextIO) -> int:
         return OK
     try:
         records = store.gate_records()  # type: ignore[attr-defined]
+        trials = store.trial_records()  # type: ignore[attr-defined]
     finally:
         store.close()  # type: ignore[attr-defined]
+    for t in trials:
+        state = (f"revoked {t.revoked_at.isoformat()} by {t.revoked_by}"
+                 if t.revoked_at is not None else "unrevoked")  # fmt: skip
+        print(f"trial #{t.seq} {state}: repository {t.terms.repository_id} "
+              f"({t.terms.repository}), agent {t.terms.agent_version}, "
+              f"{t.terms.max_executions} execution(s), {t.terms.max_spend_micros} micro-USD, "
+              f"{t.terms.starts_at.isoformat()} to {t.terms.expires_at.isoformat()}, "
+              f"by {t.authorized_by}; for {t.terms.purpose}", file=out)  # fmt: skip
     if not records:
         print("no gate records", file=out)
     for r in records:
