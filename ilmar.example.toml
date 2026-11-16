@@ -68,6 +68,15 @@ kind = "claude-code"
 # Build the image from images/claude-code/Containerfile at a pinned version.
 # The agent sandbox reaches only api.anthropic.com (or the host of base_url).
 options = { image = "localhost/ilmar-claude-code:pinned", api_key_env = "ANTHROPIC_API_KEY" }
+#
+# ADR-0044: the model gateway, OFF by default, and only in manual mode. To use
+# it, replace api_key_env above with model_route = "gateway", and add to
+# [adapters.container_runtime] options:
+#   gateway_image = "docker.io/library/python@sha256:<64 hex>"   # pinned by digest
+#   gateway_key_env = "ILMAR_GATEWAY_KEY"   # read only by the runtime's sidecar
+#   gateway_policy = "/etc/ilmar/prices.json"   # attested prices; yours, 0600
+#   gateway_max_in_flight = 1               # the default; at most 4
+# It also needs [budget]: the workspace cap stays the hard backstop.
 
 [adapters.execution_store]
 kind = "sqlite"

@@ -35,7 +35,7 @@ route: the key in the sandbox, behind an allow-list proxy.
 
 ### 1. Off unless asked for, in two places
 
-- **The runner.** `[adapters.agent_runner] credential_route = "gateway"`. The
+- **The runner.** `[adapters.agent_runner] model_route = "gateway"`. The
   default is `"environment"`, which is today's route, unchanged.
 - **The runtime.** `[adapters.container_runtime]` names the gateway's
   `gateway_image`, `gateway_key_env` and `gateway_policy`.
