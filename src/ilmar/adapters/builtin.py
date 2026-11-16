@@ -233,8 +233,18 @@ def podman_runtime(options: Options, context: BuildContext) -> Plan:
             allow_unrestricted_network=False,  # never from configuration (ADR-0014)
         )
 
-    environment = () if gateway is None else (gateway.key_env,)
-    return Plan(create, environment=environment, networks=frozenset(networks))
+    if gateway is None:
+        return Plan(create, networks=frozenset(networks))
+
+    def without_key() -> PodmanRuntime:
+        """For a person's reads only: the same runtime with no gateway, so no key."""
+        return PodmanRuntime(
+            layout=context.layout, podman=_resolve_executable(podman, options.where, context),
+            profile=profile, egress=egress, allow_unrestricted_network=False,
+        )  # fmt: skip
+
+    return Plan(create, environment=(gateway.key_env,), networks=frozenset(networks),
+                read_only=without_key)  # fmt: skip
 
 
 _DIGEST_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$")

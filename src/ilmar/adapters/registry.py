@@ -74,7 +74,10 @@ class Plan:
       its tasks belong to, which must then equal the target repository;
     * an ``execution_store`` plan may give ``read_only``, which opens the
       store for reading only (``ilmar events``): no secret, no migration, no
-      write, and no other adapter is planned or created.
+      write, and no other adapter is planned or created;
+    * a ``container_runtime`` plan may give ``read_only``, a runtime built with
+      no secret, for a person's reads (``ilmar quarantine resolve``): with a
+      model gateway configured, it has none (ADR-0044).
     """
 
     create: Callable[[Secrets], object]
@@ -255,7 +258,11 @@ def runtime_reader(
             raise
         raise ConfigError(f"{where}: {error}") from None
     options.finish()
-    if not isinstance(runtime_plan, Plan) or runtime_plan.environment:
+    if not isinstance(runtime_plan, Plan):
+        raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
+    if runtime_plan.read_only is not None:  # a runtime that needs no secret to read
+        return runtime_plan.read_only
+    if runtime_plan.environment:
         raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
     return lambda: runtime_plan.create(Secrets({}))
 

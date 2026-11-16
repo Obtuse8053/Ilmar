@@ -23,7 +23,7 @@ from ilmar.adapters.claude_code.runner import ClaudeCodeRunner
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.adapters.github.tasks import GitHubTaskProvider
 from ilmar.adapters.podman.runtime import PodmanRuntime
-from ilmar.adapters.registry import DEFAULT_REGISTRY, Registry, build, plan
+from ilmar.adapters.registry import DEFAULT_REGISTRY, Registry, build, plan, runtime_reader
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.config import IlmarConfig, parse_config
 from ilmar.core.components import AgentSandbox, Components
@@ -833,3 +833,14 @@ def test_the_gateway_route_takes_no_agent_key_or_base_url(
     raw = gateway_data(tools, tmp_path)
     options(raw, "agent_runner")["model_route"] = "proxy"
     assert "model_route" in plan_error(raw, tmp_path)
+
+
+def test_a_person_s_reads_open_the_runtime_without_the_gateway_key(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    """``ilmar quarantine resolve`` opens the runtime alone, with no secret: with a
+    gateway configured, the reader has no gateway and so needs no key."""
+    reader = runtime_reader(config(gateway_data(tools, tmp_path), tmp_path))
+    runtime = reader()
+    assert isinstance(runtime, PodmanRuntime)
+    assert runtime._gateway is None
