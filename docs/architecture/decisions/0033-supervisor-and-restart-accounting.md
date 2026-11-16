@@ -22,9 +22,11 @@
   - supervision is off by default: under systemd the loop exits 3 unless
     `[supervisor] enabled = true`, which no current mode allows.
 
+  - exit 2 (blocked) is never restarted either:
+    `RestartPreventExitStatus=2 3 78`.
+
   Unchanged: the start log is written first and fsynced; its records and
-  clock rule; the `restart-loop` suspension and its resume rule; and
-  `RestartPreventExitStatus=3 78`.
+  clock rule; and the `restart-loop` suspension and its resume rule.
 
 ## Changes from the first proposal (PR #115)
 
