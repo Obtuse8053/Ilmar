@@ -16,8 +16,11 @@ rule, and every invariant is checked after every process lifetime:
 * nothing is ever merged by Ilmar;
 * the start log accounts for every start.
 
-``ILMAR_SOAK_LIFETIMES`` (default 12) and ``ILMAR_SOAK_SEED`` (default 1) make it
-longer or different; the default run takes a few seconds.
+* the events decoded per loop check stay flat as history grows (#147);
+
+``ILMAR_SOAK_LIFETIMES`` (default 24) and ``ILMAR_SOAK_SEED`` (default 1) make it
+longer or different; the default run takes a few seconds. ``ILMAR_SOAK_LONG=<lifetimes>`` runs
+the long soak, verifying the chain every 25 lifetimes and at the end.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from typing import Any
 
 import pytest
 
+import conftest
 from coordinator_support import BASE_FILES, REPO, ScriptedAgent, WorkspaceRuntime, policy, task
 from ilmar import cli_loop
 from ilmar.adapters.memory import InMemoryExecutionStore
@@ -48,7 +52,7 @@ from ilmar.core.suspension import resume_blocker
 from ilmar.domain.agent import AgentOutcome
 from ilmar.domain.budget import BudgetLimits, Suspension, SuspensionReason
 from ilmar.domain.changes import ChangeRequestState
-from ilmar.domain.events import Actor, ActorKind, EventContext
+from ilmar.domain.events import Actor, ActorKind, Event, EventContext
 from ilmar.domain.execution import ExecutionState
 from ilmar.domain.gates import GateEvidence, GateRecorded
 from ilmar.domain.ledger import Commit
@@ -112,6 +116,9 @@ class World:
     )
     plan: list[tuple[AgentOutcome, dict[str, str]]] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
+    decodes: list[int] = field(default_factory=lambda: [0])
+    per_check: list[float] = field(default_factory=list)
+    """Events decoded per loop check, one entry per working lifetime (#147)."""
 
     @property
     def now(self) -> datetime:
@@ -175,10 +182,32 @@ def no_real_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> World:
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     tmp = tmp_path.resolve()
     (tmp / "state").mkdir(mode=0o700)
     w = World(tmp=tmp, clock=[START])
+    real = Event.from_json
+
+    verifying = [False]
+
+    def counting(line: str) -> Event:
+        if not verifying[0]:
+            w.decodes[0] += 1
+        return real(line)
+
+    def verified(
+        store: Any, check: Callable[[Any], list[str]] = conftest.event_log_problems
+    ) -> list[str]:
+        """The harness still verifies the whole chain after every pass; that read
+        is the test's, not Ilmar's, so it is not counted."""
+        verifying[0] = True
+        try:
+            return check(store)
+        finally:
+            verifying[0] = False
+
+    monkeypatch.setattr(Event, "from_json", staticmethod(counting))
+    monkeypatch.setattr(conftest, "event_log_problems", verified)
     w.scm.seed(REPO, "main", BASE_FILES)
     w.scm.repository_ids = {REPO.slug: REPO_ID}
     with w.human() as owner:  # the maintainer records the gate once
@@ -206,6 +235,7 @@ def lifetime(w: World, *, passes: int, during: Callable[[int], None] | None = No
 
     w.scm.repository_identity = counting  # type: ignore[method-assign]
     started = w.now
+    decoded = w.decodes[0]
     try:
         code = cli_loop.run(w.config_path(), now=lambda: w.now, stop=stop, builder=w.build,
                             boot_id=lambda: "boot-1", limits=StartLimits(),
@@ -214,6 +244,8 @@ def lifetime(w: World, *, passes: int, during: Callable[[int], None] | None = No
         w.scm.repository_identity = real  # type: ignore[method-assign]
     starts = read_starts(start_log_path(w.layout.coordinator_root))
     assert any(r.at == started for r in starts), "every process start is on record"
+    if seen[0] > 1:
+        w.per_check.append((w.decodes[0] - decoded) / seen[0])
     return code
 
 
@@ -311,12 +343,35 @@ def operate(w: World, rng: random.Random, number: int) -> None:
     assert blocker is None, f"{reason.value}: {blocker}"
 
 
-def test_an_unattended_soak_keeps_every_invariant(world: World) -> None:
-    lifetimes = int(os.environ.get("ILMAR_SOAK_LIFETIMES", "12"))
-    rng = random.Random(int(os.environ.get("ILMAR_SOAK_SEED", "1")))  # noqa: S311 - a schedule
+def soak(world: World, lifetimes: int, seed: int, verify_every: int = 0) -> None:
+    rng = random.Random(seed)  # noqa: S311 - a schedule, not a secret
     for number in range(lifetimes):
         operate(world, rng, number)
         world.clock[0] += timedelta(hours=2)  # the supervisor's delay, generously
+        if verify_every and (number + 1) % verify_every == 0:
+            assert conftest.event_log_problems(world.store) == []
+    assert conftest.event_log_problems(world.store) == []  # the whole chain, at the end
+    # #147: the cost of a check does not grow with history. Compare the events
+    # Ilmar decoded per check early in the soak with late in it.
+    quarter = max(1, len(world.per_check) // 4)
+    early = sum(world.per_check[:quarter]) / quarter
+    late = sum(world.per_check[-quarter:]) / quarter
+    assert late <= 2 * early + 20, (early, late)
     suspensions = [line for line in world.log if "suspended:" in line]
     assert suspensions, "the schedule must exercise suspensions"
     assert all_executions(world), "and real work"
+
+
+def test_an_unattended_soak_keeps_every_invariant(world: World) -> None:
+    """The default soak: the harness also verifies the whole chain after every pass."""
+    lifetimes = int(os.environ.get("ILMAR_SOAK_LIFETIMES", "24"))
+    soak(world, lifetimes, int(os.environ.get("ILMAR_SOAK_SEED", "1")))
+
+
+@pytest.mark.events_unchecked  # verified every 25 lifetimes instead of every pass
+@pytest.mark.skipif(not os.environ.get("ILMAR_SOAK_LONG"), reason="set ILMAR_SOAK_LONG=<lifetimes>")
+def test_a_long_soak(world: World) -> None:
+    """Gate 2's fake-provider soak (#96): ``ILMAR_SOAK_LONG=200`` or more, over
+    several ``ILMAR_SOAK_SEED`` values."""
+    lifetimes = int(os.environ["ILMAR_SOAK_LONG"])
+    soak(world, lifetimes, int(os.environ.get("ILMAR_SOAK_SEED", "1")), verify_every=25)
