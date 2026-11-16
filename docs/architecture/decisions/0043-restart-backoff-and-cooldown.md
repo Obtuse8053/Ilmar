@@ -106,8 +106,12 @@ default needs a new ADR, not a setting.
 - **Older systemd** (no `RestartSteps=`) needs a fixed `RestartSec=1h`, the
   backoff cap. ADR-0033's 12 minutes is *not* slower than the log: the sixth
   start of a chain needs 16 minutes, so it would be suspended. That is safe,
-  but it is not a schedule to rely on. `RestartPreventExitStatus=3 78` and
-  `StartLimitBurst=10` per day are unchanged.
+  but it is not a schedule to rely on. `StartLimitBurst=10` per day is
+  unchanged.
+- **Exit 2 is never restarted either** (maintainer decision, 2026-11-16):
+  `RestartPreventExitStatus=2 3 78`. Exit 2 means an execution is blocked
+  and needs a person; a restart would only meet the same block. Only exit 1
+  (a failed pass) and a crash (a signal) are restarted.
 - **If the two disagree, the log wins.** A supervisor restarting faster
   than the log allows is suspended. It is never obeyed.
 - **What is and is not verified.** systemd 254 added `RestartSteps=` and
