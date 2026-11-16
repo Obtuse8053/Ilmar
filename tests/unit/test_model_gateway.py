@@ -60,6 +60,9 @@ KEY = "sk-ant-real-key-never-in-the-sandbox-42"
 LOOPBACK = (ipaddress.ip_network("127.0.0.0/8"),)
 
 
+LOCK = threading.Lock()
+
+
 @dataclass
 class Provider:
     """Records what reached it; answers with a short SSE stream."""
@@ -69,6 +72,8 @@ class Provider:
     payload: bytes = GOOD
     status: int = 200
     entered: threading.Event = field(default_factory=threading.Event)
+    answers: list[tuple[int, bytes]] = field(default_factory=list)
+    """Per request, in order of arrival: ``(status, payload)``; then the defaults."""
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         provider = self
@@ -81,15 +86,19 @@ class Provider:
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers["content-length"]))
-                provider.seen.append({
-                    "path": self.path, "headers": dict(self.headers.items()), "body": body,
-                    "betas": self.headers.get_all("anthropic-beta") or [],
-                })  # fmt: skip
+                with LOCK:
+                    provider.seen.append({
+                        "path": self.path, "headers": dict(self.headers.items()), "body": body,
+                        "betas": self.headers.get_all("anthropic-beta") or [],
+                    })  # fmt: skip
+                    status, payload = (
+                        provider.answers.pop(0) if provider.answers
+                        else (provider.status, provider.payload)
+                    )  # fmt: skip
                 provider.entered.set()
                 if provider.hold is not None:
                     provider.hold.wait(5)
-                payload = provider.payload
-                self.send_response(provider.status)
+                self.send_response(status)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("request-id", "req_1")
                 self.send_header("anthropic-ratelimit-requests-remaining", "9")
@@ -904,3 +913,110 @@ def test_a_charge_line_that_cannot_be_written_stops_forwarding_and_leaves_spend_
         spend = _closed_record(running)  # CLOSED totals agree with the lines
         assert spend["unsettled"] > 0
         assert "admitted but never settled" in spend["uncertain"]
+
+
+# -- adversarial: concurrency, the spending bound and crash recovery (#138) -----------
+
+OVERRUN = sse(  # two million input tokens: ten dollars, far above any reservation
+    {"type": "message_start",
+     "message": {"usage": {"input_tokens": 2_000_000, "output_tokens": 1}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "message_delta", "usage": {"output_tokens": 3}},
+    {"type": "message_stop"},
+)  # fmt: skip
+ERROR = b'{"type": "error", "error": {"type": "overloaded_error"}}'
+
+
+def _concurrently(running: Running, count: int) -> list[threading.Thread]:
+    def post(running: Running = running) -> None:
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            running.post()
+
+    threads = [threading.Thread(target=post) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    return threads
+
+
+def _wait_for(predicate: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 5
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("in_flight", [1, 3])
+def test_concurrent_overruns_are_bounded_by_the_requests_in_flight(in_flight: int) -> None:
+    """ADR-0037 §4: spend is at most the budget plus the overruns of the requests in
+    flight when the attempt halted; nothing is admitted after."""
+    provider = Provider(hold=threading.Event(), payload=OVERRUN)
+    for running in start(provider, max_in_flight=in_flight):
+        threads = _concurrently(running, in_flight)
+        _wait_for(lambda: len(provider.seen) == in_flight)
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+        lines = charges(running.log)
+        assert len(lines) == in_flight
+        assert all("halted=true" in line for line in lines)
+        budget = running.gateway.budget
+        assert budget.halted
+        assert budget.spent() <= BUDGET + budget.overruns
+        code, _, data = running.post()
+        assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == in_flight  # nothing after the halt
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+def test_an_untrusted_report_stops_admission_while_another_request_finishes() -> None:
+    provider = Provider(hold=threading.Event(), answers=[(200, GOOD), (529, ERROR)])
+    for running in start(provider, max_in_flight=2):
+        threads = _concurrently(running, 2)
+        _wait_for(lambda: len(provider.seen) == 2)
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+        lines = charges(running.log)
+        assert len(lines) == 2  # the one in flight is still charged, from its report
+        assert any("reason=reported" in line for line in lines)
+        assert running.gateway.budget.halted
+        code, _, _ = running.post()
+        assert code == 429
+        assert len(provider.seen) == 2
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+def test_trusted_reports_never_take_spend_past_the_budget() -> None:
+    """Request after request, each well within its reservation, until the budget
+    can no longer cover the next one: then it is refused locally, unforwarded."""
+    provider = Provider()
+    limit = 40_000  # four cents: about a hundred small requests, then too little
+    for running in start(provider, budget=limit):
+        for _ in range(500):
+            code, _, data = running.post()
+            if code != 200:
+                break
+        assert code == 429, (code, data[:200])
+        assert json.loads(data)["error"]["type"] == "budget_exceeded"
+        assert running.gateway.budget.spent() <= limit
+        assert len(charges(running.log)) == len(provider.seen)
+        assert not running.gateway.budget.halted  # refused, not halted: nothing unknown
+
+
+def test_a_gateway_killed_mid_request_leaves_a_record_that_makes_spend_uncertain() -> None:
+    """Crash recovery (ADR-0039): what a SIGKILL leaves behind (an ADMIT, no CHARGE,
+    no CLOSED) is never a complete record; the reservation counts as unsettled."""
+    provider = Provider(hold=threading.Event())
+    for running in start(provider):
+        threads = _concurrently(running, 1)
+        assert provider.entered.wait(5)
+        _wait_for(lambda log=running.log: "ADMIT" in log.getvalue())
+        killed = running.log.getvalue().splitlines()  # the log as a kill would leave it
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+    spend = mg.parse_spend(killed)
+    assert spend["uncertain"] is not None
+    assert spend["unsettled"] > 0
