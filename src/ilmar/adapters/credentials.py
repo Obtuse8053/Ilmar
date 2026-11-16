@@ -40,6 +40,15 @@ def read_credentials(names: Iterable[str], *, environ: Mapping[str, str]) -> dic
 
 def _directory(environ: Mapping[str, str]) -> Path:
     raw = environ.get(DIRECTORY_VARIABLE, "")
+    if not raw and environ.get("INVOCATION_ID"):
+        # Started by systemd, which provided no credentials: the unit has no
+        # LoadCredentialEncrypted=, or this systemd cannot decrypt user-scoped
+        # credentials (older than 256). Either way, nothing starts.
+        raise ConfigError(
+            f"started by systemd, but it provided no ${DIRECTORY_VARIABLE}: the unit needs "
+            "LoadCredentialEncrypted= lines, and user-scoped encrypted credentials need "
+            "systemd 256 or later; nothing is read from the environment instead"
+        )
     if not raw:
         raise ConfigError(
             f'[secrets] source = "systemd-credentials", but ${DIRECTORY_VARIABLE} is not set: '

@@ -166,3 +166,25 @@ def example_with_credentials(tmp_path: Path) -> Path:
     path = tmp_path / "ilmar.toml"
     path.write_text(example.read_text() + '\n[secrets]\nsource = "systemd-credentials"\n')
     return path
+
+
+def test_under_systemd_without_credentials_the_error_names_the_likely_cause() -> None:
+    """An unsupported systemd (older than 256 for user-scoped credentials) or a
+    unit without LoadCredentialEncrypted= gives no directory: refused, and the
+    environment is still not consulted."""
+    environ = {"INVOCATION_ID": "0123", "GITHUB_TOKEN": GITHUB_SECRET}
+    with pytest.raises(ConfigError, match="systemd 256 or later") as refused:
+        read_credentials(NAMES, environ=environ)
+    assert "nothing is read from the environment" in str(refused.value)
+    assert GITHUB_SECRET not in str(refused.value)
+
+
+def test_no_credential_file_is_ever_committed() -> None:
+    root = Path(__file__).resolve().parents[2]
+    skip = {".git", ".venv", "node_modules", ".mypy_cache", ".ruff_cache"}
+    found = [
+        p for p in root.rglob("*")
+        if not skip & set(p.relative_to(root).parts)
+        and (p.suffix in {".cred", ".credential"} or p.parent.name == "credentials")
+    ]  # fmt: skip
+    assert found == []
