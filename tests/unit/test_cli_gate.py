@@ -161,3 +161,88 @@ def test_a_stored_gate_record_cannot_be_removed_or_rewritten(config: Path, check
         conn.execute("UPDATE gate_record SET revoked_at = 'x', revoked_by = 'y'")  # once
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE gate_record SET revoked_at = NULL, revoked_by = NULL")
+
+
+# -- trial authorization (ADR-0041) -----------------------------------------------------
+
+SUPERVISED = """
+[autonomy]
+mode = "supervised"
+repository_id = 987654321
+[budget]
+daily_usd = 20.0
+monthly_usd = 100.0
+reserve_per_execution_usd = 1.0
+provider_cap_attested_usd = 50.0
+kill_switch_file = "/tmp/ilmar-test-KILL"
+"""
+TRIAL = [
+    "--repository-id", "987654321", "--repository", "someone/ilmar-disposable",
+    "--agent-version", "2.1.318", "--max-executions", "3", "--max-spend-usd", "5",
+    "--hours", "24", "--purpose", "https://github.com/Obtuse8053/Ilmar/issues/93",
+    "--disposable",
+]  # fmt: skip
+
+
+@pytest.fixture
+def supervised(config: Path) -> Path:
+    text = config.read_text().replace("Obtuse8053/Ilmar", "someone/ilmar-disposable")
+    text = text.replace(
+        'api_key_env = "ANTHROPIC_API_KEY" }',
+        'api_key_env = "ANTHROPIC_API_KEY", expected_version = "2.1.318" }',
+    )
+    config.write_text(text + SUPERVISED)
+    return config
+
+
+def test_a_trial_is_authorized_shown_and_ended(supervised: Path, checkout: Path) -> None:
+    code, out, err = ilmar("gate", "trial", "--config", str(supervised), "--as", "alice",
+                           *TRIAL, checkout=checkout)  # fmt: skip
+    assert (code, err) == (0, ""), err
+    assert "until 2026-03-02T12:00:00+00:00" in out
+    assert "it is not a gate record" in out
+    code, out, _ = ilmar("gate", "show", "--config", str(supervised), checkout=checkout)
+    assert "trial #1 unrevoked: repository 987654321" in out
+    assert "no gate records" in out
+    code, out, _ = ilmar("gate", "end-trial", "--config", str(supervised), "--as", "bob",
+                         checkout=checkout)  # fmt: skip
+    assert code == 0
+    code, out, _ = ilmar("gate", "show", "--config", str(supervised), checkout=checkout)
+    assert "trial #1 revoked" in out
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--repository-id", "111", "not the configured [autonomy] repository_id"),
+        ("--hours", "73", "at most 72"),
+        ("--hours", "0", "at most 72"),
+        ("--max-spend-usd", "60", "attested provider cap"),
+        ("--max-spend-usd", "0.5", "below one attempt"),
+        ("--max-executions", "21", "1 to 20"),
+        ("--repository", "Obtuse8053/Ilmar", "Ilmar's own repository"),
+        ("--purpose", "https://example.com/x", "Gate 1"),
+    ],
+)
+def test_a_trial_outside_its_bounds_is_refused(
+    supervised: Path, checkout: Path, flag: str, value: str, message: str
+) -> None:
+    argv = list(TRIAL)
+    argv[argv.index(flag) + 1] = value
+    code, _, err = ilmar("gate", "trial", "--config", str(supervised), "--as", "alice", *argv,
+                         checkout=checkout)  # fmt: skip
+    assert code == 3
+    assert message in err
+
+
+def test_a_trial_needs_the_disposable_attestation(supervised: Path, checkout: Path) -> None:
+    argv = [a for a in TRIAL if a != "--disposable"]
+    with pytest.raises(SystemExit):
+        ilmar("gate", "trial", "--config", str(supervised), "--as", "alice", *argv,
+              checkout=checkout)  # fmt: skip
+
+
+def test_a_trial_needs_supervised_mode(config: Path, checkout: Path) -> None:
+    code, _, err = ilmar("gate", "trial", "--config", str(config), "--as", "alice", *TRIAL,
+                         checkout=checkout)  # fmt: skip
+    assert (code, "needs [autonomy] mode" in err) == (3, True)

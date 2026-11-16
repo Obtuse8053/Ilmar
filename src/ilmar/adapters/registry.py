@@ -250,6 +250,29 @@ def secret_values(
     return environ
 
 
+def runtime_reader(
+    config: IlmarConfig, *, registry: Registry = DEFAULT_REGISTRY
+) -> Callable[[], object]:
+    """How to open ``config``'s container runtime alone, with no secret, for
+    reads by a person's command (``ilmar quarantine resolve``, ADR-0042). Raises
+    ``ConfigError`` if the runtime needs a secret to be built."""
+    context = _context(config)
+    port = "container_runtime"
+    adapter = config.adapters[port]
+    where = f"[adapters.{port}] options"
+    options = Options(adapter.options, where)
+    try:
+        runtime_plan = registry.parser(port, adapter.kind)(options, context)
+    except ValueError as error:
+        if isinstance(error, ConfigError):
+            raise
+        raise ConfigError(f"{where}: {error}") from None
+    options.finish()
+    if not isinstance(runtime_plan, Plan) or runtime_plan.environment:
+        raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
+    return lambda: runtime_plan.create(Secrets({}))
+
+
 def build(
     config: IlmarConfig,
     *,
