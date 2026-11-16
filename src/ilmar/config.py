@@ -34,6 +34,7 @@ from typing import Any
 
 from ilmar.domain.budget import BudgetLimits, usd_to_micros
 from ilmar.domain.errors import ConfigError
+from ilmar.domain.gates import ILMAR_REPOSITORY_ID
 from ilmar.domain.safety_controls import safety_controls
 from ilmar.domain.verification import (
     DEFAULT_CHECK_INFLUENCING_PATHS,
@@ -312,6 +313,8 @@ def _parse_autonomy(raw: Mapping[str, Any]) -> Autonomy:
 def _check_supervised(config: IlmarConfig, *, self_target: bool) -> None:
     """Mode 1's own rules, refused here so they never reach a running loop."""
     where = '[autonomy] mode = "supervised"'
+    if config.autonomy.repository_id == ILMAR_REPOSITORY_ID:
+        raise ConfigError(f"{where} refuses Ilmar's own repository as the target (ADR-0030 §5)")
     if config.autonomy.repository_id is None:
         raise ConfigError(
             f"{where} needs [autonomy] repository_id: the approved target's immutable "

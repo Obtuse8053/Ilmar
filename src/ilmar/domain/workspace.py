@@ -222,6 +222,16 @@ class ContainerHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class SandboxPart:
+    """One part of a sandbox that still exists (ADR-0042): the container, a
+    sidecar or a network. ``owner`` is ``None`` without complete labels."""
+
+    kind: str
+    name: str
+    owner: ResourceOwner | None
+
+
+@dataclass(frozen=True, slots=True)
 class ContainerInfo:
     """What the runtime reports about a container found by name."""
 

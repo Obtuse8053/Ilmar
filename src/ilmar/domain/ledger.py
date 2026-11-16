@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from ilmar.domain.budget import BudgetLimits, Charge, ChargeKind, Suspension
 from ilmar.domain.execution import Execution, Transition
-from ilmar.domain.gates import GateChange
+from ilmar.domain.gates import GateChange, TrialCap
 
 if TYPE_CHECKING:  # events imports this module; the store validates extra events
     from ilmar.domain.events import Event
@@ -485,6 +485,8 @@ class Commit:
     """When the suspension is cleared (set only to resume)."""
     gate: GateChange | None = None
     """A gate record written or revoked (ADR-0040): only by a person, alone."""
+    trial: TrialCap | None = None
+    """The trial whose bounds this commit's admissions must keep (ADR-0041 §5)."""
 
     def __post_init__(self) -> None:
         if self.suspend is not None and self.resume is not None:
@@ -533,4 +535,5 @@ def _only_gate(commit: Commit) -> bool:
         commit.created or commit.applied or commit.operations or commit.resources
         or commit.extra_events or commit.charges or commit.budget is not None
         or commit.suspend is not None or commit.resume is not None
+        or commit.trial is not None
     )  # fmt: skip

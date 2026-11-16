@@ -74,6 +74,10 @@ jobs:
           podman rm --all --force --time 0 || true
           export ILMAR_TEST_CLAUDE_IMAGE="localhost/ilmar-claude-code:$ILMAR_TEST_CLAUDE_VERSION"
           export ILMAR_TEST_PODMAN_PROXY_IMAGE=docker.io/library/python:3.12-alpine
+          # Ilmar never pulls an image itself; the egress proxy's image must be present.
+          podman pull "$ILMAR_TEST_PODMAN_PROXY_IMAGE"
+          podman image inspect --format "$ILMAR_TEST_PODMAN_PROXY_IMAGE digest={{.Digest}}" \
+            "$ILMAR_TEST_PODMAN_PROXY_IMAGE"
           export ILMAR_LIVE_REQUIRED=1
           export ILMAR_LIVE_REPORT_DIR="$RUNNER_TEMP/gateway-reports"
           pytest -m integration -v -rs tests/integration/test_claude_code_pinned.py

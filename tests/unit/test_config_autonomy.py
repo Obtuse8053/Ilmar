@@ -83,6 +83,7 @@ def _unpinned(data: dict[str, Any]) -> None:
     ("mutate", "message"),
     [
         (lambda d: d["autonomy"].pop("repository_id"), "repository_id"),
+        (lambda d: d["autonomy"].update(repository_id=1441625109), "own repository"),
         (lambda d: d.update(limits={"max_concurrent_executions": 2}),
          "max_concurrent_executions = 1"),
         (lambda d: d.pop("budget"), "kill_switch_file"),
