@@ -75,7 +75,7 @@ options = { image = "localhost/ilmar-claude-code:pinned", api_key_env = "ANTHROP
 #   gateway_image = "docker.io/library/python@sha256:<64 hex>"   # pinned by digest
 #   gateway_key_env = "ILMAR_GATEWAY_KEY"   # read only by the runtime's sidecar
 #   gateway_policy = "/etc/ilmar/prices.json"   # attested prices; yours, 0600
-#   gateway_max_in_flight = 1               # the default; at most 4
+# The gateway forwards exactly one request at a time; that is not configurable.
 # It also needs [budget]: the workspace cap stays the hard backstop.
 
 [adapters.execution_store]

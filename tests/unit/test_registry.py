@@ -786,8 +786,8 @@ def test_the_gateway_on_one_side_only_is_refused(tmp_path: Path, tools: dict[str
     [
         ({"gateway_image": "docker.io/library/python:3.12-alpine"}, "pinned by digest"),
         ({"gateway_upstream": "http://api.anthropic.com"}, "gateway_upstream"),
-        ({"gateway_max_in_flight": 5}, "must be 1 to 4"),
-        ({"gateway_max_in_flight": 0}, "gateway_max_in_flight"),
+        ({"gateway_max_in_flight": 2}, "is not configurable"),
+        ({"gateway_max_in_flight": 1}, "is not configurable"),
         ({"gateway_policy": "/nonexistent/prices.json"}, "cannot be read"),
     ],
 )
@@ -802,7 +802,7 @@ def test_one_gateway_option_alone_is_refused(tmp_path: Path, tools: dict[str, st
     del options(raw, "container_runtime")["gateway_policy"]
     assert "gateway_policy" in plan_error(raw, tmp_path)
     raw = data(tools)
-    options(raw, "container_runtime")["gateway_max_in_flight"] = 1
+    options(raw, "container_runtime")["gateway_upstream"] = "https://api.anthropic.com"
     assert "needs gateway_image" in plan_error(raw, tmp_path)
 
 

@@ -248,7 +248,8 @@ def podman_runtime(options: Options, context: BuildContext) -> Plan:
 
 
 _DIGEST_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$")
-MAX_GATEWAY_IN_FLIGHT = 4
+GATEWAY_IN_FLIGHT = 1
+"""Requests the sidecar forwards at once: exactly one (ADR-0044, maintainer decision)."""
 
 
 @dataclass(frozen=True)
@@ -277,7 +278,12 @@ class _GatewayOptions:
 def _gateway_options(options: Options, context: BuildContext) -> _GatewayOptions | None:
     keys = ("gateway_image", "gateway_key_env", "gateway_policy")
     given = [key for key in keys if options.has(key)]
-    extras = ("gateway_upstream", "gateway_egress_network", "gateway_max_in_flight")
+    if options.has("gateway_max_in_flight"):
+        raise options.error(
+            "gateway_max_in_flight",
+            "is not configurable: the gateway forwards one request at a time (ADR-0044)",
+        )
+    extras = ("gateway_upstream", "gateway_egress_network")
     if not given:
         for key in extras:
             if options.has(key):
@@ -290,15 +296,12 @@ def _gateway_options(options: Options, context: BuildContext) -> _GatewayOptions
     if not _DIGEST_IMAGE.match(image):
         raise options.error("gateway_image", "must be pinned by digest (name@sha256:<64 hex>)")
     upstream = options.https_url("gateway_upstream", "https://api.anthropic.com")
-    max_in_flight = options.positive_int("gateway_max_in_flight", 1)
-    if max_in_flight > MAX_GATEWAY_IN_FLIGHT:
-        raise options.error("gateway_max_in_flight", f"must be 1 to {MAX_GATEWAY_IN_FLIGHT}")
     path = options.path("gateway_policy", Path("unset"), base_dir=context.base_dir)
     return _GatewayOptions(
         image=image, key_env=options.env_name("gateway_key_env"),
         policy=_read_gateway_policy(path, options), upstream=upstream,
         egress_network=options.string("gateway_egress_network", "podman"),
-        max_in_flight=max_in_flight, where=options.where,
+        max_in_flight=GATEWAY_IN_FLIGHT, where=options.where,
     )  # fmt: skip
 
 
