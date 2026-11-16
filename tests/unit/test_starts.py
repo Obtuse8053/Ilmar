@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from ilmar.core.coordinator import ExitCode
 from ilmar.core.starts import (
     StartLimits,
     StartRecord,
@@ -414,3 +415,32 @@ def test_a_supervisor_ignoring_its_delays_is_suspended(tmp_path: Path) -> None:
         minute += 1.5
     assert found is not None
     assert "backoff" in found
+
+
+# -- which exits the shipped unit restarts (ADR-0033 §1, ADR-0043) ---------------------
+
+
+def systemd_restarts(service: configparser.SectionProxy, code: int) -> bool:
+    """``Restart=on-failure``: any non-zero exit, unless it is listed in
+    ``RestartPreventExitStatus``; never a clean exit 0."""
+    assert service["Restart"] == "on-failure"
+    prevented = {int(c) for c in service["RestartPreventExitStatus"].split()}
+    return code != 0 and code not in prevented
+
+
+@pytest.mark.parametrize(
+    ("code", "restarted"),
+    [
+        (ExitCode.SUCCESS, False),  # a clean stop
+        (ExitCode.FAILURE, True),  # a pass failed: retried, bounded by the start log
+        (ExitCode.BLOCKED, True),  # needs a person; a restart meets the same block
+        (ExitCode.CONFIGURATION, False),  # never (also: supervision off by default)
+        (ExitCode.SUSPENDED, False),  # never: a person resumes
+    ],
+)
+def test_the_unit_never_restarts_after_exit_3_or_78(code: ExitCode, restarted: bool) -> None:
+    assert systemd_restarts(unit()["Service"], int(code)) is restarted
+
+
+def test_every_exit_code_ilmar_uses_is_covered() -> None:
+    assert {int(c) for c in ExitCode} == {0, 1, 2, 3, 78}
