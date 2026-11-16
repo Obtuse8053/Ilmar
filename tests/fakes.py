@@ -26,6 +26,7 @@ from ilmar.domain.changes import (
     ChangeRequestState,
     ChecksSummary,
     CheckState,
+    RepositoryIdentity,
     RepositoryRef,
 )
 from ilmar.domain.errors import (
@@ -58,6 +59,7 @@ from ilmar.domain.workspace import (
     ModelAccess,
     NetworkPolicy,
     ResourceOwner,
+    SandboxPart,
     StopSignal,
 )
 from ilmar.ports.container_runtime import ContainerRuntime, StreamConsumer
@@ -462,6 +464,12 @@ class FakeContainerRuntime:
         self.started_specs.append(spec)
         return self._create(spec, spec.owner)
 
+    def sandbox_parts(self, name: str) -> tuple[SandboxPart, ...]:
+        found = self._by_name(name)
+        if found is None:
+            return ()
+        return (SandboxPart("container", name, found.spec.owner),)
+
     def find(self, name: str) -> ContainerInfo | None:
         found = self._by_name(name)
         if found is None:
@@ -678,7 +686,7 @@ class FakeSourceControl:
 
     def __init__(self, *, name: str = "fake") -> None:
         self._name = name
-        self.repository_ids: dict[str, int] | Exception = {}
+        self.repository_ids: dict[str, int | RepositoryIdentity] | Exception = {}
         """``repository_id`` by slug; an exception is raised instead."""
         self._revisions: dict[str, Tree] = {}
         self._parents: dict[str, str | None] = {}
@@ -733,13 +741,13 @@ class FakeSourceControl:
 
     # -- SourceControlProvider -------------------------------------------
 
-    def repository_id(self, repository: RepositoryRef) -> int:
+    def repository_identity(self, repository: RepositoryRef) -> RepositoryIdentity:
         if isinstance(self.repository_ids, Exception):
             raise self.repository_ids
         found = self.repository_ids.get(repository.slug)
         if found is None:
             raise ProviderError(f"unknown repository: {repository.slug}")
-        return found
+        return found if isinstance(found, RepositoryIdentity) else RepositoryIdentity(found)
 
     def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         return self._branches.get((repository, branch))

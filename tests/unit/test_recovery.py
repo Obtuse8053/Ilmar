@@ -1579,3 +1579,63 @@ def test_a_failure_code_survives_a_crash_into_the_next_pass_output(tmp_path: Pat
         (report,) = recover(world, passes=1)
         assert "e1: failed [verification-failed] verification checks failed" in report.summary
     assert crashed_after_failing > 0  # some crash points lie between the failure and the end
+
+
+def test_a_person_s_verified_resolution_lets_the_next_pass_finish(tmp_path: Path) -> None:
+    """ADR-0042 (#59): while any part of the quarantined sandbox remains, the
+    resolution is refused and the execution stays blocked. Once a person has
+    removed the parts and recorded a verified resolution, the next pass finishes
+    the failed execution as usual: the claim is released. The row stays
+    quarantined, and automation never resolved anything by itself."""
+    from ilmar.cli_quarantine import _verify
+    from ilmar.domain.events import Actor, ActorKind, Event, EventContext, EventType
+    from ilmar.domain.ledger import Commit
+    from ilmar.domain.workspace import ResourceOwner
+
+    from fake_podman import FakePodman
+
+    podman = FakePodman()
+    sandbox = "ilmar-inst-e1-1"
+    podman.fail_rm_names.add(sandbox + "-egress")
+    world = podman_world(tmp_path.resolve(), podman)
+    first = world.process()
+    first.run()
+    first.exit()
+    podman.fail_rm_names.clear()
+    assert world.make_runtime is not None
+    runtime = world.make_runtime(world.layout)
+
+    process = world.process()
+    (row,) = [r for r in process.store.resources(execution_id="e1") if r.status is R.QUARANTINED]
+    process.exit()
+    remaining = _verify(row, None, runtime)
+    assert isinstance(remaining, list)
+    assert any("sidecar" in line for line in remaining)  # refused: something remains
+
+    owner = ResourceOwner("inst", row.execution_id, row.attempt, row.owner_token)
+    runtime.remove_owned(row.name, owner=owner)  # the person removes what remained
+    assert _verify(row, None, runtime) == "absent"
+
+    process = world.process()
+    report = process.run()  # still blocked: nothing resolved yet
+    assert report is not None
+    assert report.results[0].detail == "quarantined resources remain"
+    fence = process.ownership.fence
+    person = Actor(ActorKind.HUMAN, "alice")
+    event = Event.create(
+        EventType.RESOURCE_RESOLVED, at=world.clock(), instance="inst", epoch=fence.epoch,
+        actor=person, execution="e1", attempt=row.attempt, reason="quarantine-resolved",
+        data={"resource": row.key, "observed": "absent", "action": "removed-by-hand"},
+    )  # fmt: skip
+    context = EventContext(at=world.clock(), instance="inst", epoch=fence.epoch, actor=person)
+    process.store.commit(fence, Commit(extra_events=(event,)), context=context)
+    process.exit()
+
+    process = world.process()
+    report = process.run()
+    rows = process.store.resources(execution_id="e1")
+    process.exit()
+    assert report is not None
+    assert report.results[0].outcome.value == "failed", report.summary
+    assert [r.status for r in rows if r.kind is ResourceKind.CONTAINER] == [R.QUARANTINED]
+    assert [t.ref.key for t in world.tasks.list_eligible()] == ["1"]  # the claim is released

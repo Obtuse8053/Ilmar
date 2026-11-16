@@ -56,6 +56,7 @@ from ilmar.core.effects import (
 from ilmar.core.event_context import failure_code
 from ilmar.core.naming import branch_name, container_name
 from ilmar.core.ownership import ExecutionLease, ExecutionLeases
+from ilmar.core.quarantine import unresolved
 from ilmar.core.safe_fs import directory_identity
 from ilmar.core.state_machine import ExecutionStateMachine, RetryBackoff, attempt_wait_reason
 from ilmar.domain.agent import AgentOutcome, AgentRequest, AgentResult
@@ -1281,9 +1282,8 @@ class _Run:
                         candidate=candidate, then=lambda _r: Commit(),
                     )  # fmt: skip
         self.sweep_sandboxes()  # journaled, ownership-verified removal of every live sandbox
-        quarantined = any(
-            r.kind is ResourceKind.CONTAINER
-            for r in self.store.resources(execution_id=self.id, statuses={R.QUARANTINED})
+        quarantined = any(  # a resolved one was verified gone by a person (ADR-0042)
+            r.kind is ResourceKind.CONTAINER for r in unresolved(self.store, self.id)
         )
         if state is S.RUNNING_AGENT and not quarantined:
             # Settling these says the sandbox is gone; with a quarantined one it is
@@ -1324,7 +1324,8 @@ class _Run:
                 step = operation.key.split(":", 3)[3]
                 effects.settle_post(execution, self.lease, step=step)
         self.sweep_sandboxes()
-        quarantined = self.store.resources(execution_id=self.id, statuses={R.QUARANTINED})
+        # ADR-0042: a quarantined resource a person has resolved no longer holds it.
+        quarantined = unresolved(self.store, self.id)
         if execution.state is S.SUCCEEDED:
             self.note(
                 execution,

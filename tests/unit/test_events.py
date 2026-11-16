@@ -285,11 +285,14 @@ ADDED_CODES = {
     "suspension-check-failed",  # ADR-0029 §4 (#18 part 2, #122 review)
     "maintainer-released",  # ADR-0031 §3 (#92 part 2)
     "maintainer-abandoned",  # ADR-0031 §3 (#92 part 2)
+    "quarantine-resolved",  # ADR-0042 (#59)
     "model-spend-settled",  # P5 part 2b (ADR-0039, proposed)
     "spend-uncertain",
     "spend-reviewed",  # P5 part 2b: also the suspension reason
     "gate-recorded",  # ADR-0040 (#91)
     "gate-revoked",  # ADR-0040 (#91)
+    "trial-authorized",  # ADR-0041 (#93)
+    "trial-revoked",  # ADR-0041 (#93)
     "provider-rate-limited",  # ADR-0029 §5 (#90)
     "provider-refused",  # ADR-0029 §5 (#90)
     "candidate-secret",  # ADR-0038 (#110)

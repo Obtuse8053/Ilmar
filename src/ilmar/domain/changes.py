@@ -23,6 +23,26 @@ class RepositoryRef:
 
 
 @dataclass(frozen=True, slots=True)
+class RepositoryIdentity:
+    """A repository's immutable identity at its provider (ADR-0040, ADR-0041).
+
+    ``id`` survives a rename. ``forked_from`` holds the IDs of the repositories
+    it was forked from (its parent and the root of the network), empty for an
+    original. A fork has its own ``id``."""
+
+    id: int
+    forked_from: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value in (self.id, *self.forked_from):
+            if type(value) is not int or value < 1:
+                raise ValueError("a repository ID is a positive integer")
+
+    def is_or_descends_from(self, other: int) -> bool:
+        return self.id == other or other in self.forked_from
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateRevision:
     """The agent's output frozen into an immutable revision (ADR-0010).
 
