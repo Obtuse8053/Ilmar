@@ -17,7 +17,7 @@ passes.
 | --- | --- | --- | --- | --- |
 | 0. Manual (today) | — | `ilmar run --once`, started by a human | Provider workspace cap | — |
 | 1. Supervised autonomy | M3 | `ilmar run --loop` on approved tasks, operator on call, restarts manual | Provider workspace cap | #93 |
-| 2. Budget-limited autonomy | M4 | Unattended processing and pull requests; supervisor restarts | LiteLLM gateway per execution and per day, plus the provider cap | #96 |
+| 2. Budget-limited autonomy | M4 | Unattended processing and pull requests; supervisor restarts | Ilmar's own model gateway sidecar per attempt (ADR-0037, ADR-0039), plus the provider cap | #96 |
 | 3. Controlled self-hosting | M4 | Ilmar works on itself; humans promote releases; health-gated rollback | As Mode 2 | #98 |
 
 A mode needs all three of: `[autonomy] mode`, a gate record written by the
@@ -60,22 +60,42 @@ exhausted budget always ends in a suspended state.
 - Existing fencing, ownership, crash-recovery, containment (ADR-0010,
   ADR-0011, ADR-0015) and credential (ADR-0006) guarantees are unchanged.
 
-## Mode 2 gateway: LiteLLM, if it passes evaluation
+## Mode 2 gateway: Ilmar's own sidecar (ADR-0037, ADR-0039)
 
-An operator-run LiteLLM proxy becomes the trusted meter and per-execution cap
-only if an evaluation of a pinned version passes every point in #94:
+*Updated 2026-11-14.* The original plan of an operator-run LiteLLM proxy,
+adopted only if it passed an evaluation (#94), is **deferred**. ADR-0037
+chose a per-sandbox gateway sidecar written in Ilmar, standard library only.
+It is simpler for one repository with one execution at a time, and it adds
+no external service (no Postgres or Redis failure modes, no licence
+questions). ADR-0032 stays reserved for a shared gateway.
 
-- pre-request reservation, or a proven worst-case overshoot of one request;
-- fail-closed budget enforcement;
-- behaviour when Postgres or Redis is down, slow, read-only or flushed;
-- durable spend across restarts;
-- admin-key isolation;
-- Claude Code compatibility;
-- the security record;
-- MIT rather than Enterprise licensing.
+What the sidecar does:
 
-The Anthropic workspace cap stays as an independent backstop. If the
-evaluation fails, Ilmar stays in Mode 1 and a separate proposal follows.
+- **Only route.** The sandbox reaches the model only through it, on an
+  internal network.
+- **Throwaway token.** The sandbox holds only a per-attempt token. The real
+  key reaches only the sidecar, through a file-free hand-over.
+- **Admission.** Each request is checked against strict shapes and a beta
+  allow-list, and an estimated reservation is taken before it is forwarded.
+- **Halts.** A complete, trusted usage report is charged in full. Anything
+  else (an untrusted report, a non-200 status, an unreachable provider, or
+  an error in the gateway itself) charges the whole reservation and halts
+  the attempt.
+- **Settlement.** Settlement into the ledger, crash recovery and the
+  human spending review are ADR-0039.
+
+**What it does not give:** a proven dollar bound. Only the output term of a
+reservation is a hard bound. The input term is an estimate, and an overrun
+is charged and halts, but it is not prevented (ADR-0037 §4). **The Anthropic
+workspace cap stays the independent hard backstop**, in every mode, and the
+Gate 1 cap drill tests it.
+
+**Status:** built and tested (compatibility with the pinned Claude Code
+through the real sidecar; unit and real-Podman tests). It is **not reachable
+from any configuration** until its acceptance gates pass (#111, Gate 2).
+
+**Revisit** (ADR-0037): more than one concurrent execution or repository, or
+a provable input bound from the provider.
 
 ## Restarts and upgrades
 
@@ -92,7 +112,7 @@ Releases with schema migrations never roll back automatically.
 | Milestone | Ends at | Pull requests (estimate) | Critical path |
 | --- | --- | --- | --- |
 | M3 Reliability | Gate 1 (#93) | about 8, plus gate evidence | #89 ADRs → #13 → #18 → #91 loop mode |
-| M4 Self-hosting, Mode 2 part | Gate 2 (#96) | about 6, plus gate evidence | #111 proxy ADR and implementation; #94 evaluation → #94 integration |
+| M4 Self-hosting, Mode 2 part | Gate 2 (#96) | about 6, plus gate evidence | #111 gateway sidecar (ADR-0037, built) → configuration wiring → Gate 2 evidence; #94 LiteLLM deferred |
 | M4 Self-hosting, Mode 3 part | Gate 3 (#98) | about 6, plus gate evidence | #97 releases |
 
 In parallel within M3: #110 (candidate secret scan, a Gate 1 prerequisite),
