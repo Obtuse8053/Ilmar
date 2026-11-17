@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scripts import cap_drill as d
+
+import cap_drill as d
 
 
 def limit(amount: str = "100", **changes: Any) -> dict[str, Any]:
