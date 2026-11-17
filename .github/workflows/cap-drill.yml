@@ -1,0 +1,206 @@
+name: Provider cap drill through Ilmar (one time, manual)
+
+# The one-time provider cap drill of Gate 1 (#93), designed in
+# docs/operations/cap-drill-workflow.md. At most USD 1.00 of real spend, on the
+# scratch workspace `ilmar-cap-test`, against the disposable repository.
+#
+# Order and boundaries:
+# 1. `guard` (no secrets): started by hand on main at expected_sha; the
+#    `cap-drill` environment and main's rules are as required; the
+#    maintainer's authorization comment on #93 names this commit, the
+#    workspace and the allowance; no earlier run reached the preflight and no
+#    marker is on #93. Then it posts the one-time marker on #93.
+# 2. `prepare` (no secrets): the hash-locked wheels and the digest-pinned agent
+#    image, as live.yml prepares them.
+# 3. `drill` (the environment, after a required reviewer approves): checks the
+#    context and this run's marker before any secret; then, in order, each
+#    step running only if the one before it succeeded:
+#    - Preflight (§3): Admin API GETs and one free token count. The workspace,
+#      the key's workspace, the spend limit and month-to-date cost. A stop
+#      here spends nothing.
+#    - Reach the cap (§4): one request at a time, no retries, never past the
+#      allowance.
+#    - Ilmar's coordinator (§5): `ilmar run --once` twice and `ilmar budget`.
+#    Then, always: the actual cost (§6) and the sanitized record (§7).
+# 4. `post` (no environment, no secrets): the record on #93.
+# Nothing here runs on push or pull_request.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "The full commit SHA on main that you reviewed"
+        required: true
+        type: string
+      authorization:
+        description: "URL of your #93 comment: cap-drill: authorize <sha> workspace=ilmar-cap-test allowance=1.00"
+        required: true
+        type: string
+      model:
+        description: "A model on the script's reviewed allow-list (PRICES)"
+        required: true
+        type: string
+      attested_cap_usd:
+        description: "The ilmar-cap-test monthly limit you set, in USD (must equal what the provider reports)"
+        required: true
+        type: string
+      issue:
+        description: "Your open, unlabelled issue in ilmar-disposable"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: cap-drill
+  cancel-in-progress: false
+
+env:
+  # Untrusted inputs: only ever read from the environment, never expanded in `run:`.
+  CAP_DRILL_EXPECTED_SHA: ${{ inputs.expected_sha }}
+  CAP_DRILL_AUTHORIZATION: ${{ inputs.authorization }}
+  CAP_DRILL_MODEL: ${{ inputs.model }}
+  CAP_DRILL_ATTESTED_CAP_USD: ${{ inputs.attested_cap_usd }}
+  CAP_DRILL_ISSUE: ${{ inputs.issue }}
+
+jobs:
+  guard:
+    name: Guard and mark (no secrets)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the context, the authorization and that it never ran
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cap_drill.py guard
+      - name: Mark the authorization as used on #93
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cap_drill.py mark
+
+  prepare:
+    name: Prepare the wheels and the agent image (no secrets)
+    needs: guard
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      image_id: ${{ steps.prepare.outputs.image_id }}
+      archive_sha256: ${{ steps.prepare.outputs.archive_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.CAP_DRILL_EXPECTED_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Download the locked wheels and build the agent image
+        id: prepare
+        run: python scripts/cap_drill.py prepare "$RUNNER_TEMP/drill-inputs"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: drill-inputs
+          path: ${{ runner.temp }}/drill-inputs
+          if-no-files-found: error
+          retention-days: 1
+
+  drill:
+    name: Drill
+    needs: [guard, prepare]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: cap-drill
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.CAP_DRILL_EXPECTED_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: drill-inputs
+          path: ${{ runner.temp }}/drill-inputs
+      - name: Check the context and this run's marker (before any secret)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cap_drill.py drill-context
+      - name: Install the locked wheels (digests checked, nothing resolved)
+        run: python3 scripts/live_ci.py --install-wheels "$RUNNER_TEMP/drill-inputs/wheels" "$RUNNER_TEMP/drill-site"
+      - name: Load the images (by digest; nothing is built here)
+        env:
+          ILMAR_IMAGE_ID: ${{ needs.prepare.outputs.image_id }}
+          ILMAR_IMAGE_SHA256: ${{ needs.prepare.outputs.archive_sha256 }}
+        run: python3 scripts/cap_drill.py load-images "$RUNNER_TEMP/drill-inputs/claude-code.tar"
+      - name: Preflight (§3, read-only)
+        env:
+          CAP_DRILL_ADMIN_KEY: ${{ secrets.CAP_DRILL_ADMIN_KEY }}
+          CAP_DRILL_KEY: ${{ secrets.CAP_DRILL_KEY }}
+        run: exec python3 scripts/cap_drill.py preflight
+      - name: Reach the cap (§4)
+        env:
+          CAP_DRILL_KEY: ${{ secrets.CAP_DRILL_KEY }}
+          PYTHONPATH: ${{ runner.temp }}/drill-site
+        run: exec python3 scripts/cap_drill.py exhaust
+      - name: Ilmar's coordinator (§5)
+        env:
+          CAP_DRILL_KEY: ${{ secrets.CAP_DRILL_KEY }}
+          CAP_DRILL_GITHUB_TOKEN: ${{ secrets.CAP_DRILL_GITHUB_TOKEN }}
+          PYTHONPATH: ${{ runner.temp }}/drill-site
+        run: exec python3 scripts/cap_drill.py through-ilmar
+      - name: Actual cost (§6, read-only)
+        if: always()
+        env:
+          CAP_DRILL_ADMIN_KEY: ${{ secrets.CAP_DRILL_ADMIN_KEY }}
+        run: exec python3 scripts/cap_drill.py actual-cost
+      - name: Remove every container (no secrets)
+        if: always()
+        run: |
+          podman rm --all --force --time 0 || true
+          podman network prune --force || true
+      - name: The sanitized record (§7, no secrets)
+        if: always()
+        run: python3 scripts/cap_drill.py finish "$RUNNER_TEMP/cap-drill/cap-drill-record.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: cap-drill-record
+          path: ${{ runner.temp }}/cap-drill/cap-drill-record.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  post:
+    name: Post the record on #93
+    needs: drill
+    if: always() && (needs.drill.result == 'success' || needs.drill.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.CAP_DRILL_EXPECTED_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cap-drill-record
+          path: ${{ runner.temp }}/cap-drill-record
+      - name: Post (only a checked record of this commit)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cap_drill.py post "$RUNNER_TEMP/cap-drill-record/cap-drill-record.json"
