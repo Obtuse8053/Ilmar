@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import stat
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,7 @@ from ilmar.adapters.claude_code.runner import ClaudeCodeRunner
 from ilmar.adapters.github.source_control import GitHubSourceControl
 from ilmar.adapters.github.tasks import GitHubTaskProvider
 from ilmar.adapters.podman.runtime import PodmanRuntime
-from ilmar.adapters.registry import DEFAULT_REGISTRY, Registry, build, plan
+from ilmar.adapters.registry import DEFAULT_REGISTRY, Registry, build, plan, runtime_reader
 from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.config import IlmarConfig, parse_config
 from ilmar.core.components import AgentSandbox, Components
@@ -684,3 +686,161 @@ def test_a_configuration_owned_by_someone_else_is_refused(
     monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
     with pytest.raises(ConfigError, match="owned by this user or root"):
         plan(config(data(), tmp_path, source=source))
+
+
+# -- the model gateway, from configuration (ADR-0044) ---------------------------------
+
+GATEWAY_KEY = "sk-ant-GATEWAY-KEY-NEVER-IN-THE-SANDBOX"
+GATEWAY_IMAGE = "docker.io/library/python@sha256:" + "a" * 64
+GATEWAY_POLICY = json.dumps({
+    "prices": {"claude-opus-5-5": {"input": 5_000_000, "output": 25_000_000,
+               "cache_write_5m": 6_250_000, "cache_write_1h": 10_000_000,
+               "cache_read": 500_000}},
+    "allowed_betas": ["claude-code-20250219"],
+})  # fmt: skip
+BUDGET = {"daily_usd": 5, "monthly_usd": 10, "reserve_per_execution_usd": 2,
+          "provider_cap_attested_usd": 10}  # fmt: skip
+
+
+def gateway_data(tools: dict[str, str], tmp_path: Path, **runtime: Any) -> dict[str, Any]:
+    raw = data(tools)
+    policy = tmp_path / "prices.json"
+    policy.write_text(GATEWAY_POLICY)
+    policy.chmod(0o600)
+    options(raw, "container_runtime").update({
+        "gateway_image": GATEWAY_IMAGE, "gateway_key_env": "ILMAR_GATEWAY_KEY",
+        "gateway_policy": str(policy), **runtime,
+    })  # fmt: skip
+    runner = options(raw, "agent_runner")
+    del runner["api_key_env"]
+    runner["model_route"] = "gateway"
+    raw["budget"] = dict(BUDGET)
+    return raw
+
+
+GATEWAY_ENVIRON = {"GITHUB_TOKEN": GITHUB_SECRET, "ILMAR_GATEWAY_KEY": GATEWAY_KEY}
+
+
+def test_by_default_the_agent_holds_its_key_behind_the_allow_list(built: Components) -> None:
+    assert built.agent_sandbox.network is NetworkPolicy.ALLOWLIST
+    assert built.container_runtime._gateway is None  # type: ignore[attr-defined]
+
+
+def test_the_gateway_route_gives_the_key_to_the_runtime_and_none_to_the_runner(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    cfg = config(gateway_data(tools, tmp_path), tmp_path)
+    with build(cfg, environ=GATEWAY_ENVIRON) as components:
+        assert components.agent_sandbox.network is NetworkPolicy.GATEWAY
+        assert components.agent_sandbox.allowed_hosts == ()
+        gateway = components.container_runtime._gateway  # type: ignore[attr-defined]
+        assert gateway.key == GATEWAY_KEY
+        assert gateway.max_in_flight == 1
+        assert gateway.upstream == "https://api.anthropic.com"
+        assert json.loads(gateway.policy) == json.loads(GATEWAY_POLICY)
+        runner = components.agent_runner
+        assert isinstance(runner, ClaudeCodeRunner)
+        assert runner._api_key is None
+        assert GATEWAY_KEY not in repr(runner) + repr(gateway) + repr(components.agent_sandbox)
+        assert components.secret_scanner.scan_text(f"x{GATEWAY_KEY}x", where="w")
+        assert "ILMAR_GATEWAY_KEY" in components.secret_scanner.names
+
+
+def test_the_gateway_is_refused_outside_manual_mode(tmp_path: Path, tools: dict[str, str]) -> None:
+    """Gate 1's own configuration, plus the gateway: refused, so Gate 1, its trial
+    and the loop keep the route their evidence is for (ADR-0044 §3)."""
+    gate1 = Path(__file__).resolve().parents[2] / "deploy" / "gate1" / "ilmar.gate1.toml"
+    raw = tomllib.loads(gate1.read_text().replace("repository_id = 0", "repository_id = 7"))
+    gateway = gateway_data(tools, tmp_path)
+    options(raw, "container_runtime").update(
+        {k: v for k, v in options(gateway, "container_runtime").items() if k.startswith("gateway")}
+    )
+    runner = options(raw, "agent_runner")
+    del runner["api_key_env"]
+    runner["model_route"] = "gateway"
+    with pytest.raises(ConfigError) as refused:
+        plan(config(raw, tmp_path))
+    assert "not available in mode 'supervised'" in str(refused.value), refused.value
+
+
+def test_the_gateway_needs_a_budget(tmp_path: Path, tools: dict[str, str]) -> None:
+    raw = gateway_data(tools, tmp_path)
+    del raw["budget"]
+    assert "needs [budget]" in plan_error(raw, tmp_path)
+
+
+def test_the_gateway_on_one_side_only_is_refused(tmp_path: Path, tools: dict[str, str]) -> None:
+    raw = gateway_data(tools, tmp_path)
+    runner = options(raw, "agent_runner")
+    runner["model_route"] = "environment"
+    runner["api_key_env"] = "ANTHROPIC_API_KEY"
+    assert "does not use it" in plan_error(raw, tmp_path)
+    raw = gateway_data(tools, tmp_path)
+    for key in ("gateway_image", "gateway_key_env", "gateway_policy"):
+        del options(raw, "container_runtime")[key]
+    assert "cannot enforce the gateway network" in plan_error(raw, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("runtime", "message"),
+    [
+        ({"gateway_image": "docker.io/library/python:3.12-alpine"}, "pinned by digest"),
+        ({"gateway_upstream": "http://api.anthropic.com"}, "gateway_upstream"),
+        ({"gateway_max_in_flight": 2}, "is not configurable"),
+        ({"gateway_max_in_flight": 1}, "is not configurable"),
+        ({"gateway_policy": "/nonexistent/prices.json"}, "cannot be read"),
+    ],
+)
+def test_unsafe_gateway_options_are_refused(
+    tmp_path: Path, tools: dict[str, str], runtime: dict[str, Any], message: str
+) -> None:
+    assert message in plan_error(gateway_data(tools, tmp_path, **runtime), tmp_path)
+
+
+def test_one_gateway_option_alone_is_refused(tmp_path: Path, tools: dict[str, str]) -> None:
+    raw = gateway_data(tools, tmp_path)
+    del options(raw, "container_runtime")["gateway_policy"]
+    assert "gateway_policy" in plan_error(raw, tmp_path)
+    raw = data(tools)
+    options(raw, "container_runtime")["gateway_upstream"] = "https://api.anthropic.com"
+    assert "needs gateway_image" in plan_error(raw, tmp_path)
+
+
+@pytest.mark.parametrize("content", ["{not json", '{"prices": {}}', '{"allowed_betas": []}'])
+def test_an_invalid_price_policy_is_refused(
+    tmp_path: Path, tools: dict[str, str], content: str
+) -> None:
+    raw = gateway_data(tools, tmp_path)
+    Path(options(raw, "container_runtime")["gateway_policy"]).write_text(content)
+    assert "valid price policy" in plan_error(raw, tmp_path)
+
+
+def test_a_policy_others_can_write_is_refused(tmp_path: Path, tools: dict[str, str]) -> None:
+    raw = gateway_data(tools, tmp_path)
+    Path(options(raw, "container_runtime")["gateway_policy"]).chmod(0o620)
+    assert "writable by nobody else" in plan_error(raw, tmp_path)
+
+
+def test_the_gateway_route_takes_no_agent_key_or_base_url(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    raw = gateway_data(tools, tmp_path)
+    options(raw, "agent_runner")["api_key_env"] = "ANTHROPIC_API_KEY"
+    assert "gives the agent no key" in plan_error(raw, tmp_path)
+    raw = gateway_data(tools, tmp_path)
+    options(raw, "agent_runner")["base_url"] = "https://gw.example"
+    assert "only through its sidecar" in plan_error(raw, tmp_path)
+    raw = gateway_data(tools, tmp_path)
+    options(raw, "agent_runner")["model_route"] = "proxy"
+    assert "model_route" in plan_error(raw, tmp_path)
+
+
+def test_a_person_s_reads_open_the_runtime_without_the_gateway_key(
+    tmp_path: Path, tools: dict[str, str]
+) -> None:
+    """``ilmar quarantine resolve`` opens the runtime alone, with no secret: with a
+    gateway configured, the reader has no gateway and so needs no key."""
+    reader = runtime_reader(config(gateway_data(tools, tmp_path), tmp_path))
+    runtime = reader()
+    assert isinstance(runtime, PodmanRuntime)
+    assert runtime._gateway is None

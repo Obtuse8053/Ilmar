@@ -74,7 +74,10 @@ class Plan:
       its tasks belong to, which must then equal the target repository;
     * an ``execution_store`` plan may give ``read_only``, which opens the
       store for reading only (``ilmar events``): no secret, no migration, no
-      write, and no other adapter is planned or created.
+      write, and no other adapter is planned or created;
+    * a ``container_runtime`` plan may give ``read_only``, a runtime built with
+      no secret, for a person's reads (``ilmar quarantine resolve``): with a
+      model gateway configured, it has none (ADR-0044).
     """
 
     create: Callable[[Secrets], object]
@@ -255,7 +258,11 @@ def runtime_reader(
             raise
         raise ConfigError(f"{where}: {error}") from None
     options.finish()
-    if not isinstance(runtime_plan, Plan) or runtime_plan.environment:
+    if not isinstance(runtime_plan, Plan):
+        raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
+    if runtime_plan.read_only is not None:  # a runtime that needs no secret to read
+        return runtime_plan.read_only
+    if runtime_plan.environment:
         raise ConfigError(f"[adapters.{port}] kind '{adapter.kind}' cannot be opened here")
     return lambda: runtime_plan.create(Secrets({}))
 
@@ -364,6 +371,7 @@ def _check_combinations(
             f"{runtime} cannot enforce the {sandbox.network.value} network the agent "
             f"'{kinds['agent_runner']}' needs (for podman: set proxy_image)"
         )
+    _check_gateway(config, sandbox, networks, runtime)
     _check_sandbox_secrets_by_name(plans)
     tasks = plans["task_provider"].task_repository
     if tasks is not None and tasks != target.repository:
@@ -513,6 +521,35 @@ def _signature_problem(member: str, declared: Callable[..., Any], actual: Any) -
     if extra:
         return f"{member} requires {', '.join(extra)}, which the port never passes"
     return None
+
+
+GATEWAY_MODES = ("manual",)
+"""Modes in which an agent may be routed through the model gateway (ADR-0044 §3)."""
+
+
+def _check_gateway(
+    config: IlmarConfig, sandbox: AgentSandbox, networks: frozenset[NetworkPolicy], runtime: str
+) -> None:
+    """ADR-0044: the gateway on both sides or neither, in manual mode only, with a
+    budget whose attested provider cap stays the backstop."""
+    wanted = sandbox.network is NetworkPolicy.GATEWAY
+    if NetworkPolicy.GATEWAY in networks and not wanted:
+        raise ConfigError(
+            f"{runtime} configures a model gateway, but [adapters.agent_runner] does not use it: "
+            'set model_route = "gateway" or remove the gateway_* options'
+        )
+    if not wanted:
+        return
+    if config.autonomy.mode not in GATEWAY_MODES:
+        raise ConfigError(
+            f"the model gateway is not available in mode {config.autonomy.mode!r}: only in "
+            f"{', '.join(GATEWAY_MODES)} until Mode 2's own decision (ADR-0044)"
+        )
+    if config.budget is None:
+        raise ConfigError(
+            "the model gateway needs [budget]: each attempt's reservation comes from it, and "
+            "provider_cap_attested_usd records the workspace cap that stays the hard backstop"
+        )
 
 
 def _check_trusted_file(path: Path) -> None:

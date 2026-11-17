@@ -411,11 +411,11 @@ def test_the_gateway_is_given_a_digest_never_the_token() -> None:
                          clients=LOOPBACK, policy=POLICY, budget=BUDGET)  # fmt: skip
 
 
-def test_no_configuration_can_route_an_agent_through_the_gateway_yet() -> None:
-    """Until the worst-case cost reservation (ADR-0037 §2, P5) lands, nothing
-    that builds a deployment from configuration may choose ``GATEWAY``."""
+def test_only_the_adapter_builders_can_route_an_agent_through_the_gateway() -> None:
+    """ADR-0044: the gateway is reachable only through the explicit runner and
+    runtime options; the configuration loader and the CLI never choose it."""
     src = Path(__file__).resolve().parents[2] / "src" / "ilmar"
-    for module in ("config.py", "adapters/builtin.py", "adapters/registry.py", "cli.py"):
+    for module in ("config.py", "cli.py"):
         assert "GATEWAY" not in (src / module).read_text(), module
         assert "GatewaySettings" not in (src / module).read_text(), module
 

@@ -92,14 +92,14 @@ class ClaudeCodeRunner:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: str | None,
         settings: ClaudeCodeSettings | None = None,
         name: str = "claude-code",
         event_observer: EventObserver | None = None,
     ) -> None:
         """``event_observer`` sees only each event's type, subtype and whether it
         followed the result (the pinned-version live test records these)."""
-        if not api_key or any(c in api_key for c in "\r\n\0"):
+        if api_key is not None and (not api_key or any(c in api_key for c in "\r\n\0")):
             raise ValueError("a single-line model credential is required")
         self._api_key = api_key
         self._settings = settings or ClaudeCodeSettings()
@@ -120,6 +120,12 @@ class ClaudeCodeRunner:
     ) -> AgentResult:
         settings = self._settings
         route = runtime.model_access(container)
+        if route is None and self._api_key is None:
+            # ADR-0044 §2: a runner configured for the gateway holds no model
+            # credential, so it runs only where the runtime gives a gateway route.
+            raise PolicyViolationError(
+                "this runner has no model credential: it runs only in a GATEWAY sandbox (ADR-0044)"
+            )
         if route is not None and settings.base_url is not None:
             raise PolicyViolationError(
                 "a gateway sandbox reaches the model only through its own sidecar; "
@@ -227,8 +233,9 @@ class ClaudeCodeRunner:
         """The agent command's environment. In a ``GATEWAY`` sandbox (ADR-0037 §1)
         the key is the sidecar's throwaway token and the base URL is the address
         the runtime provided: the real key never enters the sandbox."""
+        key = route.token if route is not None else self._api_key
         env = {
-            "ANTHROPIC_API_KEY": self._api_key if route is None else route.token,
+            "ANTHROPIC_API_KEY": key or "",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_TELEMETRY": "1",

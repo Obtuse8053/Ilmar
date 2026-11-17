@@ -370,3 +370,29 @@ def test_a_rejected_stream_never_quotes_its_lines(tmp_path: Path) -> None:
     assert result.outcome is AgentOutcome.FAILED
     assert result.summary == "malformed stream: malformed-event at line 1"
     assert "private" not in result.summary
+
+
+# -- a runner configured for the gateway holds no key (ADR-0044 §2) ------------------
+
+
+def test_a_keyless_runner_works_in_a_gateway_sandbox(tmp_path: Path) -> None:
+    runtime, handle, script = gateway_setup(tmp_path, ok())
+    result = ClaudeCodeRunner(api_key=None).run(runtime, handle, request())
+    assert result.outcome is AgentOutcome.COMPLETED
+    route = runtime.model_access(handle)
+    assert route is not None
+    _, env = script.calls[-1]
+    assert env["ANTHROPIC_API_KEY"] == route.token
+
+
+def test_a_keyless_runner_refuses_any_other_sandbox(tmp_path: Path) -> None:
+    runtime, handle, script = setup(tmp_path, ok())
+    with pytest.raises(PolicyViolationError, match="only in a GATEWAY sandbox"):
+        ClaudeCodeRunner(api_key=None).run(runtime, handle, request())
+    assert script.calls == []  # nothing ran, not even the probe
+
+
+@pytest.mark.parametrize("key", ["", "two\nlines", "nul\0"])
+def test_a_given_key_must_still_be_one_line(key: str) -> None:
+    with pytest.raises(ValueError, match="single-line"):
+        ClaudeCodeRunner(api_key=key)
