@@ -208,7 +208,9 @@ class ExecutionStore(Protocol):
     ) -> Sequence[Event]:
         """Stored events with ``seq`` greater than ``after_seq``, in ``seq`` order;
         only ``execution_id``'s when given; only of ``types`` when given; only
-        those naming no execution when ``instance_scoped`` (ADR-0045). Filtering
+        those naming no execution when ``instance_scoped`` (ADR-0045). ``limit``
+        caps how many are returned: ``0`` returns none, and a negative limit is
+        a ``ValueError``, on every store. Filtering
         happens before decoding: a narrow read decodes only what it returns. The
         hash chain is verified over the whole log, never through a filter."""
         ...

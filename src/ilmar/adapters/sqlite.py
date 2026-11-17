@@ -824,6 +824,10 @@ class SQLiteExecutionStore:
         """``(seq, line)`` of the stored events after ``after_seq``, in ``seq`` order,
         unparsed: an exporter prints them as they are and reports a corrupt one
         itself. No events table: nothing."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must not be negative")
+        if limit == 0:
+            return ()
         with self._reading(any_version=True) as conn:
             if not _has_events(conn):
                 return ()
@@ -1055,12 +1059,6 @@ def _raw_event_lines(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(_text(line) for (line,) in conn.execute("SELECT line FROM events ORDER BY seq"))
 
 
-def _event_lines(
-    conn: sqlite3.Connection, after_seq: int, limit: int | None, execution_id: str | None = None
-) -> list[str]:
-    return [e.to_json() for e in _event_rows(conn, after_seq, limit, execution_id, None, False)]
-
-
 def _event_rows(
     conn: sqlite3.Connection,
     after_seq: int,
@@ -1073,7 +1071,9 @@ def _event_rows(
     filters are applied in SQL, before any decoding (ADR-0045)."""
     if execution_id is not None and instance_scoped:
         raise ValueError("an execution's events are never instance-scoped")
-    if not _has_events(conn):
+    if limit is not None and limit < 0:
+        raise ValueError("limit must not be negative")
+    if limit == 0 or not _has_events(conn):
         return []
     query = "SELECT seq, line FROM events WHERE seq > ?"
     values: list[object] = [after_seq]

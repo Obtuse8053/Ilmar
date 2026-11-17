@@ -809,7 +809,7 @@ class EventLogContract:
             pair = (EventType.EXECUTION_TRANSITIONED, EventType.OWNERSHIP_ACQUIRED)
             for types in (None, (), (EventType.EXECUTION_CREATED,), pair):
                 for after in (0, 3, len(everything)):
-                    for limit in (None, 1, 2):
+                    for limit in (None, 0, 1, 2):
                         expected = [
                             e for e in everything if (e.seq or 0) > after
                             and (execution_id is None or e.execution == execution_id)
@@ -821,6 +821,10 @@ class EventLogContract:
                         assert list(got) == expected, (execution_id, instance, types, after, limit)
         with pytest.raises(ValueError, match="never instance-scoped"):
             store.events(execution_id="e1", instance_scoped=True)
+        for kwargs in ({}, {"execution_id": "e1"}, {"types": (EventType.EXECUTION_CREATED,)}):
+            assert tuple(store.events(limit=0, **kwargs)) == ()
+            with pytest.raises(ValueError, match="limit must not be negative"):
+                store.events(limit=-1, **kwargs)
 
     # -- extra events (ADR-0025 §4: execution.cancel_requested) ---------------------------
 
