@@ -10,6 +10,7 @@ coverage starts at the first claim, with a baseline of what exists.
 
 from __future__ import annotations
 
+import bisect
 import threading
 from collections.abc import Collection, Sequence
 from dataclasses import replace
@@ -23,14 +24,29 @@ from ilmar.domain.errors import (
     FencingError,
 )
 from ilmar.domain.event_history import StoredState
-from ilmar.domain.events import Event, EventContext
+from ilmar.domain.events import Event, EventContext, EventType
 from ilmar.domain.execution import Execution, ExecutionState, Transition
-from ilmar.domain.gates import GateRecord, GateRecorded, active_gate
+from ilmar.domain.gates import (
+    GateRecord,
+    GateRecorded,
+    TrialAuthorized,
+    TrialRecord,
+    TrialRevoked,
+    active_gate,
+    trial_in_force,
+    unrevoked_trial,
+)
 from ilmar.domain.ledger import Commit, Fence, Operation, OperationStatus, Resource, ResourceStatus
 from ilmar.domain.tasks import TaskRef
 from ilmar.domain.verification import EvidenceRecord
 from ilmar.ports import event_log
-from ilmar.ports.execution_store import check_apply, check_commit, check_create, check_fence
+from ilmar.ports.execution_store import (
+    check_apply,
+    check_commit,
+    check_create,
+    check_fence,
+    check_trial,
+)
 
 FROM_SCHEMA_VERSION = 0
 """What the baseline records as the version migrated from: this store has no schema."""
@@ -44,6 +60,7 @@ class InMemoryExecutionStore:
         self._charges: list[Charge] = []
         self._suspension: Suspension | None = None
         self._gates: list[GateRecord] = []
+        self._trials: list[TrialRecord] = []
         self._executions: dict[str, Execution] = {}
         self._history: dict[str, list[Transition]] = {}
         self._evidence: dict[str, list[str]] = {}  # serialised, so stored copies cannot change
@@ -51,6 +68,9 @@ class InMemoryExecutionStore:
         self._operations: dict[str, Operation] = {}
         self._resources: dict[str, Resource] = {}
         self._events: list[str] = []  # canonical lines, so stored events cannot change
+        # ADR-0045: what each line is about, so a narrow read decodes only its own.
+        self._event_keys: list[tuple[str | None, EventType]] = []
+        self._by_execution: dict[str | None, list[int]] = {}
 
     def create(
         self, execution: Execution, transition: Transition, *, fence: Fence | None = None
@@ -161,6 +181,14 @@ class InMemoryExecutionStore:
                 suspension=self._suspension,
                 totals=self._totals,
             )
+            check_trial(
+                changes,
+                trial=lambda seq: next((t for t in self._trials if t.seq == seq), None),
+                created_since=lambda at: sum(
+                    1 for e in self._executions.values() if e.created_at >= at
+                ),
+                charged_since=lambda at: sum(c.amount_micros for c in self._charges if c.at >= at),
+            )
             events = event_log.commit_events(
                 fence,
                 changes,
@@ -211,13 +239,31 @@ class InMemoryExecutionStore:
         with self._lock:
             return tuple(self._gates)
 
-    def _active_gate(self, changes: Commit) -> GateRecord | None:
+    def trial_records(self) -> Sequence[TrialRecord]:
+        with self._lock:
+            return tuple(self._trials)
+
+    def _active_gate(self, changes: Commit) -> GateRecord | TrialRecord | None:
+        gate = changes.gate
+        if isinstance(gate, TrialAuthorized):
+            return trial_in_force(self._trials, gate.at)
+        if isinstance(gate, TrialRevoked):
+            return unrevoked_trial(self._trials)
         mode = event_log.gate_mode(changes)
         return None if mode is None else active_gate(self._gates, mode)
 
     def _write_gate(self, changes: Commit, context: EventContext | None) -> None:
         gate = changes.gate
         if gate is None or context is None:  # checked: a gate change has a person's context
+            return
+        who = context.actor.ref or ""
+        if isinstance(gate, TrialAuthorized):
+            self._trials.append(TrialRecord(len(self._trials) + 1, gate.terms, who))
+            return
+        if isinstance(gate, TrialRevoked):
+            trial = unrevoked_trial(self._trials)
+            if trial is not None:
+                self._trials[trial.seq - 1] = replace(trial, revoked_at=gate.at, revoked_by=who)
             return
         if isinstance(gate, GateRecorded):
             self._gates.append(GateRecord(len(self._gates) + 1, gate.evidence, gate.at,
@@ -238,14 +284,36 @@ class InMemoryExecutionStore:
             return tuple(c for c in self._charges if c.execution_id == execution_id)
 
     def events(
-        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        execution_id: str | None = None,
+        types: Collection[EventType] | None = None,
+        instance_scoped: bool = False,
     ) -> Sequence[Event]:
+        if execution_id is not None and instance_scoped:
+            raise ValueError("an execution's events are never instance-scoped")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must not be negative")
+        if limit == 0:
+            return ()
+        start = max(after_seq, 0)  # seq n is at index n - 1
+        wanted = None if types is None else frozenset(types)
         with self._lock:
-            lines = self._events[max(after_seq, 0) :]
-        events = [Event.from_json(line) for line in lines]
-        if execution_id is not None:
-            events = [e for e in events if e.execution == execution_id]
-        return tuple(events if limit is None else events[:limit])
+            indexes: Sequence[int]
+            if execution_id is not None or instance_scoped:
+                own = self._by_execution.get(execution_id, [])
+                indexes = own[bisect.bisect_left(own, start) :]
+            else:
+                indexes = range(start, len(self._events))
+            lines = []
+            for i in indexes:
+                if wanted is None or self._event_keys[i][1] in wanted:
+                    lines.append(self._events[i])
+                    if limit is not None and len(lines) >= limit:
+                        break
+        return tuple(Event.from_json(line) for line in lines)
 
     def operation(self, key: str) -> Operation | None:
         with self._lock:
@@ -288,7 +356,10 @@ class InMemoryExecutionStore:
     def _append(self, events: Sequence[Event]) -> None:
         """Called last, once every check passed: nothing can fail after it."""
         numbered = event_log.with_seqs(events, len(self._events) + 1)
-        self._events.extend(event.to_json() for event in numbered)
+        for event in numbered:
+            self._by_execution.setdefault(event.execution, []).append(len(self._events))
+            self._event_keys.append((event.execution, event.type))
+            self._events.append(event.to_json())
 
     def _stored_state(self) -> StoredState:
         return event_log.stored_state(
