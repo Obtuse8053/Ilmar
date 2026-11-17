@@ -61,3 +61,11 @@ def _event_log_after_every_pass(
 
     monkeypatch.setattr(Coordinator, "run_once", checked)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _not_under_a_supervisor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never inherit their runner's supervisor: CI runners themselves run
+    under systemd and set ``INVOCATION_ID``, which ADR-0043 and the systemd
+    credentials reader read. A test that needs it sets it explicitly."""
+    monkeypatch.delenv("INVOCATION_ID", raising=False)

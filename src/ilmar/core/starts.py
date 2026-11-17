@@ -35,21 +35,47 @@ _READ = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 @dataclass(frozen=True, slots=True)
 class StartLimits:
-    """Conservative defaults: one start a minute, six an hour, twenty a UTC day."""
+    """Conservative defaults: one start a minute, six an hour, twenty a UTC day;
+    and, within a chain of restarts, a gap that doubles from one minute up to an
+    hour, reset by six quiet hours (ADR-0043 §1)."""
 
     min_interval_seconds: float = 60.0
     per_hour: int = 6
     per_day: int = 20
+    backoff_max_seconds: float = 3600.0
+    cooldown_seconds: float = 21600.0
 
     def __post_init__(self) -> None:
         if self.min_interval_seconds < 0:
             raise ValueError("min_interval_seconds must not be negative")
         if self.per_hour < 1 or self.per_day < 1:
             raise ValueError("per_hour and per_day must be at least 1")
+        if self.backoff_max_seconds < self.min_interval_seconds:
+            raise ValueError("backoff_max_seconds must be at least min_interval_seconds")
+        if self.cooldown_seconds < self.backoff_max_seconds:
+            raise ValueError("cooldown_seconds must be at least backoff_max_seconds")
 
     @property
     def longest_window(self) -> timedelta:
         return max(DAY, timedelta(seconds=self.min_interval_seconds))
+
+    @property
+    def chain_depth(self) -> int:
+        """How many earlier starts of a chain can still raise the required gap:
+        beyond that it is capped at ``backoff_max_seconds``."""
+        if self.min_interval_seconds <= 0:
+            return 1
+        depth = 1
+        while self.min_interval_seconds * 2 ** (depth - 1) < self.backoff_max_seconds:
+            depth += 1
+        return depth
+
+    def required_gap(self, earlier_in_chain: int) -> timedelta:
+        """ADR-0043 §1: how long after the previous start this one must come."""
+        if earlier_in_chain < 1:
+            return timedelta(0)
+        doubled = self.min_interval_seconds * 2 ** min(earlier_in_chain - 1, 64)
+        return timedelta(seconds=min(doubled, self.backoff_max_seconds))
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +161,15 @@ def breach(records: Sequence[StartRecord], *, now: datetime, limits: StartLimits
     gap = timedelta(seconds=limits.min_interval_seconds)
     if earlier and any(now - r.at < gap for r in earlier):
         return f"started again within {limits.min_interval_seconds:g} seconds of an earlier start"
+    if earlier:
+        chained = chain(earlier, now=now, limits=limits)
+        required = limits.required_gap(chained)
+        if now - earlier[-1].at < required:
+            return (
+                f"restart {chained} of a chain came "
+                f"{max(0.0, (now - earlier[-1].at).total_seconds()):g} seconds after the "
+                f"last start (backoff needs {required.total_seconds():g})"
+            )
     in_hour = sum(1 for r in records if now - r.at < HOUR)
     if in_hour > limits.per_hour:
         return f"{in_hour} starts in the last hour (at most {limits.per_hour})"
@@ -145,6 +180,19 @@ def breach(records: Sequence[StartRecord], *, now: datetime, limits: StartLimits
     return None
 
 
+def chain(earlier: Sequence[StartRecord], *, now: datetime, limits: StartLimits) -> int:
+    """How many of ``earlier`` (oldest first) form a chain with a start at ``now``:
+    walking back, each start less than ``cooldown_seconds`` before the next
+    (ADR-0043 §1). A future-dated record always continues the chain."""
+    cooldown = timedelta(seconds=limits.cooldown_seconds)
+    count, later = 0, now
+    for record in reversed(earlier):
+        if later - record.at >= cooldown:
+            break
+        count, later = count + 1, min(later, record.at)
+    return count
+
+
 def breach_if_started(
     records: Sequence[StartRecord], *, now: datetime, limits: StartLimits
 ) -> str | None:
@@ -153,13 +201,24 @@ def breach_if_started(
     return breach((*records, StartRecord(now, "resume-check")), now=now, limits=limits)
 
 
-def compact(path: Path, records: Sequence[StartRecord], *, now: datetime, keep: timedelta) -> None:
+def compact(
+    path: Path,
+    records: Sequence[StartRecord],
+    *,
+    now: datetime,
+    keep: timedelta,
+    chain_tail: int = 0,
+) -> None:
     """Rewrite the log without records older than ``keep``, atomically.
 
-    Future-dated records are always kept. The new file is written, fsynced and
-    renamed over the old one, then the directory is fsynced.
+    Future-dated records are always kept, and so are the last ``chain_tail``
+    records whatever their age: a chain may last longer than ``keep``, and its
+    backoff must not shrink because its oldest starts were dropped. The new file
+    is written, fsynced and renamed over the old one, then the directory is
+    fsynced.
     """
-    kept = [r for r in records if now - r.at < keep]
+    tail = set(range(max(0, len(records) - chain_tail), len(records)))
+    kept = [r for i, r in enumerate(records) if now - r.at < keep or i in tail]
     if len(kept) == len(records):
         return
     temporary = path.with_name(path.name + ".new")
@@ -217,5 +276,6 @@ def account_start(
     path = start_log_path(coordinator_root)
     records = record_start(path, StartRecord(now, boot_id))
     found = breach(records, now=now, limits=limits)
-    compact(path, records, now=now, keep=limits.longest_window)
+    compact(path, records, now=now, keep=limits.longest_window,
+            chain_tail=limits.chain_depth + 1)  # fmt: skip
     return found

@@ -26,10 +26,11 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from ilmar.adapters.registry import event_reader, store_writer
+from ilmar.cli_loop import start_limits
 from ilmar.config import IlmarConfig, load_config
 from ilmar.core import kill_switch
 from ilmar.core.ownership import Ownership
-from ilmar.core.starts import StartLimits, breach_if_started, read_starts, start_log_path
+from ilmar.core.starts import breach_if_started, read_starts, start_log_path
 from ilmar.core.suspension import SPEND_EVENTS, resume_blocker, spend_reviews, unreviewed_spend
 from ilmar.domain.budget import Suspension, SuspensionReason, micros_to_usd
 from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError, StartLogError
@@ -146,7 +147,7 @@ def run(
                     restart_breach = breach_if_started(
                         read_starts(start_log_path(layout.coordinator_root)),
                         now=at,
-                        limits=StartLimits(),
+                        limits=start_limits(config),
                     )
                 except StartLogError as exc:
                     restart_breach = f"an unusable start log ({exc})"

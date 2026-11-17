@@ -5,18 +5,26 @@
 # Install as ~/.config/systemd/user/ilmar.service. `ilmar run --loop` needs
 # #91 (loop mode), which also enforces the gate records before it starts.
 #
+# Supervision is OFF by default (ADR-0043 §3): under systemd, `ilmar run
+# --loop` exits 3 (never restarted) unless `[supervisor] enabled = true`, and
+# that setting is refused until a Mode 2 gate exists. Do not enable this unit
+# before then.
+#
 # Two independent bounds on restarts:
-#   * systemd's own start limits below;
+#   * systemd's own settings below;
 #   * Ilmar's durable start log (<state_dir>/coordinator/starts.log), written
 #     before anything else; a breach suspends with `restart-loop` and exits 78.
 #
 # The two agree: systemd alone never restarts faster than the start log allows
-# (defaults: 60 s apart, 6 an hour, 20 a UTC day), so every restart systemd
-# makes is one Ilmar accepts. A fixed RestartSec of 12 minutes gives at most 5
-# starts in any hour even when every run fails at once, and StartLimitBurst
-# stops systemd after 10 starts in a day. tests/unit/test_starts.py simulates
-# this schedule against the start log's rules. If you change RestartSec or the
-# start limits, keep that property.
+# (defaults: 60 s apart, 6 an hour, 20 a UTC day, and within a chain a gap that
+# doubles from 60 s up to 1 h, reset after 6 quiet hours). systemd's delay
+# grows from RestartSec to RestartMaxDelaySec over RestartSteps (systemd 254 or
+# later), each step at least the start log's required gap. With older systemd,
+# delete RestartSteps and RestartMaxDelaySec and set RestartSec=1h (the backoff
+# cap); a shorter fixed delay is suspended by the start log within a chain.
+# tests/unit/test_starts.py simulates this schedule against the start log's
+# rules. If you change these settings, keep that property. If systemd is ever
+# faster, the start log suspends: safe, but it needs a person.
 
 [Unit]
 Description=Ilmar coordinator (loop mode)
@@ -29,9 +37,11 @@ StartLimitBurst=10
 Type=exec
 ExecStart=%h/.local/bin/ilmar run --loop --config %h/.config/ilmar/ilmar.toml
 Restart=on-failure
-RestartSec=12min
+RestartSec=2min
+RestartSteps=6
+RestartMaxDelaySec=2h
 # 3: disabled or misconfigured. 78: suspended. Never restarted.
-RestartPreventExitStatus=3 78
+RestartPreventExitStatus=2 3 78
 # Credentials are never in this unit, and never in a plaintext file it reads.
 # Proposed delivery (not yet implemented; see docs/operations/supervisor.md):
 # systemd user-scoped encrypted credentials, decrypted only into the service's
