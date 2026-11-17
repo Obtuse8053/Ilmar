@@ -20,6 +20,7 @@ from ilmar import (
     cli_quarantine,
     cli_suspend,
 )
+from ilmar.adapters.credentials import read_credentials
 from ilmar.adapters.registry import build, plan
 from ilmar.cli_loop import make_coordinator
 from ilmar.config import load_config
@@ -118,11 +119,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def _config_validate(path: Path, *, check_environment: bool = False) -> int:
     """Validate structure, every adapter's options and the rules between ports.
 
-    Nothing is created and no secret is read; ``--check-environment`` only
-    checks that the named variables are set.
+    Nothing is created. ``--check-environment`` checks that each named secret
+    is present: set in the environment, or, with systemd credentials, a usable
+    file in ``$CREDENTIALS_DIRECTORY``. No value is ever printed.
     """
     try:
-        blueprint = plan(load_config(path))
+        config = load_config(path)
+        blueprint = plan(config)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -137,15 +140,28 @@ def _config_validate(path: Path, *, check_environment: bool = False) -> int:
     policy = blueprint.context.verification
     names = ", ".join(c.name for c in policy.commands)
     print(f"  verification: {names} ({policy.digest()})")
-    missing = [name for name in blueprint.environment if not os.environ.get(name)]
-    if check_environment:
-        for name in blueprint.environment:
-            print(f"  secret {name}: {'missing' if name in missing else 'set'}")
-        if missing:
-            print(f"error: not set: {', '.join(missing)}", file=sys.stderr)
+    systemd = config.credentials_from == "systemd-credentials"
+    origin = "systemd credentials" if systemd else "environment"
+    if not check_environment:
+        print(f"  secrets read from the {origin}: {', '.join(blueprint.environment) or 'none'}")
+        return 0
+    if systemd:
+        # Only inside the unit does $CREDENTIALS_DIRECTORY exist. Each file is
+        # checked as Ilmar would read it; the value is never printed.
+        try:
+            read_credentials(blueprint.environment, environ=os.environ)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return 1
-    else:
-        print(f"  secrets read from: {', '.join(blueprint.environment) or 'none'}")
+        for name in blueprint.environment:
+            print(f"  secret {name}: set (systemd credential)")
+        return 0
+    missing = [name for name in blueprint.environment if not os.environ.get(name)]
+    for name in blueprint.environment:
+        print(f"  secret {name}: {'missing' if name in missing else 'set'}")
+    if missing:
+        print(f"error: not set: {', '.join(missing)}", file=sys.stderr)
+        return 1
     return 0
 
 

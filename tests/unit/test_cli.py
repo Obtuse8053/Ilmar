@@ -45,7 +45,7 @@ def test_validate_shows_target_sandbox_and_secret_names_only(
     out = capsys.readouterr().out
     assert "target: github:Obtuse8053/Ilmar (main)" in out
     assert "network allowlist (api.anthropic.com)" in out
-    assert "secrets read from: ANTHROPIC_API_KEY, GITHUB_TOKEN" in out
+    assert "secrets read from the environment: ANTHROPIC_API_KEY, GITHUB_TOKEN" in out
     assert "ghp_VISIBLE-IF-LEAKED" not in out
 
 

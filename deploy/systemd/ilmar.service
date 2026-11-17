@@ -33,10 +33,10 @@ RestartSec=12min
 # 3: disabled or misconfigured. 78: suspended. Never restarted.
 RestartPreventExitStatus=3 78
 # Credentials are never in this unit, and never in a plaintext file it reads.
-# Proposed delivery (not yet implemented; see docs/operations/supervisor.md):
-# systemd user-scoped encrypted credentials, decrypted only into the service's
-# private $CREDENTIALS_DIRECTORY at start, for example
-#   LoadCredentialEncrypted=github-token:%h/.config/ilmar/credentials/github-token.cred
+# Use systemd user-scoped encrypted credentials (systemd 256 or later), each
+# named like the variable the configuration names, with
+# `[secrets] source = "systemd-credentials"` (docs/operations/supervisor.md):
+#   LoadCredentialEncrypted=<name>:%h/.config/ilmar/credentials/<name>.cred
 NoNewPrivileges=yes
 
 [Install]

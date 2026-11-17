@@ -684,3 +684,63 @@ def test_a_configuration_owned_by_someone_else_is_refused(
     monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
     with pytest.raises(ConfigError, match="owned by this user or root"):
         plan(config(data(), tmp_path, source=source))
+
+
+@pytest.fixture
+def directory(tmp_path: Path) -> Path:
+    """What systemd makes: a private directory, one 0400 file per credential."""
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    for name, value in ENVIRON.items():
+        (directory / name).write_text(value)
+        (directory / name).chmod(0o400)
+    return directory
+
+
+# -- secrets from systemd credentials (docs/operations/supervisor.md) -------------------
+
+
+def with_credentials(raw: dict[str, Any]) -> dict[str, Any]:
+    raw["secrets"] = {"source": "systemd-credentials"}
+    return raw
+
+
+def test_build_reads_secrets_from_credentials_and_not_the_environment(
+    directory: Path,
+    tmp_path: Path,
+    tools: dict[str, str],
+) -> None:
+    decoys = {"GITHUB_TOKEN": "ghp_FROM-THE-ENVIRONMENT", "ANTHROPIC_API_KEY": "sk-ant-ENV"}
+    cfg = config(with_credentials(data(tools)), tmp_path)
+    with build(cfg, environ={"CREDENTIALS_DIRECTORY": str(directory), **decoys}) as components:
+        assert components.secret_scanner.names == ("ANTHROPIC_API_KEY", "GITHUB_TOKEN")
+        assert components.secret_scanner.scan_text(f"x{GITHUB_SECRET}x", where="w")
+        assert not components.secret_scanner.scan_text("ghp_FROM-THE-ENVIRONMENT", where="w")
+    assert "ghp_FROM-THE-ENVIRONMENT" not in os.environ.get("GITHUB_TOKEN", "")
+
+
+def test_build_fails_closed_without_the_directory(tmp_path: Path, tools: dict[str, str]) -> None:
+    cfg = config(with_credentials(data(tools)), tmp_path)
+    with pytest.raises(ConfigError, match="CREDENTIALS_DIRECTORY is not set"):
+        build(cfg, environ=ENVIRON)  # secrets in the environment are not used
+
+
+def test_secrets_are_not_copied_into_the_process_environment(
+    directory: Path,
+    tmp_path: Path,
+    tools: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ENVIRON:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
+    cfg = config(with_credentials(data(tools)), tmp_path)
+    with build(cfg):
+        assert not any(value in (GITHUB_SECRET, MODEL_SECRET) for value in os.environ.values())
+
+
+def test_an_unknown_source_is_refused(tmp_path: Path) -> None:
+    raw = data()
+    raw["secrets"] = {"source": "keyring"}
+    with pytest.raises(ConfigError, match=r"\[secrets\] source must be one of"):
+        config(raw, tmp_path)

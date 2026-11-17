@@ -15,13 +15,13 @@ install -m 0644 deploy/systemd/ilmar.service ~/.config/systemd/user/ilmar.servic
 systemctl --user daemon-reload
 ```
 
-## Credentials (proposed; not yet implemented)
+## Credentials (systemd encrypted credentials)
 
 The unit reads **no plaintext secrets file**: no `EnvironmentFile=`, no
 `Environment=` with a secret, and no plaintext `LoadCredential=`. A test
 (`tests/unit/test_starts.py`) keeps it that way. Loop mode (#91) needs a way
-to receive the forge token and the model credential. The proposal, for the
-maintainer's decision:
+to receive the forge token and the model credential. The maintainer approved
+this design; step 4 is implemented (`[secrets] source`):
 
 **systemd encrypted credentials, scoped to the operator's user** (systemd 256
 or later).
@@ -32,24 +32,43 @@ or later).
    ```sh
    install -d -m 0700 ~/.config/ilmar/credentials
    systemd-ask-password -n "GitHub token: " |
-     systemd-creds encrypt --user --name=github-token - \
-       ~/.config/ilmar/credentials/github-token.cred
+     systemd-creds encrypt --user --name=ILMAR_GITHUB_TOKEN - \
+       ~/.config/ilmar/credentials/ILMAR_GITHUB_TOKEN.cred
    ```
 
    The file at rest is ciphertext. It is bound to this user and machine, and
    to the host key or the TPM2 when there is one, so a copy is useless
    elsewhere.
 2. The unit names it:
-   `LoadCredentialEncrypted=github-token:%h/.config/ilmar/credentials/github-token.cred`.
+   `LoadCredentialEncrypted=ILMAR_GITHUB_TOKEN:%h/.config/ilmar/credentials/ILMAR_GITHUB_TOKEN.cred`.
 3. At each start, systemd decrypts it into the service's private
    `$CREDENTIALS_DIRECTORY`, which lives in memory, is readable only by the
    service, and disappears when the service stops.
-4. Ilmar would read it from there, by name, instead of from an environment
-   variable: a configuration key such as `token_credential = "github-token"`
-   next to today's `token_env`. It would never copy the value into its own
-   environment, which every child process inherits. The model credential
-   still reaches only the gateway sidecar, through the file-free handoff of
-   #120.
+4. Ilmar reads it from there, by name, instead of from the environment. Set
+
+   ```toml
+   [secrets]
+   source = "systemd-credentials"
+   ```
+
+   Each credential is named exactly like the variable the configuration
+   already names (`token_env = "ILMAR_GITHUB_TOKEN"` reads the credential
+   `ILMAR_GITHUB_TOKEN`), so step 1's `--name=` and step 2's
+   `LoadCredentialEncrypted=<name>:` use that name. Ilmar never copies a value
+   into its own environment, which every child process would inherit.
+   **It fails closed**, and nothing starts, when:
+   - `$CREDENTIALS_DIRECTORY` is unset, relative, not a directory, not yours,
+     or writable by others;
+   - a credential is missing, a symlink, not a regular file, not yours,
+     readable by group or others, larger than 16 KiB, not UTF-8, empty, or
+     longer than one line (one trailing newline is allowed).
+
+   There is **no fallback** to the environment. `ilmar config validate
+   --check-environment` checks each file the same way. That only works
+   inside the unit, where `$CREDENTIALS_DIRECTORY` exists, and it never
+   prints a value. Today the model credential is read the same way. Once
+   the gateway is wired (Mode 2), it reaches only the gateway sidecar,
+   through the file-free hand-over of #120.
 
 **Alternatives considered.**
 
@@ -67,8 +86,11 @@ memory. Encryption protects copies, backups and disk access, not a
 compromised account. Hosts with systemd older than 256 cannot use user-scoped
 encryption.
 
-Implementing step 4 touches credential handling, a sensitive area. It comes
-in its own pull request after the maintainer approves this design.
+**Requirements.** Use systemd 256 or later for user-scoped encryption
+(`systemd-creds --user`). Older hosts (this repository's CI host and the
+development container run 255) cannot encrypt user-scoped credentials. On
+those hosts, keep `source = "environment"` and run Ilmar by hand, which is
+how Mode 1 runs anyway.
 
 ## How restarts are bounded
 
