@@ -1141,3 +1141,44 @@ def test_a_concurrent_fault_stops_a_request_waiting_to_be_admitted(
         assert len(charges(running.log)) == (0 if halt_breaks else 1)
         spend = _closed_record(running)
         assert spend["uncertain"] is not None or charges(running.log)
+
+
+# -- an ADMIT line that cannot be written (#138 review, 2026-11-17) -------------------
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+def test_an_admit_line_that_cannot_be_written_fails_closed(
+    halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fault happens before forwarding, outside the forwarding handler: the
+    request is never sent, nothing more is admitted (even if Budget.halt fails),
+    and the record cannot pass as complete."""
+    admission = mg.load_admission()
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider):
+        write = running.gateway.log
+        failures: list[str] = []
+
+        def flaky(line: str, write: Callable[[str], None] = write,
+                  failures: list[str] = failures) -> None:  # fmt: skip
+            if line.startswith("ADMIT") and not failures:
+                failures.append(line)
+                raise OSError("disk full")
+            write(line)
+
+        monkeypatch.setattr(running.gateway, "log", flaky)
+        _attempt(running)
+        assert failures  # the ADMIT write was attempted and failed
+        assert provider.seen == []  # never forwarded
+        assert running.gateway.failed == "gateway error"
+        assert running.gateway.budget.halted is not halt_breaks
+        for path, body in (("/v1/messages", BODY), ("/v1/messages/count_tokens", COUNT)):
+            code, _, data = running.post(path, body=body)
+            assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert provider.seen == []
+        running.gateway.close(1.0)
+        with pytest.raises(ValueError, match="missing lines"):  # never a complete record
+            mg.parse_spend(running.log.getvalue().splitlines())

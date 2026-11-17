@@ -330,7 +330,15 @@ class Gateway:
             if ticket is not None:
                 self._open.add(ticket)
                 self._admits += 1
-                self.log(f"ADMIT ticket={ticket} reservation={reservation}")
+                try:
+                    self.log(f"ADMIT ticket={ticket} reservation={reservation}")
+                except BaseException:
+                    # The record cannot be trusted any more. Refuse everything
+                    # from now on, before anything else can fail: the flag is set
+                    # here, under the lock, whatever Budget.halt does later. The
+                    # ticket stays open, so the record reads as uncertain.
+                    self._failed = "gateway error"
+                    raise
             return None
 
     def record_charge(self, ticket: int, charged: int, line: str) -> None:
@@ -441,7 +449,17 @@ class _Handler(BaseHTTPRequestHandler):
             if ticket is not None:
                 gateway.budget.release(ticket)
             return self._refuse(429, "rate_limit_error", "too many requests in flight")
-        stopped = gateway.admit(ticket, admitted.reservation)
+        try:
+            stopped = gateway.admit(ticket, admitted.reservation)
+        except BaseException:
+            # The ADMIT line could not be written. Never sent, but not provably
+            # on record either: fail closed (admit() has already set the flag),
+            # free the slot, and let the error propagate.
+            try:
+                gateway.fail("gateway error")
+            finally:
+                gateway.release()
+            raise
         if stopped is not None:  # failed or closed meanwhile: never sent, never on record
             if ticket is not None:
                 gateway.budget.release(ticket)
