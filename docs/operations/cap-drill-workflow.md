@@ -25,7 +25,7 @@ recorded only by `ilmar gate record`.
 
 | Need | Documented means | Caveat |
 | --- | --- | --- |
-| Which workspace a key belongs to | Admin API: list API keys (`workspace_id`, `partial_key_hint`) | A standard key cannot report its own workspace, so an Admin credential is needed. |
+| Which workspace a key belongs to | Claude API responses carry an `anthropic-workspace-id` header ([R35]). The Admin API's key list gives each key's `workspace_id` and a `partial_key_hint` | The workspace's ID comes from its name only through the Admin API. |
 | The workspace's spend limit | Admin API: `GET /v1/organizations/spend_limits?scope_type=workspace&workspace_id=…`, beta header `spend-limit-reads-2026-09-26`; amounts in cents | Listing Claude Console limits is an **early-access preview**. The Spend Limits guide calls the API Enterprise-only. Without access the read fails and the drill stops. |
 | Month-to-date cost | Admin API cost report, grouped by workspace; amounts in cents | It can lag behind real spend. |
 | A minimum workspace limit | Not documented | |
@@ -52,7 +52,7 @@ recorded only by `ilmar gate record`.
 
 | Secret | What it is | Steps |
 | --- | --- | --- |
-| `CAP_DRILL_KEY` | the `ilmar-cap-test` key | Preflight (compared with the Admin API's hint, never sent there); Reach the cap; Ilmar's coordinator |
+| `CAP_DRILL_KEY` | the `ilmar-cap-test` key | Preflight (one free token count; compared locally with the Admin API's hints, never sent there); Reach the cap; Ilmar's coordinator |
 | `CAP_DRILL_ADMIN_KEY` | an Admin API key, used only for reads | Preflight; Actual cost |
 | `CAP_DRILL_GITHUB_TOKEN` | a fine-grained token for `ilmar-disposable` only, valid for a short time | Ilmar's coordinator |
 
@@ -82,21 +82,25 @@ before any secret, that this run holds that marker.
 With `GET` requests only, the preflight establishes:
 
 1. **The workspace:** exactly one active workspace named `ilmar-cap-test`.
-2. **The key's workspace:** exactly one active key in the organization whose
-   hint fits `CAP_DRILL_KEY`, and that key belongs to `ilmar-cap-test`.
+2. **The key's binding, two ways:**
+   - a free token-count call with `CAP_DRILL_KEY`, sent without an
+     `anthropic-workspace-id` request header, must return that workspace's ID
+     in its `anthropic-workspace-id` response header. A missing header, or
+     another workspace (as an unscoped key would report), fails closed;
+   - exactly one active key in the organization has a hint that fits
+     `CAP_DRILL_KEY`, and the Admin API lists it in `ilmar-cap-test`.
 3. **The limit:** an enabled monthly USD limit on that workspace, read from
-   the Spend Limits API. The lowest configured limit counts, and it must be
-   **at most USD 1.00**.
+   the Spend Limits API. The lowest configured limit counts. It must be
+   **at most USD 1.00** and must equal the attested cap (a dispatch input).
 4. **The month-to-date cost** from the cost report.
-5. **Headroom.** The drill's estimated cost must stay within the USD 1.00
-   allowance:
+5. **Headroom.** The workspace's whole month-to-date cost must stay within
+   the USD 1.00 allowance, and the limit can only be reached by a request
+   that crosses it. How far a request may overshoot is not documented.
+   Therefore:
 
    ```
-   (limit − month-to-date) + the largest single request + Ilmar's reserve  ≤  1.00
+   limit + the largest single request + Ilmar's reserve  ≤  1.00
    ```
-
-   The limit can only be reached by a request that crosses it, and how far a
-   request may overshoot is not documented.
 
    With the defaults (5¢ per request, 10¢ reserve), the workspace limit must
    be at most **USD 0.85**. **At USD 1.00 the preflight stops with
@@ -110,15 +114,20 @@ requirement. An attestation alone never suffices.
 
 With `CAP_DRILL_KEY`:
 
+- **The model** is on the script's reviewed allow-list, at Anthropic's
+  published prices ([R36]). Today that is only Claude Haiku 4.5
+  (`claude-haiku-4-5`), at USD 1 / USD 5 per million input / output tokens,
+  one rate at every prompt length. About 17 requests of 5¢ reach an 85¢
+  limit. Claude Code uses the same model inside Ilmar.
 - **The prompt.** A fixed prompt is sized with the free token-count endpoint.
-  Its worst case, the counted input plus 8 output tokens at the attested
-  prices, × 1.25, is at most 5¢.
+  Its worst case, the counted input plus 8 output tokens at those prices,
+  × 1.25, is at most 5¢.
 - **One request at a time:** `max_tokens` 8, never retried, at most 60
   requests.
 - **The ceiling.** Before each request:
 
-  *estimated spend so far + the next request's worst case + Ilmar's 10¢
-  reserve ≤ USD 1.00*
+  *month-to-date cost read in §3 + estimated spend so far + the next
+  request's worst case + Ilmar's 10¢ reserve ≤ USD 1.00*
 
   Otherwise the request is never sent, and the run ends `inconclusive`.
 - **The first non-success ends this step.**
@@ -169,15 +178,29 @@ The Admin key never reaches Ilmar's environment.
 
 The two are never merged into one figure.
 
+**Spend verification.** The provider may enforce limits with delayed usage
+accounting, and no client-side estimate can guarantee the final bill. The
+record states:
+
+- `within-allowance`: the cost report covers the run and stays within USD
+  1.00;
+- `overshoot`: the cost report shows more than USD 1.00;
+- `pending`: the report has not caught up.
+
+Only `within-allowance` can make the result `cap-enforced-through-ilmar`.
+Otherwise the result is `inconclusive`, never a successful verification at
+or below USD 1.00. A later read-only cost read can settle a `pending` record
+for review.
+
 ## 7. Sanitized record
 
 `cap-drill-record.json` is uploaded as an artifact and posted on #93. It
 holds:
 
 - the run, `expected_sha` and the workspace name;
-- the allowance, the limit as read, the month-to-date cost before the run
-  and the time of the read;
-- the model, its attested prices and the number of requests;
+- the allowance, the limit as read (which equals the attested cap), the
+  month-to-date cost before the run and the time of the read;
+- the model, its allow-listed prices and the number of requests;
 - the estimated and actual costs;
 - the provider's final status, error `type` and redacted message (at most
   300 characters);
@@ -187,7 +210,8 @@ holds:
   - `cap-enforced-through-ilmar`;
   - `ilmar-check-failed` (the cap refused, but Ilmar did not behave as
     required);
-  - `inconclusive`;
+  - `inconclusive` (including any run whose spend is `pending` or
+    `overshoot`);
   - `cap-too-high`;
   - `no-headroom`;
   - `cap-unverified`.
