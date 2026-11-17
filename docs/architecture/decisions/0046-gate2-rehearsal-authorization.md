@@ -1,7 +1,7 @@
 # ADR-0046: A Gate 2 rehearsal: an expiring, explicit authorization for supervised restarts
 
 - Status: Proposed
-- Date: 2026-11-16
+- Date: 2026-11-16, revised 2026-11-17 after review
 - Depends on: ADR-0040 (gate records), ADR-0041 (trial authorization),
   ADR-0043 (restart backoff, Proposed), ADR-0044 (gateway configuration,
   Proposed)
@@ -48,7 +48,9 @@ ADR-0041 term, and these:
 
 - **The repository:** the dedicated disposable repository, by immutable ID,
   never Ilmar's own repository or a fork of it.
-- **Duration:** at most **72 hours**. Expiry needs no one to act.
+- **Duration:** an explicit `--expires-in`, with no default, of at most
+  **72 hours**. Expiry needs no one to act: it is checked before every pass
+  and at every admission (ADR-0041 §4 and §5).
 - **Executions:** `max_executions` of at most 20.
 - **Spending:** `max_spend_micros`, no higher than the attested workspace
   cap. The workspace cap stays the independent backstop.
@@ -56,20 +58,44 @@ ADR-0041 term, and these:
   the start log while the rehearsal is in force. Once they are used up, the
   next start exits 3, and the unit never restarts exit 3.
 - **Gate 1 first:** a **Gate 1 gate record** must already exist for the same
-  repository ID. A rehearsal cannot be written before Gate 1.
+  repository ID: unrevoked, its evidence naming this immutable repository
+  ID, and passing every check ADR-0040 makes when reading a record. Ilmar
+  does not re-verify what ADR-0040 leaves to the person who recorded Gate 1.
+  This is checked:
+  - when the rehearsal is written: before Gate 1 is recorded,
+    `ilmar gate rehearsal` refuses, and nothing else can write one;
+  - before every pass and at every admission: if the Gate 1 record is
+    missing, revoked or names another repository, the rehearsal is not in
+    force.
 
 ### 2. Writing one
 
-`ilmar gate rehearsal`, by a person (`--as`) under the instance lock, with:
+`ilmar gate rehearsal`, by a person (`--as`) under the instance lock. It
+is an **explicit authorization**: every limit is given on the command line,
+none has a default, and the command refuses if any is missing:
 
+- `--authorization`: the URL of a maintainer's comment on #96 naming the
+  repository ID, the expiry and every limit. The store keeps it with the
+  record, and Gate 2's evidence PR cites it;
+- `--repository-id`, `--expires-in`, `--max-executions`, `--max-spend-usd`
+  and `--max-restarts`, each checked against §1's bounds;
 - `--disposable`, as in ADR-0041;
 - `--workspace-cap-usd`: the person's attestation of the workspace cap, at
   most `[budget] provider_cap_attested_usd`;
 - `--supervisor systemd`: the person states that they installed the unit
   themselves. Ilmar never installs or enables a unit.
 
-`ilmar gate end-trial` revokes it, like any trial. A second trial of any kind
-is refused while one is in force.
+**Revocation.** `ilmar gate end-trial` revokes it, like any trial:
+
+- it takes effect at the next check, at the latest at the next admission;
+  a pass already admitted finishes under Ilmar's ordinary limits and the
+  next start exits 3;
+- it is final: a revoked rehearsal is never reinstated. Continuing needs a
+  new rehearsal with a new authorization;
+- the kill switch and every suspension also stop the loop, as today, and
+  do not need the rehearsal to be revoked.
+
+A second trial of any kind is refused while one is in force.
 
 ### 3. Exactly what it lifts, and only for `ilmar run --loop --trial`
 
@@ -102,6 +128,16 @@ Everything else is unchanged:
 - When the rehearsal ends (expiry, revocation, its restart, execution or
   spend limit), the next start exits 3 and nothing restarts it.
 
+### 5. The guarantees, in one place
+
+| Property | How it holds |
+| --- | --- |
+| Explicitly authorized | Written only by a person, with a maintainer's #96 comment and every limit stated, no defaults (§2). |
+| Disposable-only | The disposable repository by immutable ID, never Ilmar's own or a fork; `--disposable` required; the configuration's repository ID must match before every pass (§1, ADR-0041 §4). |
+| Expiring | At most 72 hours, checked before every pass and at every admission; no one has to act (§1). |
+| Revocable | `ilmar gate end-trial`, effective by the next admission and final (§2). |
+| Unavailable before Gate 1 | Refused unless an unrevoked Gate 1 record exists for the same repository ID, checked at writing and before every pass (§1). |
+
 ## Consequences
 
 - Good: Gate 2's evidence can be produced on the real path, with real
@@ -120,9 +156,12 @@ Everything else is unchanged:
 
 ## Tests required
 
-- **Store:** a rehearsal is written only by a person; it is refused without a
-  Gate 1 record for the same repository ID; it is refused while another
-  trial is in force; it is never returned as a gate record.
+- **Store and command:** a rehearsal is written only by a person; it is
+  refused without a Gate 1 record, with a revoked one, or with one for
+  another repository ID; it is
+  refused without `--authorization` or any limit, or with a limit out of
+  bounds; it is refused while another trial is in force; it is never
+  returned as a gate record; a revoked one is never reinstated.
 - **Configuration:** `enabled = true` and the gateway route are refused in
   `supervised` mode without `rehearsal = true`, and refused in every other
   mode.
@@ -131,6 +170,8 @@ Everything else is unchanged:
   - without a rehearsal in force;
   - with a Gate 1 trial instead of a rehearsal;
   - after expiry or revocation;
+  - once the Gate 1 record is revoked;
+  - with a configuration naming another repository ID;
   - once `max_restarts` starts are recorded under it.
 
   With all conditions met, it runs, and a crash is restarted under the
