@@ -70,6 +70,7 @@ class FakeAnthropic:
         limit: str | None = "100",
         spent: str = "0",
         limits_status: int = 200,
+        limit_rows: list[dict[str, Any]] | None = None,
         key_workspace: str = WS,
         reported_workspace: str | None = WS,
         extra_keys: tuple[str, ...] = (),
@@ -83,6 +84,7 @@ class FakeAnthropic:
         self.limit = limit
         self.spent = Decimal(spent)
         self.limits_status = limits_status
+        self.limit_rows = limit_rows
         self.key_workspace = key_workspace
         self.reported_workspace = reported_workspace
         self.extra_keys = extra_keys
@@ -145,6 +147,8 @@ class FakeAnthropic:
                 "type": "spend_limit", "amount": self.limit, "currency": "USD",
                 "period": "monthly", "is_enabled": True,
                 "scope": {"type": "workspace", "workspace_id": WS}}]  # fmt: skip
+            if self.limit_rows is not None:
+                rows = self.limit_rows
             return ok({"data": rows, "next_page": None})
         if path == cap_drill.COST_REPORT:
             total = self.spent + self.charged
@@ -744,6 +748,144 @@ def test_an_actual_cost_above_115_cents_is_an_overshoot_not_a_verification() -> 
     done = state | {"cost": cost, "exhaust": {"end": "spend-limit-refused"},
                     "ilmar": {"failed_checks": []}}  # fmt: skip
     assert cap_drill.record(done, INPUTS, {})["result"] == "inconclusive"
+
+
+# -- regression: only enabled, monthly, USD workspace limits count -------------------------
+
+
+def limit_row(amount: str, period: str = "monthly", **change: Any) -> dict[str, Any]:
+    row = {"type": "spend_limit", "amount": amount, "currency": "USD", "period": period,
+           "is_enabled": True, "scope": {"type": "workspace", "workspace_id": WS}}  # fmt: skip
+    return row | change
+
+
+@pytest.mark.parametrize(
+    ("rows", "accepted"),
+    [
+        # a lower daily or weekly limit is not the monthly cap, and is never taken for it
+        ([limit_row("100"), limit_row("10", "daily"), limit_row("30", "weekly")], "100"),
+        ([limit_row("10", "daily"), limit_row("100"), limit_row("500", "weekly")], "100"),
+        # several monthly limits: the lowest enabled one
+        ([limit_row("100"), limit_row("90")], "90"),
+        # a disabled monthly limit is skipped, an enabled one still counts
+        ([limit_row("50", is_enabled=False), limit_row("100")], "100"),
+        # another period's malformed row is not read at all
+        ([limit_row("100"), limit_row("x", "daily", currency="EUR")], "100"),
+    ],
+)
+def test_only_enabled_monthly_usd_limits_are_accepted(
+    rows: list[dict[str, Any]], accepted: str
+) -> None:
+    assert cap_drill.accepted_limit(rows) == Decimal(accepted)
+
+
+@pytest.mark.parametrize(
+    ("rows", "says"),
+    [
+        ([limit_row("100", is_enabled=False)], "no enabled monthly USD"),
+        ([{k: v for k, v in limit_row("100").items() if k != "is_enabled"}],
+         "no enabled monthly USD"),
+        ([limit_row("100", is_enabled="true")], "no enabled monthly USD"),
+        ([limit_row("10", "daily"), limit_row("30", "weekly")], "no enabled monthly USD"),
+        ([limit_row("100", is_enabled=False), limit_row("10", "daily")], "no enabled monthly USD"),
+        ([limit_row("100", currency="EUR")], "not a whole number of USD cents"),
+        ([limit_row("100"), limit_row("99.5")], "not a whole number of USD cents"),
+        ([limit_row("100"), limit_row(None)], "not a whole number of USD cents"),  # type: ignore[arg-type]
+    ],
+)  # fmt: skip
+def test_a_workspace_without_an_accepted_monthly_limit_stops(
+    rows: list[dict[str, Any]], says: str
+) -> None:
+    with pytest.raises(cap_drill.StopError) as stop:
+        cap_drill.accepted_limit(rows)
+    assert stop.value.result == "cap-unverified"
+    assert says in str(stop.value)
+
+
+def test_a_disabled_monthly_limit_stops_the_preflight_before_any_paid_request() -> None:
+    fake = FakeAnthropic(limit_rows=[limit_row("100", is_enabled=False), limit_row("5", "daily")])
+    with pytest.raises(cap_drill.StopError, match="no enabled monthly USD") as stop:
+        cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, INPUTS, NOW)
+    assert stop.value.result == "cap-unverified"
+    assert fake.messages == 0
+
+
+def test_mixed_periods_through_the_preflight_take_the_monthly_limit() -> None:
+    fake = FakeAnthropic(limit_rows=[limit_row("5", "daily"), limit_row("100")])
+    facts = cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, INPUTS, NOW)
+    assert facts["limit_cents"] == "100"
+
+
+# -- regression: no within-allowance before billing reconciles -------------------------------
+
+
+def cost_state(estimated: str, before: str = "0") -> dict[str, Any]:
+    return {"preflight": {"workspace_id": WS, "month_to_date_before_cents": before,
+                          "limit_cents": "100", "allowance_cents": "115"},
+            "exhaust": {"estimated_cents": estimated}}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("before", "reported", "estimated", "spend"),
+    [
+        ("0", "0", "100", "pending"),  # nothing billed yet
+        ("0", "40", "100", "pending"),  # a partly updated report
+        ("0", "98.9", "100", "pending"),  # still short of every sent request
+        ("20", "60", "100", "pending"),  # partial, on top of earlier spend
+        ("20", "10", "100", "pending"),  # the report went down: not reconciled
+        ("0", "99", "100", "within-allowance"),  # reconciled within rounding
+        ("0", "104", "100", "within-allowance"),  # every request, plus the crossing one
+        ("10", "115", "100", "within-allowance"),  # exactly the allowance
+        ("0", "116", "100", "overshoot"),  # final: more can only be added
+        ("0", "116", "40", "overshoot"),  # even before the report is complete
+        ("0", "0", "0", "within-allowance"),  # nothing billed and nothing sent that cost
+    ],
+)
+def test_spend_is_within_the_allowance_only_once_billing_reconciles(
+    before: str, reported: str, estimated: str, spend: str
+) -> None:
+    fake = FakeAnthropic(spent=reported)
+    cost = cap_drill.actual_cost(admin(fake), cost_state(estimated, before), NOW)
+    assert cost["spend"] == spend
+    if spend == "pending":
+        assert cost["actual_cents"] == "pending"
+        assert cost["above_provider_limit"] is None
+
+
+@pytest.mark.parametrize("reported", ["0", "50", "98.9"])
+def test_a_partly_updated_cost_report_never_verifies_the_drill(reported: str) -> None:
+    fake = FakeAnthropic(spent=reported)
+    cost = cap_drill.actual_cost(admin(fake), cost_state("100"), NOW)
+    done = cost_state("100") | {"cost": cost, "exhaust": {"end": "spend-limit-refused"},
+                                "ilmar": {"failed_checks": []}}  # fmt: skip
+    record = cap_drill.record(done, INPUTS, {})
+    assert record["result"] == "inconclusive"
+    assert record["provider_spend"]["actual"]["spend"] == "pending"
+
+
+def test_the_main_flow_stays_pending_while_the_report_lags(tmp_path: Path) -> None:
+    fake = FakeAnthropic(limit="100")
+    issue = Issue93()
+    state = tmp_path / "state.json"
+    env = DISPATCH | {cap_drill.KEY_ENV: KEY, cap_drill.ADMIN_ENV: ADMIN_KEY,
+                      "GH_TOKEN": "t", "GITHUB_RUN_ID": "10"}  # fmt: skip
+
+    def main(*argv: str) -> int:
+        return cap_drill.main([*argv, "--state", str(state)], environ=env,
+                              http=issue.route(fake), get=issue.get, now=lambda: NOW)  # fmt: skip
+
+    assert main("preflight") == 0
+    assert main("mark") == 0
+    assert main("exhaust") == 0
+    billed = fake.charged
+    fake.charged = billed / 2  # the cost report has caught up with half the requests
+    assert main("actual-cost") == 0
+    saved = json.loads(state.read_text())
+    assert saved["cost"]["spend"] == "pending"
+    assert saved["cost"]["actual_cents"] == "pending"
+    fake.charged = billed  # later, fully reconciled
+    assert main("actual-cost") == 0
+    assert json.loads(state.read_text())["cost"]["spend"] == "within-allowance"
 
 
 # -- the workflow ---------------------------------------------------------------------------

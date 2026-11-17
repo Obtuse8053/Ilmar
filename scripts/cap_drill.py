@@ -372,16 +372,30 @@ def workspace_limit(admin: Admin, workspace: str) -> Decimal:
         raise StopError("cap-unverified", "the spend-limit read was unexpectedly paged")
     if not rows:
         raise StopError("cap-unverified", f"no spend limit is set on {WORKSPACE}")
+    return accepted_limit(rows)
+
+
+def accepted_limit(rows: Sequence[Mapping[str, Any]]) -> Decimal:
+    """The lowest **enabled, monthly, USD** workspace limit, in cents; nothing else counts.
+
+    Rows of other periods (daily, weekly) are not the cap the drill verifies and
+    are never accepted in its place. A disabled monthly limit, or one whose
+    ``is_enabled`` is not exactly ``true``, is not accepted. A monthly row that
+    is not in USD or has no whole number of cents stops the drill: it cannot be
+    understood, so nothing is assumed about it."""
     amounts = []
     for row in rows:
+        if row.get("period") != "monthly":
+            continue
         amount = row.get("amount")
         if row.get("currency") != "USD" or not isinstance(amount, str) or not amount.isdigit():
-            raise StopError("cap-unverified", "a workspace limit without a USD amount in cents")
-        if row.get("is_enabled") is False:
+            raise StopError("cap-unverified", "a monthly workspace limit is not a whole number "
+                            "of USD cents")  # fmt: skip
+        if row.get("is_enabled") is not True:
             continue
         amounts.append(Decimal(amount))
-    if not any(r.get("period") == "monthly" for r in rows) or not amounts:
-        raise StopError("cap-unverified", f"no enabled monthly spend limit on {WORKSPACE}")
+    if not amounts:
+        raise StopError("cap-unverified", f"no enabled monthly USD spend limit on {WORKSPACE}")
     return min(amounts)
 
 
@@ -791,23 +805,54 @@ def ilmar_checks(out: Mapping[str, Any]) -> list[str]:
 # -- §6 and §7: costs and the record --------------------------------------------------------
 
 
+RECONCILED = Decimal("0.99")
+"""The share of the estimated spend of every sent request the cost report must show."""
+
+
+def spend_status(
+    before: Decimal, after: Decimal, estimated: Decimal, allowance: Decimal
+) -> tuple[str, Decimal | None]:
+    """``within-allowance``, ``overshoot`` or ``pending``, and the reconciled share.
+
+    * **overshoot**: the report already shows more than the allowance. That is
+      final: a later, fuller report can only show more.
+    * **pending**: the report does not yet account for the requests that were
+      sent: the month-to-date cost rose by less than ``RECONCILED`` of their
+      estimated cost, or did not rise, or fell. A partly updated report is
+      therefore never read as a verified total.
+    * **within-allowance**: only when the report accounts for every sent
+      request (within the 1 % tolerance for rounding) and stays within the
+      allowance.
+    """
+    delta = after - before
+    if after > allowance:
+        return "overshoot", (delta / estimated if estimated > 0 else None)
+    if estimated <= 0:
+        # No request was billed by this drill's own estimate; any rise is unexplained
+        # spend (Ilmar's attempt, or another client) and is accepted only as reported.
+        return ("within-allowance", None) if delta >= 0 else ("pending", None)
+    share = delta / estimated
+    if share < RECONCILED:
+        return "pending", share
+    return "within-allowance", share
+
+
 def actual_cost(admin: Admin, state: Mapping[str, Any], now: datetime) -> dict[str, Any]:
     pre = state["preflight"]
+    before = Decimal(pre["month_to_date_before_cents"])
     after = month_to_date(admin, pre["workspace_id"], now)
-    delta = after - Decimal(pre["month_to_date_before_cents"])
     estimated = Decimal((state.get("exhaust") or {}).get("estimated_cents", "0"))
-    pending = delta <= 0 < estimated  # the cost report has not caught up yet
-    allowance = Decimal(pre["allowance_cents"])
-    if pending:
-        verified = "pending"
-    elif Decimal(pre["month_to_date_before_cents"]) + delta > allowance:
-        verified = "overshoot"
-    else:
-        verified = "within-allowance"
-    return {"read_at": iso(now), "actual_cents": "pending" if pending else str(delta),
-            "month_to_date_after_cents": str(after), "spend": verified,
-            "above_provider_limit": None if pending
-            else after > Decimal(pre["limit_cents"])}  # fmt: skip
+    status, share = spend_status(before, after, estimated, Decimal(pre["allowance_cents"]))
+    settled = status != "pending"
+    return {
+        "read_at": iso(now),
+        "actual_cents": str(after - before) if settled else "pending",
+        "reported_delta_cents": str(after - before),
+        "month_to_date_after_cents": str(after),
+        "reconciled_share": None if share is None else str(share.quantize(Decimal("0.0001"))),
+        "spend": status,
+        "above_provider_limit": after > Decimal(pre["limit_cents"]) if settled else None,
+    }
 
 
 def record(

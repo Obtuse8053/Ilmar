@@ -101,9 +101,18 @@ establishes:
      `CAP_DRILL_KEY`, and the Admin API lists it in `ilmar-cap-test`.
 3. **Spend-limit read access and the limit:** an enabled monthly USD limit on
    that workspace, read from the Spend Limits API. Without access, the run
-   stops here with `cap-unverified` and the authorization stays unused. The
-   lowest configured limit counts. It must be **at most USD 1.00** (it is
-   USD 1.00) and must equal the attested cap (a dispatch input).
+   stops here with `cap-unverified` and the authorization stays unused.
+   **Only enabled, monthly, USD workspace limits are accepted**, and the
+   lowest of them counts:
+   - a limit of another period (daily, weekly) is never taken for the
+     monthly cap, however low;
+   - a monthly limit that is disabled, or whose `is_enabled` is not exactly
+     `true`, is not accepted;
+   - a monthly limit that is not a whole number of USD cents stops the run.
+
+   With no accepted limit, the run stops. The accepted limit must be **at
+   most USD 1.00** (it is USD 1.00) and must equal the attested cap (a
+   dispatch input).
 4. **The month-to-date cost** from the cost report.
 5. **Headroom inside the USD 1.15 allowance.** The limit can only be reached
    by a request that crosses it, and how far a request may overshoot is not
@@ -208,11 +217,18 @@ The two are never merged into one figure.
 accounting, and no client-side estimate can guarantee the final bill. The
 record states:
 
-- `within-allowance`: the cost report covers the run, and the month-to-date
-  provider spend stays within USD 1.15. Spend above the USD 1.00 limit by at
-  most one request is expected, and is shown as `above_provider_limit`;
-- `overshoot`: the cost report shows more than USD 1.15;
-- `pending`: the report has not caught up.
+- `within-allowance`: the cost report is **reconciled against every sent
+  request**, and the month-to-date provider spend stays within USD 1.15.
+  Reconciled means its rise since the preflight is at least 99 % of the
+  estimated cost of all successful requests (1 % for rounding). Spend above
+  the USD 1.00 limit by at most one request is expected, and is shown as
+  `above_provider_limit`;
+- `overshoot`: the cost report already shows more than USD 1.15. This is
+  final, because a fuller report can only show more;
+- `pending`: anything short of reconciled, so a partly updated report is
+  never read as the total. That covers no rise, a fall, or a rise below 99 %
+  of the estimate. The record then gives the reported rise and its
+  reconciled share, and the actual cost reads `pending`.
 
 Only `within-allowance` can make the result `cap-enforced-through-ilmar`.
 Otherwise the result is `inconclusive`, never a successful verification at
