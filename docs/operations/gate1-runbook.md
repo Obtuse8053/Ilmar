@@ -19,7 +19,8 @@ Rules for every step:
 
 ## Operator checklist
 
-Tick each line on #93 as you go. Never paste a credential.
+Tick each line on #93 as you go. Never paste a credential. The commands, in
+order and nothing else, are in `gate1-commands.md`.
 
 - [ ] 0. #132, #133, #135, #136 and #137 are merged; checkout at `main`.
 - [ ] 1. Dedicated Anthropic workspace, USD 10 monthly limit (or lower), one key.
@@ -53,7 +54,8 @@ Tick each line on #93 as you go. Never paste a credential.
 ## 1. The Anthropic workspace (you)
 
 1. In the Anthropic Console, create a **dedicated, non-default workspace** for
-   Ilmar with a **monthly spend limit of USD 10** (or lower).
+   Ilmar (the maintainer's is named `ilmar-test`) with a **monthly spend limit
+   of USD 10** (or lower).
 2. Create **one** API key scoped to that workspace. Keep it in your password
    manager only.
 3. Record the limit on #93: the amount and the workspace name. Never record the
@@ -159,7 +161,12 @@ what establishes it.
 2. **The passed live run and the recorded stream fixture (you, the step 1
    key).** `ilmar gate record --live-test` takes a GitHub Actions run URL, so
    use the *Live tests (manual)* workflow (`live.yml`) on `main`, with
-   `claude_version = 2.1.318`. Its one-time setup (the protected `live`
+   `claude_version = 2.1.318` and `expected_sha` = the full `main` SHA you
+   reviewed (the workflow refuses any other commit):
+
+       gh workflow run live.yml --repo Obtuse8053/Ilmar --ref main \
+         -f expected_sha="$(git rev-parse origin/main)" -f claude_version=2.1.318
+ Its one-time setup (the protected `live`
    environment, its two secrets and a required reviewer) is in
    `docs/operations/live-testing.md`. The run's artifacts include
    `issue-13-stream-event-types.json` (`provenance: recorded`,
