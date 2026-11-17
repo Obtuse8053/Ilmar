@@ -2,20 +2,22 @@
 """The one-time provider cap drill through Ilmar (#93, docs/operations/cap-drill-workflow.md).
 
     python3 scripts/cap_drill.py guard              # guard job (no secrets)
-    python3 scripts/cap_drill.py mark               # guard job: the one-time marker on #93
     python3 scripts/cap_drill.py prepare DIR        # prepare job (no secrets)
     python3 scripts/cap_drill.py drill-context      # drill job, before any secret
     python3 scripts/cap_drill.py load-images TAR    # drill job, before any secret
-    python3 scripts/cap_drill.py preflight          # CAP_DRILL_ADMIN_KEY, CAP_DRILL_KEY (compared)
+    python3 scripts/cap_drill.py preflight          # CAP_DRILL_ADMIN_READ, CAP_DRILL_KEY; free
+    python3 scripts/cap_drill.py mark               # the one-time marker on #93 (GH_TOKEN)
     python3 scripts/cap_drill.py exhaust            # CAP_DRILL_KEY
     python3 scripts/cap_drill.py through-ilmar      # CAP_DRILL_KEY, CAP_DRILL_GITHUB_TOKEN
-    python3 scripts/cap_drill.py actual-cost        # CAP_DRILL_ADMIN_KEY
+    python3 scripts/cap_drill.py actual-cost        # CAP_DRILL_ADMIN_READ
     python3 scripts/cap_drill.py finish             # no secrets: the sanitized record
     python3 scripts/cap_drill.py post FILE          # post job: the record on #93
 
 Each stage reads and extends one state file that never holds a secret. A
 stage that stops exits 1, so GitHub skips every later stage that spends;
 ``finish`` always runs and writes the record.
+The free preflight runs before ``mark``: a run that stops there leaves the
+one-time authorization unused.
 
 Rules this file keeps (tests/unit/test_cap_drill.py checks them):
 
@@ -66,8 +68,12 @@ GATE1_CONFIG = ROOT / "deploy" / "gate1" / "ilmar.gate1.toml"
 CLAUDE_VERSION = "2.1.318"
 
 WORKSPACE = "ilmar-cap-test"
-ALLOWANCE_CENTS = Decimal(100)
-"""The most the whole drill may spend: USD 1.00. Inputs may only lower it."""
+ALLOWANCE_CENTS = Decimal(115)
+"""The test allowance, independent of the provider's limit: USD 1.15. Inputs may only
+lower it. It bounds the workspace's month-to-date provider spend plus the drill's
+accounting reservations (see ``exhaust``)."""
+PROVIDER_LIMIT_MAX_CENTS = Decimal(100)
+"""The workspace's own monthly limit must be at most USD 1.00."""
 MAX_REQUESTS = 60
 MAX_TOKENS = 8
 SAFETY = Decimal("1.25")
@@ -84,7 +90,7 @@ AUTHORIZATION_URL = re.compile(
 AUTHORIZATION_MAX_AGE = timedelta(days=7)
 
 KEY_ENV = "CAP_DRILL_KEY"
-ADMIN_ENV = "CAP_DRILL_ADMIN_KEY"
+ADMIN_ENV = "CAP_DRILL_ADMIN_READ"
 GITHUB_ENV = "CAP_DRILL_GITHUB_TOKEN"
 SECRET_ENVS = (KEY_ENV, ADMIN_ENV, GITHUB_ENV)
 
@@ -453,15 +459,15 @@ def preflight(
              "month_to_date_before_cents": str(spent), "read_at": iso(now),
              "allowance_cents": str(allowance)}  # fmt: skip
     attested = Decimal(inputs["attested_cap_usd"]) * 100
-    if limit > allowance:
-        raise StopError("cap-too-high", f"the workspace limit is {usd(limit)}, above the "
-                        f"{usd(allowance)} allowance")  # fmt: skip
+    if limit > min(PROVIDER_LIMIT_MAX_CENTS, allowance):
+        raise StopError("cap-too-high", f"the workspace limit is {usd(limit)}, above "
+                        f"{usd(min(PROVIDER_LIMIT_MAX_CENTS, allowance))}")  # fmt: skip
     if attested != limit:
         raise StopError("cap-unverified", f"the attested cap {usd(attested)} is not the "
                         f"{usd(limit)} limit the provider reports")  # fmt: skip
     if limit + largest + reserve > allowance:
-        # The limit is reached only by a request that crosses it: month-to-date
-        # spend plus the drill's own can reach limit + one request, plus Ilmar's.
+        # The limit is reached only by a request that crosses it: provider spend can
+        # reach the limit plus one request; Ilmar's reservation is accounting on top.
         raise StopError("no-headroom", f"reaching the {usd(limit)} limit can cost up to "
                         f"{usd(limit + largest + reserve)} with the last request and Ilmar's "
                         f"reserve, above the {usd(allowance)} allowance; lower the workspace "
@@ -519,33 +525,59 @@ def exhaust(
     classify: Callable[[str], str | None],
     key: str,
     month_to_date_cents: str,
+    limit_cents: str,
 ) -> dict[str, Any]:
-    """Send tiny paid requests, one at a time, until the provider refuses.
+    """Send small paid requests, one at a time, until the provider refuses.
+
+    While the workspace's estimated spend is below its limit, each request uses
+    the sized prompt (worst case at most ``max_request_cents``). Once the
+    estimate has reached the limit, only the fixed probe is sent: a tiny request
+    whose refusal is the signal, and whose worst case is a fraction of a cent.
+    So at a USD 1.00 limit, provider spend stays within the limit plus one
+    sized request, and the refusing request needs almost no headroom.
+
+    The ceiling mixes two kinds of figure, kept apart in the record:
+
+    * **provider spending**: the month-to-date cost read in the preflight and
+      this step's estimated cost of each sent request;
+    * **accounting reservations**: the next request's worst case before it is
+      sent, and the reserve held for Ilmar's own attempt. Neither is spending.
 
     ``classify`` is Ilmar's own provider-error classifier: it returns ``"cap"``,
     ``"auth"``, ``"rate"`` or ``None``."""
     prompt, tokens, worst = size_prompt(model, inputs)
+    probe_tokens = count_tokens(model, inputs["model"], PROBE)
+    probe_worst = (cost_cents(probe_tokens, MAX_TOKENS, inputs) * SAFETY).quantize(
+        Decimal("0.0001"), rounding=ROUND_CEILING
+    )
     before = Decimal(month_to_date_cents)
+    limit = Decimal(limit_cents)
     allowance = Decimal(inputs["allowance_cents"])
     reserve = Decimal(inputs["ilmar_reserve_cents"])
     spent = Decimal(0)
-    sent = 0
-    result: dict[str, Any] = {"prompt_tokens": tokens, "worst_case_cents": str(worst)}
+    sent = probes = 0
+    result: dict[str, Any] = {"prompt_tokens": tokens, "worst_case_cents": str(worst),
+                              "probe_worst_case_cents": str(probe_worst)}  # fmt: skip
     while True:
+        probing = before + spent >= limit
+        text, size, next_worst = (
+            (PROBE, probe_tokens, probe_worst) if probing else (prompt, tokens, worst)
+        )
         if sent >= MAX_REQUESTS:
             result["end"] = "request-cap"
             break
-        if before + spent + worst + reserve > allowance:
+        if before + spent + next_worst + reserve > allowance:
             result["end"] = "allowance"  # the next request could exceed it: never sent
             break
         status, _, body = model.post(MESSAGES, {
             "model": inputs["model"], "max_tokens": MAX_TOKENS,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": text}],
         })  # fmt: skip
         sent += 1
+        probes += probing
         if status == 200:
             usage = (decode(body) or {}).get("usage") or {}
-            used_in = int(usage.get("input_tokens", tokens))
+            used_in = int(usage.get("input_tokens", size))
             used_out = int(usage.get("output_tokens", MAX_TOKENS))
             spent += cost_cents(used_in, used_out, inputs)
             continue
@@ -555,7 +587,15 @@ def exhaust(
                    "message": redact(message, [key]), "classified": cause}  # fmt: skip
         result["end"] = "spend-limit-refused" if cause == "cap" else "other-refusal"
         break
-    result |= {"requests": sent, "estimated_cents": str(spent.quantize(Decimal("0.0001")))}
+    result |= {
+        "requests": sent,
+        "probes": probes,
+        "estimated_cents": str(spent.quantize(Decimal("0.0001"))),
+        # Accounting, not spending: the reserve held back for Ilmar's attempt was
+        # never sent to the provider by this step.
+        "accounting_reserve_cents": str(reserve),
+        "ceiling_cents": str(allowance),
+    }
     return result
 
 
@@ -765,7 +805,9 @@ def actual_cost(admin: Admin, state: Mapping[str, Any], now: datetime) -> dict[s
     else:
         verified = "within-allowance"
     return {"read_at": iso(now), "actual_cents": "pending" if pending else str(delta),
-            "spend": verified}  # fmt: skip
+            "month_to_date_after_cents": str(after), "spend": verified,
+            "above_provider_limit": None if pending
+            else after > Decimal(pre["limit_cents"])}  # fmt: skip
 
 
 def record(
@@ -796,6 +838,7 @@ def record(
         "expected_sha": inputs.get("expected_sha"),
         "workspace": WORKSPACE,
         "allowance_usd": usd(Decimal(inputs.get("allowance_cents", ALLOWANCE_CENTS))),
+        "provider_limit_max_usd": usd(PROVIDER_LIMIT_MAX_CENTS),
         "limit_read_usd": usd(Decimal(pre["limit_cents"])) if pre.get("limit_cents") else None,
         "month_to_date_before_usd": usd(Decimal(pre["month_to_date_before_cents"]))
         if pre.get("month_to_date_before_cents") else None,
@@ -803,9 +846,19 @@ def record(
         "model": inputs.get("model"),
         "prices_usd_per_mtok": [str(p) for p in PRICES.get(str(inputs.get("model")), ())],
         "requests": ex.get("requests"),
-        "estimated_cost_usd": usd(Decimal(ex["estimated_cents"])) if ex.get("estimated_cents")
-        else None,
-        "actual_cost": (state.get("cost") or {}),
+        "provider_spend": {
+            "estimated_usd": usd(Decimal(ex["estimated_cents"])) if ex.get("estimated_cents")
+            else None,
+            "actual": (state.get("cost") or {}),
+        },
+        "accounting_reservations": {
+            "note": "held back in the drill's ceiling and Ilmar's ledger; not provider spend",
+            "drill_reserve_for_ilmar_usd": usd(Decimal(ex["accounting_reserve_cents"]))
+            if ex.get("accounting_reserve_cents") else None,
+            "ilmar_ledger_reservations": (ilmar.get("after_run2") or {}).get("attempts"),
+            "ilmar_reserve_per_attempt_usd": usd(Decimal(inputs["ilmar_reserve_cents"]))
+            if inputs.get("ilmar_reserve_cents") else None,
+        },
         "provider_final": {k: ex.get(k) for k in ("status", "error_type", "message",
                                                     "classified", "end")},
         "ilmar": dict(ilmar),
@@ -928,7 +981,11 @@ def check_authorization(
 
 
 def check_once(get: Callable[[str, str], Any], token: str, env: Mapping[str, str]) -> list[str]:
-    """Refused if any earlier run reached the preflight, or a marker exists on #93."""
+    """Refused if a marker is on #93, or any earlier run started a paid step.
+
+    The free preflight does not use the authorization: a run that stopped
+    there (for example without spend-limit read access) may be dispatched
+    again. The marker is posted after the preflight and before any paid step."""
     problems = []
     if any(str(c.get("body", "")).startswith(MARKER) for c in comments(get, token)
            if isinstance(c, dict)):  # fmt: skip
@@ -940,10 +997,10 @@ def check_once(get: Callable[[str, str], Any], token: str, env: Mapping[str, str
         jobs = get(f"/repos/{UPSTREAM}/actions/runs/{run.get('id')}/jobs?per_page=100", token)
         for job in (jobs or {}).get("jobs") or []:
             for step in job.get("steps") or []:
-                if str(step.get("name", "")).startswith("Preflight") and step.get(
+                if str(step.get("name", "")).startswith(PAID_STEPS) and step.get(
                     "conclusion"
                 ) not in (None, "skipped"):
-                    problems.append(f"run {run.get('id')} already reached the preflight")
+                    problems.append(f"run {run.get('id')} already started a paid step")
     return problems
 
 
@@ -973,19 +1030,25 @@ def guard(env: Mapping[str, str], get: Callable[[str, str], Any], now: datetime)
     return problems
 
 
+PAID_STEPS = ("Mark", "Reach the cap", "Ilmar's coordinator")
+"""Workflow steps that use the authorization: the marker, then everything that spends."""
+
+
 def run_url(env: Mapping[str, str]) -> str:
     return f"https://github.com/{UPSTREAM}/actions/runs/{env.get('GITHUB_RUN_ID', '')}"
 
 
-def mark(env: Mapping[str, str], http: Http) -> None:
-    github(http, env["GH_TOKEN"], "POST", f"/repos/{UPSTREAM}/issues/{ISSUE}/comments",
+def mark(env: Mapping[str, str], http: Http, get: Callable[[str, str], Any]) -> None:
+    """Use the authorization: only after a passed preflight, and only if still unused."""
+    token = env.get("GH_TOKEN", "")
+    if problems := check_once(get, token, env):
+        raise DrillError("; ".join(problems))
+    github(http, token, "POST", f"/repos/{UPSTREAM}/issues/{ISSUE}/comments",
            {"body": f"{MARKER} {run_url(env)}"})  # fmt: skip
-
-
-def marked_for_this_run(get: Callable[[str, str], Any], env: Mapping[str, str]) -> bool:
-    mine = f"{MARKER} {run_url(env)}"
-    return any(isinstance(c, dict) and c.get("body") == mine
-               for c in comments(get, env.get("GH_TOKEN", "")))  # fmt: skip
+    markers = [c.get("body") for c in comments(get, token)
+               if isinstance(c, dict) and str(c.get("body", "")).startswith(MARKER)]  # fmt: skip
+    if markers != [f"{MARKER} {run_url(env)}"]:
+        raise DrillError(f"another '{MARKER}' marker is on #{ISSUE}: refusing to spend")
 
 
 # -- the command line ----------------------------------------------------------------------
@@ -1018,10 +1081,6 @@ def main(
                 return 1
             print("Authorized, once, for this commit; the environment is protected.")
             return 0
-        if args.stage == "mark":
-            mark(env, http)
-            print(f"Marked #{ISSUE}: this authorization is now used.")
-            return 0
         if args.stage == "prepare":
             outputs = live_ci.prepare(Path(args.path), {**env, "ILMAR_TEST_CLAUDE_VERSION":
                                       CLAUDE_VERSION}, run)  # fmt: skip
@@ -1034,11 +1093,9 @@ def main(
                                                  inputs["expected_sha"]}, get)  # fmt: skip
             if live_ci.checked_out_commit(run=run) != inputs["expected_sha"]:
                 problems.append("the checked-out tree is not the expected commit")
-            if not marked_for_this_run(get, env):
-                problems.append(f"this run's marker is not on #{ISSUE}")
             if problems:
                 raise DrillError("; ".join(problems))
-            print("Running the authorized commit; this run holds the one-time marker.")
+            print("Running the authorized commit.")
             return 0
         if args.stage == "load-images":
             live_ci.load_images(Path(args.path), {**env, "ILMAR_TEST_CLAUDE_VERSION":
@@ -1061,12 +1118,24 @@ def main(
                   f"{usd(Decimal(pre['limit_cents']))}; spent this month "
                   f"{usd(Decimal(pre['month_to_date_before_cents']))}.")  # fmt: skip
             return 0
+        if args.stage == "mark":
+            if "preflight" not in state or "stop" in state:
+                raise DrillError("refused: the preflight did not pass; the authorization "
+                                 "stays unused")  # fmt: skip
+            mark(env, http, get)
+            state["marked"] = run_url(env)
+            save_state(state_path, state, secrets)
+            print(f"Marked #{ISSUE}: this authorization is now used.")
+            return 0
         if args.stage == "exhaust":
             if "preflight" not in state or "stop" in state:
                 raise DrillError("refused: the preflight did not pass")
+            if state.get("marked") != run_url(env):
+                raise DrillError("refused: this run does not hold the one-time marker")
             key = secret(env, KEY_ENV)
             before = state["preflight"]["month_to_date_before_cents"]
-            state["exhaust"] = exhaust(Model(key, http), inputs, ilmar_classify, key, before)
+            limit = state["preflight"]["limit_cents"]
+            state["exhaust"] = exhaust(Model(key, http), inputs, ilmar_classify, key, before, limit)
             save_state(state_path, state, secrets)
             print(f"{state['exhaust']['requests']} requests; end: {state['exhaust']['end']}.")
             return 0 if state["exhaust"]["end"] == "spend-limit-refused" else 1

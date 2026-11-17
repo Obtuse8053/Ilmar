@@ -1,10 +1,11 @@
 # The one-time provider cap drill through Ilmar
 
-*Designed 2026-11-16; revised 2026-11-17 for a USD 1.00 allowance on the
-existing scratch workspace `ilmar-cap-test`.* The workflow is
-`.github/workflows/cap-drill.yml`, the script is `scripts/cap_drill.py`, and
-`tests/unit/test_cap_drill.py` tests both offline. **Nothing runs until the
-maintainer dispatches it once, after authorizing it on #93.**
+*Designed 2026-11-16; revised 2026-11-17: the scratch workspace
+`ilmar-cap-test` keeps its own USD 1.00 monthly limit, inside an independent
+USD 1.15 test allowance.* The workflow is `.github/workflows/cap-drill.yml`,
+the script is `scripts/cap_drill.py`, and `tests/unit/test_cap_drill.py` tests
+both offline. **Nothing runs until the maintainer dispatches it, after
+authorizing it on #93.**
 
 ## Purpose
 
@@ -53,7 +54,7 @@ recorded only by `ilmar gate record`.
 | Secret | What it is | Steps |
 | --- | --- | --- |
 | `CAP_DRILL_KEY` | the `ilmar-cap-test` key | Preflight (one free token count; compared locally with the Admin API's hints, never sent there); Reach the cap; Ilmar's coordinator |
-| `CAP_DRILL_ADMIN_KEY` | an Admin API key, used only for reads | Preflight; Actual cost |
+| `CAP_DRILL_ADMIN_READ` | an Admin API key, used only for reads | Preflight; Actual cost |
 | `CAP_DRILL_GITHUB_TOKEN` | a fine-grained token for `ilmar-disposable` only, valid for a short time | Ilmar's coordinator |
 
 ## 2. One-time authorization
@@ -66,20 +67,29 @@ The `guard` job, which has no secrets, refuses unless all of these hold:
 - **The authorization:** a comment on #93, by the maintainer (`OWNER`), never
   edited, at most seven days old, containing the line
 
-      cap-drill: authorize <expected_sha> workspace=ilmar-cap-test allowance=1.00
+      cap-drill: authorize <expected_sha> workspace=ilmar-cap-test allowance=1.15
 
 - **Once:** no `cap-drill: started` marker exists on #93, and no earlier run
-  of the workflow reached its Preflight step.
+  of the workflow started its Mark step or a paid step.
 
-It then posts `cap-drill: started <run URL>` on #93. The `drill` job checks,
-before any secret, that this run holds that marker.
+**The authorization is used only after the free preflight passes.** In the
+`drill` job, the preflight (§3) runs first and makes no paid request. Only
+if it passes does the Mark step check again that no marker exists, post
+`cap-drill: started <run URL>` on #93, and confirm that it is the only
+marker. The paid steps refuse to run without this run's marker.
+
+So a run that stops in the preflight, for example because the organization
+has no spend-limit read access, leaves the authorization unused. It can be
+dispatched again once the cause is fixed.
 
 - **No retries.** There is no `continue-on-error` and no retry in the code.
-- **A failed, rejected or cancelled run uses up the authorization.**
+- **Once the marker is posted,** a failed or cancelled run has used up the
+  authorization.
 
-## 3. Preflight: read-only, before any paid request
+## 3. Preflight: free, before the authorization is used
 
-With `GET` requests only, the preflight establishes:
+With Admin API `GET` requests and one free token count, the preflight
+establishes:
 
 1. **The workspace:** exactly one active workspace named `ilmar-cap-test`.
 2. **The key's binding, two ways:**
@@ -89,22 +99,23 @@ With `GET` requests only, the preflight establishes:
      another workspace (as an unscoped key would report), fails closed;
    - exactly one active key in the organization has a hint that fits
      `CAP_DRILL_KEY`, and the Admin API lists it in `ilmar-cap-test`.
-3. **The limit:** an enabled monthly USD limit on that workspace, read from
-   the Spend Limits API. The lowest configured limit counts. It must be
-   **at most USD 1.00** and must equal the attested cap (a dispatch input).
+3. **Spend-limit read access and the limit:** an enabled monthly USD limit on
+   that workspace, read from the Spend Limits API. Without access, the run
+   stops here with `cap-unverified` and the authorization stays unused. The
+   lowest configured limit counts. It must be **at most USD 1.00** (it is
+   USD 1.00) and must equal the attested cap (a dispatch input).
 4. **The month-to-date cost** from the cost report.
-5. **Headroom.** The workspace's whole month-to-date cost must stay within
-   the USD 1.00 allowance, and the limit can only be reached by a request
-   that crosses it. How far a request may overshoot is not documented.
-   Therefore:
+5. **Headroom inside the USD 1.15 allowance.** The limit can only be reached
+   by a request that crosses it, and how far a request may overshoot is not
+   documented. Therefore:
 
    ```
-   limit + the largest single request + Ilmar's reserve  ≤  1.00
+   limit + the largest single request + Ilmar's reservation  ≤  allowance
+   USD 1.00 + 5¢ + 10¢ = USD 1.15  ≤  USD 1.15
    ```
 
-   With the defaults (5¢ per request, 10¢ reserve), the workspace limit must
-   be at most **USD 0.85**. **At USD 1.00 the preflight stops with
-   `no-headroom`.** Reaching a USD 1.00 limit could take more than USD 1.00.
+   A lower allowance, or a limit above USD 1.00, stops with `no-headroom` or
+   `cap-too-high`.
 
 **Any failure stops the run with no paid request:** `cap-unverified`,
 `cap-too-high` or `no-headroom`. The stop is recorded with the missing
@@ -117,19 +128,34 @@ With `CAP_DRILL_KEY`:
 - **The model** is on the script's reviewed allow-list, at Anthropic's
   published prices ([R36]). Today that is only Claude Haiku 4.5
   (`claude-haiku-4-5`), at USD 1 / USD 5 per million input / output tokens,
-  one rate at every prompt length. About 17 requests of 5¢ reach an 85¢
-  limit. Claude Code uses the same model inside Ilmar.
+  one rate at every prompt length. About 25 requests reach a USD 1.00 limit.
+  Claude Code uses the same model inside Ilmar.
 - **The prompt.** A fixed prompt is sized with the free token-count endpoint.
   Its worst case, the counted input plus 8 output tokens at those prices,
   × 1.25, is at most 5¢.
 - **One request at a time:** `max_tokens` 8, never retried, at most 60
   requests.
+- **Probes past the limit.** Once the estimated month-to-date spend has
+  reached the limit, only a tiny fixed probe is sent, whose worst case is a
+  fraction of a cent. The provider refuses the probe, not a 5¢ request. So
+  provider spend stays within the limit plus one sized request (at most
+  USD 1.05). The request cap (60) bounds the probes if the provider keeps
+  accepting them.
 - **The ceiling.** Before each request:
 
   *month-to-date cost read in §3 + estimated spend so far + the next
-  request's worst case + Ilmar's 10¢ reserve ≤ USD 1.00*
+  request's worst case + Ilmar's 10¢ reservation ≤ USD 1.15*
 
   Otherwise the request is never sent, and the run ends `inconclusive`.
+- **Spending and accounting are kept apart.** In the ceiling and in the
+  record:
+  - **provider spending** is the month-to-date cost and each sent request's
+    estimated cost;
+  - **accounting reservations** are the next request's worst case before it
+    is sent, and the 10¢ held for Ilmar's attempt (also charged in Ilmar's
+    own ledger as `reserve_per_execution_usd`).
+
+  A reservation is never reported as provider spend.
 - **The first non-success ends this step.**
   - A refusal that Ilmar's own classifier calls a spend limit is the expected
     end.
@@ -170,7 +196,7 @@ The Admin key never reaches Ilmar's environment.
 
 ## 6. Costs: estimated and actual, reported apart
 
-- **Estimated:** each successful request's `usage` at the attested prices.
+- **Estimated:** each successful request's `usage` at the allow-listed prices.
 - **Actual:** the cost report's month-to-date cost after the run, minus the
   preflight's reading. If the report has not caught up, the actual cost reads
   `pending` with the time of the read. The figure can be completed later by
@@ -182,14 +208,15 @@ The two are never merged into one figure.
 accounting, and no client-side estimate can guarantee the final bill. The
 record states:
 
-- `within-allowance`: the cost report covers the run and stays within USD
-  1.00;
-- `overshoot`: the cost report shows more than USD 1.00;
+- `within-allowance`: the cost report covers the run, and the month-to-date
+  provider spend stays within USD 1.15. Spend above the USD 1.00 limit by at
+  most one request is expected, and is shown as `above_provider_limit`;
+- `overshoot`: the cost report shows more than USD 1.15;
 - `pending`: the report has not caught up.
 
 Only `within-allowance` can make the result `cap-enforced-through-ilmar`.
 Otherwise the result is `inconclusive`, never a successful verification at
-or below USD 1.00. A later read-only cost read can settle a `pending` record
+or below USD 1.15. A later read-only cost read can settle a `pending` record
 for review.
 
 ## 7. Sanitized record
@@ -201,7 +228,9 @@ holds:
 - the allowance, the limit as read (which equals the attested cap), the
   month-to-date cost before the run and the time of the read;
 - the model, its allow-listed prices and the number of requests;
-- the estimated and actual costs;
+- **provider spending:** estimated and actual, kept apart;
+- **accounting reservations:** the drill's reserve for Ilmar, and Ilmar's
+  ledger reservations, labelled as not provider spend;
 - the provider's final status, error `type` and redacted message (at most
   300 characters);
 - the outputs and checks of §5;
@@ -226,7 +255,7 @@ is written and before it is posted.
 
 ## 8. Afterwards
 
-- Delete `CAP_DRILL_ADMIN_KEY` and `CAP_DRILL_GITHUB_TOKEN`. Delete
+- Delete `CAP_DRILL_ADMIN_READ` and `CAP_DRILL_GITHUB_TOKEN`. Delete
   `CAP_DRILL_KEY` too, or archive the key.
 - Review the record.
 - If the result is `cap-enforced-through-ilmar`, the maintainer may tick

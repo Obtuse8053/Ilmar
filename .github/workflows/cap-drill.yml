@@ -1,23 +1,26 @@
 name: Provider cap drill through Ilmar (one time, manual)
 
 # The one-time provider cap drill of Gate 1 (#93), designed in
-# docs/operations/cap-drill-workflow.md. At most USD 1.00 of real spend, on the
-# scratch workspace `ilmar-cap-test`, against the disposable repository.
+# docs/operations/cap-drill-workflow.md. On the scratch workspace
+# `ilmar-cap-test` (its own limit at most USD 1.00), within a USD 1.15 test
+# allowance, against the disposable repository.
 #
 # Order and boundaries:
 # 1. `guard` (no secrets): started by hand on main at expected_sha; the
 #    `cap-drill` environment and main's rules are as required; the
 #    maintainer's authorization comment on #93 names this commit, the
-#    workspace and the allowance; no earlier run reached the preflight and no
-#    marker is on #93. Then it posts the one-time marker on #93.
+#    workspace and the allowance; no marker is on #93 and no earlier run
+#    started a paid step.
 # 2. `prepare` (no secrets): the hash-locked wheels and the digest-pinned agent
 #    image, as live.yml prepares them.
 # 3. `drill` (the environment, after a required reviewer approves): checks the
-#    context and this run's marker before any secret; then, in order, each
-#    step running only if the one before it succeeded:
-#    - Preflight (§3): Admin API GETs and one free token count. The workspace,
-#      the key's workspace, the spend limit and month-to-date cost. A stop
-#      here spends nothing.
+#    context before any secret; then, in order, each step running only if the
+#    one before it succeeded:
+#    - Preflight (§3): Admin API GETs and one free token count. Spend-limit
+#      read access, the workspace, the key's workspace, the limit and
+#      month-to-date cost. A stop here spends nothing and leaves the one-time
+#      authorization unused.
+#    - Mark: the one-time marker on #93, after checking again that none exists.
 #    - Reach the cap (§4): one request at a time, no retries, never past the
 #      allowance.
 #    - Ilmar's coordinator (§5): `ilmar run --once` twice and `ilmar budget`.
@@ -33,7 +36,7 @@ on:
         required: true
         type: string
       authorization:
-        description: "URL of your #93 comment: cap-drill: authorize <sha> workspace=ilmar-cap-test allowance=1.00"
+        description: "URL of your #93 comment: cap-drill: authorize <sha> workspace=ilmar-cap-test allowance=1.15"
         required: true
         type: string
       model:
@@ -41,7 +44,7 @@ on:
         required: true
         type: string
       attested_cap_usd:
-        description: "The ilmar-cap-test monthly limit you set, in USD (must equal what the provider reports)"
+        description: "The ilmar-cap-test monthly limit you set, in USD, at most 1.00 (must equal what the provider reports)"
         required: true
         type: string
       issue:
@@ -65,14 +68,14 @@ env:
 
 jobs:
   guard:
-    name: Guard and mark (no secrets)
+    name: Guard (no secrets)
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: read
       contents: read
-      issues: write
+      issues: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -81,10 +84,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/cap_drill.py guard
-      - name: Mark the authorization as used on #93
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/cap_drill.py mark
 
   prepare:
     name: Prepare the wheels and the agent image (no secrets)
@@ -123,8 +122,9 @@ jobs:
     timeout-minutes: 75
     environment: cap-drill
     permissions:
+      actions: read
       contents: read
-      issues: read
+      issues: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -134,7 +134,7 @@ jobs:
         with:
           name: drill-inputs
           path: ${{ runner.temp }}/drill-inputs
-      - name: Check the context and this run's marker (before any secret)
+      - name: Check the context and the commit (before any secret)
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/cap_drill.py drill-context
@@ -145,11 +145,15 @@ jobs:
           ILMAR_IMAGE_ID: ${{ needs.prepare.outputs.image_id }}
           ILMAR_IMAGE_SHA256: ${{ needs.prepare.outputs.archive_sha256 }}
         run: python3 scripts/cap_drill.py load-images "$RUNNER_TEMP/drill-inputs/claude-code.tar"
-      - name: Preflight (§3, read-only)
+      - name: Preflight (§3, read-only, no paid request)
         env:
-          CAP_DRILL_ADMIN_KEY: ${{ secrets.CAP_DRILL_ADMIN_KEY }}
+          CAP_DRILL_ADMIN_READ: ${{ secrets.CAP_DRILL_ADMIN_READ }}
           CAP_DRILL_KEY: ${{ secrets.CAP_DRILL_KEY }}
         run: exec python3 scripts/cap_drill.py preflight
+      - name: Mark the authorization as used on #93 (no secrets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cap_drill.py mark
       - name: Reach the cap (§4)
         env:
           CAP_DRILL_KEY: ${{ secrets.CAP_DRILL_KEY }}
@@ -164,7 +168,7 @@ jobs:
       - name: Actual cost (§6, read-only)
         if: always()
         env:
-          CAP_DRILL_ADMIN_KEY: ${{ secrets.CAP_DRILL_ADMIN_KEY }}
+          CAP_DRILL_ADMIN_READ: ${{ secrets.CAP_DRILL_ADMIN_READ }}
         run: exec python3 scripts/cap_drill.py actual-cost
       - name: Remove every container (no secrets)
         if: always()

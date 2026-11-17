@@ -41,8 +41,8 @@ INPUTS: dict[str, Any] = {
     "expected_sha": SHA,
     "authorization": "https://github.com/Obtuse8053/Ilmar/issues/93#issuecomment-123",
     "model": "claude-haiku-4-5",
-    "attested_cap_usd": "0.80",
-    "allowance_cents": "100",
+    "attested_cap_usd": "1.00",
+    "allowance_cents": "115",
     "max_request_cents": "5",
     "ilmar_reserve_cents": "10",
     "issue": "7",
@@ -52,7 +52,7 @@ DISPATCH = {
     "CAP_DRILL_EXPECTED_SHA": SHA,
     "CAP_DRILL_AUTHORIZATION": INPUTS["authorization"],
     "CAP_DRILL_MODEL": "claude-haiku-4-5",
-    "CAP_DRILL_ATTESTED_CAP_USD": "0.80",
+    "CAP_DRILL_ATTESTED_CAP_USD": "1.00",
     "CAP_DRILL_ISSUE": "7",
 }
 
@@ -67,13 +67,13 @@ class FakeAnthropic:
     def __init__(
         self,
         *,
-        limit: str | None = "80",
+        limit: str | None = "100",
         spent: str = "0",
         limits_status: int = 200,
         key_workspace: str = WS,
         reported_workspace: str | None = WS,
         extra_keys: tuple[str, ...] = (),
-        refuse_after_cents: Decimal | None = Decimal(80),
+        refuse_after_cents: Decimal | None = Decimal(100),
         refusal: tuple[int, str, str] = (
             400,
             "invalid_request_error",
@@ -163,9 +163,10 @@ def admin(fake: FakeAnthropic) -> cap_drill.Admin:
 
 
 def test_the_preflight_verifies_workspace_key_limit_and_spend_with_reads_only() -> None:
-    fake = FakeAnthropic(limit="80", spent="0")
+    fake = FakeAnthropic(limit="100", spent="0")
     facts = cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, INPUTS, NOW)
-    assert facts["limit_cents"] == "80"
+    assert facts["limit_cents"] == "100"
+    assert facts["allowance_cents"] == "115"
     assert facts["month_to_date_before_cents"] == "0"
     assert {m for m, path in fake.calls if path.startswith("/v1/organizations/")} == {"GET"}
     assert fake.messages == 0
@@ -181,8 +182,8 @@ def test_the_preflight_verifies_workspace_key_limit_and_spend_with_reads_only() 
         (FakeAnthropic(reported_workspace="wrkspc_other"), "cap-unverified", "not bound"),
         (FakeAnthropic(reported_workspace=None), "cap-unverified", "did not report"),
         (FakeAnthropic(extra_keys=(KEY,)), "cap-unverified", "2 active keys"),
-        (FakeAnthropic(limit="101"), "cap-too-high", "above the $1.0000 allowance"),
-        (FakeAnthropic(limit="90"), "cap-unverified", "attested cap $0.8000"),
+        (FakeAnthropic(limit="101"), "cap-too-high", "above $1.0000"),
+        (FakeAnthropic(limit="90"), "cap-unverified", "attested cap $1.0000"),
     ],
 )
 def test_the_preflight_stops_before_any_paid_request(
@@ -204,7 +205,7 @@ def test_a_key_from_another_organization_is_not_matched() -> None:
 
 def test_a_one_dollar_limit_under_a_one_dollar_allowance_has_no_headroom() -> None:
     fake = FakeAnthropic(limit="100")
-    inputs = INPUTS | {"attested_cap_usd": "1.00"}
+    inputs = INPUTS | {"allowance_cents": "100"}
     with pytest.raises(cap_drill.StopError) as stop:
         cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, inputs, NOW)
     assert stop.value.result == "no-headroom"
@@ -256,30 +257,43 @@ def classify(text: str) -> str | None:
 
 
 def test_requests_go_one_at_a_time_until_the_spend_limit_refuses() -> None:
-    fake = FakeAnthropic(refuse_after_cents=Decimal(80))
-    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0")
+    fake = FakeAnthropic(refuse_after_cents=Decimal(100))
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0", "100")
     assert out["end"] == "spend-limit-refused"
     assert out["classified"] == "cap"
     assert out["requests"] == fake.messages
     assert Decimal(out["worst_case_cents"]) <= Decimal(INPUTS["max_request_cents"])
-    assert fake.charged + Decimal(out["worst_case_cents"]) + 10 <= 100
+    assert fake.charged <= 100 + Decimal(out["worst_case_cents"])
+    assert fake.charged + 10 <= 115
+    assert out["probes"] >= 1  # the refusing request was the tiny probe
 
 
 def test_the_allowance_is_a_ceiling_when_the_provider_never_refuses() -> None:
     fake = FakeAnthropic(refuse_after_cents=None)
-    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0")
+    inputs = INPUTS | {"allowance_cents": "60"}  # binds before the limit is reached
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), inputs, classify, KEY, "0", "100")
     assert out["end"] == "allowance"
     worst = Decimal(out["worst_case_cents"])
-    assert fake.charged <= 100 - 10
-    assert fake.charged + worst + 10 > 100  # the next one could have exceeded it
+    assert fake.charged <= 60 - 10
+    assert fake.charged + worst + 10 > 60  # the next one could have exceeded it
     assert Decimal(out["estimated_cents"]) == fake.charged.quantize(Decimal("0.0001"))
+
+
+def test_past_the_limit_only_tiny_probes_go_and_the_request_cap_ends_it() -> None:
+    fake = FakeAnthropic(refuse_after_cents=None)
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0", "100")
+    assert out["end"] == "request-cap"
+    assert fake.messages == cap_drill.MAX_REQUESTS
+    assert fake.charged <= 100 + Decimal(out["worst_case_cents"])
+    assert fake.charged + 10 <= 115
 
 
 def test_the_ceiling_counts_what_the_workspace_spent_before() -> None:
     fake = FakeAnthropic(refuse_after_cents=None, spent="30")
-    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "30")
+    inputs = INPUTS | {"allowance_cents": "60"}
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), inputs, classify, KEY, "30", "100")
     assert out["end"] == "allowance"
-    assert 30 + fake.charged <= 100 - 10
+    assert 30 + fake.charged <= 60 - 10
 
 
 @pytest.mark.parametrize(
@@ -292,7 +306,7 @@ def test_the_ceiling_counts_what_the_workspace_spent_before() -> None:
 )
 def test_any_other_refusal_ends_it_without_a_retry(refusal: tuple[int, str, str]) -> None:
     fake = FakeAnthropic(refuse_after_cents=Decimal(0), refusal=refusal)
-    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0")
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0", "100")
     assert out["end"] == "other-refusal"
     assert fake.messages == 1
 
@@ -300,7 +314,7 @@ def test_any_other_refusal_ends_it_without_a_retry(refusal: tuple[int, str, str]
 def test_a_provider_message_echoing_the_key_is_redacted() -> None:
     refusal = (400, "invalid_request_error", f"spend limit reached for {KEY}")
     fake = FakeAnthropic(refuse_after_cents=Decimal(0), refusal=refusal)
-    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0")
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0", "100")
     assert KEY not in json.dumps(out)
     assert "[redacted]" in out["message"]
 
@@ -461,7 +475,7 @@ def test_through_ilmar_runs_the_coordinator_twice_and_cleans_up(tmp_path: Path) 
     hub = FakeGitHub()
     env = {cap_drill.KEY_ENV: KEY, cap_drill.GITHUB_ENV: TOKEN, cap_drill.ADMIN_ENV: ADMIN_KEY,
            "PATH": "/usr/bin", "GITHUB_RUN_ID": "1"}  # fmt: skip
-    state = {"exhaust": {"end": "spend-limit-refused"}, "preflight": {"limit_cents": "80"}}
+    state = {"exhaust": {"end": "spend-limit-refused"}, "preflight": {"limit_cents": "100"}}
     out = cap_drill.through_ilmar(run=run, http=hub, env=env, inputs=INPUTS, state=state,
                                   work=tmp_path)  # fmt: skip
     assert out["failed_checks"] == [], out
@@ -481,7 +495,7 @@ def authorization(**change: Any) -> dict[str, Any]:
         "issue_url": "https://api.github.com/repos/Obtuse8053/Ilmar/issues/93",
         "user": {"login": "Obtuse8053"}, "author_association": "OWNER",
         "created_at": "2026-11-16T10:00:00Z", "updated_at": "2026-11-16T10:00:00Z",
-        "body": f"Go ahead.\ncap-drill: authorize {SHA} workspace=ilmar-cap-test allowance=1.00\n",
+        "body": f"Go ahead.\ncap-drill: authorize {SHA} workspace=ilmar-cap-test allowance=1.15\n",
     }  # fmt: skip
     return comment | change
 
@@ -495,9 +509,10 @@ def github_get(comment: Mapping[str, Any], *, marker: bool = False, reached: boo
         if path.endswith("/runs?per_page=100"):
             return {"workflow_runs": [{"id": 9}, {"id": 10}]}
         if "/runs/9/jobs" in path:
-            step = {"name": "Preflight (§3, read-only)",
+            free = {"name": "Preflight (§3, read-only, no paid request)", "conclusion": "failure"}
+            paid = {"name": "Reach the cap (§4)",
                     "conclusion": "failure" if reached else "skipped"}  # fmt: skip
-            return {"jobs": [{"name": "Drill", "steps": [step]}]}
+            return {"jobs": [{"name": "Drill", "steps": [free, paid]}]}
         raise AssertionError(path)
 
     return get
@@ -512,12 +527,12 @@ def github_get(comment: Mapping[str, Any], *, marker: bool = False, reached: boo
         (authorization(updated_at="2026-11-16T11:00:00Z"), "edited"),
         (authorization(created_at="2026-11-01T10:00:00Z", updated_at="2026-11-01T10:00:00Z"),
          "seven days"),
-        (authorization(body=f"cap-drill: authorize {SHA} workspace=ilmar-test allowance=1.00"),
+        (authorization(body=f"cap-drill: authorize {SHA} workspace=ilmar-test allowance=1.15"),
          "must say"),
-        (authorization(body=f"cap-drill: authorize {SHA} workspace=ilmar-cap-test allowance=2.00"),
+        (authorization(body=f"cap-drill: authorize {SHA} workspace=ilmar-cap-test allowance=1.00"),
          "must say"),
         (authorization(body=f"cap-drill: authorize {'b' * 40} workspace=ilmar-cap-test "
-                            "allowance=1.00"), "must say"),
+                            "allowance=1.15"), "must say"),
         (authorization(issue_url="https://api.github.com/repos/Obtuse8053/Ilmar/issues/94"),
          "not on #93"),
     ],
@@ -530,19 +545,20 @@ def test_the_authorization(comment: dict[str, Any], says: str | None) -> None:
         assert any(says in p for p in problems), problems
 
 
-def test_once_a_marker_or_a_run_that_reached_the_preflight_refuses() -> None:
+def test_once_a_marker_or_a_run_that_started_a_paid_step_refuses() -> None:
     env = {"GITHUB_RUN_ID": "10"}
+    # A run that stopped in the free preflight left the authorization unused.
     assert cap_drill.check_once(github_get(authorization()), "t", env) == []
     assert cap_drill.check_once(github_get(authorization(), marker=True), "t", env)
     assert cap_drill.check_once(github_get(authorization(), reached=True), "t", env)
 
 
-def test_the_inputs_are_validated_and_the_allowance_is_capped_at_one_dollar() -> None:
+def test_the_inputs_are_validated_and_the_allowance_is_capped_at_115_cents() -> None:
     env = dict(DISPATCH)
     inputs = cap_drill.read_inputs(env)
-    assert inputs["allowance_cents"] == "100"
+    assert inputs["allowance_cents"] == "115"
     with pytest.raises(cap_drill.DrillError, match="allowance_cents"):
-        cap_drill.read_inputs(env | {"CAP_DRILL_ALLOWANCE_CENTS": "101"})
+        cap_drill.read_inputs(env | {"CAP_DRILL_ALLOWANCE_CENTS": "116"})
     with pytest.raises(cap_drill.DrillError, match="model must be one of"):
         cap_drill.read_inputs(env | {"CAP_DRILL_MODEL": "claude-opus-5-5"})
     with pytest.raises(cap_drill.DrillError, match="attested_cap_usd"):
@@ -553,17 +569,17 @@ def test_the_inputs_are_validated_and_the_allowance_is_capped_at_one_dollar() ->
     ("state", "result"),
     [
         ({"stop": {"result": "no-headroom", "message": "m"}}, "no-headroom"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "allowance"}}, "inconclusive"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "spend-limit-refused"},
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "allowance"}}, "inconclusive"),
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "spend-limit-refused"},
           "ilmar": {"failed_checks": []}, "cost": {"spend": "within-allowance"}},
          "cap-enforced-through-ilmar"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "spend-limit-refused"},
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "spend-limit-refused"},
           "ilmar": {"failed_checks": []}, "cost": {"spend": "pending"}}, "inconclusive"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "spend-limit-refused"},
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "spend-limit-refused"},
           "ilmar": {"failed_checks": []}, "cost": {"spend": "overshoot"}}, "inconclusive"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "spend-limit-refused"},
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "spend-limit-refused"},
           "ilmar": {"failed_checks": []}}, "inconclusive"),
-        ({"preflight": {"limit_cents": "80"}, "exhaust": {"end": "spend-limit-refused"},
+        ({"preflight": {"limit_cents": "100"}, "exhaust": {"end": "spend-limit-refused"},
           "ilmar": {"failed_checks": ["x"]}}, "ilmar-check-failed"),
     ],
 )  # fmt: skip
@@ -575,7 +591,7 @@ def test_the_main_flow_stops_at_the_preflight_and_never_spends(tmp_path: Path) -
     fake = FakeAnthropic(limit="100")
     state = tmp_path / "state.json"
     env = DISPATCH | {cap_drill.KEY_ENV: KEY, cap_drill.ADMIN_ENV: ADMIN_KEY,
-                      "CAP_DRILL_ATTESTED_CAP_USD": "1.00"}  # fmt: skip
+                      "CAP_DRILL_ALLOWANCE_CENTS": "100"}  # fmt: skip
 
     def main(*argv: str) -> int:
         return cap_drill.main([*argv, "--state", str(state)], environ=env, http=fake,
@@ -583,6 +599,7 @@ def test_the_main_flow_stops_at_the_preflight_and_never_spends(tmp_path: Path) -
 
     assert main("preflight") == 1
     assert json.loads(state.read_text())["stop"]["result"] == "no-headroom"
+    assert main("mark") == 1  # the authorization stays unused
     assert main("exhaust") == 1  # refused: the preflight did not pass
     assert fake.messages == 0
     assert main("finish", str(tmp_path / "record.json")) == 0
@@ -593,23 +610,140 @@ def test_the_main_flow_stops_at_the_preflight_and_never_spends(tmp_path: Path) -
     assert WS not in text
 
 
+class Issue93:
+    """#93's comments and the run history, for the marker."""
+
+    def __init__(self, *, marked_elsewhere: bool = False) -> None:
+        self.comments: list[dict[str, Any]] = (
+            [{"body": f"{cap_drill.MARKER} https://x/runs/9"}] if marked_elsewhere else []
+        )
+
+    def get(self, path: str, token: str) -> Any:
+        if "/issues/93/comments" in path:
+            return list(self.comments)
+        if path.endswith("/runs?per_page=100"):
+            return {"workflow_runs": []}
+        raise AssertionError(path)
+
+    def route(self, fake: FakeAnthropic) -> cap_drill.Http:
+        def http(
+            method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float
+        ) -> cap_drill.Response:
+            if url.startswith("https://api.github.com/"):
+                assert (method, urllib.parse.urlsplit(url).path) == (
+                    "POST", "/repos/Obtuse8053/Ilmar/issues/93/comments")  # fmt: skip
+                self.comments.append(json.loads(body or b"{}"))
+                return 201, {}, b"{}"
+            return fake(method, url, headers, body, timeout)
+
+        return http
+
+
 def test_the_main_flow_reaches_the_cap_and_reports_costs_apart(tmp_path: Path) -> None:
-    fake = FakeAnthropic(limit="80")
+    fake = FakeAnthropic(limit="100")
+    issue = Issue93()
     state = tmp_path / "state.json"
-    env = DISPATCH | {cap_drill.KEY_ENV: KEY, cap_drill.ADMIN_ENV: ADMIN_KEY}
+    env = DISPATCH | {cap_drill.KEY_ENV: KEY, cap_drill.ADMIN_ENV: ADMIN_KEY,
+                      "GH_TOKEN": "t", "GITHUB_RUN_ID": "10"}  # fmt: skip
 
     def main(*argv: str) -> int:
-        return cap_drill.main([*argv, "--state", str(state)], environ=env, http=fake,
+        return cap_drill.main([*argv, "--state", str(state)], environ=env,
+                              http=issue.route(fake), get=issue.get,
                               now=lambda: NOW + timedelta(hours=1))  # fmt: skip
 
     assert main("preflight") == 0
+    assert main("exhaust") == 1  # not yet marked: refused
+    assert fake.messages == 0
+    assert main("mark") == 0
+    assert [c["body"] for c in issue.comments] == [
+        f"{cap_drill.MARKER} https://github.com/Obtuse8053/Ilmar/actions/runs/10"]  # fmt: skip
     assert main("exhaust") == 0
     assert main("actual-cost") == 0
     saved = json.loads(state.read_text())
     assert saved["exhaust"]["end"] == "spend-limit-refused"
     assert Decimal(saved["cost"]["actual_cents"]) == fake.charged
     assert saved["cost"]["spend"] == "within-allowance"
-    assert Decimal(saved["exhaust"]["estimated_cents"]) == fake.charged.quantize(Decimal("0.0001"))
+    assert saved["cost"]["above_provider_limit"] is True  # the crossing request
+    assert main("finish", str(tmp_path / "record.json")) == 0
+    record = json.loads((tmp_path / "record.json").read_text())
+    assert record["allowance_usd"] == "$1.1500"
+    assert record["limit_read_usd"] == "$1.0000"
+    assert record["accounting_reservations"]["drill_reserve_for_ilmar_usd"] == "$0.1000"
+    assert "not provider spend" in record["accounting_reservations"]["note"]
+    assert record["provider_spend"]["actual"]["spend"] == "within-allowance"
+
+
+def test_the_mark_refuses_when_another_run_marked_first(tmp_path: Path) -> None:
+    fake = FakeAnthropic(limit="100")
+    issue = Issue93(marked_elsewhere=True)
+    state = tmp_path / "state.json"
+    env = DISPATCH | {cap_drill.KEY_ENV: KEY, cap_drill.ADMIN_ENV: ADMIN_KEY,
+                      "GH_TOKEN": "t", "GITHUB_RUN_ID": "10"}  # fmt: skip
+
+    def main(*argv: str) -> int:
+        return cap_drill.main([*argv, "--state", str(state)], environ=env,
+                              http=issue.route(fake), get=issue.get, now=lambda: NOW)  # fmt: skip
+
+    assert main("preflight") == 0
+    assert main("mark") == 1
+    assert len(issue.comments) == 1  # nothing posted
+    assert main("exhaust") == 1
+    assert fake.messages == 0
+
+
+# -- regression: a USD 1.00 provider limit inside a USD 1.15 allowance ----------------------
+
+
+def test_a_one_dollar_limit_inside_a_115_cent_allowance_passes_the_preflight() -> None:
+    fake = FakeAnthropic(limit="100")
+    facts = cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, INPUTS, NOW)
+    assert (facts["limit_cents"], facts["allowance_cents"]) == ("100", "115")
+
+
+@pytest.mark.parametrize(
+    ("limit", "allowance", "result"),
+    [
+        ("100", "114", "no-headroom"),  # 100 + 5 + 10 > 114
+        ("101", "115", "cap-too-high"),  # the provider limit itself may not exceed USD 1.00
+    ],
+)
+def test_the_boundaries_around_100_and_115(limit: str, allowance: str, result: str) -> None:
+    fake = FakeAnthropic(limit=limit)
+    inputs = INPUTS | {"allowance_cents": allowance, "attested_cap_usd": f"{int(limit) / 100:.2f}"}
+    with pytest.raises(cap_drill.StopError) as stop:
+        cap_drill.preflight(admin(fake), cap_drill.Model(KEY, fake), KEY, inputs, NOW)
+    assert stop.value.result == result
+
+
+@pytest.mark.parametrize("spent", ["0", "37.5", "99.99", "100"])
+def test_provider_spend_never_passes_the_allowance_less_ilmars_reserve(spent: str) -> None:
+    fake = FakeAnthropic(refuse_after_cents=None, spent=spent)
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, spent, "100")
+    assert out["end"] in ("request-cap", "allowance")
+    assert Decimal(spent) + fake.charged <= 115 - 10
+    assert out["accounting_reserve_cents"] == "10"
+
+
+def test_at_a_one_dollar_limit_the_crossing_request_stays_within_115_cents() -> None:
+    fake = FakeAnthropic(limit="100", refuse_after_cents=Decimal(100))
+    out = cap_drill.exhaust(cap_drill.Model(KEY, fake), INPUTS, classify, KEY, "0", "100")
+    assert out["end"] == "spend-limit-refused"
+    assert fake.charged >= 100  # the provider refused only after its limit was crossed
+    assert fake.charged <= 100 + Decimal(out["worst_case_cents"])
+    assert fake.charged + 10 <= 115  # with Ilmar's reservation, still inside the allowance
+
+
+def test_an_actual_cost_above_115_cents_is_an_overshoot_not_a_verification() -> None:
+    fake = FakeAnthropic(limit="100", spent="0")
+    fake.charged = Decimal("116")
+    state = {"preflight": {"workspace_id": WS, "month_to_date_before_cents": "0",
+                           "limit_cents": "100", "allowance_cents": "115"},
+             "exhaust": {"estimated_cents": "100"}}  # fmt: skip
+    cost = cap_drill.actual_cost(admin(fake), state, NOW)
+    assert cost["spend"] == "overshoot"
+    done = state | {"cost": cost, "exhaust": {"end": "spend-limit-refused"},
+                    "ilmar": {"failed_checks": []}}  # fmt: skip
+    assert cap_drill.record(done, INPUTS, {})["result"] == "inconclusive"
 
 
 # -- the workflow ---------------------------------------------------------------------------
@@ -639,10 +773,10 @@ def test_the_workflow_is_manual_only_with_no_default_permissions() -> None:
 
 def test_secrets_reach_only_the_steps_that_need_them() -> None:
     expected = {
-        "Preflight (§3, read-only)": {"CAP_DRILL_ADMIN_KEY", "CAP_DRILL_KEY"},
+        "Preflight (§3, read-only, no paid request)": {"CAP_DRILL_ADMIN_READ", "CAP_DRILL_KEY"},
         "Reach the cap (§4)": {"CAP_DRILL_KEY"},
         "Ilmar's coordinator (§5)": {"CAP_DRILL_KEY", "CAP_DRILL_GITHUB_TOKEN"},
-        "Actual cost (§6, read-only)": {"CAP_DRILL_ADMIN_KEY"},
+        "Actual cost (§6, read-only)": {"CAP_DRILL_ADMIN_READ"},
     }
     found = {name: set(SECRET.findall(block)) for name, block in steps().items()}
     assert {name: s for name, s in found.items() if s} == expected
@@ -657,6 +791,22 @@ def test_no_input_is_expanded_in_a_shell() -> None:
 
 def test_paid_steps_run_only_if_everything_before_them_succeeded() -> None:
     named = steps()
-    for name in ("Preflight (§3, read-only)", "Reach the cap (§4)", "Ilmar's coordinator (§5)"):
+    for name in ("Preflight (§3, read-only, no paid request)", "Reach the cap (§4)",
+                 "Ilmar's coordinator (§5)"):  # fmt: skip
         assert "if:" not in named[name], name
     assert "if: always()" in named["Actual cost (§6, read-only)"]
+
+
+def test_the_free_preflight_runs_before_the_authorization_is_used() -> None:
+    order = list(steps())
+    preflight = order.index("Preflight (§3, read-only, no paid request)")
+    mark = order.index("Mark the authorization as used on #93 (no secrets)")
+    assert preflight < mark < order.index("Reach the cap (§4)")
+    assert "secrets." not in steps()["Mark the authorization as used on #93 (no secrets)"]
+    guard = WORKFLOW.split("\n  guard:\n", 1)[1].split("\n  prepare:\n", 1)[0]
+    assert "issues: write" not in guard  # the guard never consumes the authorization
+
+
+def test_the_admin_secret_is_cap_drill_admin_read() -> None:
+    assert "CAP_DRILL_ADMIN_KEY" not in WORKFLOW
+    assert cap_drill.ADMIN_ENV == "CAP_DRILL_ADMIN_READ"
