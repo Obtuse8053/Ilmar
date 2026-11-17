@@ -9,6 +9,7 @@ The workflow is manually dispatched, approved, and pinned to main.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -19,9 +20,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_UP
+from decimal import ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "Obtuse8053/Ilmar"
@@ -74,7 +76,9 @@ def api(
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     if data is not None:
         headers["content-type"] = "application/json"
-    request = urllib.request.Request(origin + path, data=data, headers=headers, method=method)
+    request = urllib.request.Request(  # noqa: S310 - fixed HTTPS Anthropic origin
+        origin + path, data=data, headers=headers, method=method
+    )
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(request, timeout=25) as response:
@@ -200,8 +204,10 @@ def read_workspaces(admin_key: str) -> str:
     status, data, _ = api("/v1/organizations/workspaces?limit=1000", admin_key, admin=True)
     if status != 200:
         raise DrillError("workspace identity cannot be verified via Admin API")
-    matches = [w for w in data.get("data", [])
-               if isinstance(w, dict) and w.get("name") == WORKSPACE and w.get("archived_at") is None]
+    matches = [
+        w for w in data.get("data", [])
+        if isinstance(w, dict) and w.get("name") == WORKSPACE and w.get("archived_at") is None
+    ]
     if len(matches) != 1 or not WORKSPACE_ID.fullmatch(str(matches[0].get("id", ""))):
         raise DrillError("workspace name not unique or its identity is invalid")
     if data.get("has_more"):
@@ -334,7 +340,8 @@ def _state(path: Path) -> dict[str, Any]:
 
 def preflight(path: Path) -> None:
     check_paid_context(os.environ)
-    admin, model_key = os.environ.get("CAP_DRILL_ADMIN_READ", ""), os.environ.get("CAP_DRILL_KEY", "")
+    admin = os.environ.get("CAP_DRILL_ADMIN_READ", "")
+    model_key = os.environ.get("CAP_DRILL_KEY", "")
     if not admin or not model_key or admin == model_key:
         raise DrillError("Admin read and model keys are both required")
     workspace_id = read_workspaces(admin)
@@ -431,7 +438,7 @@ def _repo_issue(github_key: str, number: int) -> int:
         ):
             raise DrillError("disposable repository not verified")
         issue = github(f"/repos/{DISPOSABLE}/issues/{number}")
-        labels = [l.get("name") for l in issue.get("labels", [])]
+        labels = [label.get("name") for label in issue.get("labels", [])]
         if issue.get("state") != "open" or issue.get("pull_request") or labels:
             raise DrillError("disposable issue must be open and have no labels")
         return int(repo["id"])
@@ -451,10 +458,8 @@ def _issue_label(key: str, number: int, *, add: bool) -> None:
             github(path, method="POST", payload={"labels": ["ilmar:ready"]})
         else:
             # Delete one label only, and never expose a credential on failure.
-            try:
+            with contextlib.suppress(DrillError):
                 github(path + "/ilmar%3Aready", method="DELETE")
-            except DrillError:
-                pass
     finally:
         if old is None:
             os.environ.pop("GH_TOKEN", None)
@@ -467,7 +472,8 @@ def _run_cli(path: Path, command: str, env: dict[str, str]) -> int:
     argv.extend(["--once"] if command == "run" else [])
     argv.extend(["--config", str(path)])
     try:
-        result = subprocess.run(argv, cwd=ROOT, env=env, capture_output=True,
+        result = subprocess.run(  # noqa: S603 - fixed python module and constrained CLI
+            argv, cwd=ROOT, env=env, capture_output=True,
                                 timeout=1200, check=False)
     except (subprocess.TimeoutExpired, OSError):
         raise DrillError("Ilmar CLI did not finish; no retry") from None
@@ -483,11 +489,12 @@ def through_ilmar(path: Path, issue: int) -> None:
     state = _state(path)
     if state.get("phase") != "cap-refused":
         raise DrillError("real provider cap refusal not established")
-    model_key, gh_key = os.environ.get("CAP_DRILL_KEY", ""), os.environ.get("CAP_DRILL_GITHUB_TOKEN", "")
+    model_key = os.environ.get("CAP_DRILL_KEY", "")
+    gh_key = os.environ.get("CAP_DRILL_GITHUB_TOKEN", "")
     if not model_key or not gh_key:
         raise DrillError("disposable credentials missing")
     repo_id = _repo_issue(gh_key, issue)
-    work = Path(tempfile.mkdtemp(prefix="ilmar-cap-", dir=os.environ.get("RUNNER_TEMP", "/tmp")))
+    work = Path(tempfile.mkdtemp(prefix="ilmar-cap-", dir=os.environ["RUNNER_TEMP"]))
     work.chmod(0o700)
     config = _config(work / "gate1.toml", repo_id=repo_id, state_dir=work / "state")
     (work / "state").mkdir(mode=0o700)
@@ -588,8 +595,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=("guard", "mark", "preflight", "exhaust",
                                          "through-ilmar", "reconcile", "record"))
-    parser.add_argument("--state", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/cap-state.json")
-    parser.add_argument("--record", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/cap-drill.json")
+    temp = Path(os.environ.get("RUNNER_TEMP", str(Path.home() / ".cache" / "ilmar")))
+    parser.add_argument("--state", default=str(temp / "cap-state.json"))
+    parser.add_argument("--record", default=str(temp / "cap-drill.json"))
     parser.add_argument("--issue", type=int, default=0)
     args = parser.parse_args(argv)
     try:
