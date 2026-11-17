@@ -24,7 +24,7 @@ import argparse
 import os
 import sqlite3
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TextIO, runtime_checkable
@@ -47,7 +47,13 @@ class CancelReader(Protocol):
     def get(self, execution_id: str) -> Execution | None: ...
 
     def events(
-        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        execution_id: str | None = None,
+        types: Collection[EventType] | None = None,
+        instance_scoped: bool = False,
     ) -> Sequence[Event]: ...
 
     def close(self) -> None: ...

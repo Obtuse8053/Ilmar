@@ -62,7 +62,7 @@ from ilmar.domain.errors import (
     LedgerIntegrityError,
 )
 from ilmar.domain.event_history import StoredState
-from ilmar.domain.events import CorruptEventError, Event, EventContext
+from ilmar.domain.events import CorruptEventError, Event, EventContext, EventType
 from ilmar.domain.execution import Execution, ExecutionState, Transition
 from ilmar.domain.gates import (
     GateEvidence,
@@ -807,11 +807,16 @@ class SQLiteExecutionStore:
             _append_events(conn, events)
 
     def events(
-        self, *, after_seq: int = 0, limit: int | None = None, execution_id: str | None = None
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+        execution_id: str | None = None,
+        types: Collection[EventType] | None = None,
+        instance_scoped: bool = False,
     ) -> Sequence[Event]:
         with self._reading(any_version=True) as conn:
-            lines = _event_lines(conn, after_seq, limit, execution_id)
-        return tuple(Event.from_json(line) for line in lines)
+            return tuple(_event_rows(conn, after_seq, limit, execution_id, types, instance_scoped))
 
     def event_lines(
         self, *, after_seq: int = 0, limit: int | None = None
@@ -819,6 +824,10 @@ class SQLiteExecutionStore:
         """``(seq, line)`` of the stored events after ``after_seq``, in ``seq`` order,
         unparsed: an exporter prints them as they are and reports a corrupt one
         itself. No events table: nothing."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must not be negative")
+        if limit == 0:
+            return ()
         with self._reading(any_version=True) as conn:
             if not _has_events(conn):
                 return ()
@@ -1050,27 +1059,46 @@ def _raw_event_lines(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(_text(line) for (line,) in conn.execute("SELECT line FROM events ORDER BY seq"))
 
 
-def _event_lines(
-    conn: sqlite3.Connection, after_seq: int, limit: int | None, execution_id: str | None = None
-) -> list[str]:
-    if not _has_events(conn):
+def _event_rows(
+    conn: sqlite3.Connection,
+    after_seq: int,
+    limit: int | None,
+    execution_id: str | None,
+    types: Collection[EventType] | None,
+    instance_scoped: bool,
+) -> list[Event]:
+    """Each matching row decoded once, its ``seq`` checked against its line. The
+    filters are applied in SQL, before any decoding (ADR-0045)."""
+    if execution_id is not None and instance_scoped:
+        raise ValueError("an execution's events are never instance-scoped")
+    if limit is not None and limit < 0:
+        raise ValueError("limit must not be negative")
+    if limit == 0 or not _has_events(conn):
         return []
     query = "SELECT seq, line FROM events WHERE seq > ?"
     values: list[object] = [after_seq]
     if execution_id is not None:  # the events_by_execution index
         query += " AND execution_id = ?"
         values.append(execution_id)
+    if instance_scoped:  # the same index: NULL execution_id
+        query += " AND execution_id IS NULL"
+    if types is not None:
+        wanted = sorted({t.value for t in types})
+        if not wanted:
+            return []
+        query += f" AND type IN ({', '.join('?' * len(wanted))})"
+        values.extend(wanted)
     query += " ORDER BY seq"
     if limit is not None:
         query += " LIMIT ?"
         values.append(limit)
-    lines = []
+    found = []
     for seq, line in conn.execute(query, values).fetchall():
         event = Event.from_json(_text(line))
         if event.seq != seq:
             raise CorruptEventError(f"event row {seq} holds seq {event.seq}")
-        lines.append(_text(line))
-    return lines
+        found.append(event)
+    return found
 
 
 def _latest_update(conn: sqlite3.Connection) -> datetime | None:
