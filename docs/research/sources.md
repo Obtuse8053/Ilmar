@@ -59,7 +59,7 @@ Add a row whenever a source is consulted for a decision or a review.
 
 | Date | IDs | Purpose | Notes |
 | --- | --- | --- | --- |
-| 2026-11-16 | R33 | Provider cap drill (#93) | No minimum workspace limit was found; the design stops if USD 0.50 cannot be set. |
+| 2026-11-16 | R33 | Provider cap drill (#93) | No minimum workspace limit was found; the design reads the limit through the Admin API and stops without spending if it cannot be verified at or below USD 0.50 (revised 2026-11-17). |
 | 2026-11-10 | R15, R28 | ADR-0035 review (telemetry) | Claude Code can emit `rate_limit_event` lines, sometimes after the `result` object. Source: upstream issue R28, cited by the maintainer; corrected at acceptance from an earlier wording that called this the maintainer's own observation. R28 was not readable from this environment. Not yet reproduced on Ilmar's pinned version. The ADR requires a recorded sample from that version and the live test before it relies on this. |
 | 2026-11-10 | R15 | ADR-0035 (stall detection) | The headless page itself could not be fetched from this environment. That `stream-json` requires `--verbose` in print mode, writes one JSON object per line ending with the `result` object, and emits `system/api_retry` events before retries came from search snippets of the official docs and agreeing secondary write-ups. The opt-in live test is the check against the pinned version. |
 | 2026-11-10 | R14, R15, R27 | Autonomy roadmap, ADR-0029 | The spend-limit page and the workspaces announcement were read as snippets. The error a capped workspace returns was **not observed**; ADR-0029 requires the Gate 1 drill to establish it. |
