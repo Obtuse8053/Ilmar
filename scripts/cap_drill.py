@@ -440,12 +440,14 @@ def exhaust(path: Path) -> None:
 
 def _config(path: Path, *, repo_id: int, state_dir: Path) -> Path:
     original = (ROOT / "deploy/gate1/ilmar.gate1.toml").read_text()
+    database_location = f'path = "{state_dir / "executions.sqlite3"}"'
+    kill_location = f'kill_switch_file = "{state_dir / "KILL"}"'
     changes = {
         'state_dir = "/var/tmp/ilmar-gate1"': f'state_dir = "{state_dir}"',
         'instance_id = "gate1"': 'instance_id = "cap-drill"',
         "repository_id = 0": f"repository_id = {repo_id}",
-        'path = "/var/tmp/ilmar-gate1/executions.sqlite3"': f'path = "{state_dir / "executions.sqlite3"}"',
-        'kill_switch_file = "/var/tmp/ilmar-gate1-KILL"': f'kill_switch_file = "{state_dir / "KILL"}"',
+        'path = "/var/tmp/ilmar-gate1/executions.sqlite3"': database_location,
+        'kill_switch_file = "/var/tmp/ilmar-gate1-KILL"': kill_location,
         "daily_usd = 5": "daily_usd = 1",
         "monthly_usd = 10": "monthly_usd = 1",
         "reserve_per_execution_usd = 2": "reserve_per_execution_usd = 1",
