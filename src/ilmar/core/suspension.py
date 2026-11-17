@@ -23,6 +23,10 @@ from ilmar.domain.events import Actor, Event, EventType
 SPEND_UNCERTAIN = SuspensionReason.SPEND_UNCERTAIN.value
 
 
+SPEND_EVENTS = (EventType.EXECUTION_MODEL_SPEND, EventType.EXECUTION_SPEND_REVIEWED)
+"""The only events ``unreviewed_spend`` reads: a store can read just these (ADR-0045)."""
+
+
 def unreviewed_spend(events: Sequence[Event]) -> tuple[Event, ...]:
     """Every uncertain gateway settlement (ADR-0039) no operator has reviewed yet.
 
