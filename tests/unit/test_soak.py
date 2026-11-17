@@ -29,7 +29,7 @@ import io
 import os
 import random
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +41,7 @@ import conftest
 from coordinator_support import BASE_FILES, REPO, ScriptedAgent, WorkspaceRuntime, policy, task
 from ilmar import cli_loop
 from ilmar.adapters.memory import InMemoryExecutionStore
+from ilmar.adapters.sqlite import SQLiteExecutionStore
 from ilmar.core import kill_switch
 from ilmar.core.components import AgentSandbox, Components, Target
 from ilmar.core.coordinator import ExitCode
@@ -109,7 +110,7 @@ EDIT = {"src/app.py": "print('fixed')\n"}
 class World:
     tmp: Path
     clock: list[datetime]
-    store: InMemoryExecutionStore = field(default_factory=InMemoryExecutionStore)
+    store: Any = field(default_factory=InMemoryExecutionStore)
     scm: FakeSourceControl = field(default_factory=FakeSourceControl)
     tasks: FakeTaskProvider = field(
         default_factory=lambda: FakeTaskProvider(tuple(task(str(n)) for n in range(1, 81)))
@@ -181,11 +182,15 @@ def no_real_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("ilmar.cli_loop.run_loop", quick)
 
 
-@pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+@pytest.fixture(params=["memory", "sqlite"])
+def world(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[World]:
     tmp = tmp_path.resolve()
     (tmp / "state").mkdir(mode=0o700)
     w = World(tmp=tmp, clock=[START])
+    if request.param == "sqlite":  # the store a real deployment uses (#147 review)
+        w.store = SQLiteExecutionStore(tmp / "soak.db")
     real = Event.from_json
 
     verifying = [False]
@@ -213,7 +218,9 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     with w.human() as owner:  # the maintainer records the gate once
         w.store.commit(owner.fence, Commit(gate=GateRecorded(EVIDENCE, w.now)),
                        context=w.context(owner))  # fmt: skip
-    return w
+    yield w
+    if isinstance(w.store, SQLiteExecutionStore):
+        w.store.close()
 
 
 def lifetime(w: World, *, passes: int, during: Callable[[int], None] | None = None) -> int:
