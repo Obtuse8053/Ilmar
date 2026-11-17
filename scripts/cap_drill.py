@@ -19,10 +19,10 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
