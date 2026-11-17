@@ -538,11 +538,17 @@ class Coordinator:
         ]
 
     def _intent_event(self, key: str) -> Event | None:
-        return next(
-            (e for e in self._store.events()
-             if e.operation == key and e.type is EventType.OPERATION_INTENDED),
-            None,
-        )  # fmt: skip
+        """ADR-0045: the operation's own events, intents only; never the whole log."""
+        operation = self._store.operation(key)
+        if operation is None:
+            return None
+        if operation.execution_id is None:
+            found = self._store.events(instance_scoped=True, types=(EventType.OPERATION_INTENDED,))
+        else:
+            found = self._store.events(
+                execution_id=operation.execution_id, types=(EventType.OPERATION_INTENDED,)
+            )
+        return next((e for e in found if e.operation == key), None)
 
     def _created_after(self, ref: TaskRef, seq: int) -> bool:
         """Whether an execution of the task was created after ``seq`` (store order)."""
