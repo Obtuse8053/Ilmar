@@ -536,6 +536,31 @@ def through_ilmar(path: Path, issue: int) -> None:
         env.clear()
 
 
+def reconcile(path: Path) -> None:
+    """Read actual billing separately from the model's estimated token charges."""
+    check_paid_context(os.environ)
+    key = os.environ.get("CAP_DRILL_ADMIN_READ", "")
+    if not key:
+        raise DrillError("Admin key required to reconcile billing")
+    state = _state(path)
+    if state.get("phase") != "ilmar-verified":
+        raise DrillError("cannot reconcile an incomplete cap drill")
+    billed = month_spend(key, str(state["workspace_id"]))
+    starting = Decimal(str(state["spent_before_usd"]))
+    if billed < starting:
+        raise DrillError("cost report moved backwards; reconciliation unknown")
+    actual = billed - starting
+    estimated = Decimal(str(state["estimated_spend_usd"]))
+    state["actual_spend_usd"] = str(actual)
+    state["actual_status"] = "pending" if actual < estimated else "reported"
+    state["actual_checked_at"] = datetime.now(UTC).isoformat()
+    if actual > Decimal("1.00"):
+        state["outcome"] = "inconclusive: reported cost exceeds authorization"
+        _private_json(path, state)
+        raise DrillError("billing exceeds authorization; operator review needed")
+    _private_json(path, state)
+
+
 def record(path: Path, target: Path) -> None:
     """Write only a bounded allow-listed record, checked against every provided key."""
     try:
@@ -544,7 +569,8 @@ def record(path: Path, target: Path) -> None:
         state = {}
     allow = ("phase", "outcome", "cap_cents", "spent_before_usd", "estimated_spend_usd",
              "requests", "model", "provider_status", "provider_error_type",
-             "ilmar_first_exit", "budget_exit", "second_run_exit", "executions")
+             "ilmar_first_exit", "budget_exit", "second_run_exit", "executions",
+             "actual_spend_usd", "actual_status", "actual_checked_at")
     result = {k: state[k] for k in allow if k in state}
     result["run"] = os.environ.get("GITHUB_RUN_ID", "")
     result["sha"] = os.environ.get("ILMAR_EXPECTED_SHA", "")
@@ -561,7 +587,7 @@ def record(path: Path, target: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=("guard", "mark", "preflight", "exhaust",
-                                         "through-ilmar", "record"))
+                                         "through-ilmar", "reconcile", "record"))
     parser.add_argument("--state", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/cap-state.json")
     parser.add_argument("--record", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/cap-drill.json")
     parser.add_argument("--issue", type=int, default=0)
@@ -580,6 +606,8 @@ def main(argv: list[str] | None = None) -> int:
             if not 1 <= args.issue <= 1000000:
                 raise DrillError("a disposable issue number is required")
             through_ilmar(state, args.issue)
+        elif args.phase == "reconcile":
+            reconcile(state)
         else:
             record(state, Path(args.record))
     except (DrillError, ValueError, KeyError, OSError) as error:
