@@ -8,6 +8,8 @@ network) is tested in ``tests/integration/test_podman_gateway.py``.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import hashlib
 import http.client
 import io
@@ -17,10 +19,12 @@ import os
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -57,6 +61,9 @@ KEY = "sk-ant-real-key-never-in-the-sandbox-42"
 LOOPBACK = (ipaddress.ip_network("127.0.0.0/8"),)
 
 
+LOCK = threading.Lock()
+
+
 @dataclass
 class Provider:
     """Records what reached it; answers with a short SSE stream."""
@@ -66,6 +73,8 @@ class Provider:
     payload: bytes = GOOD
     status: int = 200
     entered: threading.Event = field(default_factory=threading.Event)
+    answers: list[tuple[int, bytes]] = field(default_factory=list)
+    """Per request, in order of arrival: ``(status, payload)``; then the defaults."""
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         provider = self
@@ -78,15 +87,19 @@ class Provider:
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers["content-length"]))
-                provider.seen.append({
-                    "path": self.path, "headers": dict(self.headers.items()), "body": body,
-                    "betas": self.headers.get_all("anthropic-beta") or [],
-                })  # fmt: skip
+                with LOCK:
+                    provider.seen.append({
+                        "path": self.path, "headers": dict(self.headers.items()), "body": body,
+                        "betas": self.headers.get_all("anthropic-beta") or [],
+                    })  # fmt: skip
+                    status, payload = (
+                        provider.answers.pop(0) if provider.answers
+                        else (provider.status, provider.payload)
+                    )  # fmt: skip
                 provider.entered.set()
                 if provider.hold is not None:
                     provider.hold.wait(5)
-                payload = provider.payload
-                self.send_response(provider.status)
+                self.send_response(status)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("request-id", "req_1")
                 self.send_header("anthropic-ratelimit-requests-remaining", "9")
@@ -753,3 +766,419 @@ def test_an_empty_or_cut_off_record_is_never_complete() -> None:
     assert mg.parse_spend([R, A, C])["closed"] is False
     complete = mg.parse_spend([R, A, C, "CLOSED admitted=1 settled=1 charged=100 open=0"])
     assert (complete["closed"], complete["charged"], complete["uncertain"]) == (True, 100, None)
+
+
+# -- an error in the gateway itself fails closed --------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_an_error_inside_the_gateway_charges_the_reservation_and_halts(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the request may have reached the provider, a fault in the gateway's
+    own code leaves the cost unknown: it is settled like an untrusted report, the
+    attempt halts, and nothing more is forwarded."""
+    admission = mg.load_admission()
+
+    def broken(self: object, chunk: bytes) -> None:
+        raise RuntimeError("a bug in the meter")
+
+    monkeypatch.setattr(admission.UsageMeter, "feed", broken)
+    monkeypatch.setattr(mg, "load_admission", lambda path=None: admission)
+    monkeypatch.setattr(mg._Handler, "handle_one_request", _quiet(mg._Handler.handle_one_request))
+    provider = Provider()
+    for running in start(provider):
+        body = BODY if path == "/v1/messages" else COUNT
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            running.post(path, body=body)  # the response is cut off
+        assert len(provider.seen) == 1
+        if path == "/v1/messages":
+            (line,) = charges(running.log)
+            assert "reason=gateway_error" in line
+            assert "halted=true" in line
+            reservation = re.search(r"reservation=(\d+)", line)
+            assert reservation is not None
+            assert f"charged={reservation[1]} " in line
+        else:
+            assert charges(running.log) == []
+            assert halts(running.log) == [
+                "HALT counting reason=gateway_error charged=0 halted=true"
+            ]
+        code, _, data = running.post()
+        assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == 1
+        spend = mg.parse_spend(running.log.getvalue().splitlines())
+        assert spend["unsettled"] == 0
+
+
+def _quiet(handle: Callable[[mg._Handler], None]) -> Callable[[mg._Handler], None]:
+    """The server prints the error's traceback; keep test output clean."""
+
+    def wrapped(self: mg._Handler) -> None:
+        try:
+            handle(self)
+        except (RuntimeError, OSError):
+            self.close_connection = True
+
+    return wrapped
+
+
+# -- faults during settlement itself and while writing the record (#138 review) -------
+
+
+def _gateway_with(admission: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mg, "load_admission", lambda path=None: admission)
+    monkeypatch.setattr(mg._Handler, "handle_one_request", _quiet(mg._Handler.handle_one_request))
+
+
+def _attempt(running: Running) -> None:
+    with contextlib.suppress(http.client.HTTPException, OSError):
+        running.post(body=BODY)
+
+
+def _nothing_more_is_forwarded(running: Running) -> None:
+    code, _, data = running.post()
+    assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+    code, _, data = running.post("/v1/messages/count_tokens", body=COUNT)
+    assert code == 429
+    assert len(running.provider.seen) == 1
+
+
+def _closed_record(running: Running) -> dict[str, Any]:
+    running.gateway.close(1.0)
+    return mg.parse_spend(running.log.getvalue().splitlines())
+
+
+def test_a_fault_computing_the_charge_charges_the_reservation_and_halts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = mg.load_admission()
+
+    def broken(*_args: object) -> object:
+        raise RuntimeError("a bug in charge()")
+
+    monkeypatch.setattr(admission, "charge", broken)
+    _gateway_with(admission, monkeypatch)
+    for running in start(Provider()):
+        _attempt(running)
+        (line,) = charges(running.log)
+        assert "reason=gateway_error" in line
+        assert "halted=true" in line
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)
+        assert spend["uncertain"] is not None  # not a trusted report
+        assert spend["unsettled"] == 0
+
+
+@pytest.mark.parametrize("halt_breaks_too", [False, True])
+def test_a_fault_inside_budget_settlement_stops_forwarding_and_leaves_spend_uncertain(
+    monkeypatch: pytest.MonkeyPatch, halt_breaks_too: bool
+) -> None:
+    """The budget itself cannot settle (and, worse, cannot halt): the gateway's own
+    flag still stops every later request, and the record shows a request admitted
+    but never settled."""
+    admission = mg.load_admission()
+
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in Budget.settle")
+
+    monkeypatch.setattr(admission.Budget, "settle", broken)
+    if halt_breaks_too:
+        monkeypatch.setattr(admission.Budget, "halt", broken)
+    _gateway_with(admission, monkeypatch)
+    for running in start(Provider()):
+        _attempt(running)
+        assert charges(running.log) == []
+        assert running.gateway.failed == "gateway error"
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)
+        assert spend["unsettled"] > 0
+        assert "admitted but never settled" in spend["uncertain"]
+
+
+def test_a_charge_line_that_cannot_be_written_stops_forwarding_and_leaves_spend_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget took the charge but the log did not: the request must not be
+    charged twice, nothing more is forwarded, and the record (whose totals stay
+    consistent) shows the request admitted but never settled."""
+    _gateway_with(mg.load_admission(), monkeypatch)
+    for running in start(Provider()):
+        write = running.gateway.log
+        failures: list[str] = []
+
+        def flaky(line: str, write: Callable[[str], None] = write,
+                  failures: list[str] = failures) -> None:  # fmt: skip
+            if line.startswith("CHARGE") and not failures:
+                failures.append(line)
+                raise OSError("disk full")
+            write(line)
+
+        monkeypatch.setattr(running.gateway, "log", flaky)
+        _attempt(running)
+        assert len(failures) == 1  # tried once; never retried or re-charged
+        assert charges(running.log) == []
+        assert running.gateway.failed == "gateway error"
+        assert running.gateway.budget.halted
+        _nothing_more_is_forwarded(running)
+        spend = _closed_record(running)  # CLOSED totals agree with the lines
+        assert spend["unsettled"] > 0
+        assert "admitted but never settled" in spend["uncertain"]
+
+
+# -- adversarial: concurrency, the spending bound and crash recovery (#138) -----------
+
+OVERRUN = sse(  # two million input tokens: ten dollars, far above any reservation
+    {"type": "message_start",
+     "message": {"usage": {"input_tokens": 2_000_000, "output_tokens": 1}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "message_delta", "usage": {"output_tokens": 3}},
+    {"type": "message_stop"},
+)  # fmt: skip
+ERROR = b'{"type": "error", "error": {"type": "overloaded_error"}}'
+
+
+def _concurrently(running: Running, count: int) -> list[threading.Thread]:
+    def post(running: Running = running) -> None:
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            running.post()
+
+    threads = [threading.Thread(target=post) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    return threads
+
+
+def _wait_for(predicate: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 5
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("in_flight", [1, 3])
+def test_concurrent_overruns_are_bounded_by_the_requests_in_flight(in_flight: int) -> None:
+    """ADR-0037 §4: spend is at most the budget plus the overruns of the requests in
+    flight when the attempt halted; nothing is admitted after."""
+    provider = Provider(hold=threading.Event(), payload=OVERRUN)
+    for running in start(provider, max_in_flight=in_flight):
+        threads = _concurrently(running, in_flight)
+        _wait_for(lambda: len(provider.seen) == in_flight)
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+        lines = charges(running.log)
+        assert len(lines) == in_flight
+        assert all("halted=true" in line for line in lines)
+        budget = running.gateway.budget
+        assert budget.halted
+        assert budget.spent() <= BUDGET + budget.overruns
+        code, _, data = running.post()
+        assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert len(provider.seen) == in_flight  # nothing after the halt
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+def test_an_untrusted_report_stops_admission_while_another_request_finishes() -> None:
+    provider = Provider(hold=threading.Event(), answers=[(200, GOOD), (529, ERROR)])
+    for running in start(provider, max_in_flight=2):
+        threads = _concurrently(running, 2)
+        _wait_for(lambda: len(provider.seen) == 2)
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+        lines = charges(running.log)
+        assert len(lines) == 2  # the one in flight is still charged, from its report
+        assert any("reason=reported" in line for line in lines)
+        assert running.gateway.budget.halted
+        code, _, _ = running.post()
+        assert code == 429
+        assert len(provider.seen) == 2
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+def test_trusted_reports_never_take_spend_past_the_budget() -> None:
+    """Request after request, each well within its reservation, until the budget
+    can no longer cover the next one: then it is refused locally, unforwarded."""
+    provider = Provider()
+    limit = 40_000  # four cents: about a hundred small requests, then too little
+    for running in start(provider, budget=limit):
+        for _ in range(500):
+            code, _, data = running.post()
+            if code != 200:
+                break
+        assert code == 429, (code, data[:200])
+        assert json.loads(data)["error"]["type"] == "budget_exceeded"
+        assert running.gateway.budget.spent() <= limit
+        assert len(charges(running.log)) == len(provider.seen)
+        assert not running.gateway.budget.halted  # refused, not halted: nothing unknown
+
+
+def test_a_gateway_killed_mid_request_leaves_a_record_that_makes_spend_uncertain() -> None:
+    """Crash recovery (ADR-0039): what a SIGKILL leaves behind (an ADMIT, no CHARGE,
+    no CLOSED) is never a complete record; the reservation counts as unsettled."""
+    provider = Provider(hold=threading.Event())
+    for running in start(provider):
+        threads = _concurrently(running, 1)
+        assert provider.entered.wait(5)
+
+        def admitted(log: io.StringIO = running.log) -> bool:
+            return "ADMIT" in log.getvalue()
+
+        _wait_for(admitted)
+        killed = running.log.getvalue().splitlines()  # the log as a kill would leave it
+        provider.hold.set()  # type: ignore[union-attr]
+        for thread in threads:
+            thread.join(5)
+    spend = mg.parse_spend(killed)
+    assert spend["uncertain"] is not None
+    assert spend["unsettled"] > 0
+
+
+# -- the failure flag and admission are atomic (#138 review, 2026-11-16) --------------
+
+
+class Pause:
+    """Holds the first call of a wrapped method just after it returns."""
+
+    def __init__(self) -> None:
+        self.reached, self.go, self.used = threading.Event(), threading.Event(), False
+
+    def wrap(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        def held(*args: Any) -> Any:
+            result = original(*args)
+            if not self.used:
+                self.used = True
+                self.reached.set()
+                assert self.go.wait(5)
+            return result
+
+        return held
+
+
+def _in_thread(call: Callable[[], tuple[int, Any, bytes]]) -> tuple[threading.Thread, list[int]]:
+    codes: list[int] = []
+
+    def run() -> None:
+        with contextlib.suppress(http.client.HTTPException, OSError):
+            codes.append(call()[0])
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, codes
+
+
+def _halt_breaks(admission: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in Budget.halt")
+
+    monkeypatch.setattr(admission.Budget, "halt", broken)
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_a_request_past_the_early_check_is_refused_once_the_gateway_fails(
+    path: str, halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Request A passes the unlocked failure check and the budget; the gateway then
+    fails (and the budget may not even halt). A must not be forwarded."""
+    admission = mg.load_admission()
+    pause = Pause()
+    method = "admit" if path == "/v1/messages" else "check"
+    monkeypatch.setattr(admission.Budget, method, pause.wrap(getattr(admission.Budget, method)))
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider):
+        body = BODY if path == "/v1/messages" else COUNT
+        thread, codes = _in_thread(functools.partial(running.post, path, body=body))
+        assert pause.reached.wait(5)  # A is between the budget and the last word
+        if halt_breaks:
+            with pytest.raises(RuntimeError):
+                running.gateway.fail("gateway error")
+        else:
+            running.gateway.fail("gateway error")
+        pause.go.set()
+        thread.join(5)
+        assert codes == [429]
+        assert provider.seen == []  # never forwarded
+        assert "ADMIT" not in running.log.getvalue()
+        assert not running.gateway.budget.in_flight  # its reservation released
+        spend = _closed_record(running)
+        assert spend["unsettled"] == 0
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+def test_a_concurrent_fault_stops_a_request_waiting_to_be_admitted(
+    halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same race from a real second request: B's own meter faults while A is
+    held after the budget. B is charged its reservation; A is never sent."""
+    admission = mg.load_admission()
+    pause = Pause()
+    monkeypatch.setattr(admission.Budget, "admit", pause.wrap(admission.Budget.admit))
+
+    def broken(*_args: object) -> None:
+        raise RuntimeError("a bug in the meter")
+
+    monkeypatch.setattr(admission.UsageMeter, "feed", broken)
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider, max_in_flight=2):
+        first, codes = _in_thread(running.post)
+        assert pause.reached.wait(5)  # A is held
+        _attempt(running)  # B: forwarded, then its meter faults
+        assert running.gateway.failed == "gateway error"
+        pause.go.set()
+        first.join(5)
+        assert codes == [429]
+        assert len(provider.seen) == 1  # B only
+        assert len(charges(running.log)) == (0 if halt_breaks else 1)
+        spend = _closed_record(running)
+        assert spend["uncertain"] is not None or charges(running.log)
+
+
+# -- an ADMIT line that cannot be written (#138 review, 2026-11-17) -------------------
+
+
+@pytest.mark.parametrize("halt_breaks", [False, True])
+def test_an_admit_line_that_cannot_be_written_fails_closed(
+    halt_breaks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fault happens before forwarding, outside the forwarding handler: the
+    request is never sent, nothing more is admitted (even if Budget.halt fails),
+    and the record cannot pass as complete."""
+    admission = mg.load_admission()
+    if halt_breaks:
+        _halt_breaks(admission, monkeypatch)
+    _gateway_with(admission, monkeypatch)
+    provider = Provider()
+    for running in start(provider):
+        write = running.gateway.log
+        failures: list[str] = []
+
+        def flaky(line: str, write: Callable[[str], None] = write,
+                  failures: list[str] = failures) -> None:  # fmt: skip
+            if line.startswith("ADMIT") and not failures:
+                failures.append(line)
+                raise OSError("disk full")
+            write(line)
+
+        monkeypatch.setattr(running.gateway, "log", flaky)
+        _attempt(running)
+        assert failures  # the ADMIT write was attempted and failed
+        assert provider.seen == []  # never forwarded
+        assert running.gateway.failed == "gateway error"
+        assert running.gateway.budget.halted is not halt_breaks
+        for path, body in (("/v1/messages", BODY), ("/v1/messages/count_tokens", COUNT)):
+            code, _, data = running.post(path, body=body)
+            assert (code, json.loads(data)["error"]["type"]) == (429, "budget_exceeded")
+        assert provider.seen == []
+        running.gateway.close(1.0)
+        with pytest.raises(ValueError, match="missing lines"):  # never a complete record
+            mg.parse_spend(running.log.getvalue().splitlines())

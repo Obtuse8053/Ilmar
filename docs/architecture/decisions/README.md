@@ -48,6 +48,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0041](0041-gate1-trial-authorization.md) | A bounded, expiring trial authorization for the Gate 1 live run | Proposed |
 | [0042](0042-quarantine-resolution.md) | A person resolves a quarantined resource, and the row stays quarantined | Proposed |
 | [0043](0043-restart-backoff-and-cooldown.md) | Exponential restart backoff, a cooldown and configurable, stricter-only limits | Proposed |
+| [0045](0045-narrow-event-reads.md) | Narrow event reads, filtered before decoding | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
 is Proposed while its PR is open. It becomes Accepted when the maintainer

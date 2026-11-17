@@ -31,7 +31,7 @@ from ilmar.config import IlmarConfig, load_config
 from ilmar.core import kill_switch
 from ilmar.core.ownership import Ownership
 from ilmar.core.starts import breach_if_started, read_starts, start_log_path
-from ilmar.core.suspension import resume_blocker, spend_reviews, unreviewed_spend
+from ilmar.core.suspension import SPEND_EVENTS, resume_blocker, spend_reviews, unreviewed_spend
 from ilmar.domain.budget import Suspension, SuspensionReason, micros_to_usd
 from ilmar.domain.errors import ConfigError, FencingError, LedgerIntegrityError, StartLogError
 from ilmar.domain.events import Actor, ActorKind, EventContext
@@ -151,7 +151,7 @@ def run(
                     )
                 except StartLogError as exc:
                     restart_breach = f"an unusable start log ({exc})"
-            pending = unreviewed_spend(store.events())
+            pending = unreviewed_spend(store.events(types=SPEND_EVENTS))
             blocker = resume_blocker(
                 current,
                 now=at,
@@ -205,7 +205,7 @@ def _status(config: IlmarConfig, *, out: TextIO, err: TextIO, now: datetime) -> 
     try:
         suspension = store.suspension()  # type: ignore[attr-defined]
         totals = store.budget_totals(now)  # type: ignore[attr-defined]
-        pending = unreviewed_spend(store.events())  # type: ignore[attr-defined]
+        pending = unreviewed_spend(store.events(types=SPEND_EVENTS))  # type: ignore[attr-defined]
     finally:
         store.close()  # type: ignore[attr-defined]
     if config.budget is None:

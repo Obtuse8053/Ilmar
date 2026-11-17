@@ -221,7 +221,9 @@ def trial_use(store: Any, config: IlmarConfig, at: datetime) -> TrialUse:
     executions = spent = 0
     if record is not None:
         since = record.terms.starts_at
-        for event in store.events():
+        # ADR-0045: only what the trial counts, and only after its own record.
+        usage = (EventType.EXECUTION_CREATED, EventType.BUDGET_RESERVED, EventType.BUDGET_CHARGED)
+        for event in store.events(after_seq=record.seq, types=usage):
             when = datetime.strptime(event.at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
             if when < since:
                 continue
