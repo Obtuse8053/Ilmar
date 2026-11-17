@@ -42,10 +42,15 @@ PROMPT = "Reply OK. The following text is harmless padding:\n" + ("red blue gree
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 WORKSPACE_ID = re.compile(r"wrkspc_[A-Za-z0-9]+\Z")
 KEY_SHAPE = re.compile(r"(sk-ant-[A-Za-z0-9_-]{12,}|github_pat_[A-Za-z0-9_]{12,})")
-CAP_MESSAGE = re.compile(r"(workspace|organization).*(usage|spend|billing|credit).*(limit|cap)|"
-                         r"(usage|spend|billing|credit).*(limit|cap)", re.I)
+CAP_MESSAGE = re.compile(
+    r"(workspace|organization).*(usage|spend|billing|credit).*(limit|cap)|"
+    r"(usage|spend|billing|credit).*(limit|cap)",
+    re.I,
+)
 MODEL_BODY: dict[str, Any] = {
-    "model": MODEL, "max_tokens": MAX_OUTPUT, "messages": [{"role": "user", "content": PROMPT}]
+    "model": MODEL,
+    "max_tokens": MAX_OUTPUT,
+    "messages": [{"role": "user", "content": PROMPT}],
 }
 
 
@@ -59,8 +64,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def api(
-    path: str, key: str, *, admin: bool, method: str = "GET",
-    payload: Mapping[str, Any] | None = None, beta: bool = False,
+    path: str,
+    key: str,
+    *,
+    admin: bool,
+    method: str = "GET",
+    payload: Mapping[str, Any] | None = None,
+    beta: bool = False,
 ) -> tuple[int, dict[str, Any], Mapping[str, str]]:
     """One request, with no redirects, logging, retry or credential-bearing error."""
     if not path.startswith("/") or "//" in path or not key:
@@ -111,9 +121,13 @@ def github(path: str, *, method: str = "GET", payload: Any = None) -> Any:
     req = urllib.request.Request(
         "https://api.github.com" + path,
         data=body,
-        headers={"authorization": f"Bearer {token}", "accept": "application/vnd.github+json",
-                 "x-github-api-version": "2022-11-28", "user-agent": "ilmar-cap-drill",
-                 "content-type": "application/json"},
+        headers={
+            "authorization": f"Bearer {token}",
+            "accept": "application/vnd.github+json",
+            "x-github-api-version": "2022-11-28",
+            "user-agent": "ilmar-cap-drill",
+            "content-type": "application/json",
+        },
         method=method,
     )
     try:
@@ -144,9 +158,7 @@ def authorization(env: Mapping[str, str]) -> None:
     if main.get("object", {}).get("sha") != sha:
         raise DrillError("main moved since the cap drill was reviewed")
     link = env.get("ILMAR_CAP_AUTHORIZATION", "")
-    match = re.fullmatch(
-        r"https://github\.com/Obtuse8053/Ilmar/issues/93#issuecomment-(\d+)", link
-    )
+    match = re.fullmatch(r"https://github\.com/Obtuse8053/Ilmar/issues/93#issuecomment-(\d+)", link)
     if not match:
         raise DrillError("a maintainer #93 authorization comment URL is required")
     comment = github(f"/repos/{REPO}/issues/comments/{match[1]}")
@@ -168,8 +180,11 @@ def markers() -> list[str]:
         comments = github(f"/repos/{REPO}/issues/{ISSUE}/comments?per_page=100&page={page}")
         if not isinstance(comments, list):
             raise DrillError("cannot verify one-time markers")
-        found.extend(str(c.get("body", "")) for c in comments
-                     if str(c.get("body", "")).startswith("ilmar-cap-drill: started "))
+        found.extend(
+            str(c.get("body", ""))
+            for c in comments
+            if str(c.get("body", "")).startswith("ilmar-cap-drill: started ")
+        )
         if len(comments) < 100:
             return found
     raise DrillError("issue comment history too large to verify once-only marker")
@@ -184,8 +199,11 @@ def guard(env: Mapping[str, str]) -> None:
 def mark(env: Mapping[str, str]) -> None:
     guard(env)
     run_url = f"https://github.com/{REPO}/actions/runs/{env['GITHUB_RUN_ID']}"
-    github(f"/repos/{REPO}/issues/{ISSUE}/comments", method="POST",
-           payload={"body": f"ilmar-cap-drill: started {run_url}"})
+    github(
+        f"/repos/{REPO}/issues/{ISSUE}/comments",
+        method="POST",
+        payload={"body": f"ilmar-cap-drill: started {run_url}"},
+    )
     if markers() != [f"ilmar-cap-drill: started {run_url}"]:
         raise DrillError("could not confirm the once-only marker")
 
@@ -205,7 +223,8 @@ def read_workspaces(admin_key: str) -> str:
     if status != 200:
         raise DrillError("workspace identity cannot be verified via Admin API")
     matches = [
-        w for w in data.get("data", [])
+        w
+        for w in data.get("data", [])
         if isinstance(w, dict) and w.get("name") == WORKSPACE and w.get("archived_at") is None
     ]
     if len(matches) != 1 or not WORKSPACE_ID.fullmatch(str(matches[0].get("id", ""))):
@@ -221,10 +240,13 @@ def validate_limit(data: Mapping[str, Any], workspace_id: str, *, ceiling: int =
     if not isinstance(records, list) or data.get("next_page"):
         raise DrillError("spend limit read is incomplete")
     matches = [
-        x for x in records if isinstance(x, dict) and
-        x.get("scope") == {"type": "workspace", "workspace_id": workspace_id} and
-        x.get("period") == "monthly" and x.get("currency") == "USD" and
-        x.get("is_enabled") is True
+        x
+        for x in records
+        if isinstance(x, dict)
+        and x.get("scope") == {"type": "workspace", "workspace_id": workspace_id}
+        and x.get("period") == "monthly"
+        and x.get("currency") == "USD"
+        and x.get("is_enabled") is True
     ]
     if len(matches) != 1 or not re.fullmatch(r"\d+", str(matches[0].get("amount", ""))):
         raise DrillError("workspace spending limit missing or ambiguous")
@@ -250,8 +272,10 @@ def verify_model_key(key: str, workspace_id: str) -> int:
         "/v1/messages/count_tokens", key, admin=False, method="POST", payload=MODEL_BODY
     )
     if (
-        status != 200 or headers.get("anthropic-workspace-id") != workspace_id
-        or type(body.get("input_tokens")) is not int or body["input_tokens"] <= 0
+        status != 200
+        or headers.get("anthropic-workspace-id") != workspace_id
+        or type(body.get("input_tokens")) is not int
+        or body["input_tokens"] <= 0
     ):
         raise DrillError("model key could not be proved scoped to the capped workspace")
     return int(body["input_tokens"])
@@ -262,11 +286,15 @@ def month_spend(admin_key: str, workspace_id: str, *, now: datetime | None = Non
     now = datetime.now(UTC) if now is None else now.astimezone(UTC)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    query = urllib.parse.urlencode({
-        "starting_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "ending_at": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "bucket_width": "1d", "group_by[]": "workspace_id", "limit": "31",
-    })
+    query = urllib.parse.urlencode(
+        {
+            "starting_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ending_at": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "bucket_width": "1d",
+            "group_by[]": "workspace_id",
+            "limit": "31",
+        }
+    )
     total = Decimal("0")
     for _ in range(5):
         status, data, _ = api("/v1/organizations/cost_report?" + query, admin_key, admin=True)
@@ -297,7 +325,7 @@ def month_spend(admin_key: str, workspace_id: str, *, now: datetime | None = Non
 def max_cost(input_tokens: int, *, output_tokens: int = MAX_OUTPUT) -> Decimal:
     if type(input_tokens) is not int or not 0 < input_tokens < 100000:
         raise DrillError("token count invalid")
-    amount = (Decimal(input_tokens) * INPUT_PRICE + Decimal(output_tokens) * OUTPUT_PRICE)
+    amount = Decimal(input_tokens) * INPUT_PRICE + Decimal(output_tokens) * OUTPUT_PRICE
     return (amount * Decimal("1.10") / 1_000_000).quantize(Decimal("0.000001"), rounding=ROUND_UP)
 
 
@@ -312,10 +340,11 @@ def reported_cost(usage: Mapping[str, Any]) -> Decimal:
 def is_cap_refusal(status: int, body: Mapping[str, Any]) -> bool:
     error = body.get("error")
     return (
-        status == 400 and isinstance(error, dict) and
-        isinstance(error.get("message"), str) and
-        bool(CAP_MESSAGE.search(error["message"])) and
-        error.get("type") in ("invalid_request_error", "permission_error")
+        status == 400
+        and isinstance(error, dict)
+        and isinstance(error.get("message"), str)
+        and bool(CAP_MESSAGE.search(error["message"]))
+        and error.get("type") in ("invalid_request_error", "permission_error")
     )
 
 
@@ -350,12 +379,20 @@ def preflight(path: Path) -> None:
     spend = month_spend(admin, workspace_id)
     if spend >= Decimal(limit) / 100:
         raise DrillError("the workspace already exhausted its cap")
-    _private_json(path, {
-        "phase": "verified", "workspace_id": workspace_id, "cap_cents": limit,
-        "spent_before_usd": str(spend), "input_tokens": tokens,
-        "estimated_spend_usd": "0", "requests": 0, "model": MODEL,
-        "outcome": "cap-unverified",
-    })
+    _private_json(
+        path,
+        {
+            "phase": "verified",
+            "workspace_id": workspace_id,
+            "cap_cents": limit,
+            "spent_before_usd": str(spend),
+            "input_tokens": tokens,
+            "estimated_spend_usd": "0",
+            "requests": 0,
+            "model": MODEL,
+            "outcome": "cap-unverified",
+        },
+    )
 
 
 def exhaust(path: Path) -> None:
@@ -406,11 +443,9 @@ def _config(path: Path, *, repo_id: int, state_dir: Path) -> Path:
     changes = {
         'state_dir = "/var/tmp/ilmar-gate1"': f'state_dir = "{state_dir}"',
         'instance_id = "gate1"': 'instance_id = "cap-drill"',
-        'repository_id = 0': f'repository_id = {repo_id}',
-        'path = "/var/tmp/ilmar-gate1/executions.sqlite3"':
-            f'path = "{state_dir / "executions.sqlite3"}"',
-        'kill_switch_file = "/var/tmp/ilmar-gate1-KILL"':
-            f'kill_switch_file = "{state_dir / "KILL"}"',
+        "repository_id = 0": f"repository_id = {repo_id}",
+        'path = "/var/tmp/ilmar-gate1/executions.sqlite3"': f'path = "{state_dir / "executions.sqlite3"}"',
+        'kill_switch_file = "/var/tmp/ilmar-gate1-KILL"': f'kill_switch_file = "{state_dir / "KILL"}"',
         "daily_usd = 5": "daily_usd = 1",
         "monthly_usd = 10": "monthly_usd = 1",
         "reserve_per_execution_usd = 2": "reserve_per_execution_usd = 1",
@@ -433,8 +468,10 @@ def _repo_issue(github_key: str, number: int) -> int:
     try:
         repo = github(f"/repos/{DISPOSABLE}")
         if (
-            not repo.get("private") or "ilmar-disposable" not in repo.get("topics", [])
-            or repo.get("full_name") != DISPOSABLE or type(repo.get("id")) is not int
+            not repo.get("private")
+            or "ilmar-disposable" not in repo.get("topics", [])
+            or repo.get("full_name") != DISPOSABLE
+            or type(repo.get("id")) is not int
         ):
             raise DrillError("disposable repository not verified")
         issue = github(f"/repos/{DISPOSABLE}/issues/{number}")
@@ -473,8 +510,8 @@ def _run_cli(path: Path, command: str, env: dict[str, str]) -> int:
     argv.extend(["--config", str(path)])
     try:
         result = subprocess.run(  # noqa: S603 - fixed python module and constrained CLI
-            argv, cwd=ROOT, env=env, capture_output=True,
-                                timeout=1200, check=False)
+            argv, cwd=ROOT, env=env, capture_output=True, timeout=1200, check=False
+        )
     except (subprocess.TimeoutExpired, OSError):
         raise DrillError("Ilmar CLI did not finish; no retry") from None
     # Never print stdout/stderr: Claude can reflect untrusted provider content.
@@ -498,9 +535,18 @@ def through_ilmar(path: Path, issue: int) -> None:
     work.chmod(0o700)
     config = _config(work / "gate1.toml", repo_id=repo_id, state_dir=work / "state")
     (work / "state").mkdir(mode=0o700)
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("CAP_DRILL_KEY", "CAP_DRILL_GITHUB_TOKEN", "CAP_DRILL_ADMIN_READ",
-                        "GH_TOKEN", "GITHUB_TOKEN")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "CAP_DRILL_KEY",
+            "CAP_DRILL_GITHUB_TOKEN",
+            "CAP_DRILL_ADMIN_READ",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+        )
+    }
     env["ANTHROPIC_API_KEY"] = model_key
     env["ILMAR_GATE1_GITHUB_TOKEN"] = gh_key
     from ilmar.adapters.sqlite import SQLiteExecutionStore
@@ -517,7 +563,8 @@ def through_ilmar(path: Path, issue: int) -> None:
             events = store.events()
             executions = store.list_in_states(set(ExecutionState))
         if (
-            suspension is None or suspension.reason.value != "provider-cap"
+            suspension is None
+            or suspension.reason.value != "provider-cap"
             or not any(e.reason == "provider-refused" for e in events)
             or not any(e.reason == "provider-cap" for e in events)
             or any(e.change_request_url for e in executions)
@@ -532,9 +579,16 @@ def through_ilmar(path: Path, issue: int) -> None:
             after = [(e.id, e.attempt) for e in store.list_in_states(set(ExecutionState))]
         if second != 78 or after != before:
             raise DrillError("suspended coordinator retried or changed execution state")
-        state.update({"phase": "ilmar-verified", "outcome": "cap-enforced-through-ilmar",
-                      "ilmar_first_exit": first, "budget_exit": budget,
-                      "second_run_exit": second, "executions": len(before)})
+        state.update(
+            {
+                "phase": "ilmar-verified",
+                "outcome": "cap-enforced-through-ilmar",
+                "ilmar_first_exit": first,
+                "budget_exit": budget,
+                "second_run_exit": second,
+                "executions": len(before),
+            }
+        )
         _private_json(path, state)
     finally:
         if labeled:
@@ -574,18 +628,34 @@ def record(path: Path, target: Path) -> None:
         state = _state(path)
     except (DrillError, ValueError, OSError):
         state = {}
-    allow = ("phase", "outcome", "cap_cents", "spent_before_usd", "estimated_spend_usd",
-             "requests", "model", "provider_status", "provider_error_type",
-             "ilmar_first_exit", "budget_exit", "second_run_exit", "executions",
-             "actual_spend_usd", "actual_status", "actual_checked_at")
+    allow = (
+        "phase",
+        "outcome",
+        "cap_cents",
+        "spent_before_usd",
+        "estimated_spend_usd",
+        "requests",
+        "model",
+        "provider_status",
+        "provider_error_type",
+        "ilmar_first_exit",
+        "budget_exit",
+        "second_run_exit",
+        "executions",
+        "actual_spend_usd",
+        "actual_status",
+        "actual_checked_at",
+    )
     result = {k: state[k] for k in allow if k in state}
     result["run"] = os.environ.get("GITHUB_RUN_ID", "")
     result["sha"] = os.environ.get("ILMAR_EXPECTED_SHA", "")
     result["workspace"] = WORKSPACE
     result.setdefault("outcome", "inconclusive")
     serialized = json.dumps(result, sort_keys=True)
-    secrets = [os.environ.get(k, "") for k in
-               ("CAP_DRILL_KEY", "CAP_DRILL_ADMIN_READ", "CAP_DRILL_GITHUB_TOKEN")]
+    secrets = [
+        os.environ.get(k, "")
+        for k in ("CAP_DRILL_KEY", "CAP_DRILL_ADMIN_READ", "CAP_DRILL_GITHUB_TOKEN")
+    ]
     if any(secret and secret in serialized for secret in secrets) or KEY_SHAPE.search(serialized):
         raise DrillError("credential-looking value in evidence; record withheld")
     _private_json(target, result)
@@ -593,8 +663,10 @@ def record(path: Path, target: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("guard", "mark", "preflight", "exhaust",
-                                         "through-ilmar", "reconcile", "record"))
+    parser.add_argument(
+        "phase",
+        choices=("guard", "mark", "preflight", "exhaust", "through-ilmar", "reconcile", "record"),
+    )
     temp = Path(os.environ.get("RUNNER_TEMP", str(Path.home() / ".cache" / "ilmar")))
     parser.add_argument("--state", default=str(temp / "cap-state.json"))
     parser.add_argument("--record", default=str(temp / "cap-drill.json"))
