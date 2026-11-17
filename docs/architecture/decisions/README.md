@@ -47,6 +47,7 @@ A changed decision gets a new ADR, and the old one is marked superseded.
 | [0040](0040-gate-records.md) | Gate records bound to version-pinned evidence and an immutable target | Proposed |
 | [0041](0041-gate1-trial-authorization.md) | A bounded, expiring trial authorization for the Gate 1 live run | Proposed |
 | [0042](0042-quarantine-resolution.md) | A person resolves a quarantined resource, and the row stays quarantined | Proposed |
+| [0044](0044-gateway-configuration.md) | Configuring the model gateway: opt-in, manual mode only, key outside the sandbox | Proposed |
 | [0045](0045-narrow-event-reads.md) | Narrow event reads, filtered before decoding | Proposed |
 
 Status values: Proposed, Accepted, Superseded by ADR-NNNN, Rejected. An ADR
