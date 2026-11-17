@@ -28,14 +28,21 @@ def test_limit_100_cents_matches_operator_authorization() -> None:
     assert d.validate_limit(limit(), "wrkspc_1234") == 100
 
 
-@pytest.mark.parametrize("bad", [
-    limit("101"), limit("200"), limit("0"),
-    limit(currency="EUR"), limit(period="daily"),
-    limit(is_enabled=False), limit(scope={"type": "organization"}),
-    {"data": [], "next_page": None},
-    {"data": limit()["data"] * 2},
-    {"data": limit()["data"], "next_page": "cursor"},
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        limit("101"),
+        limit("200"),
+        limit("0"),
+        limit(currency="EUR"),
+        limit(period="daily"),
+        limit(is_enabled=False),
+        limit(scope={"type": "organization"}),
+        {"data": [], "next_page": None},
+        {"data": limit()["data"] * 2},
+        {"data": limit()["data"], "next_page": "cursor"},
+    ],
+)
 def test_limit_verification_fails_closed(bad: dict[str, Any]) -> None:
     with pytest.raises(d.DrillError):
         d.validate_limit(bad, "wrkspc_1234")
@@ -48,8 +55,13 @@ def test_other_workspaces_limit_cannot_be_mistaken_for_target() -> None:
 
 def test_model_binding_requires_workspace_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_api(
-        path: str, key: str, *, admin: bool, method: str = "GET",
-        payload: Any = None, beta: bool = False,
+        path: str,
+        key: str,
+        *,
+        admin: bool,
+        method: str = "GET",
+        payload: Any = None,
+        beta: bool = False,
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
         assert path == "/v1/messages/count_tokens"
         assert key == "dummy"
@@ -71,8 +83,13 @@ def test_model_binding_refuses_missing_header(monkeypatch: pytest.MonkeyPatch) -
 
 def test_only_genuine_workspace_limit_refusal_counts() -> None:
     assert d.is_cap_refusal(
-        400, {"error": {"type": "invalid_request_error",
-                        "message": "You have reached your specified workspace API usage limits"}}
+        400,
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "You have reached your specified workspace API usage limits",
+            }
+        },
     )
     for status, kind, message in [
         (429, "rate_limit_error", "request rate limit reached"),
@@ -93,19 +110,24 @@ def test_cost_bound_includes_margin_and_prevents_excess() -> None:
 
 
 def test_untrusted_usage_refuses_further_spend() -> None:
-    for usage in ({"input_tokens": -1, "output_tokens": 1},
-                  {"input_tokens": 10, "output_tokens": 9},
-                  {"input_tokens": "10", "output_tokens": 1},
-                  {"input_tokens": 10}):
+    for usage in (
+        {"input_tokens": -1, "output_tokens": 1},
+        {"input_tokens": 10, "output_tokens": 9},
+        {"input_tokens": "10", "output_tokens": 1},
+        {"input_tokens": 10},
+    ):
         with pytest.raises(d.DrillError):
             d.reported_cost(usage)
 
 
 def test_context_needs_first_manual_run_at_exact_main_sha() -> None:
     env = {
-        "GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch",
-        "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": d.REPO,
-        "GITHUB_RUN_ATTEMPT": "1", "ILMAR_EXPECTED_SHA": "a" * 40,
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_REPOSITORY": d.REPO,
+        "GITHUB_RUN_ATTEMPT": "1",
+        "ILMAR_EXPECTED_SHA": "a" * 40,
         "GITHUB_SHA": "a" * 40,
     }
     d.run_context(env)
@@ -146,8 +168,15 @@ def test_record_whitelists_fields_and_never_includes_secrets(
 ) -> None:
     monkeypatch.setenv("CAP_DRILL_KEY", "sk-ant-secret-example")
     state = tmp_path / "state.json"
-    d._private_json(state, {"phase": "verified", "workspace_id": "private",
-                            "api_key": "sk-ant-secret-example", "requests": 0})
+    d._private_json(
+        state,
+        {
+            "phase": "verified",
+            "workspace_id": "private",
+            "api_key": "sk-ant-secret-example",
+            "requests": 0,
+        },
+    )
     record = tmp_path / "record.json"
     d.record(state, record)
     text = record.read_text()
