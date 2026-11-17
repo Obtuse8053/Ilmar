@@ -294,6 +294,10 @@ class InMemoryExecutionStore:
     ) -> Sequence[Event]:
         if execution_id is not None and instance_scoped:
             raise ValueError("an execution's events are never instance-scoped")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must not be negative")
+        if limit == 0:
+            return ()
         start = max(after_seq, 0)  # seq n is at index n - 1
         wanted = None if types is None else frozenset(types)
         with self._lock:

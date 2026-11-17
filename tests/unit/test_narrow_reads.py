@@ -4,6 +4,7 @@ per-pass reads cost the same however long the log grows (#147)."""
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -117,3 +118,67 @@ def test_trial_usage_reads_only_what_the_trial_counts(
         "types": (EventType.EXECUTION_CREATED, EventType.BUDGET_RESERVED,
                   EventType.BUDGET_CHARGED),
     }]  # fmt: skip
+
+
+# -- SQLite: a regression guard on the real file store (#147 review) ------------------
+
+
+def sqlite_store(tmp_path: Path) -> SQLiteExecutionStore:
+    return SQLiteExecutionStore(tmp_path / "ilmar.db")
+
+
+def per_pass_reads(store: ExecutionStore, trial_seq: int) -> None:
+    """What a loop check and a pass read from the event log after #147: the trial's
+    usage since its own record, and intents (instance-scoped and one execution's).
+    Spend review is read by ``ilmar resume``, not by a pass."""
+    usage = (EventType.EXECUTION_CREATED, EventType.BUDGET_RESERVED, EventType.BUDGET_CHARGED)
+    store.events(after_seq=trial_seq, types=usage)
+    store.events(instance_scoped=True, types=(EventType.OPERATION_INTENDED,))
+    store.events(execution_id="e5", types=(EventType.OPERATION_INTENDED,))
+
+
+def test_sqlite_per_pass_reads_decode_nothing_more_with_fifty_times_the_history(
+    tmp_path: Path, decodes: list[int]
+) -> None:
+    store = sqlite_store(tmp_path)
+    try:
+        grow(store, 20)
+        trial = len(store.events())  # a trial authorized now
+        small = narrow_read_cost(store, decodes, lambda: per_pass_reads(store, trial))
+        grow(store, 980, start=20)
+        trial = len(store.events())  # the same moment in a much longer history
+        large = narrow_read_cost(store, decodes, lambda: per_pass_reads(store, trial))
+        assert trial > 2000
+        assert large <= small + 2, (small, large)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("query", "values"),
+    [
+        ("EXPLAIN QUERY PLAN SELECT seq, line FROM events WHERE seq > ? AND execution_id = ? "
+         "AND type IN (?) ORDER BY seq", [0, "e5", "operation.intended"]),
+        ("EXPLAIN QUERY PLAN SELECT seq, line FROM events WHERE seq > ? AND execution_id IS NULL "
+         "AND type IN (?) ORDER BY seq", [0, "operation.intended"]),
+    ],
+    ids=["one-execution", "instance-scoped"],
+)  # fmt: skip
+def test_sqlite_narrow_reads_use_the_execution_index(
+    tmp_path: Path, query: str, values: list[object]
+) -> None:
+    """The per-execution and instance-scoped reads are index searches, never a
+    scan of the whole table (the type filter alone scans rows without decoding
+    them; ADR-0045, Consequences)."""
+    store = sqlite_store(tmp_path)
+    try:
+        grow(store, 50)
+        conn = sqlite3.connect(tmp_path / "ilmar.db")
+        try:
+            plan = conn.execute(query, values).fetchall()
+        finally:
+            conn.close()
+        detail = " ".join(str(row[-1]) for row in plan)
+        assert "events_by_execution" in detail, detail
+    finally:
+        store.close()
