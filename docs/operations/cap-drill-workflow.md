@@ -16,7 +16,7 @@ and Ilmar then:
 4. **never retries**: the next pass starts nothing and calls nothing.
 
 Today that is a manual drill (runbook §2, #93). This workflow makes it one
-recorded run on the disposable test environment, with **at most USD 0.50**
+recorded run on the disposable test environment, with **a USD 1.00 authorized budget**
 of real spend. **It replaces no Gate 1 requirement.** It is one way to
 perform the cap drill, which the maintainer reviews like every other piece
 of Gate 1 evidence. The gate is still recorded only by `ilmar gate record`.
@@ -28,14 +28,14 @@ of Gate 1 evidence. The gate is still recorded only by `ilmar gate record`.
   Setting limits through the API is an early-access preview. Reading them
   goes through the Admin API's spend-limit reads, behind a beta header.
 - **Not found: a minimum workspace limit.** So the design never assumes
-  USD 0.50 can be set. It **reads** the limit from the provider and stops
-  when it is above 50 cents (§3).
+  USD 1.00 can be set. It **reads** the limit from the provider and stops
+  when it is above 100 cents (§3).
 - **Not known: how quickly the cap takes effect after spend.** So the
   design's own ceiling never relies on the provider stopping it (§4).
 
 ## 1. Isolation
 
-- **A dedicated scratch workspace**, `ilmar-cap-drill`, never `ilmar-test`.
+- **A dedicated scratch workspace**, `ilmar-cap-test`, never `ilmar-test`.
   It has its own model key, created for the drill and deleted after.
 - **The disposable test environment of Gate 1:**
   - the `ilmar-disposable` repository;
@@ -50,7 +50,7 @@ of Gate 1 evidence. The gate is still recorded only by `ilmar gate record`.
 
 | Secret | What it is | Steps that read it |
 | --- | --- | --- |
-| `CAP_DRILL_MODEL_KEY` | the scratch workspace's model key | §4 and §5 |
+| `CAP_DRILL_KEY` | the scratch workspace's model key | §4 and §5 |
 | `CAP_DRILL_ADMIN_READ` | an Admin API key used only for reads: spend limits and the cost report; **required** | §3 and §6 |
 | `CAP_DRILL_GITHUB_TOKEN` | a fine-grained token for `ilmar-disposable` only, valid for a short time | §5 |
 
@@ -76,24 +76,26 @@ The run proceeds only if all of these hold:
 Using `CAP_DRILL_ADMIN_READ` only, the run reads from the provider:
 
 - **the workspace's effective monthly limit.** It must exist, be enabled and
-  be **≤ 50 cents**;
+  be **≤ 100 cents**;
 - **the workspace's month-to-date cost.**
 
 **It stops, making no paid request,** if:
 - the read fails or is not understood;
-- there is no limit, or the limit is above 50 cents;
+- there is no limit, or the limit is above 100 cents;
 - the attested cap (a dispatch input) differs from the read limit;
 - the month-to-date cost cannot be read.
 
 That stop is recorded as `cap-unverified` or `cap-too-high`. An attestation
 alone never suffices.
 
+The model key's binding must also be proved before paid requests: call the free token-count endpoint without an anthropic-workspace-id request header, and require its response's anthropic-workspace-id to match the Admin API's uniquely named workspace ID. A missing header or an unscoped key fails closed.
+
 ## 4. Reaching the cap: tiny direct requests, with a conservative ceiling
 
 The cap must be used up before Ilmar runs, so that Claude Code's very first
-request is refused and costs nothing. Using `CAP_DRILL_MODEL_KEY`:
+request is refused and costs nothing. Using `CAP_DRILL_KEY`:
 
-- **The model is the cheapest on an allow-list in the script.** The prompt is
+- **The model is pinned to an allow-list and chosen to reach the cap in a bounded number of requests; pricing is reviewed against Anthropic's published rates.** The prompt is
   fixed, `max_tokens` is 8, and requests go one at a time.
 - **A worst-case cost bound per request**, computed before sending it: the
   fixed prompt's input tokens counted with the free token-count endpoint,
@@ -101,9 +103,9 @@ request is refused and costs nothing. Using `CAP_DRILL_MODEL_KEY`:
 - **The ceiling.** Before each request, the run requires:
 
   *month-to-date cost read in §3, plus the estimated spend so far, plus the
-  next request's worst case ≤ 50 cents.*
+  next request's worst case ≤ 100 cents.*
 
-  Otherwise it stops. The provider's limit is at most 50 cents, so it should
+  Otherwise it stops. The provider's limit is at most 100 cents, so it should
   refuse first; if it does not, the ceiling stops the run anyway, as
   `inconclusive`.
 - **The first non-success ends §4.**
@@ -140,7 +142,7 @@ record notes how many attempts the agent's stream shows.
   response's `usage` at the attested prices.
 - **Actual:** the provider's month-to-date cost for the workspace, read
   again with `CAP_DRILL_ADMIN_READ` after §5, minus the §3 reading.
-  - The cost report may lag. If it does not cover the run yet, the record
+  - The cost report may lag (and the spend-limit effective endpoint supports Enterprise organizations only, not Claude Console). If it does not cover the run yet, the record
     says `actual: pending` with the time of the read.
   - The same read-only command can be run again later, with no paid request,
     to complete the record.
@@ -165,6 +167,8 @@ It never holds keys or their prefixes, headers, request bodies or
 organization IDs. Before it is saved, the writer checks the record against
 all three secrets' values and against patterns shaped like keys. It is
 uploaded as an artifact and posted on #93.
+
+The provider may enforce spending with delayed usage accounting. No client-side estimate can guarantee the provider's final bill, so an overshoot or absent trusted billing data is reported as inconclusive, never as a successful ≤ USD 1.00 verification.
 
 ## 8. Afterwards
 
@@ -210,13 +214,13 @@ jobs:
         with: {ref: "${{ inputs.expected_sha }}"}
       - name: Verify the cap (§3)
         env: {CAP_DRILL_ADMIN_READ: "${{ secrets.CAP_DRILL_ADMIN_READ }}"}
-        run: python3 scripts/cap_drill.py verify-cap --max-cents 50 --state cap.json
+        run: python3 scripts/cap_drill.py verify-cap --max-cents 100 --state cap.json
       - name: Reach the cap (§4)
-        env: {CAP_DRILL_MODEL_KEY: "${{ secrets.CAP_DRILL_MODEL_KEY }}"}
+        env: {CAP_DRILL_KEY: "${{ secrets.CAP_DRILL_KEY }}"}
         run: python3 scripts/cap_drill.py exhaust --state cap.json
       - name: Ilmar's coordinator (§5)
         env:
-          CAP_DRILL_MODEL_KEY: "${{ secrets.CAP_DRILL_MODEL_KEY }}"
+          CAP_DRILL_KEY: "${{ secrets.CAP_DRILL_KEY }}"
           CAP_DRILL_GITHUB_TOKEN: "${{ secrets.CAP_DRILL_GITHUB_TOKEN }}"
         run: python3 scripts/cap_drill.py through-ilmar --state cap.json
       - name: Actual cost (§6)
